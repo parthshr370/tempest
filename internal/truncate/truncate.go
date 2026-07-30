@@ -54,7 +54,7 @@ type LineResult struct {
 }
 
 // FormatSize returns a human-readable byte count string (e.g. "1.5MB",
-// "512B", "3.2KB").
+// "512B", "3.2KB", "2.0GB", "1.1TB").
 func FormatSize(bytes int) string {
 	if bytes < 1024 {
 		return fmt.Sprintf("%dB", bytes)
@@ -62,7 +62,13 @@ func FormatSize(bytes int) string {
 	if bytes < 1024*1024 {
 		return fmt.Sprintf("%.1fKB", float64(bytes)/1024)
 	}
-	return fmt.Sprintf("%.1fMB", float64(bytes)/(1024*1024))
+	if bytes < 1024*1024*1024 {
+		return fmt.Sprintf("%.1fMB", float64(bytes)/(1024*1024))
+	}
+	if bytes < 1024*1024*1024*1024 {
+		return fmt.Sprintf("%.1fGB", float64(bytes)/(1024*1024*1024))
+	}
+	return fmt.Sprintf("%.1fTB", float64(bytes)/(1024*1024*1024))
 }
 
 // Head keeps the earliest complete lines that fit the configured line and byte caps.
