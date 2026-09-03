@@ -3,12 +3,8 @@ package adapter
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/anthropic"
@@ -16,6 +12,10 @@ import (
 	"go.harness.dev/harness/internal/provider/google"
 	"go.harness.dev/harness/internal/provider/openai"
 	"go.harness.dev/harness/internal/retry"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // AnthropicMessagesAPI is the provider API id for the Anthropic Messages protocol.
@@ -158,17 +158,26 @@ func erroredStream(model types.Model, err error) *stream.AssistantStream {
 	return s
 }
 
-// ResolveProviderForModel returns the provider for a model name. Currently all
-// models route to "anthropic". This stub exists so provider-aware routing can
-// be added without changing callers.
+// ResolveProviderForModel returns the provider for a bare model name. The
+// embedded catalog decides by exact id; id-shape prefixes cover unknown ids;
+// slash-prefixed ids ("openai/gpt-4o") keep the Anthropic proxy route the
+// router has always given them, as does anything unrecognized.
 func ResolveProviderForModel(modelID string) string {
 	trimmed := strings.TrimSpace(strings.ToLower(modelID))
+	for _, prov := range []string{"anthropic", "openai", "google"} {
+		if _, ok := catalog.Lookup(prov, trimmed); ok {
+			return prov
+		}
+	}
 	switch {
-	case strings.HasPrefix(trimmed, "claude-"), strings.HasPrefix(trimmed, "anthropic/"), strings.HasPrefix(trimmed, "openai/"), strings.HasPrefix(trimmed, "google/"), strings.HasPrefix(trimmed, "gemini/"):
-		return "anthropic"
-	default:
+	case strings.HasPrefix(trimmed, "gemini-"):
+		return "google"
+	case strings.HasPrefix(trimmed, "gpt-"), strings.HasPrefix(trimmed, "o1"), strings.HasPrefix(trimmed, "o3"), strings.HasPrefix(trimmed, "o4"):
+		return "openai"
+	case strings.HasPrefix(trimmed, "claude-"):
 		return "anthropic"
 	}
+	return "anthropic"
 }
 
 func firstNonEmpty(values ...string) string {

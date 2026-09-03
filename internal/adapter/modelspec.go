@@ -2,9 +2,12 @@ package adapter
 
 import (
 	"fmt"
-	"go.harness.dev/harness/internal/engine/types"
 	"net/url"
+	"strconv"
 	"strings"
+
+	"go.harness.dev/harness/internal/catalog"
+	"go.harness.dev/harness/internal/engine/types"
 )
 
 // modelSpec is a parsed model string of the form "provider:model" or
@@ -54,8 +57,8 @@ func ValidateModelSpec(raw string) error {
 	if strings.TrimSpace(raw) == "" || spec.ModelID == "" {
 		return fmt.Errorf("model spec must include a model id")
 	}
-	if spec.Provider != "" && spec.Provider != "anthropic" && spec.Provider != "openai" {
-		return fmt.Errorf("unsupported model provider; use anthropic or openai")
+	if spec.Provider != "" && spec.Provider != "anthropic" && spec.Provider != "openai" && spec.Provider != "google" {
+		return fmt.Errorf("unsupported model provider; use anthropic, openai, or google")
 	}
 	if spec.BaseURL != "" {
 		if err := ValidateBaseURL(spec.BaseURL); err != nil {
@@ -89,12 +92,16 @@ type route struct {
 // resolveRoute turns the routing config + environment into a concrete provider
 // route. Anthropic is the default when the model carries no (or an "anthropic")
 // provider prefix. "openai" uses an explicit or configured compatible endpoint.
+// "google" speaks the Generative AI protocol with a GEMINI_API_KEY (or
+// GOOGLE_API_KEY) credential. When the model id hits the embedded catalog, the
+// catalog's context window and cost win and its output cap becomes the default
+// max tokens; the hardcoded values below stay as fallbacks for unknown ids.
 // An unknown provider is a deterministic configuration error rather than a
 // silent Anthropic fallback.
 func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 	maxTokens := cfg.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = resolveMaxTokens(env)
+		maxTokens = envMaxTokens(env)
 	}
 	raw := firstNonEmpty(cfg.ModelID, env("ANTHROPIC_DEFAULT_SONNET_MODEL"), "claude-opus-4-8")
 	spec := parseModelSpec(raw)
@@ -103,29 +110,61 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		prov = "anthropic"
 	}
 	model := types.Model{ID: spec.ModelID, Name: spec.ModelID, MaxTokens: maxTokens}
+	var api, apiKey, authToken string
 	switch prov {
 	case "anthropic":
-		model.API = AnthropicMessagesAPI
+		api = AnthropicMessagesAPI
 		model.Provider = "anthropic"
 		model.BaseURL = firstNonEmpty(spec.BaseURL, cfg.AnthropicBaseURL, cfg.BaseURL, env("HARNESS_ANTHROPIC_BASE_URL"), env("ANTHROPIC_BASE_URL"))
 		model.ContextWindow = 200000
-		return route{
-			Model:     model,
-			API:       AnthropicMessagesAPI,
-			APIKey:    firstNonEmpty(cfg.APIKey, env("ANTHROPIC_OAUTH_TOKEN"), env("ANTHROPIC_API_KEY")),
-			AuthToken: firstNonEmpty(cfg.AuthToken, env("ANTHROPIC_AUTH_TOKEN")),
-		}, nil
+		apiKey = firstNonEmpty(cfg.APIKey, env("ANTHROPIC_OAUTH_TOKEN"), env("ANTHROPIC_API_KEY"))
+		authToken = firstNonEmpty(cfg.AuthToken, env("ANTHROPIC_AUTH_TOKEN"))
 	case "openai":
-		model.API = OpenAICompletionsAPI
+		api = OpenAICompletionsAPI
 		model.Provider = "openai"
 		model.BaseURL = firstNonEmpty(spec.BaseURL, cfg.OpenAIBaseURL, cfg.BaseURL, env("OPENAI_BASE_URL"))
 		model.ContextWindow = 128000
-		return route{
-			Model:  model,
-			API:    OpenAICompletionsAPI,
-			APIKey: firstNonEmpty(cfg.APIKey, env("OPENAI_API_KEY")),
-		}, nil
+		apiKey = firstNonEmpty(cfg.APIKey, env("OPENAI_API_KEY"))
+	case "google":
+		api = GoogleGenerativeAPI
+		model.Provider = "google"
+		model.BaseURL = firstNonEmpty(spec.BaseURL, cfg.BaseURL, env("GEMINI_BASE_URL"))
+		model.ContextWindow = 1048576
+		apiKey = firstNonEmpty(cfg.APIKey, env("GEMINI_API_KEY"), env("GOOGLE_API_KEY"))
 	default:
-		return route{}, fmt.Errorf("unsupported model provider; use anthropic or openai")
+		return route{}, fmt.Errorf("unsupported model provider; use anthropic, openai, or google")
 	}
+	model.API = api
+	// Catalog defaults override the hardcoded fallbacks for known model ids.
+	// An explicit cfg.MaxTokens or HARNESS_MAX_TOKENS still beats the catalog.
+	if cm, ok := catalog.Lookup(prov, spec.ModelID); ok {
+		if cm.ContextWindow > 0 {
+			model.ContextWindow = cm.ContextWindow
+		}
+		model.Cost = cm.Cost
+		if maxTokens <= 0 && cm.MaxTokens > 0 {
+			model.MaxTokens = cm.MaxTokens
+		}
+	}
+	if model.MaxTokens <= 0 {
+		model.MaxTokens = defaultMaxTokens
+	}
+	return route{Model: model, API: api, APIKey: apiKey, AuthToken: authToken}, nil
+}
+
+// envMaxTokens returns the HARNESS_MAX_TOKENS override, or 0 when unset or
+// invalid so the caller falls back to the catalog or defaultMaxTokens.
+func envMaxTokens(env func(string) string) int {
+	if env == nil {
+		return 0
+	}
+	v := strings.TrimSpace(env("HARNESS_MAX_TOKENS"))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }

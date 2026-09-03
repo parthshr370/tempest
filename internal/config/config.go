@@ -74,6 +74,9 @@ type FlagValues struct {
 	LogLevel             StringInput
 	LogFile              StringInput
 	LogFileMaxBytes      IntInput
+	EnableTask           BoolInput
+	Plan                 BoolInput
+	Attach               StringsInput
 	EnableWeb            BoolInput
 	WebSearchURL         StringInput
 	AgentDir             StringInput
@@ -128,6 +131,9 @@ type ResolvedConfig struct {
 	permissionModeDefault string
 	logLevel              string
 	logFile               string
+	enableTask            bool
+	plan                  bool
+	attachPaths           []string
 	logFileMaxBytes       int64
 	enableWeb             bool
 	webSearchURL          string
@@ -166,6 +172,17 @@ func (c *ResolvedConfig) LogFile() string { return c.logFile }
 
 // LogFileMaxBytes returns the diagnostic log rotation threshold.
 func (c *ResolvedConfig) LogFileMaxBytes() int64 { return c.logFileMaxBytes }
+
+// EnableTask reports whether the delegated task tool is enabled.
+func (c *ResolvedConfig) EnableTask() bool { return c.enableTask }
+
+// Plan reports whether the run uses the read-only plan stack.
+func (c *ResolvedConfig) Plan() bool { return c.plan }
+
+// AttachPaths returns a defensive copy of startup attachment file paths.
+func (c *ResolvedConfig) AttachPaths() []string {
+	return append([]string(nil), c.attachPaths...)
+}
 
 // EnableWeb reports whether web tools are enabled.
 func (c *ResolvedConfig) EnableWeb() bool { return c.enableWeb }
@@ -235,6 +252,9 @@ type fileSettings struct {
 	EnableWeb             *bool    `json:"enable_web"`
 	WebSearchURL          *string  `json:"web_search_url"`
 	AgentDir              *string  `json:"agent_dir"`
+	EnableTask            *bool    `json:"enable_task"`
+	Plan                  *bool    `json:"plan"`
+	Attach                []string `json:"attach"`
 	SessionDir            *string  `json:"session_dir"`
 	AnthropicBaseURL      *string  `json:"anthropic_base_url"`
 	OpenAIBaseURL         *string  `json:"openai_base_url"`
@@ -320,6 +340,14 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, &Error{Field: "retry_enabled", Err: err}
 	}
+	taskEnabled, err := resolveBool(c.Flags.EnableTask, lookup("HARNESS_ENABLE_TASK"), settings.EnableTask, false)
+	if err != nil {
+		return nil, &Error{Field: "enable_task", Err: err}
+	}
+	planEnabled, err := resolveBool(c.Flags.Plan, lookup("HARNESS_PLAN"), settings.Plan, false)
+	if err != nil {
+		return nil, &Error{Field: "plan", Err: err}
+	}
 	retryMaxAttempts, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_MAX_ATTEMPTS"), settings.RetryMaxAttempts, 11)
 	if err != nil || retryMaxAttempts < 1 {
 		if err == nil {
@@ -362,6 +390,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		}
 		return nil, &Error{Field: "retry_jitter_max", Err: err}
 	}
+	attachPaths := resolveToolList(c.Flags.Attach, lookup("HARNESS_ATTACH"), settings.Attach)
 	var skillPaths []string
 	if c.Flags.SkillPaths.Set {
 		skillPaths = append([]string(nil), c.Flags.SkillPaths.Values...)
@@ -385,6 +414,9 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		logFile:               resolveString(c.Flags.LogFile, lookup("HARNESS_LOG_FILE"), settings.LogFile, ""),
 		logFileMaxBytes:       logFileMax,
 		enableWeb:             webEnabled,
+		enableTask:            taskEnabled,
+		plan:                  planEnabled,
+		attachPaths:           attachPaths,
 		webSearchURL:          resolveString(c.Flags.WebSearchURL, lookup("HARNESS_WEB_SEARCH_URL"), settings.WebSearchURL, ""),
 		agentDir:              ExpandTildePath(agentDir),
 		sessionDir:            ExpandTildePath(sessionDir),

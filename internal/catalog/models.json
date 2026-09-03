@@ -1,0 +1,109 @@
+{
+  "as_of": "2026-09",
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "api": "anthropic-messages",
+      "key_env": "ANTHROPIC_API_KEY",
+      "base_url": "https://api.anthropic.com"
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "api": "openai-completions",
+      "key_env": "OPENAI_API_KEY",
+      "base_url": "https://api.openai.com/v1"
+    },
+    {
+      "id": "google",
+      "name": "Google",
+      "api": "google-generative-ai",
+      "key_env": "GEMINI_API_KEY",
+      "base_url": "https://generativelanguage.googleapis.com"
+    }
+  ],
+  "models": [
+    {
+      "provider": "anthropic",
+      "id": "claude-opus-4-8",
+      "name": "Claude Opus 4.8",
+      "context_window": 200000,
+      "max_tokens": 64000,
+      "cost": { "input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25 },
+      "capabilities": ["thinking", "tools", "images", "cache"]
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-sonnet-4-6",
+      "name": "Claude Sonnet 4.6",
+      "context_window": 200000,
+      "max_tokens": 64000,
+      "cost": { "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 3.75 },
+      "capabilities": ["thinking", "tools", "images", "cache"]
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-haiku-4-5",
+      "name": "Claude Haiku 4.5",
+      "context_window": 200000,
+      "max_tokens": 64000,
+      "cost": { "input": 1.0, "output": 5.0, "cacheRead": 0.1, "cacheWrite": 1.25 },
+      "capabilities": ["thinking", "tools", "images", "cache"]
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-5",
+      "name": "GPT-5",
+      "context_window": 400000,
+      "max_tokens": 128000,
+      "cost": { "input": 1.25, "output": 10.0, "cacheRead": 0.125, "cacheWrite": 0 },
+      "capabilities": ["thinking", "tools"]
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-5-mini",
+      "name": "GPT-5 mini",
+      "context_window": 400000,
+      "max_tokens": 128000,
+      "cost": { "input": 0.25, "output": 2.0, "cacheRead": 0.025, "cacheWrite": 0 },
+      "capabilities": ["thinking", "tools"]
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-4.1",
+      "name": "GPT-4.1",
+      "context_window": 1047576,
+      "max_tokens": 32768,
+      "cost": { "input": 2.0, "output": 8.0, "cacheRead": 0.5, "cacheWrite": 0 },
+      "capabilities": ["tools", "images"]
+    },
+    {
+      "provider": "openai",
+      "id": "o3",
+      "name": "o3",
+      "context_window": 200000,
+      "max_tokens": 100000,
+      "cost": { "input": 2.0, "output": 8.0, "cacheRead": 0.5, "cacheWrite": 0 },
+      "capabilities": ["thinking", "tools"]
+    },
+    {
+      "provider": "google",
+      "id": "gemini-2.5-pro",
+      "name": "Gemini 2.5 Pro",
+      "context_window": 1048576,
+      "max_tokens": 65536,
+      "cost": { "input": 1.25, "output": 10.0, "cacheRead": 0.31, "cacheWrite": 0 },
+      "capabilities": ["thinking", "tools", "images"]
+    },
+    {
+      "provider": "google",
+      "id": "gemini-2.5-flash",
+      "name": "Gemini 2.5 Flash",
+      "context_window": 1048576,
+      "max_tokens": 65536,
+      "cost": { "input": 0.3, "output": 2.5, "cacheRead": 0.075, "cacheWrite": 0 },
+      "capabilities": ["thinking", "tools", "images"]
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +15,9 @@ func TestResolvePrecedence(t *testing.T) {
 	if err := os.WriteFile(settingsPath, []byte(`{
 		"model":"anthropic:settings",
 		"max_tokens":9000,
+		"enable_task":true,
+		"plan":true,
+		"attach":["/settings-note.md"],
 		"enable_web":true,
 		"agent_dir":"/settings-agent",
 		"log_level":"warn"
@@ -44,6 +48,16 @@ func TestResolvePrecedence(t *testing.T) {
 		{name: "debug alias", path: settingsPath, env: map[string]string{"HARNESS_DEBUG": "1"}, check: func(c *ResolvedConfig) string { return c.LogLevel() }, want: "debug"},
 		{name: "log level environment wins debug alias", path: settingsPath, env: map[string]string{"HARNESS_LOG_LEVEL": "error", "HARNESS_DEBUG": "1"}, check: func(c *ResolvedConfig) string { return c.LogLevel() }, want: "error"},
 		{name: "log level flag wins debug alias", path: settingsPath, flags: FlagValues{LogLevel: StringInput{Value: "error", Set: true}}, env: map[string]string{"HARNESS_DEBUG": "1"}, check: func(c *ResolvedConfig) string { return c.LogLevel() }, want: "error"},
+		{name: "enable task settings", path: settingsPath, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.EnableTask()) }, want: "true"},
+		{name: "enable task environment false", path: settingsPath, env: map[string]string{"HARNESS_ENABLE_TASK": "false"}, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.EnableTask()) }, want: "false"},
+		{name: "enable task flag false", path: settingsPath, flags: FlagValues{EnableTask: BoolInput{Value: false, Set: true}}, env: map[string]string{"HARNESS_ENABLE_TASK": "true"}, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.EnableTask()) }, want: "false"},
+		{name: "plan settings", path: settingsPath, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.Plan()) }, want: "true"},
+		{name: "plan environment false", path: settingsPath, env: map[string]string{"HARNESS_PLAN": "false"}, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.Plan()) }, want: "false"},
+		{name: "plan flag false", path: settingsPath, flags: FlagValues{Plan: BoolInput{Value: false, Set: true}}, env: map[string]string{"HARNESS_PLAN": "true"}, check: func(c *ResolvedConfig) string { return strconv.FormatBool(c.Plan()) }, want: "false"},
+		{name: "attach settings", path: settingsPath, check: func(c *ResolvedConfig) string { return strings.Join(c.AttachPaths(), ",") }, want: "/settings-note.md"},
+		{name: "attach environment", path: settingsPath, env: map[string]string{"HARNESS_ATTACH": "/env-a.md,/env-b.md"}, check: func(c *ResolvedConfig) string { return strings.Join(c.AttachPaths(), ",") }, want: "/env-a.md,/env-b.md"},
+		{name: "attach flag", path: settingsPath, flags: FlagValues{Attach: StringsInput{Values: []string{"/flag-a.md"}, Set: true}}, env: map[string]string{"HARNESS_ATTACH": "/env-a.md"}, check: func(c *ResolvedConfig) string { return strings.Join(c.AttachPaths(), ",") }, want: "/flag-a.md"},
+		{name: "attach default", path: filepath.Join(t.TempDir(), "missing.json"), check: func(c *ResolvedConfig) string { return strings.Join(c.AttachPaths(), ",") }, want: ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
