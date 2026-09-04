@@ -151,6 +151,7 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			model.ContextWindow = cm.ContextWindow
 		}
 		model.Cost = cm.Cost
+		model.OpenAICompat = cm.OpenAICompat
 		if maxTokens <= 0 && cm.MaxTokens > 0 {
 			model.MaxTokens = cm.MaxTokens
 		}

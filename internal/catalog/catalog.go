@@ -39,6 +39,9 @@ type Model struct {
 	MaxTokens     int             `json:"max_tokens"`
 	Cost          types.ModelCost `json:"cost"`
 	Capabilities  []string        `json:"capabilities"`
+	// OpenAICompat mirrors types.Model.OpenAICompat for models whose
+	// thinking-off wire dialect is non-default (effort SKUs).
+	OpenAICompat *types.OpenAICompat `json:"openai_compat,omitempty"`
 }
 
 // file mirrors models.json on disk. asOf records the pricing date so future

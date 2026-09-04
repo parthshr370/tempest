@@ -42,8 +42,19 @@ func StreamSimple(ctx context.Context, model types.Model, c types.Context, opts 
 		apiKey = opts.APIKey
 	}
 	base := buildBaseOptions(model, c, opts, apiKey)
-	if opts != nil && opts.Reasoning != "" {
-		return Stream(ctx, model, c, &Options{StreamOptions: base, ReasoningEffort: opts.Reasoning})
+	effort := ""
+	if opts != nil {
+		effort = opts.Reasoning
+	}
+	// The catalog decides how "thinking off" reaches the wire for this model.
+	// Effort-SKU models like gpt-5.6-luna reject function tools on chat
+	// completions unless reasoning_effort is explicitly "none" (mirrors omp's
+	// reasoningDisableMode: "none-effort"); everything else just omits the field.
+	if effort == "" && model.OpenAICompat != nil && model.OpenAICompat.ReasoningDisableMode == types.ReasoningDisableNoneEffort {
+		effort = "none"
+	}
+	if effort != "" {
+		return Stream(ctx, model, c, &Options{StreamOptions: base, ReasoningEffort: effort})
 	}
 	return Stream(ctx, model, c, &Options{StreamOptions: base})
 }

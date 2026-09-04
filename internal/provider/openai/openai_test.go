@@ -390,3 +390,41 @@ func streamEventTypes(in []types.StreamEventType) []string {
 
 func intPtr(v int) *int       { return &v }
 func strPtr(v string) *string { return &v }
+
+// An effort-SKU model whose catalog compat says none-effort must send
+// reasoning_effort "none" when thinking is off; with tools present, upstream
+// (Bifrost/OpenAI) otherwise rejects the request outright. Live-verified
+// against Bifrost gpt-5.6-luna, 2026-09-04.
+func TestStreamSimpleNoneEffortDisable(t *testing.T) {
+	var reqBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := map[string]any{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		reqBody = body
+		writeTextOpenAIStream(w, "ok")
+	}))
+	defer server.Close()
+
+	model := baseModel()
+	model.BaseURL = server.URL
+	model.OpenAICompat = &types.OpenAICompat{ReasoningDisableMode: types.ReasoningDisableNoneEffort}
+	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}}))
+	if reqBody["reasoning_effort"] != "none" {
+		t.Fatalf("reasoning_effort = %v, want none", reqBody["reasoning_effort"])
+	}
+
+	// An explicit level must win over the disable dialect.
+	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}, Reasoning: "high"}))
+	if reqBody["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort = %v, want high", reqBody["reasoning_effort"])
+	}
+
+	// Without the compat flag the field stays omitted.
+	model.OpenAICompat = nil
+	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}}))
+	if _, present := reqBody["reasoning_effort"]; present {
+		t.Fatalf("reasoning_effort unexpectedly present: %v", reqBody["reasoning_effort"])
+	}
+}
