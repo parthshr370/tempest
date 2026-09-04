@@ -14,6 +14,7 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/skills"
+	"go.harness.dev/harness/internal/subagent"
 	"go.harness.dev/harness/internal/tools"
 )
 
@@ -30,7 +31,9 @@ type StackConfig struct {
 	SpillDir         string
 	Model            ptypes.Model
 	PlanModel        ptypes.Model
+	SmolModel        ptypes.Model
 	StreamFn         agent.StreamFn
+	SmolStreamFn     agent.StreamFn
 	ProductName      string
 	CustomPrompt     string
 	PromptGuidelines []string
@@ -48,6 +51,7 @@ type StackConfig struct {
 	PermissionModeFunc PermissionModeFunc
 	PermissionPolicy   permission.Policy
 	ExcludeTools       []string
+	EnableTask         bool
 	EnableWeb          bool
 	WebSearchURL       string
 	ConfiguredTools    []agent.AgentTool
@@ -112,6 +116,37 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		cfg.SpillDir = dir
 	}
 	transformContext := compaction.Transform(compaction.TransformOptions{Cwd: cwd, SpillToolResults: true, SpillDir: cfg.SpillDir})
+	// Children compact against the default role; the parent keeps its own
+	// plan-adjusted runner further below.
+	childCompact := func(agent.ShouldStopAfterTurnContext) *agent.AgentLoopTurnUpdate { return nil }
+	if runner := newCompactionRunner(cfg.Model, cfg.StreamFn); runner != nil {
+		childCompact = runner.hook(nil)
+	}
+	var taskTool agent.AgentTool
+	if cfg.EnableTask && !cfg.Plan {
+		// The read-only plan stack never delegates: every registered child type
+		// would be able to write, which Plan exists to prevent.
+		registry := subagent.Registry{
+			"explore": subagent.Definition{
+				Description: "Read-only investigation: read files, grep, find, and list without changing anything.",
+				Tools:       tools.ReadOnlyTools(cwd, tools.ToolsOptions{EnableWeb: cfg.EnableWeb, SearchURL: cfg.WebSearchURL}),
+				Model:       cfg.SmolModel,
+				StreamFn:    cfg.SmolStreamFn,
+			},
+			"general": subagent.Definition{
+				Description: "Full coding task with the complete tool set.",
+				Tools:       append(tools.CodingTools(cwd, tools.ToolsOptions{}), tools.ReadOnlyTools(cwd, tools.ToolsOptions{})...),
+			},
+		}
+		taskTool = subagent.NewTool(subagent.Options{
+			Model:            cfg.Model,
+			StreamFn:         cfg.StreamFn,
+			Registry:         registry,
+			TransformContext: transformContext,
+			PrepareNextTurn:  childCompact,
+			BeforeToolCall:   beforeToolCall,
+		})
+	}
 	var readResolver tools.ReadResourceResolver
 	if len(cfg.Skills) > 0 {
 		resolver, err := skills.NewResolver(cfg.Skills)
@@ -124,6 +159,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		EnableWeb:          cfg.EnableWeb,
 		SearchURL:          cfg.WebSearchURL,
 		ConfiguredTools:    cfg.ConfiguredTools,
+		TaskTool:           taskTool,
 		AttachmentRegistry: cfg.AttachmentRegistry,
 		AttachmentReader:   cfg.AttachmentReader,
 		Sanitize:           cfg.Sanitize,

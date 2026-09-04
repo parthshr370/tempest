@@ -32,6 +32,23 @@ type Model struct {
 	MaxTokens        int                `json:"maxTokens,omitempty"`
 	Headers          map[string]string  `json:"headers,omitempty"`
 	Compat           *AnthropicCompat   `json:"compat,omitempty"`
+	OpenAICompat     *OpenAICompat      `json:"openaiCompat,omitempty"`
+}
+
+// OpenAI reasoning disable dialects. When thinking is off, each provider
+// family needs a different way to say so on the wire; the catalog declares
+// which one a model speaks and the adapter encodes it. Mirrors omp's
+// reasoningDisableMode.
+const (
+	// ReasoningDisableNoneEffort sends reasoning_effort: "none". Required by
+	// effort-SKU GPT models (gpt-5.6-luna): with tools present they reject
+	// chat-completions requests that omit the field.
+	ReasoningDisableNoneEffort = "none-effort"
+)
+
+// OpenAICompat holds per-model OpenAI compatibility flags.
+type OpenAICompat struct {
+	ReasoningDisableMode string `json:"reasoningDisableMode,omitempty"`
 }
 
 // SupportsVision reports whether the model accepts image input.

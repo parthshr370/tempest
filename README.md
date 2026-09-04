@@ -21,7 +21,7 @@ One prompt in, real work out. Tempest reads and edits your files, runs commands,
 drives itself turn by turn until the job is done — as a single static Go binary with
 no Node runtime, no interpreter, and nothing to install but the executable.
 
-**3** provider families · **13** built-in tools · **one** static binary · **zero** runtime deps.
+**3** provider families · **13** built-in tools (**8** on by default) · **one** static binary · **zero** runtime deps.
 
 ## Install
 
@@ -39,18 +39,21 @@ That produces a single self-contained `tempest` binary you can drop on your `PAT
 ANTHROPIC_API_KEY=... ./tempest -p "Create hello.txt with hi"
 ```
 
-`-model` selects the model: a bare name or `anthropic:model` uses the Anthropic
-Messages API; `openai:model@baseURL` targets any OpenAI-compatible endpoint. Output
-is text by default; `-output-format json` prints the final message as JSON.
+`-model` selects the model: a bare name, `anthropic:model`, `google:model` (Gemini
+via `GEMINI_API_KEY`), or `openrouter:<vendor/model>` via `OPENROUTER_API_KEY`;
+`openai:model@baseURL` targets any OpenAI-compatible endpoint with that base URL
+(OpenRouter, Together, Groq, Ollama, vLLM all work this way).
+Output is text by default; `-output-format json` prints the final message as JSON.
 
 ## Features
 
 ### 01 · One binary, every provider
 
-Anthropic, any OpenAI-compatible endpoint, and Google Gemini — chosen per run, mixed
-per role. A bare model name resolves against the built-in provider map; an unknown
-provider is a configuration error, never a silent fallback. No SDK zoo, no wrapper
-processes: the provider layer speaks each wire protocol directly.
+Anthropic, OpenAI, Google Gemini, and OpenRouter, plus any OpenAI-compatible
+endpoint by base URL — chosen per run, mixed per role. A bare model name resolves
+against the embedded catalog; an unknown provider is a configuration error, never
+a silent fallback. No SDK zoo, no wrapper processes: the provider layer speaks
+each wire protocol directly.
 
 ### 02 · Hash-anchored edits that never corrupt a file
 
@@ -87,8 +90,9 @@ no matter the mode.
 
 ### 06 · Model roles, routed by intent
 
-A `default` agent for normal turns, a read-only `plan` model, and a small `smol`
-helper — each routable to a different provider and model. Set them with
+A `default` agent for normal turns, a read-only `plan` model (used by `-plan`), and a
+small `smol` helper (the model behind the `explore` subagent of `-enable-task`) — each
+routable to a different provider and model. Set them with
 `-model`/`-plan-model`/`-smol-model` or the matching `HARNESS_*_MODEL` variables.
 
 ### 07 · Context that discovers itself
@@ -98,10 +102,11 @@ At startup the agent walks `AGENTS.md` up from your working directory, loads a s
 bundled or `-skill`-supplied skills. Skill bodies load on demand through the `skill`
 tool or a `skill://` read — nothing bloats the prompt until it's needed.
 
-### 08 · Subagents, in parallel
+### 08 · Subagents, behind `-enable-task`
 
-The `task` tool fans work out to isolated subagents and reads their results back, so a
-big job splits into independent slices instead of one long serial transcript.
+`-enable-task` registers the `task` tool with two built-in subagent types: `explore`,
+read-only investigation on the `smol` role, and `general`, full coding on the default
+role. Children never get the `task` tool, so delegation never recurses.
 
 ### 09 · Reads that summarize, not dump
 
@@ -111,8 +116,10 @@ window on lines it doesn't need yet.
 
 ## Every tool, in one namespace
 
-Thirteen built-in tools live beside `read` and `bash`; pin the active set with
-`-exclude-tools`, and gate the web tools behind `-enable-web`.
+Thirteen built-in tools live beside `read` and `bash`, **8 of them on by default**; pin
+the active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
+All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
+fall back to pure Go when `rg`/`fd` are absent.
 
 **Files & search**
 
@@ -129,18 +136,28 @@ Thirteen built-in tools live beside `read` and `bash`; pin the active set with
 
 **Coordination**
 
-- `task` — fan out subagents and collect their results.
+- `task` — fan out subagents and collect their results *(behind `-enable-task`)*.
 - `todo_write` — ordered task list with phase tracking.
 
 **Context**
 
-- `skill` — load a skill body on demand (also via `skill://`).
-- `attachment` — read resolved session attachments (documents, images).
+- `skill` — load a skill body on demand when skills are loaded (also via `skill://`).
+- `attachment` — read resolved session attachments *(behind `-attach`)*.
 
 **Web** *(gated behind `-enable-web`)*
 
 - `web_search` — one query against the configured search endpoint.
 - `web_fetch` — fetch a URL as bounded, structured text.
+
+## Flags
+
+| Flag | Purpose |
+|---|---|
+| `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
+| `-plan` | Run the read-only plan stack on the `plan` role model. |
+| `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
+| `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
+| `-skill <path>` | Additional skill location; repeatable. |
 
 ## Configuration
 

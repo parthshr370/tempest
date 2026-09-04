@@ -39,6 +39,42 @@ func TestResolveRolesUsesFallbacksAndFullRoutes(t *testing.T) {
 		t.Fatalf("max tokens were not threaded: default=%d plan=%d", roles.Default.Model.MaxTokens, roles.Plan.Model.MaxTokens)
 	}
 }
+
+func TestRoleCredentialsPerProvider(t *testing.T) {
+	lookup := func(key string) (string, bool) {
+		switch key {
+		case "GEMINI_API_KEY":
+			return "gem-key", true
+		case "OPENAI_API_KEY":
+			return "oai-key", true
+		case "ANTHROPIC_API_KEY":
+			return "ant-key", true
+		}
+		return "", false
+	}
+	tests := map[string][2]string{
+		"google:gemini-2.5-flash": {"gem-key", ""},
+		"gemini-2.5-flash":        {"gem-key", ""},
+		"openai:gpt-5":            {"oai-key", ""},
+		"claude-opus-4-8":         {"ant-key", ""},
+	}
+	for model, want := range tests {
+		got, _ := roleCredentials(model, lookup)
+		if got != want[0] {
+			t.Fatalf("roleCredentials(%q) key = %q, want %q", model, got, want[0])
+		}
+	}
+	// GOOGLE_API_KEY is the google fallback when GEMINI_API_KEY is absent.
+	fallback, _ := roleCredentials("google:gemini-2.5-flash", func(k string) (string, bool) {
+		if k == "GOOGLE_API_KEY" {
+			return "gcp-key", true
+		}
+		return "", false
+	})
+	if fallback != "gcp-key" {
+		t.Fatalf("google fallback key = %q", fallback)
+	}
+}
 func TestResolveRolesPropagatesRetryToEveryRealRouter(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

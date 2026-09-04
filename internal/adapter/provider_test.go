@@ -136,19 +136,22 @@ func TestResolveProviderForModelRoutesThroughAnthropicProxy(t *testing.T) {
 
 func TestProviderRouterMaxTokensDefaultAndOverride(t *testing.T) {
 	router := mustRouter(t, RoutingConfig{Env: func(string) string { return "" }})
-	if router.Model.MaxTokens != defaultMaxTokens {
-		t.Fatalf("default MaxTokens = %d, want %d", router.Model.MaxTokens, defaultMaxTokens)
+	// The default model id hits the catalog, so the catalog output cap (128000
+	// for claude-opus-4-8) is the effective default, not defaultMaxTokens.
+	if router.Model.MaxTokens != 128000 {
+		t.Fatalf("catalog default MaxTokens = %d, want 128000", router.Model.MaxTokens)
 	}
 	env := map[string]string{"HARNESS_MAX_TOKENS": "12000"}
 	override := mustRouter(t, RoutingConfig{Env: func(k string) string { return env[k] }})
 	if override.Model.MaxTokens != 12000 {
 		t.Fatalf("override MaxTokens = %d, want 12000", override.Model.MaxTokens)
 	}
-	// invalid/zero override falls back to the default
+	// invalid/zero override falls back to the catalog default for the
+	// default model id, same as the no-override case above.
 	bad := map[string]string{"HARNESS_MAX_TOKENS": "0"}
 	fallback := mustRouter(t, RoutingConfig{Env: func(k string) string { return bad[k] }})
-	if fallback.Model.MaxTokens != defaultMaxTokens {
-		t.Fatalf("bad-override MaxTokens = %d, want %d", fallback.Model.MaxTokens, defaultMaxTokens)
+	if fallback.Model.MaxTokens != 128000 {
+		t.Fatalf("bad-override MaxTokens = %d, want 128000", fallback.Model.MaxTokens)
 	}
 }
 

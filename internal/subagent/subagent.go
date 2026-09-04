@@ -35,10 +35,16 @@ type Options struct {
 }
 
 // Definition describes a registered subagent type with its own system prompt and tools.
+// Model and StreamFn, when set, override the runner's defaults for this type
+// only; explore-type read-only helpers can run on the small smol role while
+// general-purpose children keep the default role without splitting the task
+// tool in two.
 type Definition struct {
 	Description  string
 	SystemPrompt string
 	Tools        []agent.AgentTool
+	Model        ptypes.Model
+	StreamFn     agent.StreamFn
 }
 
 // Registry maps subagent type names to their definitions.
@@ -174,6 +180,8 @@ func (r *Runner) Execute(ctx context.Context, _ string, params json.RawMessage, 
 
 	systemPrompt := r.opts.SystemPrompt
 	childTools := r.opts.Tools
+	childModel := r.opts.Model
+	childStreamFn := r.opts.StreamFn
 	if len(r.opts.Registry) > 0 {
 		subagentType := strings.TrimSpace(input.SubagentType)
 		if subagentType == "" {
@@ -189,17 +197,20 @@ func (r *Runner) Execute(ctx context.Context, _ string, params json.RawMessage, 
 		if len(definition.Tools) > 0 {
 			childTools = stripTaskTools(definition.Tools)
 		}
-	}
-	if systemPrompt == "" {
-		systemPrompt = defaultSystemPrompt(input.SubagentType, input.Description)
+		if definition.Model.ID != "" {
+			childModel = definition.Model
+		}
+		if definition.StreamFn != nil {
+			childStreamFn = definition.StreamFn
+		}
 	}
 	child := agent.NewAgent(agent.AgentOptions{
 		InitialState: &agent.AgentState{
 			SystemPrompt: systemPrompt,
-			Model:        r.opts.Model,
+			Model:        childModel,
 			Tools:        append([]agent.AgentTool(nil), childTools...),
 		},
-		StreamFn:                   r.opts.StreamFn,
+		StreamFn:                   childStreamFn,
 		TransformContext:           r.opts.TransformContext,
 		PrepareNextTurnWithContext: r.opts.PrepareNextTurn,
 		BeforeToolCall:             r.opts.BeforeToolCall,

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
+	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/retry"
@@ -118,6 +120,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	streamFn := roles.Default.StreamFn
 	selectedModel := roles.Default.Model
 	planSelected := roles.Plan.Model
+	stackModel := roles.Default.Model
+	stackStreamFn := roles.Default.StreamFn
 	if opts.Config.FauxScript() != "" {
 		fauxProvider, fauxModel, err := loadFauxScript(opts.Config.FauxScript())
 		if err != nil {
@@ -125,10 +129,17 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		selectedModel = fauxModel
-		planSelected = fauxModel
+		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
+		stackStreamFn = streamFn
 	} else if !providerCredentialPresent(selectedModel.Provider, opts.Secrets) {
 		fmt.Fprintf(stderr, "warning: no %s credential resolved; model calls will fail until one is present\n", selectedModel.Provider)
+	}
+	if opts.Config.Plan() {
+		// The plan flag routes the whole run through the read-only stack on the
+		// plan role, not just the plan-agent model.
+		stackModel = roles.Plan.Model
+		stackStreamFn = roles.Plan.StreamFn
 	}
 
 	cwd, err := os.Getwd()
@@ -163,20 +174,34 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			}
 		}()
 	}
+	var attachRegistry *document.AttachmentRegistry
+	var attachReader *document.CacheRootBlobReader
+	if attachPaths := opts.Config.AttachPaths(); len(attachPaths) > 0 {
+		attachRegistry, attachReader, err = session.ResolveLocalAttachments(runCtx, attachPaths, filepath.Join(opts.Config.SessionDir(), "attachments"))
+		if err != nil {
+			fmt.Fprintf(stderr, "attach error: %v\n", err)
+			return 1
+		}
+	}
 	stack, err := session.BuildAgentStack(session.StackConfig{
-		Cwd:              cwd,
-		Model:            selectedModel,
-		PlanModel:        planSelected,
-		StreamFn:         streamFn,
-		PermissionMode:   permissionMode,
-		PermissionPolicy: permissionPolicy,
-		ExcludeTools:     splitCSV(opts.ExcludeTools),
-		EnableWeb:        opts.Config.EnableWeb(),
-		WebSearchURL:     opts.Config.WebSearchURL(),
-		ContextFiles:     inputs.ContextFiles,
-		Skills:           inputs.Skills,
-		GenericRules:     inputs.GenericRules,
-		InitialMessages:  seedMessages,
+		Cwd:                cwd,
+		Model:              stackModel,
+		PlanModel:          planSelected,
+		SmolModel:          roles.Smol.Model,
+		StreamFn:           stackStreamFn,
+		SmolStreamFn:       roles.Smol.StreamFn,
+		PermissionMode:     permissionMode,
+		PermissionPolicy:   permissionPolicy,
+		ExcludeTools:       splitCSV(opts.ExcludeTools),
+		EnableTask:         opts.Config.EnableTask(),
+		EnableWeb:          opts.Config.EnableWeb(),
+		WebSearchURL:       opts.Config.WebSearchURL(),
+		ContextFiles:       inputs.ContextFiles,
+		Skills:             inputs.Skills,
+		GenericRules:       inputs.GenericRules,
+		InitialMessages:    seedMessages,
+		AttachmentRegistry: attachRegistry,
+		AttachmentReader:   attachReader,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "agent stack error: %v\n", err)
@@ -237,8 +262,10 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	fs.StringVar(&values.LogLevel.Value, "log-level", "", "log level: debug, info, warn, error")
 	fs.StringVar(&values.LogFile.Value, "log-file", "", "diagnostic log file")
 	fs.IntVar(&values.LogFileMaxBytes.Value, "log-file-max-bytes", 0, "diagnostic log rotation size in bytes")
+	fs.BoolVar(&values.EnableTask.Value, "enable-task", false, "enable the delegated task tool with explore and general subagents")
+	fs.BoolVar(&values.Plan.Value, "plan", false, "run the read-only plan stack")
+	fs.Var(skillPathsFlag{input: &values.Attach}, "attach", "file to attach to the session (repeatable)")
 	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
-	fs.StringVar(&values.WebSearchURL.Value, "web-search-url", "", "HTTP endpoint for web_search; receives q and limit query parameters")
 	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
 	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
@@ -281,6 +308,12 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 			values.LogFile.Set = true
 		case "log-file-max-bytes":
 			values.LogFileMaxBytes.Set = true
+		case "enable-task":
+			values.EnableTask.Set = true
+		case "plan":
+			values.Plan.Set = true
+		case "attach":
+			values.Attach.Set = true
 		case "enable-web":
 			values.EnableWeb.Set = true
 		case "web-search-url":
@@ -338,6 +371,10 @@ func secretResolver(values config.FlagValues) config.SecretResolver {
 			}
 		case "OPENAI_API_KEY":
 			value = os.Getenv("OPENAI_API_KEY")
+		case "GEMINI_API_KEY":
+			value = os.Getenv("GEMINI_API_KEY")
+		case "GOOGLE_API_KEY":
+			value = os.Getenv("GOOGLE_API_KEY")
 		}
 		value = strings.TrimSpace(value)
 		return value, value != ""
@@ -353,6 +390,13 @@ func providerCredentialPresent(provider string, secrets config.SecretResolver) b
 	case "openai":
 		_, present := secrets.Resolve("OPENAI_API_KEY")
 		return present
+	case "openrouter":
+		_, present := secrets.Resolve("OPENROUTER_API_KEY")
+		return present
+	case "google":
+		_, gemini := secrets.Resolve("GEMINI_API_KEY")
+		_, googleKey := secrets.Resolve("GOOGLE_API_KEY")
+		return gemini || googleKey
 	default:
 		_, apiKey := secrets.Resolve("ANTHROPIC_API_KEY")
 		_, authToken := secrets.Resolve("ANTHROPIC_AUTH_TOKEN")

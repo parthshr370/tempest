@@ -73,17 +73,36 @@ func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) 
 	})
 }
 
-// roleCredentials keeps OpenAI's API-key route separate from Anthropic's key-or-token route.
+// roleCredentials keeps each provider's key route separate: OpenAI takes an
+// API key, Anthropic a key-or-token pair, Google a Gemini key with the
+// Google Cloud key as fallback. Resolution goes through
+// ResolveProviderForModel so bare model ids ("gemini-2.5-flash") route like
+// prefixed ones ("google:gemini-2.5-flash").
 func roleCredentials(model string, lookup func(string) (string, bool)) (string, string) {
 	if lookup == nil {
 		return "", ""
 	}
 	spec := parseModelSpec(model)
-	if spec.Provider == "openai" {
+	provider := spec.Provider
+	if provider == "" {
+		provider = ResolveProviderForModel(spec.ModelID)
+	}
+	switch provider {
+	case "openai":
 		key, _ := lookup("OPENAI_API_KEY")
 		return key, ""
+	case "openrouter":
+		key, _ := lookup("OPENROUTER_API_KEY")
+		return key, ""
+	case "google":
+		if key, _ := lookup("GEMINI_API_KEY"); key != "" {
+			return key, ""
+		}
+		key, _ := lookup("GOOGLE_API_KEY")
+		return key, ""
+	default:
+		apiKey, _ := lookup("ANTHROPIC_API_KEY")
+		authToken, _ := lookup("ANTHROPIC_AUTH_TOKEN")
+		return apiKey, authToken
 	}
-	apiKey, _ := lookup("ANTHROPIC_API_KEY")
-	authToken, _ := lookup("ANTHROPIC_AUTH_TOKEN")
-	return apiKey, authToken
 }

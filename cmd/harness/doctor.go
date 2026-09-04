@@ -7,6 +7,7 @@ import (
 	"os"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/catalog"
 )
 
 // runDoctor resolves the same config and roles as execution, then prints their safe-to-share shape without invoking a model.
@@ -50,7 +51,16 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	printRole(stdout, "default", roles.Default)
 	printRole(stdout, "plan", roles.Plan)
 	printRole(stdout, "smol", roles.Smol)
-	fmt.Fprintln(stdout, "paths:")
+	fmt.Fprintln(stdout, "providers:")
+	for _, p := range catalog.Providers() {
+		fmt.Fprintf(stdout, "  %s: api=%s key=%s present=%s base_url=%s\n", p.ID, p.API, p.KeyEnv, yesNo(providerCredentialPresent(p.ID, opts.Secrets)), p.BaseURL)
+	}
+	fmt.Fprintf(stdout, "models: (pricing as of %s, USD per million tokens)\n", catalog.AsOf())
+	for _, m := range catalog.Models() {
+		fmt.Fprintf(stdout, "  %s/%s: window=%d max_tokens=%d cost={in=%.2f out=%.2f cache_read=%.2f cache_write=%.2f}\n",
+			m.Provider, m.ID, m.ContextWindow, m.MaxTokens, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite)
+	}
+	fmt.Fprintln(stdout, "path checks:")
 	fmt.Fprintf(stdout, "  config: %s\n", opts.Config.SettingsPath())
 	fmt.Fprintf(stdout, "  agent: %s\n", opts.Config.AgentDir())
 	fmt.Fprintf(stdout, "  session: %s\n", opts.Config.SessionDir())
@@ -97,6 +107,15 @@ func redactedURL(raw string) string {
 		return parsed.String() + " (REDACTED)"
 	}
 	return raw
+}
+
+// yesNo renders a boolean as the lowercase yes/no doctor prints for key
+// presence. Doctor only ever says whether a credential exists, never its value.
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
 }
 
 func printRoleCredentialCheck(w io.Writer, role, provider string, opts commandOptions) {

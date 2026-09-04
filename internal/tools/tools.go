@@ -15,12 +15,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -483,6 +485,8 @@ func mustTools(cwd string, options ToolsOptions, names ...ToolName) []agent.Agen
 // newReadTool builds the file reader rooted at cwd. It accepts path plus optional
 // offset and limit inputs so callers can page through text without loading it all at once.
 func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
+	// One os.Root per tool keeps every read inside the working directory.
+	getRoot := rootOnce(cwd)
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(ReadTool),
@@ -509,6 +513,10 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := ctx.Err(); err != nil {
 				return agent.AgentToolResult{}, errors.New("Operation aborted")
 			}
+			rootForRead, err := getRoot()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
 			selector, err := parseReadPathSelector(input.Path)
 			if err != nil {
 				return agent.AgentToolResult{}, err
@@ -528,7 +536,11 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 				displayPath = content.URI
 			} else {
 				absolutePath = pathutil.ResolveReadPath(selector.Path, cwd)
-				data, err = os.ReadFile(absolutePath)
+				relPath, err := rootRelPath(cwd, absolutePath)
+				if err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				data, err = readFileInRoot(rootForRead, relPath)
 				if err != nil {
 					return agent.AgentToolResult{}, err
 				}
@@ -640,18 +652,20 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
 			}
+			rootForWrite, err := rootOnce(cwd)()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
 			absolutePath := pathutil.ResolveToCwd(input.Path, cwd)
-			err := queue.Do(absolutePath, func() error {
+			relPath, err := rootRelPath(cwd, absolutePath)
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			err = queue.Do(absolutePath, func() error {
 				if err := abortErr(ctx); err != nil {
 					return err
 				}
-				if err := os.MkdirAll(filepath.Dir(absolutePath), 0o755); err != nil {
-					return err
-				}
-				if err := abortErr(ctx); err != nil {
-					return err
-				}
-				if err := os.WriteFile(absolutePath, []byte(input.Content), 0o644); err != nil {
+				if err := writeFileInRoot(rootForWrite, relPath, []byte(input.Content)); err != nil {
 					return err
 				}
 				return abortErr(ctx)
@@ -699,12 +713,20 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 				return agent.AgentToolResult{}, errors.New("edit requires path and at least one edit")
 			}
 			absolutePath := pathutil.ResolveToCwd(input.Path, cwd)
+			rootForEdit, err := rootOnce(cwd)()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			relPath, err := rootRelPath(cwd, absolutePath)
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
 			var details *editToolDetails
-			err := queue.Do(absolutePath, func() error {
+			err = queue.Do(absolutePath, func() error {
 				if err := abortErr(ctx); err != nil {
 					return err
 				}
-				rawContent, err := os.ReadFile(absolutePath)
+				rawContent, err := readFileInRoot(rootForEdit, relPath)
 				if err != nil {
 					return fmt.Errorf("could not edit %s: %w", input.Path, err)
 				}
@@ -738,7 +760,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 					return err
 				}
 				finalContent := bom + editdiff.RestoreLineEndings(applied.NewContent, ending)
-				if err := os.WriteFile(absolutePath, []byte(finalContent), 0o644); err != nil {
+				if err := writeFileInRoot(rootForEdit, relPath, []byte(finalContent)); err != nil {
 					return err
 				}
 				if err := abortErr(ctx); err != nil {
@@ -910,12 +932,16 @@ func newGrepTool(cwd string) agent.AgentTool {
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			rgPath, ok := toolio.EnsureTool("rg")
-			if !ok {
-				return agent.AgentToolResult{}, fmt.Errorf("ripgrep (rg) is not available in PATH")
+			rootForGrep, err := rootOnce(cwd)()
+			if err != nil {
+				return agent.AgentToolResult{}, err
 			}
-			searchPath := pathutil.ResolveToCwd(defaultString(input.Path, "."), cwd)
-			stat, err := os.Stat(searchPath)
+			relSearch, err := resolveRootPath(cwd, defaultString(input.Path, "."))
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			searchPath := filepath.Join(cwd, relSearch)
+			stat, err := statInRoot(rootForGrep, relSearch)
 			if err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", searchPath)
 			}
@@ -927,89 +953,95 @@ func newGrepTool(cwd string) agent.AgentTool {
 			if contextLines < 0 {
 				contextLines = 0
 			}
-			args := []string{"--json", "--line-number", "--color=never", "--hidden"}
-			if input.IgnoreCase {
-				args = append(args, "--ignore-case")
-			}
-			if input.Literal {
-				args = append(args, "--fixed-strings")
-			}
-			if input.Glob != "" {
-				args = append(args, "--glob", input.Glob)
-			}
-			args = append(args, "--", input.Pattern, searchPath)
-			cmd := exec.CommandContext(ctx, rgPath, args...)
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			if err := cmd.Start(); err != nil {
-				return agent.AgentToolResult{}, fmt.Errorf("Failed to run ripgrep: %w", err)
-			}
-			type grepMatch struct {
-				filePath   string
-				lineNumber int
-				lineText   string
-			}
 			matches := []grepMatch{}
 			matchLimitReached := false
-			killedDueToLimit := false
-			scanner := bufio.NewScanner(stdout)
-			scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-			for scanner.Scan() {
-				if len(matches) >= limit {
-					matchLimitReached = true
-					if cmd.Process != nil {
-						killedDueToLimit = true
-						_ = cmd.Process.Kill()
+			backend := "rg"
+			if rgPath, ok := toolio.EnsureTool("rg"); ok {
+				args := []string{"--json", "--line-number", "--color=never", "--hidden"}
+				if input.IgnoreCase {
+					args = append(args, "--ignore-case")
+				}
+				if input.Literal {
+					args = append(args, "--fixed-strings")
+				}
+				if input.Glob != "" {
+					args = append(args, "--glob", input.Glob)
+				}
+				args = append(args, "--", input.Pattern, searchPath)
+				cmd := exec.CommandContext(ctx, rgPath, args...)
+				stdout, err := cmd.StdoutPipe()
+				if err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				if err := cmd.Start(); err != nil {
+					return agent.AgentToolResult{}, fmt.Errorf("Failed to run ripgrep: %w", err)
+				}
+				killedDueToLimit := false
+				scanner := bufio.NewScanner(stdout)
+				scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+				for scanner.Scan() {
+					if len(matches) >= limit {
+						matchLimitReached = true
+						if cmd.Process != nil {
+							killedDueToLimit = true
+							_ = cmd.Process.Kill()
+						}
+						continue
 					}
-					continue
-				}
-				var event struct {
-					Type string `json:"type"`
-					Data struct {
-						Path struct {
-							Text string `json:"text"`
-						} `json:"path"`
-						LineNumber int `json:"line_number"`
-						Lines      struct {
-							Text string `json:"text"`
-						} `json:"lines"`
-					} `json:"data"`
-				}
-				if err := json.Unmarshal(scanner.Bytes(), &event); err != nil || event.Type != "match" {
-					continue
-				}
-				if event.Data.Path.Text != "" && event.Data.LineNumber > 0 {
-					matches = append(matches, grepMatch{filePath: event.Data.Path.Text, lineNumber: event.Data.LineNumber, lineText: event.Data.Lines.Text})
-				}
-				if len(matches) >= limit {
-					matchLimitReached = true
-					if cmd.Process != nil {
-						killedDueToLimit = true
-						_ = cmd.Process.Kill()
+					var event struct {
+						Type string `json:"type"`
+						Data struct {
+							Path struct {
+								Text string `json:"text"`
+							} `json:"path"`
+							LineNumber int `json:"line_number"`
+							Lines      struct {
+								Text string `json:"text"`
+							} `json:"lines"`
+						} `json:"data"`
+					}
+					if err := json.Unmarshal(scanner.Bytes(), &event); err != nil || event.Type != "match" {
+						continue
+					}
+					if event.Data.Path.Text != "" && event.Data.LineNumber > 0 {
+						matches = append(matches, grepMatch{filePath: event.Data.Path.Text, lineNumber: event.Data.LineNumber, lineText: event.Data.Lines.Text})
+					}
+					if len(matches) >= limit {
+						matchLimitReached = true
+						if cmd.Process != nil {
+							killedDueToLimit = true
+							_ = cmd.Process.Kill()
+						}
 					}
 				}
-			}
-			scanErr := scanner.Err()
-			waitErr := cmd.Wait()
-			if scanErr != nil && ctx.Err() == nil {
-				return agent.AgentToolResult{}, scanErr
-			}
-			if ctx.Err() != nil {
-				return agent.AgentToolResult{}, errors.New("Operation aborted")
-			}
-			if !killedDueToLimit && waitErr != nil {
-				if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-					// rg uses exit code 1 for no matches.
-				} else {
-					message := strings.TrimSpace(stderr.String())
-					if message == "" {
-						message = waitErr.Error()
+				scanErr := scanner.Err()
+				waitErr := cmd.Wait()
+				if scanErr != nil && ctx.Err() == nil {
+					return agent.AgentToolResult{}, scanErr
+				}
+				if ctx.Err() != nil {
+					return agent.AgentToolResult{}, errors.New("Operation aborted")
+				}
+				if !killedDueToLimit && waitErr != nil {
+					if exitErr, ok := waitErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+						// rg uses exit code 1 for no matches.
+					} else {
+						message := strings.TrimSpace(stderr.String())
+						if message == "" {
+							message = waitErr.Error()
+						}
+						return agent.AgentToolResult{}, errors.New(message)
 					}
-					return agent.AgentToolResult{}, errors.New(message)
+				}
+			} else {
+				// No rg on PATH: walk the root with the pure-Go fallback.
+				backend = "go"
+				var err error
+				matches, matchLimitReached, err = goGrep(ctx, rootForGrep, relSearch, input.Pattern, input.Glob, input.IgnoreCase, input.Literal, limit)
+				if err != nil {
+					return agent.AgentToolResult{}, err
 				}
 			}
 			if len(matches) == 0 {
@@ -1031,11 +1063,10 @@ func newGrepTool(cwd string) agent.AgentTool {
 				}
 				lines, ok := fileCache[match.filePath]
 				if !ok {
-					data, err := os.ReadFile(match.filePath)
-					if err != nil {
-						lines = nil
-					} else {
-						lines = splitFileLines(string(data))
+					if relMatch, relErr := filepath.Rel(cwd, match.filePath); relErr == nil {
+						if data, readErr := readFileInRoot(rootForGrep, filepath.ToSlash(relMatch)); readErr == nil {
+							lines = splitFileLines(string(data))
+						}
 					}
 					fileCache[match.filePath] = lines
 				}
@@ -1060,6 +1091,7 @@ func newGrepTool(cwd string) agent.AgentTool {
 			}
 			rawOutput := strings.Join(outputLines, "\n")
 			truncation := truncate.Head(rawOutput, truncate.Options{MaxLines: truncate.Int(int(^uint(0) >> 1))})
+
 			output := truncation.Content
 			details := map[string]any{}
 			notices := []string{}
@@ -1075,6 +1107,7 @@ func newGrepTool(cwd string) agent.AgentTool {
 				notices = append(notices, fmt.Sprintf("Some lines truncated to %d chars. Use read tool to see full lines", truncate.GrepMaxLineLength))
 				details["linesTruncated"] = true
 			}
+			details["backend"] = backend
 			if len(notices) > 0 {
 				output += "\n\n[" + strings.Join(notices, ". ") + "]"
 			}
@@ -1106,46 +1139,62 @@ func newFindTool(cwd string) agent.AgentTool {
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			fdPath, ok := toolio.EnsureTool("fd")
-			if !ok {
-				return agent.AgentToolResult{}, fmt.Errorf("fd is not available in PATH")
+			rootForFind, err := rootOnce(cwd)()
+			if err != nil {
+				return agent.AgentToolResult{}, err
 			}
-			searchPath := pathutil.ResolveToCwd(defaultString(input.Path, "."), cwd)
-			if _, err := os.Stat(searchPath); err != nil {
+			relSearch, err := resolveRootPath(cwd, defaultString(input.Path, "."))
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			searchPath := filepath.Join(cwd, relSearch)
+			if _, err := statInRoot(rootForFind, relSearch); err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", searchPath)
 			}
 			limit := input.Limit
 			if limit <= 0 {
 				limit = 1000
 			}
-			args := []string{"--glob", "--color=never", "--hidden"}
-			if !insideGitRepo(searchPath) {
-				args = append(args, "--no-require-git")
-			}
-			args = append(args, "--max-results", fmt.Sprintf("%d", limit))
-			effectivePattern := input.Pattern
-			if strings.Contains(input.Pattern, "/") {
-				args = append(args, "--full-path")
-				if !strings.HasPrefix(input.Pattern, "/") && !strings.HasPrefix(input.Pattern, "**/") && input.Pattern != "**" {
-					effectivePattern = "**/" + input.Pattern
+			var rawLines []string
+			backend := "fd"
+			if fdPath, ok := toolio.EnsureTool("fd"); ok {
+				args := []string{"--glob", "--color=never", "--hidden"}
+				if !insideGitRepo(searchPath) {
+					args = append(args, "--no-require-git")
+				}
+				args = append(args, "--max-results", fmt.Sprintf("%d", limit))
+				effectivePattern := input.Pattern
+				if strings.Contains(input.Pattern, "/") {
+					args = append(args, "--full-path")
+					if !strings.HasPrefix(input.Pattern, "/") && !strings.HasPrefix(input.Pattern, "**/") && input.Pattern != "**" {
+						effectivePattern = "**/" + input.Pattern
+					}
+				}
+				args = append(args, "--", effectivePattern, searchPath)
+				cmd := exec.CommandContext(ctx, fdPath, args...)
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+				stdoutBytes, err := cmd.Output()
+				if ctx.Err() != nil {
+					return agent.AgentToolResult{}, errors.New("Operation aborted")
+				}
+				if err != nil && len(stdoutBytes) == 0 {
+					message := strings.TrimSpace(stderr.String())
+					if message == "" {
+						message = err.Error()
+					}
+					return agent.AgentToolResult{}, errors.New(message)
+				}
+				rawLines = strings.Split(strings.TrimRight(string(stdoutBytes), "\n"), "\n")
+			} else {
+				// No fd on PATH: walk the root with the pure-Go fallback.
+				backend = "go"
+				var err error
+				rawLines, _, err = goFind(ctx, rootForFind, relSearch, input.Pattern, limit)
+				if err != nil {
+					return agent.AgentToolResult{}, err
 				}
 			}
-			args = append(args, "--", effectivePattern, searchPath)
-			cmd := exec.CommandContext(ctx, fdPath, args...)
-			var stderr bytes.Buffer
-			cmd.Stderr = &stderr
-			stdoutBytes, err := cmd.Output()
-			if ctx.Err() != nil {
-				return agent.AgentToolResult{}, errors.New("Operation aborted")
-			}
-			if err != nil && len(stdoutBytes) == 0 {
-				message := strings.TrimSpace(stderr.String())
-				if message == "" {
-					message = err.Error()
-				}
-				return agent.AgentToolResult{}, errors.New(message)
-			}
-			rawLines := strings.Split(strings.TrimRight(string(stdoutBytes), "\n"), "\n")
 			results := []string{}
 			for _, line := range rawLines {
 				line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
@@ -1176,6 +1225,7 @@ func newFindTool(cwd string) agent.AgentTool {
 				notices = append(notices, truncate.FormatSize(truncate.DefaultMaxBytes)+" limit reached")
 				details["truncation"] = truncation
 			}
+			details["backend"] = backend
 			if len(notices) > 0 {
 				output += "\n\n[" + strings.Join(notices, ". ") + "]"
 			}
@@ -1208,15 +1258,23 @@ func newLsTool(cwd string) agent.AgentTool {
 			if err := ctx.Err(); err != nil {
 				return agent.AgentToolResult{}, errors.New("Operation aborted")
 			}
-			dirPath := pathutil.ResolveToCwd(defaultString(input.Path, "."), cwd)
-			stat, err := os.Stat(dirPath)
+			rootForLs, err := rootOnce(cwd)()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			relPath, err := resolveRootPath(cwd, defaultString(input.Path, "."))
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			dirPath := filepath.Join(cwd, relPath)
+			stat, err := statInRoot(rootForLs, relPath)
 			if err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", dirPath)
 			}
 			if !stat.IsDir() {
 				return agent.AgentToolResult{}, fmt.Errorf("Not a directory: %s", dirPath)
 			}
-			entries, err := os.ReadDir(dirPath)
+			entries, err := fs.ReadDir(rootForLs.FS(), relPath)
 			if err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Cannot read directory: %s", err.Error())
 			}
@@ -1233,7 +1291,7 @@ func newLsTool(cwd string) agent.AgentTool {
 					break
 				}
 				name := entry.Name()
-				info, err := os.Stat(filepath.Join(dirPath, name))
+				info, err := statInRoot(rootForLs, path.Join(relPath, name))
 				if err != nil {
 					continue
 				}
