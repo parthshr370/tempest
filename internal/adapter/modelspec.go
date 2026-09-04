@@ -57,8 +57,8 @@ func ValidateModelSpec(raw string) error {
 	if strings.TrimSpace(raw) == "" || spec.ModelID == "" {
 		return fmt.Errorf("model spec must include a model id")
 	}
-	if spec.Provider != "" && spec.Provider != "anthropic" && spec.Provider != "openai" && spec.Provider != "google" {
-		return fmt.Errorf("unsupported model provider; use anthropic, openai, or google")
+	if spec.Provider != "" && spec.Provider != "anthropic" && spec.Provider != "openai" && spec.Provider != "google" && spec.Provider != "openrouter" {
+		return fmt.Errorf("unsupported model provider; use anthropic, openai, google, or openrouter")
 	}
 	if spec.BaseURL != "" {
 		if err := ValidateBaseURL(spec.BaseURL); err != nil {
@@ -131,8 +131,17 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		model.BaseURL = firstNonEmpty(spec.BaseURL, cfg.BaseURL, env("GEMINI_BASE_URL"))
 		model.ContextWindow = 1048576
 		apiKey = firstNonEmpty(cfg.APIKey, env("GEMINI_API_KEY"), env("GOOGLE_API_KEY"))
+	case "openrouter":
+		// OpenRouter is an OpenAI-compatible aggregator: same completions wire,
+		// its own endpoint and credential. Model ids carry the vendor slug
+		// ("anthropic/claude-opus-5"), which parseModelSpec passes through.
+		api = OpenAICompletionsAPI
+		model.Provider = "openrouter"
+		model.BaseURL = firstNonEmpty(spec.BaseURL, env("OPENROUTER_BASE_URL"), "https://openrouter.ai/api/v1")
+		model.ContextWindow = 200000
+		apiKey = firstNonEmpty(cfg.APIKey, env("OPENROUTER_API_KEY"))
 	default:
-		return route{}, fmt.Errorf("unsupported model provider; use anthropic, openai, or google")
+		return route{}, fmt.Errorf("unsupported model provider; use anthropic, openai, google, or openrouter")
 	}
 	model.API = api
 	// Catalog defaults override the hardcoded fallbacks for known model ids.

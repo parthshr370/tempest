@@ -390,6 +390,9 @@ func providerCredentialPresent(provider string, secrets config.SecretResolver) b
 	case "openai":
 		_, present := secrets.Resolve("OPENAI_API_KEY")
 		return present
+	case "openrouter":
+		_, present := secrets.Resolve("OPENROUTER_API_KEY")
+		return present
 	case "google":
 		_, gemini := secrets.Resolve("GEMINI_API_KEY")
 		_, googleKey := secrets.Resolve("GOOGLE_API_KEY")

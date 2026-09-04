@@ -91,6 +91,9 @@ func roleCredentials(model string, lookup func(string) (string, bool)) (string, 
 	case "openai":
 		key, _ := lookup("OPENAI_API_KEY")
 		return key, ""
+	case "openrouter":
+		key, _ := lookup("OPENROUTER_API_KEY")
+		return key, ""
 	case "google":
 		if key, _ := lookup("GEMINI_API_KEY"); key != "" {
 			return key, ""

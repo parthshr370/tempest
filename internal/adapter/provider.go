@@ -164,7 +164,9 @@ func erroredStream(model types.Model, err error) *stream.AssistantStream {
 // router has always given them, as does anything unrecognized.
 func ResolveProviderForModel(modelID string) string {
 	trimmed := strings.TrimSpace(strings.ToLower(modelID))
-	for _, prov := range []string{"anthropic", "openai", "google"} {
+	// Exact-id lookup first, so aggregator slugs ("z-ai/glm-latest") hit
+	// OpenRouter before the id-shape fallbacks run.
+	for _, prov := range []string{"anthropic", "openai", "google", "openrouter"} {
 		if _, ok := catalog.Lookup(prov, trimmed); ok {
 			return prov
 		}

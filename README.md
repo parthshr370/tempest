@@ -39,18 +39,21 @@ That produces a single self-contained `tempest` binary you can drop on your `PAT
 ANTHROPIC_API_KEY=... ./tempest -p "Create hello.txt with hi"
 ```
 
-`-model` selects the model: a bare name, `anthropic:model`, or `google:model` (Gemini
-via `GEMINI_API_KEY`); `openai:model@baseURL` targets any OpenAI-compatible endpoint.
+`-model` selects the model: a bare name, `anthropic:model`, `google:model` (Gemini
+via `GEMINI_API_KEY`), or `openrouter:<vendor/model>` via `OPENROUTER_API_KEY`;
+`openai:model@baseURL` targets any OpenAI-compatible endpoint with that base URL
+(OpenRouter, Together, Groq, Ollama, vLLM all work this way).
 Output is text by default; `-output-format json` prints the final message as JSON.
 
 ## Features
 
 ### 01 · One binary, every provider
 
-Anthropic, any OpenAI-compatible endpoint, and Google Gemini — chosen per run, mixed
-per role. A bare model name resolves against the built-in provider map; an unknown
-provider is a configuration error, never a silent fallback. No SDK zoo, no wrapper
-processes: the provider layer speaks each wire protocol directly.
+Anthropic, OpenAI, Google Gemini, and OpenRouter, plus any OpenAI-compatible
+endpoint by base URL — chosen per run, mixed per role. A bare model name resolves
+against the embedded catalog; an unknown provider is a configuration error, never
+a silent fallback. No SDK zoo, no wrapper processes: the provider layer speaks
+each wire protocol directly.
 
 ### 02 · Hash-anchored edits that never corrupt a file
 

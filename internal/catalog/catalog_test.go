@@ -19,15 +19,12 @@ func TestEmbeddedCatalogParses(t *testing.T) {
 		t.Fatal("catalog lists no models")
 	}
 	known := make(map[string]bool, len(providers))
-	seenAPI := make(map[string]string, len(providers))
 	for _, p := range providers {
 		if p.ID == "" || p.API == "" || p.KeyEnv == "" {
 			t.Fatalf("provider %+v missing id, api, or key_env", p)
 		}
-		if other, dup := seenAPI[p.API]; dup {
-			t.Fatalf("providers %s and %s share api %s", other, p.ID, p.API)
-		}
-		seenAPI[p.API] = p.ID
+		// OpenRouter intentionally shares the openai-completions wire, so api
+		// strings may repeat; provider ids and model ids stay unique.
 		known[p.ID] = true
 	}
 	ids := make(map[string]bool, len(models))
@@ -53,7 +50,7 @@ func TestEmbeddedCatalogParses(t *testing.T) {
 }
 
 func TestLookup(t *testing.T) {
-	m, ok := Lookup("google", "gemini-2.5-flash")
+	m, ok := Lookup("google", "gemini-3.8-flash")
 	if !ok {
 		t.Fatal("gemini-2.5-flash missing from catalog")
 	}
