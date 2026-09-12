@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +174,21 @@ func TestResolveCommandConfigRejectsResumeContinueConflict(t *testing.T) {
 	opts := commandOptions{Resume: "session-id", Continue: true}
 	if err := resolveCommandConfig(&opts); err == nil || !strings.Contains(err.Error(), "-resume and -continue") {
 		t.Fatalf("resolveCommandConfig conflict error = %v", err)
+	}
+}
+
+func TestCommandWebSearchURLFlagReachesConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARNESS_WEB_SEARCH_URL", "")
+	opts, err := parseCommandOptions([]string{"-web-search-url", "https://search.example/v1"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parse -web-search-url: %v", err)
+	}
+	if err := resolveCommandConfig(&opts); err != nil {
+		t.Fatal(err)
+	}
+	if got := opts.Config.WebSearchURL(); got != "https://search.example/v1" {
+		t.Fatalf("resolved web search URL = %q, want the flag value", got)
 	}
 }
 
