@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -187,11 +188,27 @@ func trimMalformedFinalLine(ctx context.Context, path string) error {
 	return nil
 }
 
+// normalizeSessionID accepts the forms a user is likely to paste: the bare id
+// the journal header records, the "<timestamp>_<id>.jsonl" filename, or a path
+// ending in that filename. Session ids are hex, so the last underscore is
+// always the filename separator.
+func normalizeSessionID(id string) string {
+	id = filepath.Base(strings.TrimSpace(id))
+	id = strings.TrimSuffix(id, ".jsonl")
+	if underscore := strings.LastIndex(id, "_"); underscore >= 0 {
+		if suffix := id[underscore+1:]; suffix != "" {
+			id = suffix
+		}
+	}
+	return id
+}
+
 // Resolve returns the journal path for id under dir and cwd.
 func Resolve(ctx context.Context, dir, cwd, id string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("resolve journal: %w", err)
 	}
+	id = normalizeSessionID(id)
 	journalDir := filepath.Join(dir, encodeCwd(cwd))
 	entries, err := os.ReadDir(journalDir)
 	if err != nil {
@@ -202,29 +219,40 @@ func Resolve(ctx context.Context, dir, cwd, id string) (string, error) {
 	}
 	suffix := "_" + id + ".jsonl"
 	var corruptErr error
+	available := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("resolve journal: %w", err)
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
+		matches := strings.HasSuffix(entry.Name(), suffix)
 		path := filepath.Join(journalDir, entry.Name())
 		header, err := loadHeader(ctx, path)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return "", fmt.Errorf("resolve journal: %w", ctxErr)
 			}
-			corruptErr = fmt.Errorf("inspect journal %q: %w", entry.Name(), err)
+			if matches {
+				corruptErr = fmt.Errorf("inspect journal %q: %w", entry.Name(), err)
+			}
 			continue
 		}
 		if header.Cwd != cwd {
 			continue
 		}
-		return path, nil
+		if matches {
+			return path, nil
+		}
+		available = append(available, normalizeSessionID(entry.Name()))
 	}
 	if corruptErr != nil {
 		return "", corruptErr
+	}
+	if len(available) > 0 {
+		sort.Strings(available)
+		return "", fmt.Errorf("resolve journal %q: %w (sessions for this directory: %s)", id, ErrSessionNotFound, strings.Join(available, ", "))
 	}
 	return "", fmt.Errorf("resolve journal %q: %w", id, ErrSessionNotFound)
 }

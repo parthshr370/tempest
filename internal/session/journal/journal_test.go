@@ -218,6 +218,46 @@ func TestResolveAndRecent(t *testing.T) {
 	}
 }
 
+func TestResolveAcceptsBareFileAndPathSessionIDs(t *testing.T) {
+	dir := t.TempDir()
+	store := newTestStore(t, dir)
+	path, id := store.Path(), store.ID()
+	closeStore(t, store)
+	filename := filepath.Base(path)
+	for _, form := range []struct {
+		name string
+		id   string
+	}{
+		{name: "bare id", id: id},
+		{name: "journal filename", id: filename},
+		{name: "absolute path", id: path},
+	} {
+		t.Run(form.name, func(t *testing.T) {
+			resolved, err := Resolve(testContext, dir, "/workspace/project", form.id)
+			if err != nil {
+				t.Fatalf("Resolve(%q): %v", form.id, err)
+			}
+			if resolved != path {
+				t.Fatalf("Resolve(%q) = %q, want %q", form.id, resolved, path)
+			}
+		})
+	}
+}
+
+func TestResolveNotFoundNamesKnownSessions(t *testing.T) {
+	dir := t.TempDir()
+	store := newTestStore(t, dir)
+	id := store.ID()
+	closeStore(t, store)
+	_, err := Resolve(testContext, dir, "/workspace/project", "0123456789abcdef")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("Resolve error = %v, want ErrSessionNotFound", err)
+	}
+	if !strings.Contains(err.Error(), id) {
+		t.Fatalf("Resolve error %q does not name the existing session %q", err, id)
+	}
+}
+
 func TestUnknownEntryTypeSkipped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unknown.jsonl")
 	headerJSON, err := json.Marshal(testHeader())
