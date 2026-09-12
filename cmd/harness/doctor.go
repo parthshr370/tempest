@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/catalog"
@@ -69,7 +70,22 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	printRoleCredentialCheck(stdout, "default", roles.Default.Model.Provider, opts)
 	printRoleCredentialCheck(stdout, "plan", roles.Plan.Model.Provider, opts)
 	printRoleCredentialCheck(stdout, "smol", roles.Smol.Model.Provider, opts)
+	printWebSearchCheck(stdout, opts)
 	return 0
+}
+
+// printWebSearchCheck warns when the gated web tools are enabled without the
+// endpoint web_search needs, so a run does not fail its first search call
+// after the model has already decided to search.
+func printWebSearchCheck(w io.Writer, opts commandOptions) {
+	if !opts.Config.EnableWeb() {
+		return
+	}
+	if strings.TrimSpace(opts.Config.WebSearchURL()) == "" {
+		fmt.Fprintln(w, "WARN web_search has no endpoint: set -web-search-url or HARNESS_WEB_SEARCH_URL (web_fetch works without it)")
+		return
+	}
+	fmt.Fprintln(w, "PASS web_search endpoint configured")
 }
 
 func roleSpec(role, fallback string) string {
