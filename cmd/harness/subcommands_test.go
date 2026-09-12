@@ -31,6 +31,27 @@ func TestDoctorRedactsCredentialsAndWarnsWithoutThem(t *testing.T) {
 	}
 }
 
+func TestDoctorWarnsWhenWebSearchHasNoEndpoint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARNESS_WEB_SEARCH_URL", "")
+	var out bytes.Buffer
+	if code := runDoctor([]string{"-enable-web"}, &out, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("doctor exit = %d", code)
+	}
+	if !strings.Contains(out.String(), "WARN web_search has no endpoint") {
+		t.Fatalf("doctor output = %s", out.String())
+	}
+
+	t.Setenv("HARNESS_WEB_SEARCH_URL", "https://search.example/v1")
+	var configured bytes.Buffer
+	if code := runDoctor([]string{"-enable-web"}, &configured, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("doctor exit = %d", code)
+	}
+	if !strings.Contains(configured.String(), "PASS web_search endpoint configured") {
+		t.Fatalf("doctor output = %s", configured.String())
+	}
+}
+
 func TestDoctorFailsOnHardConfigurationError(t *testing.T) {
 	var stderr bytes.Buffer
 	if code := runDoctor([]string{"-model", "unknown:model"}, &bytes.Buffer{}, &stderr); code == 0 {
