@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tools"
 )
 
 // commandOptions keeps parsed CLI-only inputs beside the resolved config and secret lookup they feed into the runtime.
@@ -347,8 +349,45 @@ func resolveCommandConfig(opts *commandOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := validateToolNameFlags(opts.ExcludeTools, resolved); err != nil {
+		return err
+	}
 	opts.Config = resolved
 	return nil
+}
+
+// validateToolNameFlags rejects tool names the runtime does not register. The
+// one-shot CLI is headless, so a typo would otherwise be accepted silently and
+// the flag would look like it did nothing.
+func validateToolNameFlags(excludeRaw string, cfg *config.ResolvedConfig) error {
+	groups := []struct {
+		flag  string
+		names []string
+	}{
+		{flag: "-exclude-tools", names: splitCSV(excludeRaw)},
+		{flag: "-allow-tool", names: cfg.PermissionAllowTools()},
+		{flag: "-deny-tool", names: cfg.PermissionDenyTools()},
+	}
+	for _, group := range groups {
+		for _, name := range group.names {
+			if tools.AllToolNames[tools.ToolName(name)] {
+				continue
+			}
+			return fmt.Errorf("unknown tool %q in %s (known tools: %s)", name, group.flag, strings.Join(sortedToolNames(), ", "))
+		}
+	}
+	return nil
+}
+
+// sortedToolNames returns every registered tool name in a stable order for
+// error messages.
+func sortedToolNames() []string {
+	names := make([]string, 0, len(tools.AllToolNames))
+	for name := range tools.AllToolNames {
+		names = append(names, string(name))
+	}
+	sort.Strings(names)
+	return names
 }
 
 // secretResolver gives model routing the CLI's flag-first, environment-second credential lookup.

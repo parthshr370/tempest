@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -283,4 +284,41 @@ func countEntryType(t *testing.T, path, entryType string) int {
 		}
 	}
 	return count
+}
+
+func TestResolveCommandConfigRejectsUnknownToolName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "excluded tool", args: []string{"-exclude-tools", "basj"}},
+		{name: "denied tool", args: []string{"-deny-tool", "reed"}},
+		{name: "allowed tool", args: []string{"-allow-tool", "writ"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts, err := parseCommandOptions(test.args, io.Discard)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = resolveCommandConfig(&opts)
+			if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+				t.Fatalf("resolveCommandConfig(%v) error = %v, want an unknown-tool error", test.args, err)
+			}
+			if !strings.Contains(err.Error(), "known tools:") {
+				t.Fatalf("error %q does not list the known tools", err)
+			}
+		})
+	}
+}
+
+func TestResolveCommandConfigAcceptsKnownToolNames(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	opts, err := parseCommandOptions([]string{"-exclude-tools", "bash, task", "-deny-tool", "write", "-allow-tool", "read"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolveCommandConfig(&opts); err != nil {
+		t.Fatalf("resolveCommandConfig rejected known tools: %v", err)
+	}
 }
