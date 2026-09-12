@@ -434,7 +434,7 @@ func newWebSearchTool(options ToolsOptions) agent.AgentTool {
 				return agent.AgentToolResult{}, fmt.Errorf("web_search query is required")
 			}
 			if searchURL == "" {
-				return agent.AgentToolResult{}, fmt.Errorf("web_search requires ToolsOptions.SearchURL")
+				return agent.AgentToolResult{}, fmt.Errorf("web_search has no search endpoint: pass -web-search-url or set HARNESS_WEB_SEARCH_URL")
 			}
 			if input.NumResults <= 0 {
 				input.NumResults = 8

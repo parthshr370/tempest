@@ -157,6 +157,7 @@ fall back to pure Go when `rg`/`fd` are absent.
 | `-plan` | Run the read-only plan stack on the `plan` role model. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
+| `-web-search-url <url>` | Search endpoint for `web_search`. Without it, `web_search` fails at call time; `web_fetch` still works. |
 | `-skill <path>` | Additional skill location; repeatable. |
 
 ## Configuration

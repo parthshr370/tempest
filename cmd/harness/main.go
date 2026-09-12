@@ -266,6 +266,7 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	fs.BoolVar(&values.Plan.Value, "plan", false, "run the read-only plan stack")
 	fs.Var(skillPathsFlag{input: &values.Attach}, "attach", "file to attach to the session (repeatable)")
 	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
+	fs.StringVar(&values.WebSearchURL.Value, "web-search-url", "", "search endpoint URL for the gated web_search tool")
 	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
 	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
