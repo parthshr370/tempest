@@ -126,7 +126,7 @@ func checkContinuable(messages []types.Message) error {
 // runAgentLoop is the synchronous core behind [AgentLoop] and [Agent.Prompt]:
 // one run that starts by appending prompts to the transcript.
 func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
-	run := &loopRun{config: config, emit: emit, streamFn: streamFn, started: time.Now()}
+	ctx, run := newLoopRun(ctx, config, emit, streamFn)
 	return run.execute(ctx, prompts, func() error {
 		current := agentContext
 		current.Messages = append([]types.Message{}, agentContext.Messages...)
@@ -144,7 +144,7 @@ func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext Age
 // [Agent.Continue]: one run over the existing transcript. Callers ensure the
 // transcript is non-empty and does not end with an assistant message.
 func runAgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
-	run := &loopRun{config: config, emit: emit, streamFn: streamFn, started: time.Now()}
+	ctx, run := newLoopRun(ctx, config, emit, streamFn)
 	return run.execute(ctx, nil, func() error {
 		if err := emit(ctx, TurnStart()); err != nil {
 			return err
@@ -160,8 +160,10 @@ type loopRun struct {
 	streamFn StreamFn
 	started  time.Time
 	// messages are the messages this run added to the transcript.
-	messages []types.Message
-	result   RunResult
+	messages   []types.Message
+	result     RunResult
+	accounting *runAccounting
+	root       bool
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -174,6 +176,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 	if err == nil {
 		err = runRecoveringPanic(body)
 	}
+	err = errors.Join(err, run.accounting.failure())
 	switch {
 	case err == nil:
 	case ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
@@ -181,6 +184,9 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 	default:
 		run.result.StopReason = StopError
 		run.result.Err = err
+	}
+	if run.root {
+		run.result.Usage = run.accounting.total()
 	}
 	// agent_end must reach listeners after an abort too, so it is delivered
 	// under a context that is not canceled.
@@ -229,6 +235,9 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 	budget := run.config.Budget
 	if budget.MaxTurns > 0 && run.result.Turns >= budget.MaxTurns {
 		return StopMaxTurns, nil
+	}
+	if stop, err := run.accounting.costStop(); stop != "" || err != nil {
+		return stop, err
 	}
 	if budget.MaxCostUSD > 0 {
 		// PrepareNextTurn can switch to a model whose price is unknown; the
@@ -288,16 +297,28 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 			}
 			firstTurn = false
-			run.result.Turns++
-			slog.Info("agent turn", "turn", run.result.Turns)
+			if err := config.Budget.Validate(config.Model); err != nil {
+				return err
+			}
 
 			if err := run.appendMessages(ctx, &current, pendingMessages); err != nil {
 				return err
 			}
 			pendingMessages = nil
+			release, stop, err := run.accounting.admit(ctx, config.Model)
+			if stop != "" || err != nil {
+				release()
+				run.result.StopReason = stop
+				return err
+			}
+			run.result.Turns++
+			slog.Info("agent turn", "turn", run.result.Turns)
 
-			message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn)
-			run.result.Usage.Add(message.Usage)
+			message, err := func() (types.AssistantMessage, error) {
+				defer release()
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn)
+				return message, errors.Join(err, run.accountUsage(ctx, message))
+			}()
 			if err != nil {
 				return err
 			}
@@ -570,6 +591,7 @@ func assistantResult(ctx context.Context, response *stream.AssistantStream, conf
 		Model:        config.Model.ID,
 		StopReason:   types.StopError,
 		ErrorMessage: "assistant stream ended without a final message",
+		Usage:        types.Usage{Cost: types.Cost{Unknown: config.Model.Cost.Unknown}},
 	}
 	if err != nil {
 		message.ErrorMessage = err.Error()

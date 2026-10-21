@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,35 @@ import (
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
 )
+
+func TestChildUsageIsJournaledWithoutChildMessages(t *testing.T) {
+	ctx := context.Background()
+	store, err := journal.Create(ctx, t.TempDir(), "/workspace/project", journal.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runID := store.NewRunID()
+	if err := store.Append(ctx, journal.RunStartedRecord{Meta: journal.Meta{RunID: runID}, Model: "parent"}); err != nil {
+		t.Fatal(err)
+	}
+	r := recorder{store: store, runID: runID}
+	usage := types.Usage{Input: 3, TotalTokens: 3, Cost: types.Cost{Unknown: true}}
+	result := agent.RunResult{Usage: usage, StopReason: agent.StopCompleted}
+	if err := r.record(ctx, agent.AgentEvent{Type: agent.EventUsage, Model: "child", RunResult: result}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.record(ctx, agent.AgentEvent{Type: agent.EventAgentEnd, RunResult: result}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := journal.Load(ctx, store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UsageTotal != usage || len(loaded.Messages) != 0 {
+		t.Fatalf("delegated usage = %#v, messages = %#v; want usage counted once and no child transcript", loaded.UsageTotal, loaded.Messages)
+	}
+}
 
 // crashCalls is the scripted three-tool turn: one tool that is safe to re-run
 // and two that are not.
@@ -426,8 +456,13 @@ func TestCrashAtEveryJournalBoundaryResumesHonestly(t *testing.T) {
 					if final.LastRun == nil || !final.LastRun.Finished || final.LastRun.StopReason != string(agent.StopCompleted) {
 						t.Fatalf("boundary %s: resumed run not recorded as completed: %#v", boundary, final.LastRun)
 					}
-					if len(final.Interrupted) != len(loaded.Interrupted) {
-						t.Fatalf("boundary %s: interrupted changed across resume: %d -> %d", boundary, len(loaded.Interrupted), len(final.Interrupted))
+					if len(final.Interrupted) != 0 {
+						t.Fatalf("boundary %s: completed resume still reports interrupted tools: %#v", boundary, final.Interrupted)
+					}
+					// Only the warning is scoped to LastRun. Historical tool
+					// results must keep exactly the same unknown-outcome text.
+					if len(final.Messages) < len(loaded.Messages) || !reflect.DeepEqual(final.Messages[:len(loaded.Messages)], loaded.Messages) {
+						t.Fatalf("boundary %s: completed resume changed the historical transcript", boundary)
 					}
 					if err := checkTranscript(final.Messages); err != nil {
 						t.Fatalf("boundary %s: (d) after resume: %v", boundary, err)

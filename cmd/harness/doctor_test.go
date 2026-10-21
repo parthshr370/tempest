@@ -30,7 +30,7 @@ func TestCheapestCatalogModels(t *testing.T) {
 	}
 }
 
-func TestDoctorProbeUsesOneTokenAndRedactsFailures(t *testing.T) {
+func TestDoctorProbeUsesSmallBudgetAcceptsLengthAndRedactsFailures(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusTooManyRequests} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
@@ -45,6 +45,7 @@ func TestDoctorProbeUsesOneTokenAndRedactsFailures(t *testing.T) {
 				var body struct {
 					Model     string `json:"model"`
 					MaxTokens int    `json:"max_completion_tokens"`
+					Effort    string `json:"reasoning_effort"`
 					Messages  []struct {
 						Role    string `json:"role"`
 						Content string `json:"content"`
@@ -55,7 +56,7 @@ func TestDoctorProbeUsesOneTokenAndRedactsFailures(t *testing.T) {
 					return
 				}
 				cheapest, _ := cheapestModel("openai")
-				if body.Model != cheapest.ID || body.MaxTokens != 1 || len(body.Messages) != 1 || body.Messages[0].Role != "user" || body.Messages[0].Content != "hi" {
+				if body.Model != cheapest.ID || body.MaxTokens != 16 || body.Effort != "none" || len(body.Messages) != 1 || body.Messages[0].Role != "user" || body.Messages[0].Content != "hi" {
 					t.Errorf("unexpected probe: %+v", body)
 				}
 				writer.Header().Set("Content-Type", "text/event-stream")

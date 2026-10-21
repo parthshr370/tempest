@@ -184,7 +184,7 @@ func pingProviders(stdout io.Writer, opts commandOptions) int {
 			return os.Getenv(name)
 		}
 		router, err := adapter.NewProviderRouter(adapter.RoutingConfig{
-			ModelID: provider.ID + ":" + model.ID, MaxTokens: 1,
+			ModelID: provider.ID + ":" + model.ID, MaxTokens: 16,
 			AnthropicBaseURL: opts.Config.AnthropicBaseURL(), OpenAIBaseURL: opts.Config.OpenAIBaseURL(), Env: env,
 		})
 		if err != nil {
@@ -196,7 +196,7 @@ func pingProviders(stdout io.Writer, opts commandOptions) int {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		probe := router.StreamFn(ctx, router.Model, types.Context{
 			Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}},
-		}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{MaxTokens: 1}})
+		}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{MaxTokens: 16}})
 		message, err := probe.Result(ctx)
 		cancel()
 		if err != nil {

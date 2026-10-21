@@ -321,6 +321,21 @@ func TestCLIRunLifecycle(t *testing.T) {
 			t.Fatalf("output = %q, err = %v; want refusal before the run", out, err)
 		}
 	})
+
+	t.Run("non-finite cost is refused before session creation", func(t *testing.T) {
+		for _, limit := range []string{"NaN", "+Inf", "-Inf"} {
+			sessionDir := filepath.Join(t.TempDir(), "sessions")
+			cmd := exec.Command(exe, "-p", "go", "-model", "openai:not-a-cataloged-model@http://127.0.0.1:1/v1", "-max-cost", limit, "-session-dir", sessionDir)
+			cmd.Dir = tmp
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "budget max cost must be finite") {
+				t.Fatalf("max-cost %s: output = %q, err = %v", limit, out, err)
+			}
+			if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+				t.Fatalf("session directory created for max-cost %s: %v", limit, err)
+			}
+		}
+	})
 }
 
 // loadOnlyJournal loads the single session journal written under sessionDir.

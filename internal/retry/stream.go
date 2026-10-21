@@ -192,6 +192,7 @@ func (r *Retrier) pushGenerated(output *stream.AssistantStream, model types.Mode
 	output.Push(types.StreamEvent{Type: types.EvError, Reason: reason, Err: &types.AssistantMessage{
 		API: model.API, Provider: model.Provider, Model: model.ID, StopReason: reason,
 		ErrorCode: string(classified.Code), ErrorMessage: classified.Error(),
+		Usage: types.Usage{Cost: types.Cost{Unknown: model.Cost.Unknown}},
 	}})
 }
 
@@ -202,6 +203,7 @@ func (r *Retrier) pushGeneratedWithMessage(output *stream.AssistantStream, model
 		reason = types.StopAborted
 	}
 	message := cloneMessagePtr(partial)
+	message.Usage.Cost.Unknown = message.Usage.Cost.Unknown || model.Cost.Unknown
 	message.StopReason = reason
 	message.ErrorCode = string(classified.Code)
 	message.ErrorMessage = classified.Error()

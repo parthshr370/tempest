@@ -564,7 +564,7 @@ func openResumedSession(ctx context.Context, path string, model ptypes.Model) (*
 	// The model sees these calls as "outcome unknown"; tell the user too,
 	// because the side effect may or may not have happened.
 	for _, interrupted := range loaded.Interrupted {
-		slog.Warn("previous run ended during a tool call; its outcome is unknown", "tool", interrupted.Tool, "tool_call_id", interrupted.ToolCallID)
+		slog.Warn("previous run left a tool call unfinished; its outcome is unknown", "tool", interrupted.Tool, "tool_call_id", interrupted.ToolCallID)
 	}
 	role := loaded.Role
 	if role == "" {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
@@ -158,7 +159,7 @@ type AgentLoopConfig struct {
 type Budget struct {
 	// MaxTurns caps model calls in the run.
 	MaxTurns int
-	// MaxCostUSD caps the summed Usage.Cost.Total of the run's model calls.
+	// MaxCostUSD caps model-call cost, including delegated child runs.
 	MaxCostUSD float64
 	// MaxWallTime caps elapsed time since the run started.
 	MaxWallTime time.Duration
@@ -168,9 +169,12 @@ type Budget struct {
 // price is unknown: the budget could never trip, so the run must not start.
 var ErrUnknownPrice = errors.New("model price is unknown")
 
-// Validate rejects negative limits and a cost budget that cannot be enforced
-// for model.
+// Validate rejects negative or non-finite limits and a cost budget that cannot
+// be enforced for model.
 func (b Budget) Validate(model types.Model) error {
+	if math.IsNaN(b.MaxCostUSD) || math.IsInf(b.MaxCostUSD, 0) {
+		return fmt.Errorf("budget max cost must be finite: %g", b.MaxCostUSD)
+	}
 	if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallTime < 0 {
 		return fmt.Errorf("budget limits must not be negative (max turns %d, max cost %g, max wall time %s)", b.MaxTurns, b.MaxCostUSD, b.MaxWallTime)
 	}
@@ -206,8 +210,8 @@ type RunResult struct {
 	Err error
 	// Turns counts model calls made in this run.
 	Turns int
-	// Usage sums the usage of this run's model calls. Usage.Cost.Unknown is
-	// true when any call's price was unknown, so the total is a lower bound.
+	// Usage sums this run's model calls and delegated child calls. Cost.Unknown
+	// is true when any call's price was unknown, so the total is a lower bound.
 	Usage types.Usage
 }
 
@@ -225,6 +229,8 @@ const (
 	EventToolExecutionStart  AgentEventType = "tool_execution_start"
 	EventToolExecutionUpdate AgentEventType = "tool_execution_update"
 	EventToolExecutionEnd    AgentEventType = "tool_execution_end"
+	// EventUsage reports a delegated model call without adding its transcript.
+	EventUsage AgentEventType = "usage"
 )
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
@@ -246,7 +252,9 @@ type AgentEvent struct {
 	Result                any
 	PartialResult         any
 	IsError               bool
-	// RunResult is set on agent_end only.
+	// Model and Usage are set on usage events for delegated model calls.
+	Model string
+	// RunResult is set on agent_end; Usage is also set on usage events.
 	RunResult
 }
 

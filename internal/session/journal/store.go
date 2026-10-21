@@ -6,16 +6,21 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 )
+
+// ErrSessionLocked reports that another writer already owns the journal.
+var ErrSessionLocked = errors.New("session is locked by another writer")
 
 // Options configures a new or resumed journal.
 type Options struct {
@@ -67,6 +72,11 @@ func Create(ctx context.Context, dir, cwd string, opts Options) (*Store, error) 
 	cleanup := func() {
 		_ = file.Close()
 		_ = os.Remove(path)
+	}
+	if err := lockJournal(file); err != nil {
+		// Don't unlink an inode another opener may already have locked.
+		_ = file.Close()
+		return nil, err
 	}
 	header, err := json.Marshal(Header{
 		Type:      "session",
@@ -179,7 +189,8 @@ func (s *Store) Append(ctx context.Context, entry Entry) error {
 	return nil
 }
 
-// Close flushes and closes the journal. It is safe to call more than once.
+// Close flushes and closes the journal, releasing its exclusive writer lock.
+// It is safe to call more than once.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -195,6 +206,16 @@ func (s *Store) Close() error {
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close journal: %w", closeErr)
+	}
+	return nil
+}
+
+func lockJournal(file *os.File) error {
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("%w: %s", ErrSessionLocked, file.Name())
+		}
+		return fmt.Errorf("lock journal %s: %w", file.Name(), err)
 	}
 	return nil
 }

@@ -62,6 +62,8 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		if assistant, ok := ev.Message.(ptypes.AssistantMessage); ok && err == nil {
 			err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: assistant.Model, Usage: assistant.Usage})
 		}
+	case agent.EventUsage:
+		err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: ev.Model, Usage: ev.Usage})
 	case agent.EventToolExecutionStart:
 		r.toolStarts[ev.ToolCallID] = ev.At
 		err = r.store.Append(ctx, journal.ToolStartedRecord{

@@ -292,6 +292,61 @@ func TestUnknownRecordKindAndSeqRegressionAreDiagnosed(t *testing.T) {
 	}
 }
 
+func TestInterruptedToolsOnlyDescribeLastRun(t *testing.T) {
+	store := newTestStore(t, t.TempDir())
+	crashed := Meta{RunID: store.NewRunID()}
+	appendAll(t, store,
+		RunStartedRecord{Meta: crashed, Model: "m"},
+		MessageEntry{Meta: crashed, Message: ptypes.AssistantMessage{
+			Content:    []ptypes.ContentBlock{ptypes.NewToolCall("crashed", "bash", nil)},
+			StopReason: ptypes.StopToolUse,
+		}},
+		ToolStartedRecord{Meta: crashed, ToolCallID: "crashed", Tool: "bash"},
+	)
+	closeStore(t, store)
+
+	resumed, loaded, err := OpenForResume(testContext, store.Path(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeStore(t, resumed)
+	if len(loaded.Interrupted) != 1 || loaded.Interrupted[0].RunID != crashed.RunID {
+		t.Fatalf("first resume interrupted = %#v, want the crashed call", loaded.Interrupted)
+	}
+	completed := Meta{RunID: resumed.NewRunID()}
+	appendAll(t, resumed,
+		RunStartedRecord{Meta: completed, Model: "m"},
+		MessageEntry{Meta: completed, Message: userMessage("continue")},
+		MessageEntry{Meta: completed, Message: assistantMessage("done")},
+		RunFinishedRecord{Meta: completed, StopReason: "completed", Turns: 1},
+	)
+	closeStore(t, resumed)
+
+	again, loaded, err := OpenForResume(testContext, store.Path(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeStore(t, again)
+	if len(loaded.Interrupted) != 0 {
+		t.Fatalf("second resume interrupted = %#v, want none from the completed last run", loaded.Interrupted)
+	}
+	if loaded.LastRun == nil || loaded.LastRun.RunID != completed.RunID || !loaded.LastRun.Finished || loaded.LastRun.StopReason != "completed" {
+		t.Fatalf("last run = %#v, want the completed resume", loaded.LastRun)
+	}
+	unknown := 0
+	for _, message := range loaded.Messages {
+		if result, ok := message.(ptypes.ToolResultMessage); ok && result.ToolCallID == "crashed" {
+			if !result.IsError || !strings.HasPrefix(result.Content[0].Text, "outcome unknown") {
+				t.Fatalf("historical call result = %#v, want outcome unknown", result)
+			}
+			unknown++
+		}
+	}
+	if unknown != 1 {
+		t.Fatalf("historical unknown-outcome results = %d, want one", unknown)
+	}
+}
+
 func appendAll(t *testing.T, store *Store, entries ...Entry) {
 	t.Helper()
 	for _, entry := range entries {

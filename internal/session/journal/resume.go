@@ -40,8 +40,8 @@ type Loaded struct {
 	Model    string
 	Role     string
 	LastID   string
-	// Interrupted lists tool calls with tool_started and no tool_finished, in
-	// start order. Their outcome is unknown.
+	// Interrupted lists started-but-unfinished calls from LastRun, in start
+	// order. Older unknown outcomes remain in Messages, not in this warning.
 	Interrupted []InterruptedTool
 	// LastRun is the most recent run_started, or nil when the journal has no
 	// run records (version 1 files).
@@ -60,6 +60,7 @@ type replayMessage struct {
 	id      string
 	runID   string
 	message ptypes.Message
+	calls   []replayTool
 }
 
 // Load reads path fully and reduces its entries and records into a Loaded. A
@@ -139,24 +140,31 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 	return loaded, nil
 }
 
-// OpenForResume loads path, repairs a torn tail, and opens it for appending
-// after its last line. The returned Loaded is the reconciled reduction.
+// OpenForResume exclusively locks path until Store.Close, loads it, and repairs
+// a torn tail before appending. Load remains available to read-only callers.
 func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loaded, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
-	loaded, err := Load(ctx, path)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
+		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
+	}
+	if err := lockJournal(file); err != nil {
+		_ = file.Close()
 		return nil, nil, err
 	}
-	if err := repairTail(ctx, path); err != nil {
+	loaded, err := Load(ctx, path)
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if err := repairTail(ctx, file); err != nil {
+		_ = file.Close()
 		return nil, nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
+		_ = file.Close()
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
 	clock, newID := resolveOptions(opts)
@@ -176,11 +184,11 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 // does not decode) is truncated away; a complete final line that lost only
 // its newline gets the newline back, so the next append is not glued onto it.
 // Earlier corruption is left in place for Load to report.
-func repairTail(ctx context.Context, path string) error {
+func repairTail(ctx context.Context, file *os.File) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("repair journal tail: %w", err)
 	}
-	contents, err := os.ReadFile(path)
+	contents, err := os.ReadFile(file.Name())
 	if err != nil {
 		return fmt.Errorf("read journal tail: %w", err)
 	}
@@ -198,7 +206,7 @@ func repairTail(ctx context.Context, path string) error {
 		if terminated {
 			return nil
 		}
-		return appendNewline(path)
+		return appendNewline(file)
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("repair journal tail: %w", err)
@@ -209,26 +217,17 @@ func repairTail(ctx context.Context, path string) error {
 		if terminated {
 			return nil
 		}
-		return appendNewline(path)
+		return appendNewline(file)
 	}
-	if err := os.Truncate(path, int64(start)); err != nil {
+	if err := file.Truncate(int64(start)); err != nil {
 		return fmt.Errorf("truncate torn journal tail: %w", err)
 	}
 	return nil
 }
 
-func appendNewline(path string) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
+func appendNewline(file *os.File) error {
+	if _, err := file.Write([]byte{'\n'}); err != nil {
 		return fmt.Errorf("repair journal tail: %w", err)
-	}
-	_, writeErr := file.Write([]byte{'\n'})
-	closeErr := file.Close()
-	if writeErr != nil {
-		return fmt.Errorf("repair journal tail: %w", writeErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("repair journal tail: %w", closeErr)
 	}
 	return nil
 }

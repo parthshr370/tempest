@@ -41,8 +41,7 @@ const (
 // never re-run.
 var safeToRerun = map[string]bool{"read": true, "grep": true, "find": true, "ls": true}
 
-// toolKey scopes a tool call id to its run: providers and adapters may reuse
-// ids across processes, but never within one assistant turn.
+// toolKey identifies the queue of occurrences sharing an endpoint's call id.
 type toolKey struct {
 	runID      string
 	toolCallID string
@@ -53,19 +52,43 @@ type toolState struct {
 	finished *ToolFinishedRecord
 }
 
+type replayTool struct {
+	call     ptypes.ContentBlock
+	state    *toolState
+	answered bool
+}
+
 // reduce folds decoded lines, in file order, into loaded. It is a pure
 // function of the lines: loading the same file twice gives the same result.
 func reduce(loaded *Loaded, entries []Entry) {
 	messages := make([]replayMessage, 0, len(entries))
-	tools := map[toolKey]*toolState{}
-	var startOrder []toolKey
+	// Calls belong to their assistant turn, not just a provider-supplied id.
+	// Finished records consume started occurrences in file order.
+	calls := map[toolKey][]*toolState{}
+	unfinished := map[toolKey][]*toolState{}
+	var startOrder []*toolState
 	var runs []RunSummary
 	runIndex := map[string]int{}
 
 	for _, entry := range entries {
 		switch e := entry.(type) {
 		case MessageEntry:
-			messages = append(messages, replayMessage{id: e.ID, runID: e.RunID, message: e.Message})
+			replay := replayMessage{id: e.ID, runID: e.RunID, message: e.Message}
+			if assistant, ok := e.Message.(ptypes.AssistantMessage); ok {
+				clear(calls)
+				if assistant.StopReason != ptypes.StopError && assistant.StopReason != ptypes.StopAborted {
+					for _, block := range assistant.Content {
+						if block.Type != ptypes.BlockToolCall {
+							continue
+						}
+						state := &toolState{}
+						replay.calls = append(replay.calls, replayTool{call: block, state: state})
+						key := toolKey{runID: e.RunID, toolCallID: block.ID}
+						calls[key] = append(calls[key], state)
+					}
+				}
+			}
+			messages = append(messages, replay)
 		case ModelChangeEntry:
 			loaded.Model = e.Model
 			loaded.Role = e.Role
@@ -75,6 +98,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 		case CompactionEntry:
 			messages = applyCompaction(messages, e)
 		case RunStartedRecord:
+			clear(calls)
 			if _, seen := runIndex[e.RunID]; seen {
 				loaded.diagnose("seq %d: duplicate run_started for run %s ignored", e.Seq, e.RunID)
 				continue
@@ -91,45 +115,43 @@ func reduce(loaded *Loaded, entries []Entry) {
 			runs[index].StopReason = e.StopReason
 		case ToolStartedRecord:
 			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
-			state := tools[key]
-			if state == nil {
+			var state *toolState
+			if queue := calls[key]; len(queue) > 0 {
+				state = queue[0]
+				calls[key] = queue[1:]
+			} else {
 				state = &toolState{}
-				tools[key] = state
-			}
-			if state.started != nil {
-				loaded.diagnose("seq %d: duplicate tool_started for %s ignored", e.Seq, e.ToolCallID)
-				continue
 			}
 			record := e
 			state.started = &record
-			startOrder = append(startOrder, key)
+			startOrder = append(startOrder, state)
+			unfinished[key] = append(unfinished[key], state)
 		case ToolFinishedRecord:
 			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
-			state := tools[key]
-			if state == nil || state.started == nil {
-				// Intent precedes effect, so this means a damaged or foreign
-				// file. Keep the fact; the call is not reported interrupted.
+			queue := unfinished[key]
+			if len(queue) == 0 {
 				loaded.diagnose("seq %d: tool_finished for %s without tool_started", e.Seq, e.ToolCallID)
-				if state == nil {
-					state = &toolState{}
-					tools[key] = state
-				}
+				continue
 			}
 			record := e
-			state.finished = &record
+			queue[0].finished = &record
+			unfinished[key] = queue[1:]
 		case UsageRecord:
 			loaded.UsageTotal.Add(e.Usage)
 		}
 	}
 
-	for _, key := range startOrder {
-		state := tools[key]
-		if state.finished != nil {
+	if len(runs) > 0 {
+		last := runs[len(runs)-1]
+		loaded.LastRun = &last
+	}
+	for _, state := range startOrder {
+		if state.finished != nil || loaded.LastRun == nil || state.started.RunID != loaded.LastRun.RunID {
 			continue
 		}
 		loaded.Interrupted = append(loaded.Interrupted, InterruptedTool{
-			RunID:      key.runID,
-			ToolCallID: key.toolCallID,
+			RunID:      state.started.RunID,
+			ToolCallID: state.started.ToolCallID,
 			Tool:       state.started.Tool,
 			Args:       state.started.Args,
 			StartedAt:  state.started.Timestamp,
@@ -140,11 +162,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 			loaded.diagnose("run %s was interrupted: no run_finished record", run.RunID)
 		}
 	}
-	if len(runs) > 0 {
-		last := runs[len(runs)-1]
-		loaded.LastRun = &last
-	}
-	loaded.Messages = reconcile(messages, tools)
+	loaded.Messages = reconcile(messages)
 }
 
 // reconcile returns the transcript with one result for every tool call the
@@ -152,28 +170,31 @@ func reduce(loaded *Loaded, entries []Entry) {
 // skipped: the loop never runs their calls and the provider transform drops
 // them. A missing result is synthesized after the turn's real results, worded
 // from what the records prove.
-func reconcile(messages []replayMessage, tools map[toolKey]*toolState) []ptypes.Message {
+func reconcile(messages []replayMessage) []ptypes.Message {
 	out := make([]ptypes.Message, 0, len(messages))
-	var pending []ptypes.ContentBlock
+	var pending []replayTool
 	var pendingRun string
 	var pendingTimestamp int64
-	answered := map[string]bool{}
 	flush := func() {
-		for _, call := range pending {
-			if answered[call.ID] {
+		for _, tool := range pending {
+			if tool.answered {
 				continue
 			}
-			if result, ok := synthesizeResult(call, pendingRun, tools[toolKey{runID: pendingRun, toolCallID: call.ID}], pendingTimestamp); ok {
+			if result, ok := synthesizeResult(tool.call, pendingRun, tool.state, pendingTimestamp); ok {
 				out = append(out, result)
 			}
 		}
 		pending = nil
-		clear(answered)
 	}
 
 	for _, replay := range messages {
 		if result, ok := replay.message.(ptypes.ToolResultMessage); ok {
-			answered[result.ToolCallID] = true
+			for index := range pending {
+				if pending[index].call.ID == result.ToolCallID && !pending[index].answered {
+					pending[index].answered = true
+					break
+				}
+			}
 			out = append(out, replay.message)
 			continue
 		}
@@ -183,11 +204,7 @@ func reconcile(messages []replayMessage, tools map[toolKey]*toolState) []ptypes.
 		if !ok || assistant.StopReason == ptypes.StopError || assistant.StopReason == ptypes.StopAborted {
 			continue
 		}
-		for _, block := range assistant.Content {
-			if block.Type == ptypes.BlockToolCall {
-				pending = append(pending, block)
-			}
-		}
+		pending = replay.calls
 		pendingRun = replay.runID
 		pendingTimestamp = assistant.Timestamp
 	}
