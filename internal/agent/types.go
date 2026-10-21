@@ -86,8 +86,18 @@ type AgentState struct {
 
 // BeforeToolCallResult is returned by BeforeToolCall.
 type BeforeToolCallResult struct {
-	Block  bool
-	Reason string
+	Block      bool
+	Reason     string
+	Permission *PermissionOutcome
+}
+
+// PermissionOutcome carries the gate's decision before the tool starts.
+type PermissionOutcome struct {
+	Allow    bool
+	Reason   string
+	Source   string
+	Prompted bool
+	Wait     time.Duration
 }
 
 // AfterToolCallResult is a field-by-field override for a completed tool result.
@@ -205,6 +215,9 @@ const (
 // RunResult is how one run ended. Prompt and Continue return it, and the run's
 // agent_end event carries it.
 type RunResult struct {
+	// RunID and ElapsedMS are populated by the durable Session wrapper.
+	RunID      string
+	ElapsedMS  int64
 	StopReason StopReason
 	// Err is set only when StopReason is StopError.
 	Err error
@@ -227,6 +240,7 @@ const (
 	EventMessageUpdate       AgentEventType = "message_update"
 	EventMessageEnd          AgentEventType = "message_end"
 	EventToolExecutionStart  AgentEventType = "tool_execution_start"
+	EventToolPermission      AgentEventType = "tool_permission"
 	EventToolExecutionUpdate AgentEventType = "tool_execution_update"
 	EventToolExecutionEnd    AgentEventType = "tool_execution_end"
 	// EventUsage reports a delegated model call without adding its transcript.
@@ -252,6 +266,7 @@ type AgentEvent struct {
 	Result                any
 	PartialResult         any
 	IsError               bool
+	Permission            *PermissionOutcome
 	// Model and Usage are set on usage events for delegated model calls.
 	Model string
 	// RunResult is set on agent_end; Usage is also set on usage events.

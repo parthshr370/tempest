@@ -283,6 +283,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 		hasMoreToolCalls := true
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
+			if firstTurn && ctx.Err() != nil {
+				run.result.StopReason = StopAborted
+				return nil
+			}
 			if !firstTurn {
 				stop, err := run.boundaryStop(ctx)
 				if stop != "" || err != nil {

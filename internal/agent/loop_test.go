@@ -77,6 +77,24 @@ func countEvents(events []AgentEvent, typ AgentEventType) int {
 	return count
 }
 
+func TestAgentLoopPreCancelledEmitsDurableRunWithoutProviderCall(t *testing.T) {
+	f := faux.New(faux.Options{})
+	f.SetResponses(faux.Respond(faux.Text("must not be requested")))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	events, _ := collectLoop(t, AgentLoop(ctx, []types.Message{userMessage("accepted")}, AgentContext{}, loopConfig(f), loopStreamFn(f)))
+	if f.CallCount() != 0 {
+		t.Fatalf("provider calls = %d, want zero", f.CallCount())
+	}
+	if countEvents(events, EventAgentStart) != 1 || countEvents(events, EventAgentEnd) != 1 {
+		t.Fatalf("run brackets = %v", eventTypes(events))
+	}
+	end := events[len(events)-1]
+	if end.StopReason != StopAborted || end.Turns != 0 {
+		t.Fatalf("terminal result = %+v", end.RunResult)
+	}
+}
+
 func TestAgentLoopSingleTurnNoTools(t *testing.T) {
 	f := faux.New(faux.Options{})
 	f.SetResponses(faux.Respond(faux.Text("hi")))

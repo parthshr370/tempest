@@ -24,7 +24,9 @@ type RunSummary struct {
 	StopReason string
 	// Finished is false when the run has no run_finished record: the process
 	// ended mid-run.
-	Finished bool
+	Finished   bool
+	Error      string
+	FinishedAt time.Time
 }
 
 // Synthesized tool-result wording. The model reads these, so they state what
@@ -97,6 +99,8 @@ func reduce(loaded *Loaded, entries []Entry) {
 			}
 		case CompactionEntry:
 			messages = applyCompaction(messages, e)
+		case PermissionRecord:
+			// A decision isn't an execution intent and changes no reconciliation state.
 		case RunStartedRecord:
 			clear(calls)
 			if _, seen := runIndex[e.RunID]; seen {
@@ -113,6 +117,8 @@ func reduce(loaded *Loaded, entries []Entry) {
 			}
 			runs[index].Finished = true
 			runs[index].StopReason = e.StopReason
+			runs[index].Error = e.Error
+			runs[index].FinishedAt = e.Timestamp
 		case ToolStartedRecord:
 			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
 			var state *toolState

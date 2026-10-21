@@ -96,7 +96,8 @@ func TestGateModeTierMatrix(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			allow, reason := Gate(context.Background(), test.mode, test.tool, test.args, Policy{})
+			out := Gate(context.Background(), test.mode, test.tool, test.args, &Policy{})
+			allow, reason := out.Allow, out.Reason
 			if allow != test.wantAllow {
 				t.Fatalf("Gate() allow = %v, reason %q; want %v", allow, reason, test.wantAllow)
 			}
@@ -113,7 +114,8 @@ func TestGateModeTierMatrix(t *testing.T) {
 func TestGatePolicyOverrides(t *testing.T) {
 	t.Run("allow", func(t *testing.T) {
 		policy := Policy{Overrides: map[string]Decision{"task": DecideAllow}}
-		allow, reason := Gate(context.Background(), ModePlan, "task", nil, policy)
+		out := Gate(context.Background(), ModePlan, "task", nil, &policy)
+		allow, reason := out.Allow, out.Reason
 		if !allow || reason != "" {
 			t.Fatalf("allow override = allow %v, reason %q", allow, reason)
 		}
@@ -121,7 +123,8 @@ func TestGatePolicyOverrides(t *testing.T) {
 
 	t.Run("deny", func(t *testing.T) {
 		policy := Policy{Overrides: map[string]Decision{"edit": DecideDeny}}
-		allow, reason := Gate(context.Background(), ModeDefault, "edit", nil, policy)
+		out := Gate(context.Background(), ModeDefault, "edit", nil, &policy)
+		allow, reason := out.Allow, out.Reason
 		if allow || reason != "Tool edit denied by policy" {
 			t.Fatalf("deny override = allow %v, reason %q", allow, reason)
 		}
@@ -130,18 +133,20 @@ func TestGatePolicyOverrides(t *testing.T) {
 	t.Run("prompt", func(t *testing.T) {
 		prompter := &testPrompter{approved: true}
 		policy := Policy{Overrides: map[string]Decision{"task": DecidePrompt}, Prompter: prompter}
-		allow, reason := Gate(context.Background(), ModeDefault, "task", nil, policy)
+		out := Gate(context.Background(), ModeDefault, "task", nil, &policy)
+		allow, reason := out.Allow, out.Reason
 		if !allow || reason != "" {
 			t.Fatalf("prompt override = allow %v, reason %q", allow, reason)
 		}
-		if prompter.request != (PromptRequest{Tool: "task", Tier: TierExec}) {
+		if prompter.request.Tool != "task" || prompter.request.Tier != TierExec || len(prompter.request.Args) != 0 {
 			t.Fatalf("prompt request = %+v", prompter.request)
 		}
 	})
 
 	t.Run("safety wins over allow", func(t *testing.T) {
 		policy := Policy{Overrides: map[string]Decision{"bash": DecideAllow}}
-		allow, reason := Gate(context.Background(), ModeDefault, "bash", commandArgs("rm -rf /tmp/example"), policy)
+		out := Gate(context.Background(), ModeDefault, "bash", commandArgs("rm -rf /tmp/example"), &policy)
+		allow, reason := out.Allow, out.Reason
 		wantReason := "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): rm -rf /tmp/example"
 		if allow || reason != wantReason {
 			t.Fatalf("destructive bash = allow %v, reason %q; want reason %q", allow, reason, wantReason)
@@ -151,14 +156,16 @@ func TestGatePolicyOverrides(t *testing.T) {
 
 func TestGateHeadlessPromptDenies(t *testing.T) {
 	policy := Policy{Overrides: map[string]Decision{"task": DecidePrompt}}
-	allow, reason := Gate(context.Background(), ModeDefault, "task", nil, policy)
+	out := Gate(context.Background(), ModeDefault, "task", nil, &policy)
+	allow, reason := out.Allow, out.Reason
 	if allow || reason != "Tool task requires approval but no interactive prompt is available" {
 		t.Fatalf("headless prompt = allow %v, reason %q", allow, reason)
 	}
 
 	prompter := &testPrompter{approved: true}
 	policy.Prompter = prompter
-	allow, reason = Gate(context.Background(), ModeDefault, "task", nil, policy)
+	out = Gate(context.Background(), ModeDefault, "task", nil, &policy)
+	allow, reason = out.Allow, out.Reason
 	if !allow || reason != "" {
 		t.Fatalf("approved prompt = allow %v, reason %q", allow, reason)
 	}
@@ -167,7 +174,8 @@ func TestGateHeadlessPromptDenies(t *testing.T) {
 func TestGateCanceledContextDenies(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	allow, reason := Gate(ctx, ModeBypass, "bash", commandArgs("rm -rf /tmp/example"), Policy{})
+	out := Gate(ctx, ModeBypass, "bash", commandArgs("rm -rf /tmp/example"), &Policy{})
+	allow, reason := out.Allow, out.Reason
 	if allow || reason != "Operation aborted" {
 		t.Fatalf("canceled gate = allow %v, reason %q", allow, reason)
 	}
@@ -190,9 +198,12 @@ type testPrompter struct {
 	request  PromptRequest
 }
 
-func (p *testPrompter) Approve(_ context.Context, req PromptRequest) (bool, error) {
+func (p *testPrompter) Approve(_ context.Context, req PromptRequest) (Choice, error) {
 	p.request = req
-	return p.approved, nil
+	if p.approved {
+		return AllowOnce, nil
+	}
+	return RejectOnce, nil
 }
 
 func commandArgs(command string) json.RawMessage {
@@ -288,5 +299,52 @@ func TestPlanCollector(t *testing.T) {
 	formatted := FormatPlan(items)
 	if !strings.Contains(formatted, "[x] 1. Build the UI") || !strings.Contains(formatted, "[ ] 2. Test the UI") {
 		t.Fatalf("formatted = %q", formatted)
+	}
+}
+
+type choicePrompter func(context.Context, PromptRequest) (Choice, error)
+
+func (f choicePrompter) Approve(ctx context.Context, req PromptRequest) (Choice, error) {
+	return f(ctx, req)
+}
+
+func TestGatePromptSourcesAndAlwaysOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		choice Choice
+		err    error
+		source Source
+		allow  bool
+	}{
+		{"allow", AllowOnce, nil, SourcePrompt, true},
+		{"deny", RejectOnce, nil, SourcePrompt, false},
+		{"cancelled", "", nil, SourcePromptCancelled, false},
+		{"timeout", "", context.DeadlineExceeded, SourcePromptTimeout, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			policy := &Policy{Prompter: choicePrompter(func(_ context.Context, req PromptRequest) (Choice, error) {
+				if req.ToolCallID != "c" || string(req.Args) != `{"command":"mkdir x"}` {
+					t.Errorf("request=%+v", req)
+				}
+				return tc.choice, tc.err
+			})}
+			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("mkdir x"), policy, "c")
+			if out.Allow != tc.allow || out.Source != tc.source || !out.Prompted {
+				t.Fatalf("outcome=%+v", out)
+			}
+		})
+	}
+	for _, choice := range []Choice{AllowAlways, RejectAlways} {
+		calls := 0
+		policy := &Policy{Prompter: choicePrompter(func(context.Context, PromptRequest) (Choice, error) { calls++; return choice, nil })}
+		for range 2 {
+			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("mkdir x"), policy, "c")
+			if out.Allow != (choice == AllowAlways) {
+				t.Fatalf("choice=%s outcome=%+v", choice, out)
+			}
+		}
+		if calls != 1 {
+			t.Fatalf("choice=%s prompted %d times", choice, calls)
+		}
 	}
 }

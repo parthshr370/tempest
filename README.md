@@ -28,15 +28,15 @@ no Node runtime, no interpreter, and nothing to install but the executable.
 ```sh
 git clone https://github.com/parthshr370/tempest.git
 cd tempest
-go build -o tempest ./cmd/harness
+go build -o bin/tempest ./cmd/harness
 ```
 
-That produces a single self-contained `tempest` binary you can drop on your `PATH`.
+That produces a single self-contained `bin/tempest` binary you can drop on your `PATH`.
 
 ## Quick start
 
 ```sh
-ANTHROPIC_API_KEY=... ./tempest -p "Create hello.txt with hi"
+ANTHROPIC_API_KEY=... ./bin/tempest -p "Create hello.txt with hi"
 ```
 
 `-model` selects the model: a bare Anthropic route ID, `anthropic:<id>`,
@@ -82,7 +82,7 @@ go test ./internal/catalog/...
 TEMPEST_LIVE=1 go test ./internal/catalog/ -run TestVerifyOpenRouter
 ```
 
-`./tempest doctor` is offline and never prints credentials. `./tempest doctor --ping`
+`./bin/tempest doctor` is offline and never prints credentials. `./bin/tempest doctor --ping`
 makes one billable request per configured provider: prompt `hi`, output cap 1 token,
 using the catalog model with the lowest input-plus-output price. It reports the
 model and latency on success, or a typed failure code. Endpoint/account restrictions
@@ -168,7 +168,7 @@ fall back to pure Go when `rg`/`fd` are absent.
 
 **Runtime**
 
-- `bash` — workspace shell with a destructive-command guard.
+- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout.
 
 **Coordination**
 
@@ -221,11 +221,121 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
 assistant text goes to stdout, and a stop reason other than `completed` goes to
 stderr.
 
+## Serve
+
+`tempest serve` exposes the same durable sessions over JSON-RPC 2.0 with the
+Agent Client Protocol (ACP) method set. No listener flag means NDJSON over stdio:
+
+```sh
+./bin/tempest serve -model anthropic:claude-opus-4-8
+```
+
+Each line is one JSON object. Stdout is protocol-only; diagnostics go to stderr
+or `-log-file`. For WebSocket clients, set a listener:
+
+```sh
+TEMPEST_TOKEN=change-me ./bin/tempest serve -listen 127.0.0.1:7777
+```
+
+Connect to `ws://127.0.0.1:7777/acp` with `Authorization: Bearer change-me`
+or `?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required
+off loopback; when one is configured, loopback connections need it too.
+`GET /healthz` is unauthenticated and reports session and running counts.
+WebSocket mode doesn't also serve stdio.
+
+Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
+(30m), `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model,
+permission, budget, and bash-timeout flags supply defaults for new sessions.
+Tools run on the server host, not the client.
+
+### Protocol
+
+Initialize first, create or load a session, then prompt. A `session/prompt`
+response waits for the run to finish; `session/update` and `tempest/*`
+notifications carry progress while it runs. ACP reports `end_turn`,
+`cancelled`, or `max_turn_requests`; `_meta.tempest.stopReason` preserves the
+exact Tempest reason.
+
+`tempest/watch` returns an atomic snapshot followed by live updates.
+Reconnect with `session/resume` and watch again: an accepted prompt keeps
+running after its connection closes. A slow watcher is dropped with
+`tempest/gap`, never allowed to stall the run; re-watch for a fresh snapshot.
+Use `tempest/history` to page older updates. Frames are limited to 1 MiB.
+
+Permissions arrive as `session/request_permission` requests with
+`allow_once`, `allow_always`, `reject_once`, and `reject_always` choices.
+The first answer wins. Always-choices last only for this server process;
+unanswered asks deny after the permission timeout. Reconnecting approvers
+can watch with `approver:true` and answer pending asks with
+`tempest/permission`. `session/cancel` aborts the run.
+
+Here's a short stdio exchange. `s1` stands for the returned session ID;
+responses show selected fields, and the watch snapshot and non-text
+notifications are omitted:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"example","version":"1"}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}
+{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/workspace","mcpServers":[]}}
+{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}
+{"jsonrpc":"2.0","id":3,"method":"tempest/watch","params":{"sessionId":"s1"}}
+{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"Say hello"}]}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","messageId":"msg_2","content":{"type":"text","text":"Hello"},"_meta":{"tempest":{"seq":5}}}}}
+{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{"tempest":{"stopReason":"completed","turns":1}}}}
+```
+
+`session/new` doesn't subscribe automatically; wait for the `tempest/watch`
+response before prompting. `session/load` replays history and subscribes;
+`session/resume` opens without replay or subscription.
+
+## Embed in Go
+
+Import `go.harness.dev/harness/tempest` to drive the harness in-process:
+
+```go
+session, err := tempest.Open(ctx, tempest.Options{
+    Cwd: cwd,
+    New: &tempest.NewSession{Model: "anthropic:claude-opus-4-8"},
+})
+if err != nil {
+    return err
+}
+defer session.Close(context.Background())
+
+snapshot, updates, stopWatch := session.Watch(ctx, tempest.WatchOptions{})
+defer stopWatch()
+go func() {
+    for update := range updates {
+        fmt.Println(update.Kind, string(update.Update))
+    }
+}()
+fmt.Println("session:", snapshot.SessionID)
+result, err := session.Prompt(ctx, tempest.Prompt{Text: "Explain this project"})
+if err != nil {
+    return err
+}
+fmt.Println("stop reason:", result.StopReason)
+```
+
+`Prompt` blocks on its caller's goroutine. `Cancel` is safe from another
+goroutine; `Close` cancels, joins the run, and closes its journal.
+[The complete example](examples/embed/main.go) uses the faux provider by
+default, so it needs no API key. Pass `-model` to use a real provider:
+
+```sh
+go -C examples/embed run .
+ANTHROPIC_API_KEY=... go -C examples/embed run . -model anthropic:claude-opus-4-8
+```
+
+The example is a separate module with a local `replace`; build it with
+`go -C examples/embed build ./...` or `make build-examples`.
+
 ## Flags
 
 | Flag | Purpose |
 |---|---|
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](#runs). Zero means unlimited. |
+| `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
 | `-plan` | Run the read-only plan stack on the `plan` role model. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
@@ -247,11 +357,12 @@ not read `.env` — export variables before running it.
 | `HARNESS_PERMISSION_MODE` | Default tool gate mode. |
 | `HARNESS_PERMISSION_ALLOW_TOOLS`, `HARNESS_PERMISSION_DENY_TOOLS` | Per-tool allow/deny lists. |
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |
+| `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
-Run `./tempest -help` for the full flag list.
+Run `./bin/tempest -help` for the full flag list.
 
 ## Development
 

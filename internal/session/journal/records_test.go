@@ -113,7 +113,7 @@ func TestRecordsShareOneSeqAndStayOutOfTheEntryChain(t *testing.T) {
 	if len(loaded.Diagnostics) != 0 {
 		t.Fatalf("diagnostics = %#v", loaded.Diagnostics)
 	}
-	if !reflect.DeepEqual(loaded.LastRun, &RunSummary{RunID: runID, StopReason: "completed", Finished: true}) {
+	if loaded.LastRun == nil || loaded.LastRun.RunID != runID || loaded.LastRun.StopReason != "completed" || !loaded.LastRun.Finished || loaded.LastRun.FinishedAt.IsZero() {
 		t.Fatalf("last run = %#v", loaded.LastRun)
 	}
 	if loaded.UsageTotal.TotalTokens != 16 || !loaded.UsageTotal.Cost.Unknown {

@@ -73,13 +73,15 @@ const (
 	KindUsage EntryType = "usage"
 	// KindRunFinished records how a run ended.
 	KindRunFinished EntryType = "run_finished"
+	// KindPermission records a decision, not an execution intent.
+	KindPermission EntryType = "permission"
 )
 
 // isRecord reports whether kind is a run record rather than a conversation
 // entry. Records stay out of the parent chain.
 func isRecord(kind EntryType) bool {
 	switch kind {
-	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished:
+	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission:
 		return true
 	}
 	return false
@@ -194,6 +196,20 @@ func (RunFinishedRecord) kind() EntryType            { return KindRunFinished }
 func (e RunFinishedRecord) meta() Meta               { return e.Meta }
 func (e RunFinishedRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 
+// PermissionRecord records the gate's decision before the tool's intent.
+type PermissionRecord struct {
+	Meta       `json:"-"`
+	ToolCallID string `json:"tool_call_id"`
+	Tool       string `json:"tool"`
+	Decision   string `json:"decision"`
+	Source     string `json:"source"`
+	WaitMS     int64  `json:"wait_ms"`
+}
+
+func (PermissionRecord) kind() EntryType            { return KindPermission }
+func (e PermissionRecord) meta() Meta               { return e.Meta }
+func (e PermissionRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
+
 // wireEntry is the one JSONL envelope for entries and records. Message bodies
 // and record payloads stay raw until the kind says how to decode them.
 type wireEntry struct {
@@ -256,7 +272,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 		wire.Model, wire.Role = e.Model, e.Role
 	case CompactionEntry:
 		wire.Summary, wire.FirstKeptID, wire.TokensBefore = e.Summary, e.FirstKeptID, e.TokensBefore
-	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord:
+	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord:
 		payload, err := json.Marshal(e)
 		if err != nil {
 			return nil, fmt.Errorf("marshal %s record: %w", wire.Type, err)
@@ -331,6 +347,13 @@ func decodeRecord(kind EntryType, meta Meta, payload json.RawMessage) (Entry, er
 	var record Entry
 	var err error
 	switch kind {
+	case KindPermission:
+		var r PermissionRecord
+		err = json.Unmarshal(payload, &r)
+		if err == nil && (r.ToolCallID == "" || (r.Decision != "allow" && r.Decision != "deny")) {
+			err = fmt.Errorf("missing tool_call_id or invalid decision")
+		}
+		record = r
 	case KindRunStarted:
 		var r RunStartedRecord
 		err = json.Unmarshal(payload, &r)

@@ -7,12 +7,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/tempest"
 )
 
 func TestResolveOutputFormat(t *testing.T) {
@@ -180,6 +185,18 @@ func TestResolveCommandConfigRejectsResumeContinueConflict(t *testing.T) {
 func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 	ctx := context.Background()
 	cwd := "/workspace/project"
+	open := func(dir, resume, model string) (*tempest.Session, error) {
+		f := faux.New(faux.Options{})
+		return openSession(ctx, tempest.Options{
+			SessionDir: dir,
+			Cwd:        cwd,
+			New:        &tempest.NewSession{Model: model},
+			Stack: &tempest.StackConfig{
+				Model:    ptypes.Model{ID: model, Provider: "faux"},
+				StreamFn: f.StreamSimple,
+			},
+		}, resume, false)
+	}
 	for _, test := range []struct {
 		name        string
 		initial     string
@@ -195,12 +212,12 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 			dir := t.TempDir()
 			var id string
 			if test.withModel {
-				store, _, err := openSession(ctx, dir, cwd, "", false, ptypes.Model{ID: test.initial})
+				store, err := open(dir, "", test.initial)
 				if err != nil {
 					t.Fatal(err)
 				}
 				id = store.ID()
-				if err := store.Close(); err != nil {
+				if err := store.Close(ctx); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -213,11 +230,11 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			store, _, err := openSession(ctx, dir, cwd, id, false, ptypes.Model{ID: test.resumed})
+			store, err := open(dir, id, test.resumed)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.Close(); err != nil {
+			if err := store.Close(ctx); err != nil {
 				t.Fatal(err)
 			}
 			path, err := journal.Resolve(ctx, dir, cwd, id)
@@ -296,6 +313,44 @@ func TestCLIRunLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("resume and continue append new prompts to the same session", func(t *testing.T) {
+		_, sessionDir, code := run(t, readThenAnswer)
+		if code != 0 {
+			t.Fatalf("initial run exit = %d", code)
+		}
+		id := loadOnlyJournal(t, sessionDir).Header.ID
+		for index, flagArgs := range [][]string{{"-resume", id}, {"-continue"}} {
+			args := append([]string{"-session-dir", sessionDir}, flagArgs...)
+			report, _, code := run(t, `[{"text":"resumed answer"}]`, args...)
+			if code != 0 || report.Text != "resumed answer" {
+				t.Fatalf("resume args %v: exit %d, report %+v", flagArgs, code, report)
+			}
+			loaded := loadOnlyJournal(t, sessionDir)
+			if want := 4 + 2*(index+1); len(loaded.Messages) != want {
+				t.Fatalf("resume args %v: messages=%d, want %d", flagArgs, len(loaded.Messages), want)
+			}
+			if loaded.Header.ID != id || loaded.Messages[len(loaded.Messages)-2].Role() != "user" {
+				t.Fatalf("resume args %v didn't preserve the session and add a prompt", flagArgs)
+			}
+		}
+	})
+
+	t.Run("attached files remain readable through the attachment tool", func(t *testing.T) {
+		script := `[{"toolCalls":[{"id":"attachment-read","name":"attachment","arguments":{"op":"read","id":"note.txt"}}]},{"text":"read attachment"}]`
+		report, sessionDir, code := run(t, script, "-attach", filepath.Join(tmp, "note.txt"))
+		if code != 0 || report.Text != "read attachment" {
+			t.Fatalf("attachment run exit %d, report %+v", code, report)
+		}
+		loaded := loadOnlyJournal(t, sessionDir)
+		if len(loaded.Messages) != 4 {
+			t.Fatalf("attachment messages = %d, want 4", len(loaded.Messages))
+		}
+		result, ok := loaded.Messages[2].(ptypes.ToolResultMessage)
+		if !ok || result.IsError || len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "note body") {
+			t.Fatalf("attachment tool result = %#v", loaded.Messages[2])
+		}
+	})
+
 	t.Run("max turns stops after the turn's tools finish", func(t *testing.T) {
 		report, sessionDir, code := run(t, readThenAnswer, "-max-turns", "1")
 		if code != 0 || report.StopReason != "max_turns" || report.Turns != 1 || report.Message.Role != "toolResult" {
@@ -310,6 +365,37 @@ func TestCLIRunLifecycle(t *testing.T) {
 		report, _, code := run(t, readOnly)
 		if code != 1 || report.StopReason != "error" || report.Error == "" {
 			t.Fatalf("exit %d report %+v, want error stop with exit 1", code, report)
+		}
+	})
+
+	t.Run("bash timeout flag kills the command group", func(t *testing.T) {
+		script := `[{"toolCalls":[{"id":"timeout","name":"bash","arguments":{"command":"printf '%s' $$ > timeout-pgid; exec sleep 30"}}]},{"text":"handled timeout"}]`
+		started := time.Now()
+		report, sessionDir, code := run(t, script, "-bash-timeout", "1s", "-permission-mode", "bypass")
+		if elapsed := time.Since(started); elapsed >= 2*time.Second {
+			t.Fatalf("timeout run took %s, want less than 2s", elapsed)
+		}
+		if code != 0 || report.Text != "handled timeout" {
+			t.Fatalf("timeout run exit %d, report %+v", code, report)
+		}
+		loaded := loadOnlyJournal(t, sessionDir)
+		if len(loaded.Messages) != 4 {
+			t.Fatalf("timeout messages = %d, want 4", len(loaded.Messages))
+		}
+		toolResult, ok := loaded.Messages[2].(ptypes.ToolResultMessage)
+		if !ok || !toolResult.IsError || len(toolResult.Content) != 1 || !strings.Contains(toolResult.Content[0].Text, "Command timed out after 1 seconds") {
+			t.Fatalf("timeout result = %#v", loaded.Messages[2])
+		}
+		pgidBytes, err := os.ReadFile(filepath.Join(tmp, "timeout-pgid"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pgid, err := strconv.Atoi(string(pgidBytes))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("process group %d still exists: %v", pgid, err)
 		}
 	})
 

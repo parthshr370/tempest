@@ -85,9 +85,11 @@ var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: t
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
 type ToolsOptions struct {
-	MutationQueue   *toolio.FileMutationQueue
-	ShellPath       string
-	CommandPrefix   string
+	MutationQueue *toolio.FileMutationQueue
+	ShellPath     string
+	CommandPrefix string
+	// BashTimeout defaults to ten minutes when unset.
+	BashTimeout     time.Duration
 	TodoStore       *progress.Store
 	TaskTool        agent.AgentTool
 	ConfiguredTools []agent.AgentTool
@@ -789,6 +791,10 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	if shell == "" {
 		shell = "/bin/bash"
 	}
+	timeoutDefault := options.BashTimeout
+	if timeoutDefault <= 0 {
+		timeoutDefault = 10 * time.Minute
+	}
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(BashTool),
@@ -817,16 +823,23 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if options.CommandPrefix != "" {
 				command = options.CommandPrefix + "\n" + command
 			}
-			execCtx := ctx
-			cancel := func() {}
+			timeout := timeoutDefault
 			if input.Timeout != nil && *input.Timeout > 0 {
-				execCtx, cancel = context.WithTimeout(ctx, time.Duration(*input.Timeout)*time.Second)
+				timeout = time.Duration(*input.Timeout) * time.Second
 			}
+			execCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			cmd := exec.CommandContext(execCtx, shell, "-c", command)
 			cmd.Dir = cwd
 			if runtime.GOOS != "windows" {
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+				cmd.Cancel = func() error {
+					err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+					if errors.Is(err, syscall.ESRCH) {
+						return os.ErrProcessDone
+					}
+					return err
+				}
 			}
 			stdout, err := cmd.StdoutPipe()
 			if err != nil {
@@ -859,24 +872,11 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := cmd.Start(); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			killDone := make(chan struct{})
-			if runtime.GOOS != "windows" {
-				go func() {
-					select {
-					case <-execCtx.Done():
-						if cmd.Process != nil {
-							_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-						}
-					case <-killDone:
-					}
-				}()
-			}
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go appendPipe(stdout, &wg)
 			go appendPipe(stderr, &wg)
 			wg.Wait()
-			close(killDone)
 			waitErr := cmd.Wait()
 			accMu.Lock()
 			_ = acc.Finish()
@@ -885,7 +885,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			accMu.Unlock()
 			text, details := formatBashOutput(snapshot, acc, "(no output)")
 			if execCtx.Err() == context.DeadlineExceeded {
-				return agent.AgentToolResult{}, errors.New(appendStatus(text, fmt.Sprintf("Command timed out after %d seconds", valueOrZero(input.Timeout))))
+				return agent.AgentToolResult{}, errors.New(appendStatus(text, fmt.Sprintf("Command timed out after %g seconds", timeout.Seconds())))
 			}
 			if execCtx.Err() == context.Canceled || ctx.Err() != nil {
 				return agent.AgentToolResult{}, errors.New(appendStatus(text, "Command aborted"))
@@ -1554,14 +1554,6 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-// valueOrZero makes an optional integer safe to show in an error message.
-func valueOrZero(v *int) int {
-	if v == nil {
-		return 0
-	}
-	return *v
 }
 
 // max picks the larger bound while paging search and read results.

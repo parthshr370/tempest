@@ -1,4 +1,4 @@
-// Command harness runs a generic coding agent once and writes its final result.
+// Command harness runs Tempest once or serves durable agent sessions.
 package main
 
 import (
@@ -25,6 +25,7 @@ import (
 	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/tempest"
 )
 
 // exitAborted is the conventional exit status for a run ended by SIGINT.
@@ -66,6 +67,8 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "serve":
+			return runServe(args[1:], stdout, stderr)
 		case "doctor":
 			return runDoctor(args[1:], stdout, stderr)
 		case "version":
@@ -179,18 +182,6 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		slog.Warn("discovery diagnostic", "code", diagnostic.Code, "path", diagnostic.Path, "message", diagnostic.Message)
 	}
 
-	sessionStore, seedMessages, err := openSession(runCtx, opts.Config.SessionDir(), cwd, opts.Resume, opts.Continue, selectedModel)
-	if err != nil {
-		fmt.Fprintf(stderr, "session error: %v\n", err)
-		return 1
-	}
-	if sessionStore != nil {
-		defer func() {
-			if err := sessionStore.Close(); err != nil {
-				slog.Warn("session close failed", "error", err)
-			}
-		}()
-	}
 	var attachRegistry *document.AttachmentRegistry
 	var attachReader *document.CacheRootBlobReader
 	if attachPaths := opts.Config.AttachPaths(); len(attachPaths) > 0 {
@@ -200,7 +191,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	stack, err := session.BuildAgentStack(session.StackConfig{
+	stack := tempest.StackConfig{
 		Cwd:                cwd,
 		Model:              stackModel,
 		PlanModel:          planSelected,
@@ -213,32 +204,45 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		EnableTask:         opts.Config.EnableTask(),
 		EnableWeb:          opts.Config.EnableWeb(),
 		WebSearchURL:       opts.Config.WebSearchURL(),
+		BashTimeout:        opts.Config.BashTimeout(),
 		ContextFiles:       inputs.ContextFiles,
 		Skills:             inputs.Skills,
 		GenericRules:       inputs.GenericRules,
-		InitialMessages:    seedMessages,
 		AttachmentRegistry: attachRegistry,
 		AttachmentReader:   attachReader,
-	})
+	}
+	sess, err := openSession(runCtx, tempest.Options{
+		SessionDir: opts.Config.SessionDir(),
+		Cwd:        cwd,
+		Stack:      &stack,
+		New: &tempest.NewSession{
+			Model:          selectedModel.ID,
+			Budget:         opts.Budget,
+			PermissionMode: permissionMode,
+		},
+	}, opts.Resume, opts.Continue)
 	if err != nil {
-		fmt.Fprintf(stderr, "agent stack error: %v\n", err)
+		fmt.Fprintf(stderr, "session error: %v\n", err)
 		return 1
 	}
-	if sessionStore != nil {
-		// Registered after the store's Close, so it detaches first.
-		defer session.AttachJournal(stack.Agent, sessionStore)()
-	}
+	defer func() {
+		if err := sess.Close(context.Background()); err != nil {
+			slog.Warn("session close failed", "error", err)
+		}
+	}()
 	mode, err := resolveOutputFormat(opts.OutputFormat, opts.PrintMode)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	outcome, err := session.Run(runCtx, stack.Agent, session.InitialPrompt{Text: opts.Prompt}, session.RunOptions{Budget: opts.Budget})
+	started := time.Now()
+	result, err := sess.Prompt(runCtx, tempest.Prompt{Text: opts.Prompt})
 	if err != nil {
 		fmt.Fprintf(stderr, "run error: %v\n", err)
 		return 1
 	}
-	writeRunOutput(stdout, stderr, mode, outcome, stack.Agent.State().Messages)
+	outcome := runOutcome{RunResult: result, Elapsed: time.Since(started), LastAssistantText: sess.LastAssistantText()}
+	writeRunOutput(stdout, stderr, mode, outcome, sess.Messages())
 	if permissionMode == permission.ModePlan {
 		collector := permission.NewPlanCollector()
 		collector.Observe(outcome.LastAssistantText)
@@ -255,6 +259,12 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	default:
 		return 0
 	}
+}
+
+type runOutcome struct {
+	tempest.RunResult
+	Elapsed           time.Duration
+	LastAssistantText string
 }
 
 // runReport is the -output-format json result of one run.
@@ -275,7 +285,7 @@ type runReport struct {
 // writeRunOutput prints the run result: a runReport in json mode; otherwise
 // the last assistant text on stdout and, when the run did not complete, why
 // it stopped on stderr.
-func writeRunOutput(stdout, stderr io.Writer, mode string, outcome session.RunOutcome, messages []ptypes.Message) {
+func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, messages []ptypes.Message) {
 	var last ptypes.Message
 	if len(messages) > 0 {
 		last = messages[len(messages)-1]
@@ -326,6 +336,7 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
 	fs.IntVar(&values.MaxTokens.Value, "max-tokens", 0, "maximum model output tokens")
 	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "tool permission mode: default, plan, acceptEdits, bypass")
+	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default bash command timeout, e.g. 10m (default 10m)")
 	fs.StringVar(&values.LogLevel.Value, "log-level", "", "log level: debug, info, warn, error")
 	fs.StringVar(&values.LogFile.Value, "log-file", "", "diagnostic log file")
 	fs.IntVar(&values.LogFileMaxBytes.Value, "log-file-max-bytes", 0, "diagnostic log rotation size in bytes")
@@ -373,6 +384,8 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 			values.MaxTokens.Set = true
 		case "permission-mode":
 			values.PermissionMode.Set = true
+		case "bash-timeout":
+			values.BashTimeout.Set = true
 		case "log-level":
 			values.LogLevel.Set = true
 		case "log-file":
@@ -521,62 +534,27 @@ func buildPermissionPolicy(allow, deny []string) permission.Policy {
 	return permission.Policy{Overrides: overrides}
 }
 
-// openSession resolves or creates the session journal and returns the store plus
-// the messages to seed the agent (nil for a fresh session). A -resume id or
-// -continue reopens an existing journal for appending; otherwise a new session is
-// created and its model recorded.
-func openSession(ctx context.Context, sessionDir, cwd, resumeID string, continueRecent bool, model ptypes.Model) (*journal.Store, []ptypes.Message, error) {
-	switch {
-	case resumeID != "":
-		path, err := journal.Resolve(ctx, sessionDir, cwd, resumeID)
-		if err != nil {
-			return nil, nil, err
+// openSession keeps -continue scoped to the CLI's working directory. A resumed
+// session gets a new prompt, just as it does without -resume.
+func openSession(ctx context.Context, options tempest.Options, resumeID string, continueRecent bool) (*tempest.Session, error) {
+	if resumeID != "" || continueRecent {
+		resume := &tempest.ResumeSession{
+			SessionID:      resumeID,
+			Model:          options.New.Model,
+			Budget:         options.New.Budget,
+			PermissionMode: options.New.PermissionMode,
 		}
-		return openResumedSession(ctx, path, model)
-	case continueRecent:
-		path, err := journal.Recent(ctx, sessionDir, cwd)
-		if err != nil {
-			return nil, nil, err
+		if continueRecent {
+			path, err := journal.Recent(ctx, options.SessionDir, options.Cwd)
+			if err != nil {
+				return nil, err
+			}
+			resume.Path = path
 		}
-		return openResumedSession(ctx, path, model)
-	default:
-		store, err := journal.Create(ctx, sessionDir, cwd, journal.Options{})
-		if err != nil {
-			return nil, nil, err
-		}
-		if err := store.AppendModelChange(ctx, model.ID, "default"); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("record session model: %w", err)
-		}
-		return store, nil, nil
+		options.New = nil
+		options.Resume = resume
 	}
-}
-
-// openResumedSession records a model change when a resumed journal no longer matches today's default model or role.
-func openResumedSession(ctx context.Context, path string, model ptypes.Model) (*journal.Store, []ptypes.Message, error) {
-	store, loaded, err := journal.OpenForResume(ctx, path, journal.Options{})
-	if err != nil {
-		return nil, nil, err
-	}
-	for _, diagnostic := range loaded.Diagnostics {
-		slog.Warn("session journal diagnostic", "message", diagnostic.Message)
-	}
-	// The model sees these calls as "outcome unknown"; tell the user too,
-	// because the side effect may or may not have happened.
-	for _, interrupted := range loaded.Interrupted {
-		slog.Warn("previous run left a tool call unfinished; its outcome is unknown", "tool", interrupted.Tool, "tool_call_id", interrupted.ToolCallID)
-	}
-	role := loaded.Role
-	if role == "" {
-		role = "default"
-	}
-	if loaded.Model != model.ID || role != "default" {
-		if err := store.AppendModelChange(ctx, model.ID, "default"); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("record resumed session model: %w", err)
-		}
-	}
-	return store, loaded.Messages, nil
+	return tempest.Open(ctx, options)
 }
 
 // setupLogging installs the redacting default logger and optionally tees diagnostics into the rotating log file.

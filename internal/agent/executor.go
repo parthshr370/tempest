@@ -24,16 +24,18 @@ type ExecutedToolCallBatch struct {
 // preparedToolCall is a tool call that passed validation and the BeforeToolCall
 // gate and is ready to execute.
 type preparedToolCall struct {
-	toolCall types.ContentBlock
-	tool     AgentTool
-	args     json.RawMessage
+	toolCall   types.ContentBlock
+	tool       AgentTool
+	args       json.RawMessage
+	permission *PermissionOutcome
 }
 
 // immediateOutcome is a result produced during prepare (validation error,
 // blocked, aborted, unknown tool) that skips execution entirely.
 type immediateOutcome struct {
-	result  AgentToolResult
-	isError bool
+	result     AgentToolResult
+	isError    bool
+	permission *PermissionOutcome
 }
 
 // executedOutcome is the raw result of Execute (before AfterToolCall merges).
@@ -90,11 +92,10 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
 
 	for _, toolCall := range toolCalls {
-		if err := emit(ctx, ToolExecutionStart(toolCall.ID, toolCall.Name, toolCall.Arguments)); err != nil {
+		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
+		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, emit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
-
-		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
 		var finalized finalizedOutcome
 		if immediate != nil {
 			finalized = finalizedOutcome{toolCall: toolCall, result: immediate.result, isError: immediate.isError}
@@ -143,11 +144,10 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	preps := make([]*preparedToolCall, len(toolCalls))
 
 	for i, toolCall := range toolCalls {
-		if err := safeEmit(ctx, ToolExecutionStart(toolCall.ID, toolCall.Name, toolCall.Arguments)); err != nil {
+		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
+		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, safeEmit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
-
-		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
 		if immediate != nil {
 			finalized := finalizedOutcome{toolCall: toolCall, result: immediate.result, isError: immediate.isError}
 			slots[i] = finalized
@@ -246,6 +246,15 @@ func prepareToolCallArguments(tool AgentTool, toolCall types.ContentBlock) types
 // Panics from PrepareArguments/validation are recovered into an error result so
 // a misbehaving hook can't kill the loop.
 func prepareToolCall(ctx context.Context, currentContext AgentContext, assistantMessage types.AssistantMessage, toolCall types.ContentBlock, config AgentLoopConfig) (prepared *preparedToolCall, immediate *immediateOutcome) {
+	var outcome *PermissionOutcome
+	defer func() {
+		if prepared != nil {
+			prepared.permission = outcome
+		}
+		if immediate != nil {
+			immediate.permission = outcome
+		}
+	}()
 	// After an abort, skip validation and the BeforeToolCall gate (which may
 	// prompt a user) for calls that were never going to run.
 	if ctx.Err() != nil {
@@ -289,6 +298,9 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 			Args:             validatedArgs,
 			Context:          currentContext,
 		})
+		if beforeResult != nil {
+			outcome = beforeResult.Permission
+		}
 		if ctx.Err() != nil {
 			return nil, &immediateOutcome{result: createErrorToolResult("Operation aborted"), isError: true}
 		}
@@ -306,6 +318,22 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	}
 
 	return &preparedToolCall{toolCall: toolCall, tool: tool, args: validatedArgs}, nil
+}
+
+func emitPreparedStart(ctx context.Context, call types.ContentBlock, prepared *preparedToolCall, immediate *immediateOutcome, emit AgentEventSink) error {
+	var outcome *PermissionOutcome
+	if prepared != nil {
+		outcome = prepared.permission
+	}
+	if immediate != nil {
+		outcome = immediate.permission
+	}
+	if outcome != nil {
+		if err := emit(ctx, AgentEvent{Type: EventToolPermission, ToolCallID: call.ID, ToolName: call.Name, Args: call.Arguments, Permission: outcome}); err != nil {
+			return err
+		}
+	}
+	return emit(ctx, ToolExecutionStart(call.ID, call.Name, call.Arguments))
 }
 
 // executePreparedToolCall runs the tool's Execute and forwards partial updates

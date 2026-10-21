@@ -10,11 +10,13 @@ package permission
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -215,71 +217,102 @@ func ParseMode(value string) (Mode, error) {
 }
 
 // Gate decides whether a tool invocation is allowed under the mode and policy.
-func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy Policy) (allow bool, reason string) {
+func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, toolCallID ...string) Outcome {
 	if ctx.Err() != nil {
-		return false, "Operation aborted"
+		return Outcome{Reason: "Operation aborted", Source: SourcePromptCancelled}
 	}
-
+	if policy == nil {
+		policy = &Policy{}
+	}
+	policyMu.Lock()
+	decision, overridden := policy.Overrides[toolName]
+	sessionDecision, sessionOverride := policy.promptOverrides[toolName]
+	policyMu.Unlock()
+	deny := "Tool " + toolName + " denied by policy"
+	if overridden && decision == DecideDeny {
+		return Outcome{Reason: deny, Source: SourceOverride}
+	}
+	if sessionOverride {
+		return Outcome{Allow: sessionDecision == DecideAllow, Source: SourceOverride}
+	}
+	if mode == ModeBypass {
+		return Outcome{Allow: true, Source: SourceBypass}
+	}
 	tier := ClassifyTool(toolName)
 	command := ""
-	destructive := false
 	if toolName == "bash" {
 		command = commandFromArgs(args)
-		destructive = IsDestructiveCommand(command)
 	}
-
-	if mode == ModeBypass {
-		if policy.Overrides[toolName] == DecideDeny {
-			return false, "Tool " + toolName + " denied by policy"
+	guardReason := ""
+	if toolName == "bash" && IsDestructiveCommand(command) {
+		guardReason = "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): " + command
+	}
+	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Reason: guardReason}
+	if len(toolCallID) != 0 {
+		req.ToolCallID = toolCallID[0]
+	}
+	// The guard can be approved interactively, but a static allow never skips it.
+	if guardReason != "" {
+		if policy.Prompter == nil {
+			return Outcome{Reason: guardReason, Source: SourceGuard}
 		}
-		return true, ""
+		return resolvePrompt(ctx, policy, req)
 	}
-
-	if destructive {
-		return false, "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): " + command
-	}
-
-	if decision, ok := policy.Overrides[toolName]; ok {
+	if overridden {
 		switch decision {
 		case DecideAllow:
-			return true, ""
-		case DecideDeny:
-			return false, "Tool " + toolName + " denied by policy"
+			return Outcome{Allow: true, Source: SourceOverride}
 		case DecidePrompt:
-			return resolvePrompt(ctx, policy, PromptRequest{Tool: toolName, Tier: tier})
+			return resolvePrompt(ctx, policy, req)
 		}
 	}
-
-	if mode == ModePlan {
-		switch tier {
-		case TierRead:
-			return true, ""
-		case TierWrite:
-			return false, "Plan mode: " + toolName + " is disabled because it can mutate the workspace"
-		case TierExec:
-			if toolName == "bash" && IsSafeCommand(command) {
-				return true, ""
-			}
-			if toolName == "bash" {
-				return false, "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: " + command
-			}
-			return false, "Plan mode: " + toolName + " is disabled because it can mutate the workspace"
+	if mode == ModePlan && tier != TierRead {
+		if toolName == "bash" && IsSafeCommand(command) {
+			return Outcome{Allow: true, Source: SourceMode}
 		}
+		reason := "Plan mode: " + toolName + " is disabled because it can mutate the workspace"
+		if toolName == "bash" {
+			reason = "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: " + command
+		}
+		return Outcome{Reason: reason, Source: SourceMode}
 	}
-
-	return true, ""
+	return Outcome{Allow: true, Source: SourceMode}
 }
 
-// resolvePrompt denies headless prompt decisions instead of letting an approval requirement fall through.
-func resolvePrompt(ctx context.Context, policy Policy, req PromptRequest) (allow bool, reason string) {
+func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outcome {
 	if policy.Prompter == nil {
-		return false, "Tool " + req.Tool + " requires approval but no interactive prompt is available"
+		return Outcome{Reason: "Tool " + req.Tool + " requires approval but no interactive prompt is available", Source: SourceNoPrompter}
 	}
-	approved, err := policy.Prompter.Approve(ctx, req)
-	if err != nil || !approved {
-		return false, "Tool " + req.Tool + " was not approved"
+	started := time.Now()
+	choice, err := policy.Prompter.Approve(ctx, req)
+	out := Outcome{Source: SourcePrompt, Prompted: true, Wait: time.Since(started)}
+	if errors.Is(err, context.DeadlineExceeded) {
+		out.Source = SourcePromptTimeout
+	} else if err != nil || ctx.Err() != nil || choice == "" {
+		out.Source = SourcePromptCancelled
+	} else {
+		out.Allow = choice == AllowOnce || choice == AllowAlways
+		if choice == AllowAlways || choice == RejectAlways {
+			policyMu.Lock()
+			if policy.Overrides == nil {
+				policy.Overrides = make(map[string]Decision)
+			}
+			if out.Allow {
+				policy.Overrides[req.Tool] = DecideAllow
+			} else {
+				policy.Overrides[req.Tool] = DecideDeny
+			}
+			if policy.promptOverrides == nil {
+				policy.promptOverrides = make(map[string]Decision)
+			}
+			policy.promptOverrides[req.Tool] = policy.Overrides[req.Tool]
+			policyMu.Unlock()
+		}
 	}
-	return true, ""
+	if !out.Allow {
+		out.Reason = "Tool " + req.Tool + " was not approved"
+	}
+	return out
 }
 
 // IsSafeCommand reports whether command is non-destructive and matches
