@@ -29,24 +29,43 @@ type Diagnostic struct {
 	Message string
 }
 
-// Loaded is the reconstructed runtime view of a journal.
+// Loaded is the reconstructed runtime view of a journal: the reduction of its
+// entries and records.
 type Loaded struct {
-	Header      Header
-	Messages    []ptypes.Message
-	Model       string
-	Role        string
-	LastID      string
+	Header Header
+	// Messages is the reconciled transcript: every tool call the provider
+	// will see has exactly one result, synthesized when the journal holds no
+	// real one.
+	Messages []ptypes.Message
+	Model    string
+	Role     string
+	LastID   string
+	// Interrupted lists started-but-unfinished calls from LastRun, in start
+	// order. Older unknown outcomes remain in Messages, not in this warning.
+	Interrupted []InterruptedTool
+	// LastRun is the most recent run_started, or nil when the journal has no
+	// run records (version 1 files).
+	LastRun *RunSummary
+	// UsageTotal folds every usage record in the file.
+	UsageTotal  ptypes.Usage
 	Diagnostics []Diagnostic
+
+	// lastSeq is where a resumed store continues numbering lines.
+	lastSeq uint64
 }
 
-// replayMessage keeps each message's journal ID around until compaction has
-// found the retained-history cut point.
+// replayMessage keeps each message's journal and run IDs around until
+// compaction and reconciliation are done with them.
 type replayMessage struct {
 	id      string
+	runID   string
 	message ptypes.Message
+	calls   []replayTool
 }
 
-// Load reads path fully and reconstructs its runtime context.
+// Load reads path fully and reduces its entries and records into a Loaded. A
+// torn final line is dropped with a diagnostic; an undecodable line anywhere
+// else is an error naming the line.
 func Load(ctx context.Context, path string) (*Loaded, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("load journal: %w", err)
@@ -71,67 +90,81 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 	}
 
 	loaded := &Loaded{Header: header}
-	messages := make([]replayMessage, 0)
+	entries := make([]Entry, 0, len(lines))
 	lastContent := len(lines) - 1
 	if lastContent > 0 && len(lines[lastContent]) == 0 {
 		lastContent--
 	}
+	var maxSeq uint64
+	decoded := 0
 	for index := 1; index <= lastContent; index++ {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("load journal: %w", err)
 		}
-		line := lines[index]
-		entry, err := decodeEntry(line)
+		lineNumber := index + 1
+		entry, err := decodeEntry(lines[index])
 		if err != nil {
 			var unknown unknownEntryError
 			if errors.As(err, &unknown) {
-				loaded.Diagnostics = append(loaded.Diagnostics, Diagnostic{Message: unknown.Error()})
-				loaded.LastID = unknown.id
+				loaded.diagnose("line %d: %v skipped", lineNumber, unknown)
+				if unknown.id != "" {
+					loaded.LastID = unknown.id
+				}
+				maxSeq = max(maxSeq, unknown.seq)
+				decoded++
 				continue
 			}
 			if index == lastContent {
+				loaded.diagnose("line %d: dropped torn final line: %v", lineNumber, err)
 				break
 			}
-			return nil, fmt.Errorf("decode journal entry on line %d: %w", index+1, err)
+			return nil, fmt.Errorf("decode journal entry on line %d: %w", lineNumber, err)
 		}
-		loaded.LastID = entry.meta().ID
-		switch value := entry.(type) {
-		case MessageEntry:
-			messages = append(messages, replayMessage{id: value.ID, message: value.Message})
-		case ModelChangeEntry:
-			loaded.Model = value.Model
-			loaded.Role = value.Role
-			if loaded.Role == "" {
-				loaded.Role = "default"
+		decoded++
+		meta := entry.meta()
+		if meta.Seq != 0 {
+			if meta.Seq <= maxSeq {
+				loaded.diagnose("line %d: seq %d does not increase past %d", lineNumber, meta.Seq, maxSeq)
 			}
-		case CompactionEntry:
-			messages = applyCompaction(messages, value)
+			maxSeq = max(maxSeq, meta.Seq)
 		}
+		if meta.ID != "" {
+			loaded.LastID = meta.ID
+		}
+		entries = append(entries, entry)
 	}
-	loaded.Messages = make([]ptypes.Message, len(messages))
-	for index := range messages {
-		loaded.Messages[index] = messages[index].message
-	}
+	// Version 1 lines carry no seq; counting them keeps a resumed file's
+	// numbering past every existing line.
+	loaded.lastSeq = max(maxSeq, uint64(decoded))
+	reduce(loaded, entries)
 	return loaded, nil
 }
 
-// OpenForResume loads path and opens it for appending after its last entry.
+// OpenForResume exclusively locks path until Store.Close, loads it, and repairs
+// a torn tail before appending. Load remains available to read-only callers.
 func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loaded, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
-	loaded, err := Load(ctx, path)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
+		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
+	}
+	if err := lockJournal(file); err != nil {
+		_ = file.Close()
 		return nil, nil, err
 	}
-	if err := trimMalformedFinalLine(ctx, path); err != nil {
+	loaded, err := Load(ctx, path)
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if err := repairTail(ctx, file); err != nil {
+		_ = file.Close()
 		return nil, nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
+		_ = file.Close()
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
 	clock, newID := resolveOptions(opts)
@@ -140,19 +173,22 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 		id:     loaded.Header.ID,
 		file:   file,
 		lastID: loaded.LastID,
+		seq:    loaded.lastSeq,
 		clock:  clock,
 		newID:  newID,
 	}
 	return store, loaded, nil
 }
 
-// trimMalformedFinalLine drops only a torn final write before we append again;
-// earlier corruption stays visible instead of being silently erased.
-func trimMalformedFinalLine(ctx context.Context, path string) error {
+// repairTail makes the file safe to append to. A torn final line (one that
+// does not decode) is truncated away; a complete final line that lost only
+// its newline gets the newline back, so the next append is not glued onto it.
+// Earlier corruption is left in place for Load to report.
+func repairTail(ctx context.Context, file *os.File) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("trim malformed journal tail: %w", err)
+		return fmt.Errorf("repair journal tail: %w", err)
 	}
-	contents, err := os.ReadFile(path)
+	contents, err := os.ReadFile(file.Name())
 	if err != nil {
 		return fmt.Errorf("read journal tail: %w", err)
 	}
@@ -160,31 +196,44 @@ func trimMalformedFinalLine(ctx context.Context, path string) error {
 		return nil
 	}
 	end := len(contents)
-	if contents[end-1] == '\n' {
+	terminated := contents[end-1] == '\n'
+	if terminated {
 		end--
 	}
-	if end == 0 {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("trim malformed journal tail: %w", err)
-	}
 	start := bytes.LastIndexByte(contents[:end], '\n') + 1
-	_, err = decodeEntry(contents[start:end])
-	if err == nil {
-		return nil
-	}
-	var unknown unknownEntryError
-	if errors.As(err, &unknown) {
-		return nil
+	if start == 0 {
+		// Only the header, which Load already validated.
+		if terminated {
+			return nil
+		}
+		return appendNewline(file)
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("trim malformed journal tail: %w", err)
+		return fmt.Errorf("repair journal tail: %w", err)
 	}
-	if err := os.Truncate(path, int64(start)); err != nil {
-		return fmt.Errorf("truncate malformed journal tail: %w", err)
+	_, err = decodeEntry(contents[start:end])
+	var unknown unknownEntryError
+	if err == nil || errors.As(err, &unknown) {
+		if terminated {
+			return nil
+		}
+		return appendNewline(file)
+	}
+	if err := file.Truncate(int64(start)); err != nil {
+		return fmt.Errorf("truncate torn journal tail: %w", err)
 	}
 	return nil
+}
+
+func appendNewline(file *os.File) error {
+	if _, err := file.Write([]byte{'\n'}); err != nil {
+		return fmt.Errorf("repair journal tail: %w", err)
+	}
+	return nil
+}
+
+func (l *Loaded) diagnose(format string, args ...any) {
+	l.Diagnostics = append(l.Diagnostics, Diagnostic{Message: fmt.Sprintf(format, args...)})
 }
 
 // Resolve returns the journal path for id under dir and cwd.
@@ -289,7 +338,7 @@ func validateHeader(header Header) error {
 	if header.Type != "session" {
 		return fmt.Errorf("decode journal header: unexpected type %q", header.Type)
 	}
-	if header.Version != JournalVersion {
+	if header.Version < 1 || header.Version > JournalVersion {
 		return fmt.Errorf("decode journal header: unsupported version %d", header.Version)
 	}
 	if len(header.ID) != 16 {

@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_fixture","name":"lookup","args":{"path":"file.txt"}}}]}}]}
+
+data: {"candidates":[{"finishReason":"STOP"}]}
+

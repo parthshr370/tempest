@@ -256,7 +256,7 @@ func (f *Faux) produce(ctx context.Context, s *stream.AssistantStream, step Resp
 
 	if step == nil {
 		message := createErrorMessage("No more faux responses queued", f.api, f.provider, model.ID)
-		message = f.withUsageEstimate(message, c, opts)
+		message = f.withUsageEstimate(message, c, opts, model)
 		s.Push(types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &message})
 		return
 	}
@@ -269,7 +269,7 @@ func (f *Faux) produce(ctx context.Context, s *stream.AssistantStream, step Resp
 	}
 
 	message := f.cloneMessage(resolved, model.ID)
-	message = f.withUsageEstimate(message, c, opts)
+	message = f.withUsageEstimate(message, c, opts, model)
 	f.streamWithDeltas(ctx, s, message, rng)
 }
 
@@ -428,7 +428,7 @@ func (f *Faux) scheduleChunk(ctx context.Context, chunk string) {
 }
 
 // withUsageEstimate fabricates cache-aware usage so tests can exercise accounting without a real provider.
-func (f *Faux) withUsageEstimate(message types.AssistantMessage, c types.Context, opts *types.StreamOptions) types.AssistantMessage {
+func (f *Faux) withUsageEstimate(message types.AssistantMessage, c types.Context, opts *types.StreamOptions, model types.Model) types.AssistantMessage {
 	promptText := serializeContext(c)
 	promptTokens := estimate.EstimateTextTokens(promptText)
 	outputTokens := estimate.EstimateTextTokens(assistantContentToText(message.Content))
@@ -459,6 +459,7 @@ func (f *Faux) withUsageEstimate(message types.AssistantMessage, c types.Context
 		TotalTokens: input + outputTokens + cacheRead + cacheWrite,
 		Cost:        types.Cost{},
 	}
+	types.CalculateCost(model.Cost, &message.Usage)
 	return message
 }
 

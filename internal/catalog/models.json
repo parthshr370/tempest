@@ -1,6 +1,8 @@
 {
-  "as_of": "2026-09-03",
-  "source": "oh-my-pi catalog (packages/catalog/src/models.json), verified live-sourced",
+  "provenance": {
+    "generated_from": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+    "as_of": "2026-09-03"
+  },
   "providers": [
     {
       "id": "anthropic",
@@ -49,7 +51,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -68,7 +75,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -87,7 +99,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -106,7 +123,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -125,7 +147,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -144,7 +171,12 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03",
+      "anthropic_compat": {
+        "forceAdaptiveThinking": true
+      }
     },
     {
       "provider": "anthropic",
@@ -163,7 +195,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -182,7 +216,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -201,7 +237,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -220,7 +258,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -239,7 +279,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -258,7 +300,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -277,7 +321,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -296,7 +342,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -314,7 +362,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
@@ -333,7 +383,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -352,7 +404,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -371,7 +425,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -390,7 +446,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -409,7 +467,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -428,7 +488,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -447,7 +509,9 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "google",
@@ -466,11 +530,13 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/models.json",
+      "verified_at": "2026-09-03"
     },
     {
       "provider": "openai",
-      "id": "openai/gpt-5.6-luna",
+      "id": "gpt-5.6-luna",
       "name": "GPT-5.6 Luna",
       "context_window": 1050000,
       "max_tokens": 128000,
@@ -482,16 +548,20 @@
       },
       "capabilities": [
         "thinking",
-        "tools"
+        "tools",
+        "images",
+        "cache"
       ],
       "openai_compat": {
         "reasoningDisableMode": "none-effort"
-      }
+      },
+      "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "anthropic/claude-fable-latest",
-      "name": "Claude Fable Latest",
+      "id": "~anthropic/claude-fable-latest",
+      "name": "Anthropic: Claude Fable Latest",
       "context_window": 1000000,
       "max_tokens": 128000,
       "cost": {
@@ -505,37 +575,41 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "anthropic/claude-opus-latest",
-      "name": "Claude Opus Latest",
+      "id": "~anthropic/claude-opus-latest",
+      "name": "Anthropic: Claude Opus Latest",
       "context_window": 1000000,
       "max_tokens": 128000,
       "cost": {
-        "input": 5.0,
-        "output": 25.0,
-        "cacheRead": 0.5,
-        "cacheWrite": 6.25
+        "input": 4.0,
+        "output": 20.0,
+        "cacheRead": 0.19999999999999998,
+        "cacheWrite": 5.0
       },
       "capabilities": [
         "thinking",
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "anthropic/claude-sonnet-latest",
-      "name": "Anthropic Claude Sonnet Latest",
+      "id": "~anthropic/claude-sonnet-latest",
+      "name": "Anthropic: Claude Sonnet Latest",
       "context_window": 1000000,
       "max_tokens": 128000,
       "cost": {
         "input": 2.0,
         "output": 10.0,
-        "cacheRead": 0.2,
+        "cacheRead": 0.09999999999999999,
         "cacheWrite": 2.5
       },
       "capabilities": [
@@ -543,88 +617,98 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "anthropic/claude-haiku-latest",
-      "name": "Anthropic Claude Haiku Latest",
-      "context_window": 200000,
-      "max_tokens": 64000,
+      "id": "~anthropic/claude-haiku-latest",
+      "name": "Anthropic: Claude Haiku Latest",
+      "context_window": 1000000,
+      "max_tokens": 128000,
       "cost": {
-        "input": 1.0,
-        "output": 5.0,
-        "cacheRead": 0.1,
-        "cacheWrite": 1.25
+        "input": 0.09999999999999999,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125
       },
       "capabilities": [
         "thinking",
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "google/gemini-flash-latest",
-      "name": "Google Gemini Flash Latest",
+      "id": "~google/gemini-flash-latest",
+      "name": "Google: Gemini Flash Latest",
       "context_window": 1048576,
       "max_tokens": 65536,
       "cost": {
         "input": 0.75,
         "output": 3.75,
         "cacheRead": 0.075,
-        "cacheWrite": 0.041667
+        "cacheWrite": 0.0416666666666667
       },
       "capabilities": [
         "thinking",
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "google/gemini-pro-latest",
-      "name": "Google Gemini Pro Latest",
+      "id": "~google/gemini-pro-latest",
+      "name": "Google: Gemini Pro Latest",
       "context_window": 1048576,
-      "max_tokens": 65536,
-      "cost": {
-        "input": 2.0,
-        "output": 12.0,
-        "cacheRead": 0.2,
-        "cacheWrite": 0.375
-      },
-      "capabilities": [
-        "thinking",
-        "tools",
-        "images",
-        "cache"
-      ]
-    },
-    {
-      "provider": "openrouter",
-      "id": "openai/gpt-latest",
-      "name": "OpenAI GPT Latest",
-      "context_window": 1050000,
-      "max_tokens": 128000,
+      "max_tokens": 943718,
       "cost": {
         "input": 2.0,
         "output": 10.0,
-        "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheRead": 0.09999999999999999,
+        "cacheWrite": 0.1875
       },
       "capabilities": [
         "thinking",
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "openai/gpt-mini-latest",
-      "name": "OpenAI GPT Mini Latest",
+      "id": "~openai/gpt-astra-latest",
+      "name": "OpenAI: GPT Astra Latest",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cacheRead": 1.0,
+        "cacheWrite": 12.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
+    },
+    {
+      "provider": "openrouter",
+      "id": "~openai/gpt-mini-latest",
+      "name": "OpenAI: GPT Mini Latest",
       "context_window": 400000,
       "max_tokens": 128000,
       "cost": {
@@ -638,48 +722,54 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "z-ai/glm-latest",
-      "name": "GLM Latest",
-      "context_window": 1310720,
-      "max_tokens": 235929,
+      "id": "~z-ai/glm-latest",
+      "name": "Z.ai: GLM Latest",
+      "context_window": 1048576,
+      "max_tokens": 943718,
       "cost": {
-        "input": 1.15,
-        "output": 3.5,
-        "cacheRead": 0.1,
+        "input": 0.079,
+        "output": 1.4,
+        "cacheRead": 0.078,
         "cacheWrite": 0.0
       },
       "capabilities": [
         "thinking",
         "tools",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "deepseek/deepseek-v4-flash-latest",
-      "name": "DeepSeek V4 Flash Latest",
-      "context_window": 1310720,
-      "max_tokens": 393216,
+      "id": "~deepseek/deepseek-v4-flash-latest",
+      "name": "DeepSeek: DeepSeek V4 Flash Latest",
+      "context_window": 1048576,
+      "max_tokens": 943718,
       "cost": {
-        "input": 0.05,
-        "output": 0.16,
-        "cacheRead": 0.013,
+        "input": 0.0422,
+        "output": 0.16369999999999998,
+        "cacheRead": 0.0275,
         "cacheWrite": 0.0
       },
       "capabilities": [
         "thinking",
         "tools",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     },
     {
       "provider": "openrouter",
-      "id": "x-ai/grok-latest",
-      "name": "Grok Latest",
+      "id": "~x-ai/grok-latest",
+      "name": "xAI: Grok Latest",
       "context_window": 500000,
       "max_tokens": 450000,
       "cost": {
@@ -693,7 +783,30 @@
         "tools",
         "images",
         "cache"
-      ]
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
+    },
+    {
+      "provider": "openrouter",
+      "id": "anthropic/claude-fable-5.1",
+      "name": "Anthropic: Claude Fable 5.1",
+      "context_window": 1000000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cacheRead": 0.25,
+        "cacheWrite": 12.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-10-21"
     }
   ]
 }

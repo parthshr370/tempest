@@ -1,17 +1,31 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"time"
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/catalog"
+	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/retry"
 )
 
-// runDoctor resolves the same config and roles as execution, then prints their safe-to-share shape without invoking a model.
+// runDoctor stays offline unless --ping explicitly requests billable provider probes.
 func runDoctor(args []string, stdout, stderr io.Writer) int {
+	ping := false
+	filtered := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "--ping" || arg == "-ping" {
+			ping = true
+		} else {
+			filtered = append(filtered, arg)
+		}
+	}
+	args = filtered
 	opts, err := parseCommandOptions(args, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "doctor configuration error: %v\n", err)
@@ -57,8 +71,12 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "models: (pricing as of %s, USD per million tokens)\n", catalog.AsOf())
 	for _, m := range catalog.Models() {
-		fmt.Fprintf(stdout, "  %s/%s: window=%d max_tokens=%d cost={in=%.2f out=%.2f cache_read=%.2f cache_write=%.2f}\n",
-			m.Provider, m.ID, m.ContextWindow, m.MaxTokens, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite)
+		if m.Cost.Unknown {
+			fmt.Fprintf(stdout, "  %s/%s: window=%d max_tokens=%d cost=unknown\n", m.Provider, m.ID, m.ContextWindow, m.MaxTokens)
+		} else {
+			fmt.Fprintf(stdout, "  %s/%s: window=%d max_tokens=%d cost={in=%.2f out=%.2f cache_read=%.2f cache_write=%.2f}\n",
+				m.Provider, m.ID, m.ContextWindow, m.MaxTokens, m.Cost.Input, m.Cost.Output, m.Cost.CacheRead, m.Cost.CacheWrite)
+		}
 	}
 	fmt.Fprintln(stdout, "path checks:")
 	fmt.Fprintf(stdout, "  config: %s\n", opts.Config.SettingsPath())
@@ -69,6 +87,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	printRoleCredentialCheck(stdout, "default", roles.Default.Model.Provider, opts)
 	printRoleCredentialCheck(stdout, "plan", roles.Plan.Model.Provider, opts)
 	printRoleCredentialCheck(stdout, "smol", roles.Smol.Model.Provider, opts)
+	if ping {
+		return pingProviders(stdout, opts)
+	}
 	return 0
 }
 
@@ -80,7 +101,11 @@ func roleSpec(role, fallback string) string {
 }
 
 func printRole(w io.Writer, name string, router adapter.ProviderRouter) {
-	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL)
+	price := "known"
+	if router.Model.Cost.Unknown {
+		price = "unknown"
+	}
+	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL, price)
 }
 
 func printPathCheck(w io.Writer, name, path string) {
@@ -124,4 +149,66 @@ func printRoleCredentialCheck(w io.Writer, role, provider string, opts commandOp
 		return
 	}
 	fmt.Fprintf(w, "WARN %s provider credential: %s absent\n", role, provider)
+}
+
+func cheapestModel(provider string) (catalog.Model, bool) {
+	var cheapest catalog.Model
+	found := false
+	for _, model := range catalog.Models() {
+		if model.Provider != provider || model.Cost.Unknown {
+			continue
+		}
+		if !found || model.Cost.Input+model.Cost.Output < cheapest.Cost.Input+cheapest.Cost.Output {
+			cheapest, found = model, true
+		}
+	}
+	return cheapest, found
+}
+
+func pingProviders(stdout io.Writer, opts commandOptions) int {
+	exitCode := 0
+	for _, provider := range catalog.Providers() {
+		if !providerCredentialPresent(provider.ID, opts.Secrets) {
+			continue
+		}
+		model, found := cheapestModel(provider.ID)
+		if !found {
+			fmt.Fprintf(stdout, "  %s: error no priced catalog model\n", provider.ID)
+			exitCode = 1
+			continue
+		}
+		env := func(name string) string {
+			if value, ok := opts.Secrets.Resolve(name); ok {
+				return value
+			}
+			return os.Getenv(name)
+		}
+		router, err := adapter.NewProviderRouter(adapter.RoutingConfig{
+			ModelID: provider.ID + ":" + model.ID, MaxTokens: 16,
+			AnthropicBaseURL: opts.Config.AnthropicBaseURL(), OpenAIBaseURL: opts.Config.OpenAIBaseURL(), Env: env,
+		})
+		if err != nil {
+			fmt.Fprintf(stdout, "  %s: error configuration\n", provider.ID)
+			exitCode = 1
+			continue
+		}
+		started := time.Now()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		probe := router.StreamFn(ctx, router.Model, types.Context{
+			Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}},
+		}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{MaxTokens: 16}})
+		message, err := probe.Result(ctx)
+		cancel()
+		if err != nil {
+			classified := retry.Classify(retry.Failure{Message: err.Error()}, time.Now())
+			fmt.Fprintf(stdout, "  %s: error %s %s\n", provider.ID, model.ID, classified.Code)
+			exitCode = 1
+		} else if message.StopReason == types.StopError || message.StopReason == types.StopAborted {
+			fmt.Fprintf(stdout, "  %s: error %s %s\n", provider.ID, model.ID, message.ErrorCode)
+			exitCode = 1
+		} else {
+			fmt.Fprintf(stdout, "  %s: ok %s %s\n", provider.ID, model.ID, time.Since(started).Round(time.Millisecond))
+		}
+	}
+	return exitCode
 }

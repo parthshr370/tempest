@@ -32,9 +32,7 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 			generationConfig["maxOutputTokens"] = opts.MaxTokens
 		}
 	}
-	if len(generationConfig) > 0 {
-		params["generationConfig"] = generationConfig
-	}
+	params["generationConfig"] = generationConfig
 
 	if len(c.Tools) > 0 {
 		params["tools"] = convertTools(c.Tools)
@@ -54,9 +52,9 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 		} else if opts.Thinking.BudgetTokens > 0 {
 			tc["thinkingBudget"] = opts.Thinking.BudgetTokens
 		}
-		params["thinkingConfig"] = tc
+		generationConfig["thinkingConfig"] = tc
 	} else if model.Reasoning && opts != nil && opts.Thinking != nil && !opts.Thinking.Enabled {
-		params["thinkingConfig"] = map[string]any{"thinkingBudget": 0}
+		generationConfig["thinkingConfig"] = map[string]any{"thinkingBudget": 0}
 	}
 
 	return params

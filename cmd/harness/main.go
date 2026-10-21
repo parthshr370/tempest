@@ -9,12 +9,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"reflect"
 	"strings"
+	"syscall"
 	"time"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
 	"go.harness.dev/harness/internal/document"
@@ -24,6 +26,9 @@ import (
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 )
+
+// exitAborted is the conventional exit status for a run ended by SIGINT.
+const exitAborted = 130
 
 // commandOptions keeps parsed CLI-only inputs beside the resolved config and secret lookup they feed into the runtime.
 type commandOptions struct {
@@ -37,6 +42,7 @@ type commandOptions struct {
 	Resume       string
 	Continue     bool
 	Version      bool
+	Budget       agent.Budget
 }
 
 // skillPathsFlag adapts repeated -skill values to config's tracked input, so resolution can still tell flags from defaults.
@@ -84,7 +90,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
 	if opts.Prompt == "" {
-		fmt.Fprintln(stderr, "usage: harness -p <prompt> [-model <id>] [-output-format text|json]")
+		fmt.Fprintln(stderr, "usage: harness -p <prompt> [-model <id>] [-output-format text|json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION]")
 		return 1
 	}
 	permissionMode, err := permission.ParseMode(opts.Config.PermissionModeDefault())
@@ -141,13 +147,24 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		stackModel = roles.Plan.Model
 		stackStreamFn = roles.Plan.StreamFn
 	}
+	// Refuse an unenforceable budget before anything is written to disk.
+	if err := opts.Budget.Validate(stackModel); err != nil {
+		fmt.Fprintf(stderr, "budget error: %v\n", err)
+		return 1
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stderr, "cwd error: %v\n", err)
 		return 1
 	}
-	runCtx := context.Background()
+	// SIGINT/SIGTERM abort the run cleanly: tools are cancelled and joined and
+	// the journal records the aborted run. The first signal then restores the
+	// default handling, so a second one kills a run stuck in a tool that
+	// ignores cancellation.
+	runCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	context.AfterFunc(runCtx, stopSignals)
 	inputs, err := discovery.Discover(runCtx, discovery.Options{
 		Cwd:                  cwd,
 		AgentDir:             opts.Config.AgentDir(),
@@ -207,46 +224,96 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "agent stack error: %v\n", err)
 		return 1
 	}
+	if sessionStore != nil {
+		// Registered after the store's Close, so it detaches first.
+		defer session.AttachJournal(stack.Agent, sessionStore)()
+	}
 	mode, err := resolveOutputFormat(opts.OutputFormat, opts.PrintMode)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	completion, err := session.RunCompletionLoop(runCtx, stack.Agent, session.InitialPrompt{Text: opts.Prompt}, session.CompletionOptions{Enabled: permissionMode != permission.ModePlan, ProjectDir: cwd})
+	outcome, err := session.Run(runCtx, stack.Agent, session.InitialPrompt{Text: opts.Prompt}, session.RunOptions{Budget: opts.Budget})
 	if err != nil {
-		fmt.Fprintf(stderr, "prompt error: %v\n", err)
+		fmt.Fprintf(stderr, "run error: %v\n", err)
 		return 1
 	}
-	if completion.Status == session.PromiseMaxContinuations {
-		fmt.Fprintf(stderr, "completion warning: %s\n", completion.Reason)
-	}
-	state := stack.Agent.State()
-	if sessionStore != nil {
-		persistNewMessages(runCtx, sessionStore, state.Messages, seedMessages)
-	}
-	if len(state.Messages) == 0 {
-		return 0
-	}
-	last := state.Messages[len(state.Messages)-1]
-	lastText := assistantText(last)
-	if mode == "json" {
-		data, _ := json.MarshalIndent(last, "", "  ")
-		fmt.Fprintln(stdout, string(data))
-	} else if lastText != "" {
-		fmt.Fprintln(stdout, lastText)
-	} else {
-		data, _ := json.MarshalIndent(last, "", "  ")
-		fmt.Fprintln(stdout, string(data))
-	}
+	writeRunOutput(stdout, stderr, mode, outcome, stack.Agent.State().Messages)
 	if permissionMode == permission.ModePlan {
 		collector := permission.NewPlanCollector()
-		collector.Observe(lastText)
+		collector.Observe(outcome.LastAssistantText)
 		if formatted := permission.FormatPlan(collector.Items()); formatted != "" {
 			fmt.Fprintln(stderr, "Collected plan:")
 			fmt.Fprintln(stderr, formatted)
 		}
 	}
-	return 0
+	switch outcome.StopReason {
+	case agent.StopError:
+		return 1
+	case agent.StopAborted:
+		return exitAborted
+	default:
+		return 0
+	}
+}
+
+// runReport is the -output-format json result of one run.
+type runReport struct {
+	StopReason agent.StopReason `json:"stop_reason"`
+	Error      string           `json:"error,omitempty"`
+	Turns      int              `json:"turns"`
+	Usage      ptypes.Usage     `json:"usage"`
+	// CostUSD is null when any call's price was unknown: unknown is not free.
+	CostUSD   *float64 `json:"cost_usd"`
+	ElapsedMS int64    `json:"elapsed_ms"`
+	// Text is the run's last assistant text; Message is the transcript's
+	// last message (a tool result when a budget stopped the run mid-task).
+	Text    string         `json:"text"`
+	Message ptypes.Message `json:"message,omitempty"`
+}
+
+// writeRunOutput prints the run result: a runReport in json mode; otherwise
+// the last assistant text on stdout and, when the run did not complete, why
+// it stopped on stderr.
+func writeRunOutput(stdout, stderr io.Writer, mode string, outcome session.RunOutcome, messages []ptypes.Message) {
+	var last ptypes.Message
+	if len(messages) > 0 {
+		last = messages[len(messages)-1]
+	}
+	if mode == "json" {
+		report := runReport{
+			StopReason: outcome.StopReason,
+			Turns:      outcome.Turns,
+			Usage:      outcome.Usage,
+			ElapsedMS:  outcome.Elapsed.Milliseconds(),
+			Text:       outcome.LastAssistantText,
+			Message:    last,
+		}
+		if outcome.Err != nil {
+			report.Error = outcome.Err.Error()
+		}
+		if !outcome.Usage.Cost.Unknown {
+			cost := outcome.Usage.Cost.Total
+			report.CostUSD = &cost
+		}
+		data, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(stderr, "encode run report: %v\n", err)
+			return
+		}
+		fmt.Fprintln(stdout, string(data))
+		return
+	}
+	if outcome.LastAssistantText != "" {
+		fmt.Fprintln(stdout, outcome.LastAssistantText)
+	}
+	switch outcome.StopReason {
+	case agent.StopCompleted:
+	case agent.StopError:
+		fmt.Fprintf(stderr, "run failed after %d turns: %v\n", outcome.Turns, outcome.Err)
+	default:
+		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)
+	}
 }
 
 // parseCommandOptions tracks explicitly passed settings separately so config resolution can preserve precedence.
@@ -287,6 +354,10 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	fs.BoolVar(&version, "version", false, "print build version")
 	fs.StringVar(&resume, "resume", "", "resume a session by id")
 	fs.BoolVar(&continueRecent, "continue", false, "continue the most recent session for this directory")
+	var budget agent.Budget
+	fs.IntVar(&budget.MaxTurns, "max-turns", 0, "stop the run after this many model calls (0 = unlimited)")
+	fs.Float64Var(&budget.MaxCostUSD, "max-cost", 0, "stop the run once its model calls cost this many USD (0 = unlimited; refused when the model's price is unknown)")
+	fs.DurationVar(&budget.MaxWallTime, "max-wall-time", 0, "stop the run at the first turn boundary after this much time, e.g. 10m (0 = unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return commandOptions{}, err
 	}
@@ -335,7 +406,7 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 		}
 	})
 	secrets := secretResolver(values)
-	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, Continue: continueRecent}, nil
+	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, Continue: continueRecent, Budget: budget}, nil
 }
 
 // resolveCommandConfig rejects incompatible session flags before resolving the config's precedence layers.
@@ -371,6 +442,8 @@ func secretResolver(values config.FlagValues) config.SecretResolver {
 			}
 		case "OPENAI_API_KEY":
 			value = os.Getenv("OPENAI_API_KEY")
+		case "OPENROUTER_API_KEY":
+			value = os.Getenv("OPENROUTER_API_KEY")
 		case "GEMINI_API_KEY":
 			value = os.Getenv("GEMINI_API_KEY")
 		case "GOOGLE_API_KEY":
@@ -431,8 +504,6 @@ func splitCSV(s string) []string {
 	return result
 }
 
-func assistantText(message ptypes.Message) string { return session.AssistantMessageText(message) }
-
 // buildPermissionPolicy converts allow and deny tool lists into a permission.Policy.
 // A tool named in both lists is denied (deny wins). The one-shot CLI is headless, so
 // the policy carries no Prompter and prompt decisions resolve to denials.
@@ -487,6 +558,14 @@ func openResumedSession(ctx context.Context, path string, model ptypes.Model) (*
 	if err != nil {
 		return nil, nil, err
 	}
+	for _, diagnostic := range loaded.Diagnostics {
+		slog.Warn("session journal diagnostic", "message", diagnostic.Message)
+	}
+	// The model sees these calls as "outcome unknown"; tell the user too,
+	// because the side effect may or may not have happened.
+	for _, interrupted := range loaded.Interrupted {
+		slog.Warn("previous run left a tool call unfinished; its outcome is unknown", "tool", interrupted.Tool, "tool_call_id", interrupted.ToolCallID)
+	}
 	role := loaded.Role
 	if role == "" {
 		role = "default"
@@ -498,28 +577,6 @@ func openResumedSession(ctx context.Context, path string, model ptypes.Model) (*
 		}
 	}
 	return store, loaded.Messages, nil
-}
-
-// persistNewMessages appends the messages produced after the seeded prefix. A
-// persistence failure is logged, not fatal: losing the journal must not fail a
-// run that already completed.
-func persistNewMessages(ctx context.Context, store *journal.Store, messages, seed []ptypes.Message) {
-	if len(messages) < len(seed) {
-		slog.Warn("session not persisted: history diverged from the resume point (mid-run compaction)")
-		return
-	}
-	for index := range seed {
-		if !reflect.DeepEqual(messages[index], seed[index]) {
-			slog.Warn("session not persisted: history diverged from the resume point (mid-run compaction)")
-			return
-		}
-	}
-	for _, message := range messages[len(seed):] {
-		if err := store.AppendMessage(ctx, message); err != nil {
-			slog.Warn("session persistence failed", "error", err)
-			return
-		}
-	}
 }
 
 // setupLogging installs the redacting default logger and optionally tees diagnostics into the rotating log file.

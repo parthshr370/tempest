@@ -29,25 +29,30 @@ type Provider struct {
 	BaseURL string `json:"base_url"`
 }
 
-// Model is one catalog entry: where the model lives (Provider+ID), what it
-// costs, and the limits the adapter uses when routing to it.
+// Model holds endpoint-specific catalog metadata. ID is the exact route_id the
+// endpoint expects, including punctuation and alias prefixes; don't normalize it.
 type Model struct {
-	Provider      string          `json:"provider"`
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	ContextWindow int             `json:"context_window"`
-	MaxTokens     int             `json:"max_tokens"`
-	Cost          types.ModelCost `json:"cost"`
-	Capabilities  []string        `json:"capabilities"`
+	Provider        string                 `json:"provider"`
+	ID              string                 `json:"id"`
+	Name            string                 `json:"name"`
+	ContextWindow   int                    `json:"context_window"`
+	MaxTokens       int                    `json:"max_tokens"`
+	Cost            types.ModelCost        `json:"cost"`
+	Capabilities    []string               `json:"capabilities"`
+	Source          string                 `json:"source"`
+	VerifiedAt      string                 `json:"verified_at"`
+	AnthropicCompat *types.AnthropicCompat `json:"anthropic_compat,omitempty"`
 	// OpenAICompat mirrors types.Model.OpenAICompat for models whose
 	// thinking-off wire dialect is non-default (effort SKUs).
 	OpenAICompat *types.OpenAICompat `json:"openai_compat,omitempty"`
 }
 
-// file mirrors models.json on disk. asOf records the pricing date so future
-// readers know how stale the numbers are.
+// file mirrors the embedded snapshot and its import provenance.
 type file struct {
-	AsOf      string     `json:"as_of"`
+	Provenance struct {
+		GeneratedFrom string `json:"generated_from"`
+		AsOf          string `json:"as_of"`
+	} `json:"provenance"`
 	Providers []Provider `json:"providers"`
 	Models    []Model    `json:"models"`
 }
@@ -73,7 +78,7 @@ func load() {
 // AsOf reports the pricing snapshot date stamped in models.json.
 func AsOf() string {
 	load()
-	return data.AsOf
+	return data.Provenance.AsOf
 }
 
 // Providers returns every provider in the catalog, in file order.

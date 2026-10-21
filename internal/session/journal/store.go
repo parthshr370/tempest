@@ -6,16 +6,21 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 )
+
+// ErrSessionLocked reports that another writer already owns the journal.
+var ErrSessionLocked = errors.New("session is locked by another writer")
 
 // Options configures a new or resumed journal.
 type Options struct {
@@ -24,13 +29,19 @@ type Options struct {
 	Title string
 }
 
-// Store is an append-only session journal writer.
+// Store is an append-only session journal writer. It is safe for concurrent
+// use; appends are serialized and each line is written with one write call.
 type Store struct {
 	path   string
 	id     string
 	file   *os.File
 	mu     sync.Mutex
 	lastID string
+	seq    uint64
+	// failed is the first write or sync error. A failed write may have left a
+	// partial line, so the store refuses further appends rather than splice
+	// valid lines after it.
+	failed error
 	clock  func() time.Time
 	newID  func() string
 }
@@ -62,6 +73,11 @@ func Create(ctx context.Context, dir, cwd string, opts Options) (*Store, error) 
 		_ = file.Close()
 		_ = os.Remove(path)
 	}
+	if err := lockJournal(file); err != nil {
+		// Don't unlink an inode another opener may already have locked.
+		_ = file.Close()
+		return nil, err
+	}
 	header, err := json.Marshal(Header{
 		Type:      "session",
 		Version:   JournalVersion,
@@ -91,28 +107,42 @@ func (s *Store) ID() string { return s.id }
 // Path returns the journal file path.
 func (s *Store) Path() string { return s.path }
 
-// AppendMessage writes a message entry.
+// NewRunID returns a fresh run id from the store's id generator.
+func (s *Store) NewRunID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.newID()
+}
+
+// AppendMessage writes a message entry outside any run.
 func (s *Store) AppendMessage(ctx context.Context, message ptypes.Message) error {
-	return s.append(ctx, MessageEntry{Message: message})
+	return s.Append(ctx, MessageEntry{Message: message})
 }
 
 // AppendModelChange writes a model-change entry.
 func (s *Store) AppendModelChange(ctx context.Context, model, role string) error {
-	return s.append(ctx, ModelChangeEntry{Model: model, Role: role})
+	return s.Append(ctx, ModelChangeEntry{Model: model, Role: role})
 }
 
 // AppendCompaction writes a compaction entry.
 func (s *Store) AppendCompaction(ctx context.Context, summary, firstKeptID string, tokensBefore int) error {
-	return s.append(ctx, CompactionEntry{
+	return s.Append(ctx, CompactionEntry{
 		Summary:      summary,
 		FirstKeptID:  firstKeptID,
 		TokensBefore: tokensBefore,
 	})
 }
 
-func (s *Store) append(ctx context.Context, entry Entry) error {
+// Append writes one entry or record. The caller sets Meta.RunID and
+// Meta.EventSeq; the store assigns Seq, Timestamp, Lane and, for entries, ID
+// and ParentID. Records named by the flush policy are fsynced before Append
+// returns. After any write or sync error the store refuses further appends.
+func (s *Store) Append(ctx context.Context, entry Entry) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("append journal entry: %w", err)
+	}
+	if entry == nil {
+		return fmt.Errorf("append journal entry: nil entry")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -122,33 +152,45 @@ func (s *Store) append(ctx context.Context, entry Entry) error {
 	if s.file == nil {
 		return fmt.Errorf("append journal entry: store closed")
 	}
-	meta := Meta{ID: s.newID(), ParentID: s.lastID, Timestamp: s.clock()}
-	var withMeta Entry
-	switch value := entry.(type) {
-	case MessageEntry:
-		value.Meta = meta
-		withMeta = value
-	case ModelChangeEntry:
-		value.Meta = meta
-		withMeta = value
-	case CompactionEntry:
-		value.Meta = meta
-		withMeta = value
-	default:
-		return fmt.Errorf("append journal entry: unsupported entry type %T", entry)
+	if s.failed != nil {
+		return fmt.Errorf("append journal entry: journal failed earlier: %w", s.failed)
 	}
-	line, err := MarshalEntry(withMeta)
+	kind := entry.kind()
+	given := entry.meta()
+	meta := Meta{
+		Timestamp: s.clock(),
+		Seq:       s.seq + 1,
+		Lane:      LaneMain,
+		RunID:     given.RunID,
+		EventSeq:  given.EventSeq,
+	}
+	if !isRecord(kind) {
+		meta.ID = s.newID()
+		meta.ParentID = s.lastID
+	}
+	line, err := MarshalEntry(entry.withMeta(meta))
 	if err != nil {
 		return fmt.Errorf("marshal journal entry: %w", err)
 	}
 	if err := writeLine(s.file, line); err != nil {
+		s.failed = err
 		return fmt.Errorf("write journal entry: %w", err)
 	}
-	s.lastID = meta.ID
+	if syncsAfter(kind) {
+		if err := s.file.Sync(); err != nil {
+			s.failed = err
+			return fmt.Errorf("sync journal after %s: %w", kind, err)
+		}
+	}
+	s.seq = meta.Seq
+	if meta.ID != "" {
+		s.lastID = meta.ID
+	}
 	return nil
 }
 
-// Close flushes and closes the journal. It is safe to call more than once.
+// Close flushes and closes the journal, releasing its exclusive writer lock.
+// It is safe to call more than once.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -164,6 +206,16 @@ func (s *Store) Close() error {
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close journal: %w", closeErr)
+	}
+	return nil
+}
+
+func lockJournal(file *os.File) error {
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("%w: %s", ErrSessionLocked, file.Name())
+		}
+		return fmt.Errorf("lock journal %s: %w", file.Name(), err)
 	}
 	return nil
 }

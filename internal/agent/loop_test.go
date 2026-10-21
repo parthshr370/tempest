@@ -342,10 +342,10 @@ func TestRunAgentLoopPropagatesMessageEndListenerErrorBeforeTools(t *testing.T) 
 		return nil
 	}
 
-	_, err := runAgentLoop(context.Background(), []types.Message{userMessage("start")}, AgentContext{Tools: []AgentTool{tool}}, loopConfig(f), emit, loopStreamFn(f))
+	_, result := runAgentLoop(context.Background(), []types.Message{userMessage("start")}, AgentContext{Tools: []AgentTool{tool}}, loopConfig(f), emit, loopStreamFn(f))
 
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("runAgentLoop err = %v, want listener failure", err)
+	if result.StopReason != StopError || !errors.Is(result.Err, wantErr) {
+		t.Fatalf("runAgentLoop result = %+v, want StopError wrapping the listener failure", result)
 	}
 	if toolRan {
 		t.Fatal("tool ran after message_end listener failed")

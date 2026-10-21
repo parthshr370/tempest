@@ -22,6 +22,7 @@ type googleStreamChunk struct {
 	ResponseID    string               `json:"responseId"`
 	Candidates    []googleCandidate    `json:"candidates"`
 	UsageMetadata *googleUsageMetadata `json:"usageMetadata"`
+	Error         json.RawMessage      `json:"error"`
 }
 
 // googleCandidate is a single generation candidate within a chunk.
@@ -90,6 +91,9 @@ func iterateGoogleEvents(ctx context.Context, r io.Reader, onActivity func(), fn
 		if err := jsonrepair.ParseJsonWithRepair(data, &chunk); err != nil {
 			return fmt.Errorf("could not parse Gemini SSE chunk: %s; data=%s", err.Error(), data)
 		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			return fmt.Errorf("Gemini stream error: %s", chunk.Error)
+		}
 		return fn(&chunk)
 	})
 }
@@ -107,19 +111,18 @@ func foldGoogleChunk(chunk *googleStreamChunk, state *googleFoldState, model typ
 	}
 
 	for _, candidate := range chunk.Candidates {
-		if candidate.Content == nil {
-			continue
-		}
-		for _, part := range candidate.Content.Parts {
-			if part.FunctionCall != nil {
-				evs := foldGoogleFuncCall(part, state)
-				events = append(events, evs...)
-				continue
-			}
+		if candidate.Content != nil {
+			for _, part := range candidate.Content.Parts {
+				if part.FunctionCall != nil {
+					evs := foldGoogleFuncCall(part, state)
+					events = append(events, evs...)
+					continue
+				}
 
-			if part.Text != "" {
-				evs := foldGoogleTextPart(part, state)
-				events = append(events, evs...)
+				if part.Text != "" {
+					evs := foldGoogleTextPart(part, state)
+					events = append(events, evs...)
+				}
 			}
 		}
 

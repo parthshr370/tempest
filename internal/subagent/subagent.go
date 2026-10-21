@@ -230,10 +230,16 @@ func (r *Runner) Execute(ctx context.Context, _ string, params json.RawMessage, 
 	})
 	defer unsubscribe()
 
-	if err := child.PromptText(ctx, input.Prompt); err != nil {
+	result, err := child.PromptText(ctx, input.Prompt)
+	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
-	child.WaitForIdle()
+	if result.Err != nil {
+		return agent.AgentToolResult{}, result.Err
+	}
+	if result.StopReason != agent.StopCompleted {
+		return agent.AgentToolResult{}, fmt.Errorf("task stopped: %s", result.StopReason)
+	}
 	state := child.State()
 	if state.ErrorMessage != "" {
 		return agent.AgentToolResult{}, errors.New(state.ErrorMessage)
@@ -242,7 +248,7 @@ func (r *Runner) Execute(ctx context.Context, _ string, params json.RawMessage, 
 	if output == "" {
 		output = "(no output)"
 	}
-	details, _ := json.Marshal(map[string]any{"subagent_type": input.SubagentType, "description": input.Description, "messages": len(state.Messages), "events": events})
+	details, _ := json.Marshal(map[string]any{"subagent_type": input.SubagentType, "description": input.Description, "messages": len(state.Messages), "events": events, "usage": result.Usage, "stop_reason": result.StopReason})
 	return agent.AgentToolResult{
 		Content: []ptypes.ContentBlock{ptypes.NewText(output)},
 		Details: details,

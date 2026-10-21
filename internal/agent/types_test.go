@@ -71,10 +71,14 @@ func TestAgentEventConstructors(t *testing.T) {
 		want  AgentEventType
 		check func(t *testing.T, ev AgentEvent)
 	}{
-		{"agent_start", AgentStart(), EventAgentStart, func(t *testing.T, ev AgentEvent) {}},
-		{"agent_end", AgentEnd(msgs), EventAgentEnd, func(t *testing.T, ev AgentEvent) {
+		{"agent_start", AgentStart(msgs), EventAgentStart, func(t *testing.T, ev AgentEvent) {
 			if !reflect.DeepEqual(ev.Messages, msgs) {
-				t.Fatalf("messages = %#v, want %#v", ev.Messages, msgs)
+				t.Fatalf("prompts = %#v, want %#v", ev.Messages, msgs)
+			}
+		}},
+		{"agent_end", AgentEnd(msgs, RunResult{StopReason: StopMaxTurns, Turns: 2}), EventAgentEnd, func(t *testing.T, ev AgentEvent) {
+			if !reflect.DeepEqual(ev.Messages, msgs) || ev.StopReason != StopMaxTurns || ev.Turns != 2 {
+				t.Fatalf("agent_end fields = %#v", ev)
 			}
 		}},
 		{"turn_start", TurnStart(), EventTurnStart, func(t *testing.T, ev AgentEvent) {}},

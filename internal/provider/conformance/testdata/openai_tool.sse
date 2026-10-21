@@ -1,0 +1,4 @@
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_fixture","function":{"name":"lookup","arguments":"{\"path\":"}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"file.txt\"}"}}]},"finish_reason":"tool_calls"}]}
+

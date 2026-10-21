@@ -1,6 +1,9 @@
 package adapter
 
-import "testing"
+import (
+	"go.harness.dev/harness/internal/catalog"
+	"testing"
+)
 
 func TestParseModelSpec(t *testing.T) {
 	tests := []struct {
@@ -84,14 +87,14 @@ func TestResolveRouteGoogle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRoute unknown: %v", err)
 	}
-	if unknown.Model.ContextWindow != 1048576 || unknown.Model.Cost.Input != 0 {
+	if unknown.Model.ContextWindow != 1048576 || !unknown.Model.Cost.Unknown {
 		t.Fatalf("unknown google fallback = %+v", unknown.Model)
 	}
 }
 
 func TestResolveRouteOpenRouter(t *testing.T) {
 	env := map[string]string{"OPENROUTER_API_KEY": "or-key"}
-	rt, err := resolveRoute(RoutingConfig{ModelID: "openrouter:z-ai/glm-latest"}, func(k string) string { return env[k] })
+	rt, err := resolveRoute(RoutingConfig{ModelID: "openrouter:~z-ai/glm-latest"}, func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatalf("resolveRoute: %v", err)
 	}
@@ -102,7 +105,8 @@ func TestResolveRouteOpenRouter(t *testing.T) {
 		t.Fatalf("openrouter base URL = %q", rt.Model.BaseURL)
 	}
 	// Catalog-known slug: limits and cost come from the catalog.
-	if rt.Model.ContextWindow != 1310720 || rt.Model.Cost.Input != 1.15 {
+	entry, found := catalog.Lookup("openrouter", "~z-ai/glm-latest")
+	if !found || rt.Model.ContextWindow != entry.ContextWindow || rt.Model.Cost != entry.Cost {
 		t.Fatalf("catalog entry not applied: %+v", rt.Model)
 	}
 	// A spec baseURL overrides the OpenRouter default (any OpenAI-compatible
@@ -115,7 +119,7 @@ func TestResolveRouteOpenRouter(t *testing.T) {
 		t.Fatalf("custom base URL = %q", custom.Model.BaseURL)
 	}
 	// Bare aggregator slugs resolve through the catalog, not the Anthropic proxy.
-	if got := ResolveProviderForModel("deepseek/deepseek-v4-flash-latest"); got != "openrouter" {
+	if got := ResolveProviderForModel("~deepseek/deepseek-v4-flash-latest"); got != "openrouter" {
 		t.Fatalf("ResolveProviderForModel deepseek slug = %q, want openrouter", got)
 	}
 }
@@ -147,7 +151,7 @@ func TestResolveRouteCatalogDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveRoute fallback: %v", err)
 	}
-	if fallback.Model.MaxTokens != DefaultMaxTokens {
+	if fallback.Model.MaxTokens != DefaultMaxTokens || !fallback.Model.Cost.Unknown {
 		t.Fatalf("default max tokens = %d", fallback.Model.MaxTokens)
 	}
 }
@@ -166,5 +170,24 @@ func TestResolveProviderForModel(t *testing.T) {
 		if got := ResolveProviderForModel(raw); got != want {
 			t.Fatalf("ResolveProviderForModel(%q) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+func TestResolveRouteOpaqueIDsAndCapabilities(t *testing.T) {
+	for _, raw := range []string{"openai:MiXeD/Model.v1", "openrouter:~vendor/Model:variant", "google:unlisted-model"} {
+		routed, err := resolveRoute(RoutingConfig{ModelID: raw}, func(string) string { return "" })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if routed.Model.ID != parseModelSpec(raw).ModelID || !routed.Model.Cost.Unknown || routed.Model.ContextWindow <= 0 || routed.Model.MaxTokens <= 0 {
+			t.Fatalf("unknown opaque route lost: %+v", routed.Model)
+		}
+	}
+	routed, err := resolveRoute(RoutingConfig{ModelID: "anthropic:claude-fable-5-1"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !routed.Model.Reasoning || routed.Model.Compat == nil || routed.Model.Compat.ForceAdaptiveThinking == nil || !*routed.Model.Compat.ForceAdaptiveThinking {
+		t.Fatalf("catalog reasoning metadata not routed: %+v", routed.Model)
 	}
 }

@@ -252,3 +252,20 @@ func TestConcurrentStreamsAreRaceCleanAndConsumeDistinctResponses(t *testing.T) 
 		t.Fatalf("PendingCount = %d, want 0", got)
 	}
 }
+
+func TestUsageCostsFollowModelPrice(t *testing.T) {
+	for _, price := range []types.ModelCost{{Input: 2, Output: 10}, {Unknown: true}} {
+		provider := New(Options{})
+		provider.SetResponses(Respond(Text("a response with several tokens")))
+		model := provider.Model()
+		model.Cost = price
+		streamed := provider.Stream(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hello")}}}, nil)
+		message := assertTerminalResult(t, streamed, types.StopStop)
+		if message.Usage.Cost.Unknown != price.Unknown {
+			t.Fatalf("unknown price lost: %+v", message.Usage)
+		}
+		if !price.Unknown && message.Usage.Cost.Total <= 0 {
+			t.Fatalf("priced model reported free usage: %+v", message.Usage)
+		}
+	}
+}

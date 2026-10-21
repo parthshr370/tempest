@@ -237,7 +237,7 @@ func TestTaskToolUsesRegistryPromptAndTools(t *testing.T) {
 		InitialState: &agent.AgentState{SystemPrompt: "parent", Model: f.Model(), Tools: []agent.AgentTool{taskTool}},
 		StreamFn:     f.StreamSimple,
 	})
-	if err := parent.PromptText(context.Background(), "build app"); err != nil {
+	if _, err := parent.PromptText(context.Background(), "build app"); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.CallCount(); got != 3 {

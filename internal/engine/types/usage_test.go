@@ -1,6 +1,9 @@
 package types
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestCalculateCost(t *testing.T) {
 	// Prices in $/million tokens.
@@ -40,4 +43,37 @@ func TestCalculateCost(t *testing.T) {
 			t.Errorf("returned %v != u.Cost %v", got, u.Cost)
 		}
 	})
+}
+
+func TestUnknownCostAndUsageAdd(t *testing.T) {
+	usage := Usage{Input: 100, Output: 20, Cost: Cost{Total: 9}}
+	calculated := CalculateCost(ModelCost{Unknown: true, Input: 3}, &usage)
+	if calculated != (Cost{Unknown: true}) || calculated != usage.Cost {
+		t.Fatalf("unknown price retained numeric cost: %+v", usage)
+	}
+	encoded, err := json.Marshal(usage.Cost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"unknown":true}` {
+		t.Fatalf("unknown cost JSON: %s", encoded)
+	}
+	var decoded Cost
+	if err := json.Unmarshal(encoded, &decoded); err != nil || !decoded.Unknown {
+		t.Fatalf("unknown cost round trip: %+v, %v", decoded, err)
+	}
+	reasoning, longWrite := 3, 2
+	call := Usage{Input: 7, Output: 4, CacheRead: 5, CacheWrite: 2, TotalTokens: 18, CacheWrite1h: &longWrite, Reasoning: &reasoning, Cost: Cost{Input: 1, Output: 2, CacheRead: 3, CacheWrite: 4, Total: 10}}
+	var total Usage
+	total.Add(call)
+	total.Add(call)
+	total.Add(usage)
+	if total.Input != 114 || total.Output != 28 || total.CacheRead != 10 || total.CacheWrite != 4 || total.TotalTokens != 36 || *total.Reasoning != 6 || *total.CacheWrite1h != 4 || !total.Cost.Unknown || total.Cost.Total != 20 {
+		t.Fatalf("usage sum: %+v", total)
+	}
+	*call.Reasoning = 99
+	*call.CacheWrite1h = 99
+	if *total.Reasoning != 6 || *total.CacheWrite1h != 4 {
+		t.Fatal("total aliases caller-owned counters")
+	}
 }

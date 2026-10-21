@@ -47,7 +47,7 @@ func StreamSimple(ctx context.Context, model types.Model, c types.Context, opts 
 	if opts == nil || opts.Reasoning == "" {
 		return Stream(ctx, model, c, &Options{StreamOptions: base, Thinking: &thinkingConfig{Enabled: false}})
 	}
-	return Stream(ctx, model, c, &Options{StreamOptions: base, Thinking: &thinkingConfig{Enabled: true}})
+	return Stream(ctx, model, c, &Options{StreamOptions: base, Thinking: &thinkingConfig{Enabled: true, Level: opts.Reasoning}})
 }
 
 // runStream drives the full request/response lifecycle on a goroutine: it builds
@@ -135,7 +135,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		responseBody, _ := io.ReadAll(resp.Body)
-		pushError(s, output, fmt.Errorf("Gemini API error: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(responseBody))), parent.Err() != nil)
+		pushError(s, output, base.ResponseError(resp, responseBody), parent.Err() != nil)
 		return
 	}
 
@@ -190,7 +190,7 @@ func newOutputMessage(model types.Model) *types.AssistantMessage {
 		API:        model.API,
 		Provider:   model.Provider,
 		Model:      model.ID,
-		Usage:      types.Usage{Cost: types.Cost{}},
+		Usage:      types.Usage{Cost: types.Cost{Unknown: model.Cost.Unknown}},
 		StopReason: types.StopStop,
 		Timestamp:  time.Now().UnixMilli(),
 	}
@@ -204,9 +204,7 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 	} else {
 		output.StopReason = types.StopError
 	}
-	if err != nil {
-		output.ErrorMessage = err.Error()
-	}
+	base.ApplyError(output, err)
 	s.Push(types.StreamEvent{Type: types.EvError, Reason: output.StopReason, Err: output})
 }
 

@@ -19,7 +19,7 @@ cat >"$SCRATCH/faux.json" <<'JSON'
       {"id":"smoke_edit","name":"edit","arguments":{"path":"app/page.tsx","edits":[{"oldText":"draft","newText":"final"}]}}
     ]
   },
-  {"text":"Smoke completed. <promise>WORKFLOW_COMPLETE</promise>"}
+  {"text":"Smoke completed."}
 ]
 JSON
 

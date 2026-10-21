@@ -200,7 +200,7 @@ func TestFoldGoogleChunksBuildsMessage(t *testing.T) {
 	if strings.Join(got, ",") != want {
 		t.Fatalf("got stream events:  %v\nwant: %v", strings.Join(got, ","), want)
 	}
-	if state.Output.StopReason != types.StopStop {
+	if state.Output.StopReason != types.StopToolUse {
 		t.Fatalf("stop reason = %s", state.Output.StopReason)
 	}
 	if len(state.Output.Content) != 2 {
@@ -277,14 +277,25 @@ func TestStreamSimple(t *testing.T) {
 
 	model := baseModel()
 	model.BaseURL = server.URL
+	model.Reasoning = true
 	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}, Reasoning: "high"}))
 
-	if tc, ok := reqBody["thinkingConfig"]; ok {
-		if tcMap, ok := tc.(map[string]any); ok {
-			if tcMap["includeThoughts"] != true {
-				t.Fatalf("thinkingConfig = %#v", tcMap)
-			}
-		}
+	var request struct {
+		Generation struct {
+			Thinking struct {
+				IncludeThoughts bool `json:"includeThoughts"`
+			} `json:"thinkingConfig"`
+		} `json:"generationConfig"`
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		t.Fatal(err)
+	}
+	if !request.Generation.Thinking.IncludeThoughts {
+		t.Fatalf("generationConfig.thinkingConfig missing: %s", body)
 	}
 }
 
