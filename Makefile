@@ -10,14 +10,17 @@ COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_LDFLAGS := -X go.harness.dev/harness/internal/build.Version=$(VERSION) -X go.harness.dev/harness/internal/build.Commit=$(COMMIT) -X go.harness.dev/harness/internal/build.Date=$(DATE)
 
-.PHONY: all build test test-race test-integration test-contract smoke tidy vet clean check
+.PHONY: all build build-examples test test-race test-integration test-contract smoke tidy vet clean check
 
 all: build test
 
-check: build vet test test-race
+check: build build-examples vet test test-race
 
 build:
 	$(GO) build -ldflags "$(BUILD_LDFLAGS)" $(PKGS)
+
+build-examples:
+	$(GO) -C examples/embed build -o /dev/null ./...
 
 # Unit — fast, hermetic, no network/Docker. The default gate for every fragment.
 test:

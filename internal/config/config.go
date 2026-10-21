@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.harness.dev/harness/internal/adapter"
 )
@@ -71,6 +72,7 @@ type FlagValues struct {
 	SmolModel            StringInput
 	MaxTokens            IntInput
 	PermissionMode       StringInput
+	BashTimeout          StringInput
 	LogLevel             StringInput
 	LogFile              StringInput
 	LogFileMaxBytes      IntInput
@@ -129,6 +131,7 @@ type ResolvedConfig struct {
 	smolModel             string
 	maxTokens             int
 	permissionModeDefault string
+	bashTimeout           time.Duration
 	logLevel              string
 	logFile               string
 	enableTask            bool
@@ -163,6 +166,9 @@ func (c *ResolvedConfig) MaxTokens() int { return c.maxTokens }
 
 // PermissionModeDefault returns the configured default tool permission mode.
 func (c *ResolvedConfig) PermissionModeDefault() string { return c.permissionModeDefault }
+
+// BashTimeout returns the default limit for each shell command.
+func (c *ResolvedConfig) BashTimeout() time.Duration { return c.bashTimeout }
 
 // LogLevel returns the configured log level.
 func (c *ResolvedConfig) LogLevel() string { return c.logLevel }
@@ -246,6 +252,7 @@ type fileSettings struct {
 	SmolModel             *string  `json:"smol_model"`
 	MaxTokens             *int     `json:"max_tokens"`
 	PermissionModeDefault *string  `json:"permission_mode_default"`
+	BashTimeout           *string  `json:"bash_timeout"`
 	LogLevel              *string  `json:"log_level"`
 	LogFile               *string  `json:"log_file"`
 	LogFileMaxBytes       *int64   `json:"log_file_max_bytes"`
@@ -324,6 +331,13 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 			err = errors.New("must be positive")
 		}
 		return nil, &Error{Field: "max_tokens", Err: err}
+	}
+	bashTimeout, err := time.ParseDuration(resolveString(c.Flags.BashTimeout, lookup("HARNESS_BASH_TIMEOUT"), settings.BashTimeout, "10m"))
+	if err != nil || bashTimeout <= 0 || bashTimeout > 2147483*time.Second {
+		if err == nil {
+			err = errors.New("must be positive and no greater than 2147483s")
+		}
+		return nil, &Error{Field: "bash_timeout", Err: err}
 	}
 	logFileMax, err := resolveInt64(c.Flags.LogFileMaxBytes, lookup("HARNESS_LOG_FILE_MAX_BYTES"), settings.LogFileMaxBytes, defaultLogFileMax)
 	if err != nil || logFileMax <= 0 {
@@ -410,6 +424,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		smolModel:             resolveString(c.Flags.SmolModel, lookup("HARNESS_SMOL_MODEL"), settings.SmolModel, ""),
 		maxTokens:             maxTokens,
 		permissionModeDefault: resolveString(c.Flags.PermissionMode, lookup("HARNESS_PERMISSION_MODE"), settings.PermissionModeDefault, defaultPermissionMode),
+		bashTimeout:           bashTimeout,
 		logLevel:              resolveLogLevel(c.Flags.LogLevel, lookup("HARNESS_LOG_LEVEL"), lookup("HARNESS_DEBUG"), settings.LogLevel),
 		logFile:               resolveString(c.Flags.LogFile, lookup("HARNESS_LOG_FILE"), settings.LogFile, ""),
 		logFileMaxBytes:       logFileMax,

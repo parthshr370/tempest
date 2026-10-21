@@ -75,25 +75,30 @@ func tokensFromBytes(n int64) int {
 	return int((n + charsPerToken - 1) / charsPerToken)
 }
 
-// InitialPrompt is the first user turn, including ordered resolved attachments.
-type InitialPrompt struct {
-	Text    string
-	Media   []document.MediaRef
-	Deliver *MediaDelivery
-}
-
-// initialUserMessage preserves attachment order after the prompt text, which is
-// the order the model sees and the journal later replays.
-func initialUserMessage(prompt InitialPrompt) types.Message {
-	content := make([]types.ContentBlock, 1, len(prompt.Media)+1)
-	content[0] = types.NewText(prompt.Text)
-	for _, media := range prompt.Media {
-		content = append(content, mediaRefToBlocks(media, prompt.Deliver)...)
+// BuildUserMessage keeps attachment order and applies one admission budget across
+// all reference blocks. Inline images already carry their provider-ready content.
+func BuildUserMessage(text string, media []types.ContentBlock, deliver *MediaDelivery) types.UserMessage {
+	content := make([]types.ContentBlock, 1, len(media)+1)
+	content[0] = types.NewText(text)
+	for _, block := range media {
+		if block.Type == types.BlockImageRef || block.Type == types.BlockDocumentRef {
+			ref := document.MediaRef{
+				ID:        block.RefFilename,
+				Filename:  block.RefFilename,
+				MediaType: block.RefMediaType,
+				SizeBytes: block.RefSizeBytes,
+				PageCount: block.RefPageCount,
+				Blob:      document.BlobRef{Store: block.RefStore, Key: block.RefKey},
+			}
+			content = append(content, mediaRefToBlocks(ref, deliver)...)
+			continue
+		}
+		if block.Type == "" {
+			block.Type = types.BlockImage
+		}
+		content = append(content, block)
 	}
-	return types.UserMessage{
-		Content:   types.BlockContent(content...),
-		Timestamp: time.Now().UnixMilli(),
-	}
+	return types.UserMessage{Content: types.BlockContent(content...), Timestamp: time.Now().UnixMilli()}
 }
 
 // deliveredBlob returns the blob, media type, size, and page count actually

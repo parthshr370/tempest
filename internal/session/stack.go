@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"time"
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/compaction"
@@ -46,6 +47,8 @@ type StackConfig struct {
 	// InitialMessages seeds the agent transcript when resuming a session. Nil
 	// starts a fresh conversation.
 	InitialMessages []ptypes.Message
+	// OnMessagesChanged observes compaction's replacement transcript.
+	OnMessagesChanged func([]ptypes.Message)
 
 	PermissionMode     permission.Mode
 	PermissionModeFunc PermissionModeFunc
@@ -56,6 +59,7 @@ type StackConfig struct {
 	WebSearchURL       string
 	ConfiguredTools    []agent.AgentTool
 	PromptAdditions    []string
+	BashTimeout        time.Duration
 
 	// Plan selects a read-only stack. Zero PlanModel uses Model.
 	Plan bool
@@ -101,11 +105,8 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		if err != nil {
 			rawArgs = nil
 		}
-		allow, reason := permission.Gate(ctx, modeFunc(), c.ToolCall.Name, rawArgs, cfg.PermissionPolicy)
-		if allow {
-			return nil
-		}
-		return &agent.BeforeToolCallResult{Block: true, Reason: reason}
+		outcome := permission.Gate(ctx, modeFunc(), c.ToolCall.Name, rawArgs, &cfg.PermissionPolicy, c.ToolCall.ID)
+		return &agent.BeforeToolCallResult{Block: !outcome.Allow, Reason: outcome.Reason, Permission: &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}}
 	}
 
 	if cfg.SpillDir == "" {
@@ -129,13 +130,13 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		registry := subagent.Registry{
 			"explore": subagent.Definition{
 				Description: "Read-only investigation: read files, grep, find, and list without changing anything.",
-				Tools:       tools.ReadOnlyTools(cwd, tools.ToolsOptions{EnableWeb: cfg.EnableWeb, SearchURL: cfg.WebSearchURL}),
+				Tools:       tools.ReadOnlyTools(cwd, tools.ToolsOptions{EnableWeb: cfg.EnableWeb, SearchURL: cfg.WebSearchURL, BashTimeout: cfg.BashTimeout}),
 				Model:       cfg.SmolModel,
 				StreamFn:    cfg.SmolStreamFn,
 			},
 			"general": subagent.Definition{
 				Description: "Full coding task with the complete tool set.",
-				Tools:       append(tools.CodingTools(cwd, tools.ToolsOptions{}), tools.ReadOnlyTools(cwd, tools.ToolsOptions{})...),
+				Tools:       append(tools.CodingTools(cwd, tools.ToolsOptions{BashTimeout: cfg.BashTimeout}), tools.ReadOnlyTools(cwd, tools.ToolsOptions{BashTimeout: cfg.BashTimeout})...),
 			},
 		}
 		taskTool = subagent.NewTool(subagent.Options{
@@ -157,6 +158,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	}
 	options := tools.ToolsOptions{
 		EnableWeb:          cfg.EnableWeb,
+		BashTimeout:        cfg.BashTimeout,
 		SearchURL:          cfg.WebSearchURL,
 		ConfiguredTools:    cfg.ConfiguredTools,
 		TaskTool:           taskTool,
@@ -195,7 +197,12 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	var agt *agent.Agent
 	var compact func(agent.ShouldStopAfterTurnContext) *agent.AgentLoopTurnUpdate
 	if runner := newCompactionRunner(model, cfg.StreamFn); runner != nil {
-		compact = runner.hook(func(messages []ptypes.Message) { agt.SetMessages(messages) })
+		compact = runner.hook(func(messages []ptypes.Message) {
+			agt.SetMessages(messages)
+			if cfg.OnMessagesChanged != nil {
+				cfg.OnMessagesChanged(messages)
+			}
+		})
 	}
 	agt = agent.NewAgent(agent.AgentOptions{
 		InitialState:               &agent.AgentState{SystemPrompt: systemPrompt, Model: model, Tools: active, Messages: cfg.InitialMessages},

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/stream"
@@ -405,6 +406,9 @@ func (f *Faux) splitStringByTokenSize(text string, rng *rand.Rand) []string {
 		end := index + charSize
 		if end > len(text) {
 			end = len(text)
+		}
+		for end < len(text) && !utf8.RuneStart(text[end]) {
+			end++
 		}
 		chunks = append(chunks, text[index:end])
 		index = end

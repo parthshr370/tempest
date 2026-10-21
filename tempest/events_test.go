@@ -1,0 +1,84 @@
+package tempest
+
+import (
+	"encoding/json"
+	"errors"
+	"reflect"
+	"testing"
+	"time"
+
+	"go.harness.dev/harness/internal/agent"
+	types "go.harness.dev/harness/internal/engine/types"
+)
+
+func TestMapEveryAgentEvent(t *testing.T) {
+	assistant := types.AssistantMessage{Content: []types.ContentBlock{types.NewText("answer"), types.NewThinking("thought", "")}, StopReason: types.StopStop, Usage: Usage{Input: 10, CacheRead: 20, CacheWrite: 30}}
+	cases := []struct {
+		name  string
+		event agent.AgentEvent
+		want  []string
+	}{
+		{"agent_start", agent.AgentStart(nil), []string{"tempest/run"}},
+		{"message_start", agent.MessageStart(assistant), nil},
+		{"text_delta", agent.MessageUpdate(assistant, &types.StreamEvent{Type: types.EvTextDelta, Delta: "hi"}), []string{"agent_message_chunk"}},
+		{"thought_delta", agent.MessageUpdate(assistant, &types.StreamEvent{Type: types.EvThinkingDelta, Delta: "why"}), []string{"agent_thought_chunk"}},
+		{"tool_delta", agent.MessageUpdate(assistant, &types.StreamEvent{Type: types.EvToolCallDelta, Delta: "{}"}), nil},
+		{"user_end", agent.MessageEnd(types.UserMessage{Content: types.StringContent("question")}), []string{"user_message_chunk"}},
+		{"assistant_end", agent.MessageEnd(assistant), []string{"agent_message_chunk", "agent_thought_chunk", "tempest/message_end", "usage_update"}},
+		{"tool_result_end", agent.MessageEnd(types.ToolResultMessage{}), nil},
+		{"child_usage", agent.AgentEvent{Type: agent.EventUsage, Model: "child", RunResult: RunResult{Usage: Usage{Input: 5}}}, []string{"tempest/usage"}},
+		{"permission", agent.AgentEvent{Type: agent.EventToolPermission, ToolCallID: "c", Permission: &agent.PermissionOutcome{Allow: true, Source: "prompt", Wait: 3 * time.Millisecond}}, []string{"tool_call_update"}},
+		{"tool_start", agent.ToolExecutionStart("c", "read", json.RawMessage(`{"path":"x"}`)), []string{"tool_call"}},
+		{"tool_update", agent.ToolExecutionUpdate("c", "read", nil, agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("partial")}}), []string{"tool_call_update"}},
+		{"tool_end", agent.ToolExecutionEnd("c", "read", agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("done")}}, false), []string{"tool_call_update"}},
+		{"turn_start", agent.TurnStart(), []string{"tempest/turn"}},
+		{"turn_end", agent.TurnEnd(assistant, nil), []string{"tempest/turn"}},
+		{"agent_end", agent.AgentEnd(nil, RunResult{StopReason: agent.StopError, Err: errors.New("broken")}), []string{"tempest/run"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMapper("s", types.Model{ID: "m", ContextWindow: 1234})
+			var kinds []string
+			for _, u := range m.mapEvent(tc.event) {
+				kinds = append(kinds, u.Kind)
+				if !json.Valid(u.Update) {
+					t.Fatalf("invalid update: %s", u.Update)
+				}
+			}
+			if !reflect.DeepEqual(kinds, tc.want) {
+				t.Fatalf("updates = %v, want %v", kinds, tc.want)
+			}
+		})
+	}
+}
+func TestUsageContextAndUnknownCost(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(map[bool]string{false: "priced", true: "unknown"}[unknown], func(t *testing.T) {
+			m := newMapper("s", types.Model{ContextWindow: 65536})
+			updates := m.mapEvent(agent.MessageEnd(types.AssistantMessage{Usage: Usage{Input: 10, Output: 99, CacheRead: 20, CacheWrite: 30, Cost: types.Cost{Unknown: unknown, Total: 0.25}}}))
+			var p map[string]json.RawMessage
+			_ = json.Unmarshal(updates[len(updates)-1].Update, &p)
+			if string(p["used"]) != "60" || string(p["size"]) != "65536" {
+				t.Fatalf("usage math = %s", updates[len(updates)-1].Update)
+			}
+			_, hasCost := p["cost"]
+			if hasCost == unknown {
+				t.Fatalf("cost presence = %v, unknown %v", hasCost, unknown)
+			}
+		})
+	}
+}
+func TestToolKindAndTitle(t *testing.T) {
+	cases := []struct {
+		name, input, title string
+		kind               ToolKind
+	}{
+		{"read", `{"path":"a.go"}`, "read: a.go", "read"}, {"write", `{"path":"a"}`, "write: a", "edit"}, {"edit", `{}`, "edit", "edit"}, {"bash", `{"command":"pwd"}`, "$ pwd", "execute"}, {"grep", `{"pattern":"x"}`, "grep: x", "search"}, {"find", `{"pattern":"*.go"}`, "find: *.go", "search"}, {"ls", `{"path":"."}`, "ls: .", "search"}, {"web_fetch", `{"query":"q"}`, "web_fetch: q", "fetch"}, {"web_search", `{}`, "web_search", "fetch"}, {"todo_write", `{}`, "todo_write", "think"}, {"task", `{}`, "task", "other"},
+	}
+	for _, tc := range cases {
+		title, kind := toolDescription(tc.name, json.RawMessage(tc.input))
+		if title != tc.title || kind != tc.kind {
+			t.Fatalf("%s = %q %q, want %q %q", tc.name, title, kind, tc.title, tc.kind)
+		}
+	}
+}

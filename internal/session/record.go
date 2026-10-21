@@ -26,14 +26,21 @@ const summaryRunes = 200
 // Attach before the first Prompt or Continue. The listener relies on the
 // agent delivering events one at a time.
 func AttachJournal(agt *agent.Agent, store *journal.Store) (detach func()) {
-	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}}
+	return AttachJournalWithRunID(agt, store, nil)
+}
+
+// AttachJournalWithRunID also reports the journal's run id before later listeners
+// see agent_start, keeping public run identifiers equal to durable identifiers.
+func AttachJournalWithRunID(agt *agent.Agent, store *journal.Store, started func(string)) func() {
+	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: started}
 	return agt.Subscribe(r.record)
 }
 
 type recorder struct {
-	agt   *agent.Agent
-	store *journal.Store
-	runID string
+	agt     *agent.Agent
+	store   *journal.Store
+	runID   string
+	started func(string)
 	// toolStarts holds the start time of each in-flight tool call for its
 	// duration.
 	toolStarts map[string]time.Time
@@ -48,6 +55,9 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 	switch ev.Type {
 	case agent.EventAgentStart:
 		r.runID = r.store.NewRunID()
+		if r.started != nil {
+			r.started(r.runID)
+		}
 		clear(r.toolStarts)
 		meta.RunID = r.runID
 		model := r.agt.State().Model
@@ -64,6 +74,14 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		}
 	case agent.EventUsage:
 		err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: ev.Model, Usage: ev.Usage})
+	case agent.EventToolPermission:
+		if ev.Permission != nil {
+			decision := "deny"
+			if ev.Permission.Allow {
+				decision = "allow"
+			}
+			err = r.store.Append(ctx, journal.PermissionRecord{Meta: meta, ToolCallID: ev.ToolCallID, Tool: ev.ToolName, Decision: decision, Source: string(ev.Permission.Source), WaitMS: ev.Permission.Wait.Milliseconds()})
+		}
 	case agent.EventToolExecutionStart:
 		r.toolStarts[ev.ToolCallID] = ev.At
 		err = r.store.Append(ctx, journal.ToolStartedRecord{

@@ -2,8 +2,11 @@ package permission
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Tier is a tool's approval tier. Unknown tools are [TierExec].
@@ -32,6 +35,8 @@ const (
 
 // PromptRequest describes an approval prompt for a tool call.
 type PromptRequest struct {
+	ToolCallID string
+	Args       json.RawMessage
 	// Tool names the tool requesting approval.
 	Tool string
 	// Tier is the approval tier for Tool.
@@ -42,8 +47,8 @@ type PromptRequest struct {
 
 // Prompter asks a human to approve a tool call.
 type Prompter interface {
-	// Approve reports whether req is approved.
-	Approve(ctx context.Context, req PromptRequest) (bool, error)
+	// Approve selects one of the four standard permission choices.
+	Approve(ctx context.Context, req PromptRequest) (Choice, error)
 }
 
 // Policy is the per-session approval policy layered over the mode.
@@ -52,6 +57,57 @@ type Policy struct {
 	Overrides map[string]Decision
 	// Prompter resolves prompt decisions; nil denies them in headless sessions.
 	Prompter Prompter
+	// promptOverrides stores session choices for ordinary asks. Guard asks
+	// never use or set these overrides.
+	promptOverrides map[string]Decision
+}
+
+// policyMu protects in-memory overrides. Approval never holds it while waiting.
+var policyMu sync.Mutex
+
+// Choice is the selected scope and decision of an approval.
+type Choice string
+
+const (
+	// AllowOnce approves only the current tool invocation.
+	AllowOnce Choice = "allow_once"
+	// AllowAlways approves subsequent invocations, except destructive guard asks.
+	AllowAlways Choice = "allow_always"
+	// RejectOnce denies only the current tool invocation.
+	RejectOnce Choice = "reject_once"
+	// RejectAlways denies subsequent invocations, except destructive guard asks.
+	RejectAlways Choice = "reject_always"
+)
+
+// Source identifies the policy layer that made a decision.
+type Source string
+
+const (
+	// SourceBypass identifies an unrestricted permission mode.
+	SourceBypass Source = "bypass"
+	// SourceGuard identifies a destructive-command guard denial.
+	SourceGuard Source = "guard"
+	// SourceOverride identifies a per-tool configured or interactive decision.
+	SourceOverride Source = "override"
+	// SourceMode identifies the current mode's default policy.
+	SourceMode Source = "mode"
+	// SourcePrompt identifies an explicit approval answer.
+	SourcePrompt Source = "prompt"
+	// SourcePromptTimeout identifies an unanswered approval deadline.
+	SourcePromptTimeout Source = "prompt_timeout"
+	// SourcePromptCancelled identifies an aborted approval.
+	SourcePromptCancelled Source = "prompt_cancelled"
+	// SourceNoPrompter identifies an approval requirement with no prompt surface.
+	SourceNoPrompter Source = "no_prompter"
+)
+
+// Outcome is the decision and, for interactive decisions, its wait time.
+type Outcome struct {
+	Allow    bool
+	Reason   string
+	Source   Source
+	Prompted bool
+	Wait     time.Duration
 }
 
 // ClassifyTool returns the approval tier for toolName.

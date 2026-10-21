@@ -3,6 +3,7 @@ module go.harness.dev/harness
 go 1.26.4
 
 require (
+	github.com/coder/websocket v1.8.15
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	golang.org/x/text v0.40.0
