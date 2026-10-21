@@ -232,9 +232,6 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 	if overridden && decision == DecideDeny {
 		return Outcome{Reason: deny, Source: SourceOverride}
 	}
-	if sessionOverride {
-		return Outcome{Allow: sessionDecision == DecideAllow, Source: SourceOverride}
-	}
 	if mode == ModeBypass {
 		return Outcome{Allow: true, Source: SourceBypass}
 	}
@@ -251,12 +248,15 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 	if len(toolCallID) != 0 {
 		req.ToolCallID = toolCallID[0]
 	}
-	// The guard can be approved interactively, but a static allow never skips it.
+	// A guard approval is per-call, even when the answer says "always".
 	if guardReason != "" {
 		if policy.Prompter == nil {
 			return Outcome{Reason: guardReason, Source: SourceGuard}
 		}
 		return resolvePrompt(ctx, policy, req)
+	}
+	if sessionOverride {
+		return Outcome{Allow: sessionDecision == DecideAllow, Source: SourceOverride}
 	}
 	if overridden {
 		switch decision {
@@ -292,20 +292,16 @@ func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outco
 		out.Source = SourcePromptCancelled
 	} else {
 		out.Allow = choice == AllowOnce || choice == AllowAlways
-		if choice == AllowAlways || choice == RejectAlways {
+		if req.Reason == "" && (choice == AllowAlways || choice == RejectAlways) {
 			policyMu.Lock()
-			if policy.Overrides == nil {
-				policy.Overrides = make(map[string]Decision)
-			}
-			if out.Allow {
-				policy.Overrides[req.Tool] = DecideAllow
-			} else {
-				policy.Overrides[req.Tool] = DecideDeny
-			}
 			if policy.promptOverrides == nil {
 				policy.promptOverrides = make(map[string]Decision)
 			}
-			policy.promptOverrides[req.Tool] = policy.Overrides[req.Tool]
+			if out.Allow {
+				policy.promptOverrides[req.Tool] = DecideAllow
+			} else {
+				policy.promptOverrides[req.Tool] = DecideDeny
+			}
 			policyMu.Unlock()
 		}
 	}

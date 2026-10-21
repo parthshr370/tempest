@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/compaction"
@@ -70,8 +71,8 @@ func TestSessionPermissionRoundTripAndJournalOrder(t *testing.T) {
 				if _, err := s.Prompt(context.Background(), Prompt{Text: "try again"}); err != nil {
 					t.Fatal(err)
 				}
-				if asks.Load() != 1 {
-					t.Fatalf("reject_always asked %d times", asks.Load())
+				if asks.Load() != 2 {
+					t.Fatalf("guard reject_always asked %d times, want 2", asks.Load())
 				}
 			}
 			raw, err := os.ReadFile(s.core.store.Path())
@@ -480,5 +481,38 @@ func TestCompactionChangesPublicHistoryEpochWithoutRecountingUsage(t *testing.T)
 	}
 	if after.Usage.Total.TotalTokens != loaded.UsageTotal.TotalTokens {
 		t.Fatalf("usage recounted after compaction: snapshot=%+v journal=%+v", after.Usage.Total, loaded.UsageTotal)
+	}
+}
+
+func TestBeginRegistersRunAndWaitIsRepeatable(t *testing.T) {
+	f := faux.New(faux.Options{})
+	asked := make(chan struct{}, 1)
+	s := openFaux(t, f, promptFunc(func(ctx context.Context, _ Ask) (Choice, error) {
+		asked <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}))
+	scriptBash(f, "mkdir -p "+filepath.Join(s.Snapshot().Cwd, "never"))
+	s.Cancel()
+	run, err := s.Begin(context.Background(), Prompt{Text: "wait"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BeginContinue(context.Background()); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("admission before Wait=%v", err)
+	}
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("idle cancel affected the next admitted run")
+	}
+	s.Cancel()
+	first, err := run.Wait()
+	if err != nil || first.StopReason != agent.StopAborted {
+		t.Fatalf("cancelled run=%+v err=%v", first, err)
+	}
+	second, err := run.Wait()
+	if err != nil || second.RunID != first.RunID || second.StopReason != first.StopReason {
+		t.Fatalf("repeated Wait=%+v err=%v", second, err)
 	}
 }

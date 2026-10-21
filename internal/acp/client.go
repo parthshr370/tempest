@@ -67,7 +67,7 @@ func NewClient(c *rpc.Conn, backend Backend, broker *Broker) *Client {
 }
 
 // Serve disconnects subscriptions without cancelling session-owned runs.
-func (c *Client) Serve() error { defer c.Close(); return c.conn.Serve(c.Handle) }
+func (c *Client) Serve() error { defer c.Close(); return c.conn.ServeOrdered(c.admit) }
 
 // Close removes this connection's watchers.
 func (c *Client) Close() {
@@ -109,6 +109,17 @@ func failure(err error) *rpc.Error {
 		return rpc.NewError(-32001, "session_not_found", err.Error())
 	default:
 		return rpc.NewError(-32603, "internal_error", err.Error())
+	}
+}
+
+// admit keeps run registration and cancellation on the ordered dispatch path.
+// Everything that can wait for disk, replay, a permission, or a writer runs later.
+func (c *Client) admit(ctx context.Context, method string, raw json.RawMessage) (any, *rpc.Error) {
+	switch method {
+	case "initialize", "session/prompt", "tempest/continue", "session/cancel":
+		return c.Handle(ctx, method, raw)
+	default:
+		return rpc.Deferred(func() (any, *rpc.Error) { return c.Handle(ctx, method, raw) }), nil
 	}
 }
 
@@ -195,7 +206,12 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 	if err != nil {
 		return nil, failure(err)
 	}
-	defer release()
+	retainLease := false
+	defer func() {
+		if !retainLease {
+			release()
+		}
+	}()
 	switch method {
 	case "session/prompt", "tempest/continue":
 		var prompt tempest.Prompt
@@ -207,47 +223,56 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			}
 		}
 		remove := c.broker.add(s.ID(), c.conn)
-		defer remove()
-		ownerDone := make(chan struct{})
-		defer close(ownerDone)
-		go func() {
-			select {
-			case <-c.conn.Done():
-				remove()
-			case <-ownerDone:
-			}
-		}()
-		var result tempest.RunResult
+		var run *tempest.Run
 		if method == "session/prompt" {
-			result, err = s.Prompt(c.backend.RunContext(), prompt)
+			run, err = s.Begin(c.backend.RunContext(), prompt)
 		} else {
-			result, err = s.Continue(c.backend.RunContext())
-		}
-		if result.RunID != "" {
-			c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
-		}
-		if result.StopReason == "error" {
-			message := "run failed"
-			if result.Err != nil {
-				message = result.Err.Error()
-			}
-			return nil, rpc.NewError(-32009, "run_error", message)
+			run, err = s.BeginContinue(c.backend.RunContext())
 		}
 		if err != nil {
+			remove()
 			return nil, failure(err)
 		}
-		reason := "end_turn"
-		switch result.StopReason {
-		case "aborted":
-			reason = "cancelled"
-		case "max_turns", "max_cost", "max_wall_time":
-			reason = "max_turn_requests"
-		}
-		var cost any
-		if !result.Usage.Cost.Unknown {
-			cost = result.Usage.Cost.Total
-		}
-		return map[string]any{"stopReason": reason, "_meta": map[string]any{"tempest": map[string]any{"stopReason": result.StopReason, "runId": result.RunID, "turns": result.Turns, "usage": result.Usage, "costUsd": cost, "elapsedMs": result.ElapsedMS}}}, nil
+		retainLease = true
+		return rpc.Deferred(func() (any, *rpc.Error) {
+			defer release()
+			defer remove()
+			ownerDone := make(chan struct{})
+			defer close(ownerDone)
+			go func() {
+				select {
+				case <-c.conn.Done():
+					remove()
+				case <-ownerDone:
+				}
+			}()
+			result, err := run.Wait()
+			if result.RunID != "" {
+				c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
+			}
+			if result.StopReason == "error" {
+				message := "run failed"
+				if result.Err != nil {
+					message = result.Err.Error()
+				}
+				return nil, rpc.NewError(-32009, "run_error", message)
+			}
+			if err != nil {
+				return nil, failure(err)
+			}
+			reason := "end_turn"
+			switch result.StopReason {
+			case "aborted":
+				reason = "cancelled"
+			case "max_turns", "max_cost", "max_wall_time":
+				reason = "max_turn_requests"
+			}
+			var cost any
+			if !result.Usage.Cost.Unknown {
+				cost = result.Usage.Cost.Total
+			}
+			return map[string]any{"stopReason": reason, "_meta": map[string]any{"tempest": map[string]any{"stopReason": result.StopReason, "runId": result.RunID, "turns": result.Turns, "usage": result.Usage, "costUsd": cost, "elapsedMs": result.ElapsedMS}}}, nil
+		}), nil
 	case "session/cancel":
 		s.Cancel()
 		return struct{}{}, nil

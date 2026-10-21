@@ -17,12 +17,23 @@ import (
 )
 
 type stdioStream struct {
-	io.Reader
+	*io.PipeReader
 	io.Writer
 }
 
+func newStdioStream(input io.Reader, output io.Writer) stdioStream {
+	reader, writer := io.Pipe()
+	// stdin may stay blocked after Close. Only this CLI-owned goroutine waits
+	// for it; closing the pipe lets the server finish and the process exit.
+	go func() {
+		_, err := io.Copy(writer, input)
+		_ = writer.CloseWithError(err)
+	}()
+	return stdioStream{PipeReader: reader, Writer: output}
+}
+
 func (s stdioStream) Close() error {
-	err := os.Stdin.Close()
+	err := s.PipeReader.Close()
 	if closer, ok := s.Writer.(io.Closer); ok {
 		if closeErr := closer.Close(); err == nil {
 			err = closeErr
@@ -131,7 +142,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		_ = server.Close(context.Background())
 	}()
 	if listen == "" {
-		err = server.ServeStdio(stdioStream{Reader: os.Stdin, Writer: stdout})
+		err = server.ServeStdio(newStdioStream(os.Stdin, stdout))
 	} else {
 		err = server.ListenAndServe(listen)
 	}

@@ -168,3 +168,38 @@ func TestReplacementHistoryChangesEpochWithoutBreakingLiveSequence(t *testing.T)
 		t.Fatalf("live sequence=%d after %d", u.Seq, before.Seq)
 	}
 }
+
+func TestReplayCapturesStreamingAndReservesLiveSlack(t *testing.T) {
+	h := New(Snapshot{SessionID: "s"}, nil)
+	defer h.Close()
+	h.Emit(Update{Kind: "user_message_chunk", Update: json.RawMessage(`{"messageId":"user","content":{"text":"question"}}`)})
+	h.Emit(Update{Kind: "agent_thought_chunk", Update: json.RawMessage(`{"messageId":"answer","content":{"text":"thinking"}}`)})
+	h.Emit(Update{Kind: "agent_message_chunk", Update: json.RawMessage(`{"messageId":"answer","content":{"text":"prefix"}}`)})
+	snapshot, live, stop := h.WatchReplay(1)
+	defer stop()
+	if snapshot.HistoryLen != 1 || len(snapshot.History) != 3 {
+		t.Fatalf("replay=%+v", snapshot)
+	}
+	if snapshot.Streaming == nil || snapshot.Streaming.Text != "prefix" || snapshot.Streaming.Thought != "thinking" {
+		t.Fatalf("streaming=%+v", snapshot.Streaming)
+	}
+	for i, update := range snapshot.History {
+		if update.Seq != uint64(i+1) {
+			t.Fatalf("replay sequence=%d at index %d", update.Seq, i)
+		}
+	}
+	// One live frame per replayed frame, plus the requested live slack.
+	for range len(snapshot.History) + 1 {
+		h.Emit(Update{Kind: "agent_message_chunk", Update: json.RawMessage(`{"messageId":"answer","content":{"text":"next"}}`)})
+	}
+	for i := range len(snapshot.History) + 1 {
+		update := <-live
+		if update.Kind == "tempest/gap" || update.Seq != snapshot.Seq+uint64(i)+1 {
+			t.Fatalf("live update=%+v at index %d", update, i)
+		}
+	}
+	snapshot.History[0].Update[0] = '!'
+	if !json.Valid(h.Snapshot().History[0].Update) {
+		t.Fatal("replay aliases hub history")
+	}
+}

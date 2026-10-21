@@ -22,11 +22,21 @@ import (
 	"go.harness.dev/harness/internal/session/journal"
 )
 
-type activeRun struct {
+// Run is an admitted run. Wait may be called more than once.
+type Run struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	started time.Time
+	result  RunResult
+	err     error
 }
+
+// Wait returns the run's terminal result.
+func (r *Run) Wait() (RunResult, error) {
+	<-r.done
+	return r.result, r.err
+}
+
 type approval struct{ result chan approvalResult }
 type approvalResult struct {
 	choice Choice
@@ -43,7 +53,7 @@ type sessionCore struct {
 	mode          PermissionMode
 	prompter      Prompter
 	pending       map[string]*approval
-	active        *activeRun
+	active        *Run
 	closed        bool
 	closeOnce     sync.Once
 	closeErr      error
@@ -327,48 +337,56 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	})
 	return s, nil
 }
-func (s *Session) run(ctx context.Context, p *Prompt) (result RunResult, err error) {
+func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
 	c := s.core
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
-		return RunResult{}, ErrClosed
+		return nil, ErrClosed
 	}
 	if c.active != nil {
 		c.mu.Unlock()
-		return RunResult{}, ErrRunActive
+		return nil, ErrRunActive
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	r := &activeRun{cancel: cancel, done: make(chan struct{}), started: time.Now()}
+	r := &Run{cancel: cancel, done: make(chan struct{}), started: time.Now()}
 	c.active = r
 	c.lastText = ""
 	c.runID = ""
 	c.mu.Unlock()
+	go s.execute(runCtx, p, r)
+	return r, nil
+}
+
+func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
+	c := s.core
 	defer func() {
-		cancel()
+		r.cancel()
 		c.mu.Lock()
-		result.RunID = c.runID
-		result.ElapsedMS = time.Since(r.started).Milliseconds()
+		r.result.RunID = c.runID
+		r.result.ElapsedMS = time.Since(r.started).Milliseconds()
 		c.active = nil
 		closed := c.closed
-		close(r.done)
 		c.mu.Unlock()
 		if closed {
 			c.finishClose()
 		}
+		close(r.done)
 	}()
 	if p == nil {
-		return c.agent.Continue(runCtx)
+		r.result, r.err = c.agent.Continue(runCtx)
+		return
 	}
 	if len(p.Media) == 0 {
-		return c.agent.PromptText(runCtx, p.Text)
+		r.result, r.err = c.agent.PromptText(runCtx, p.Text)
+		return
 	}
 	var delivery *session.MediaDelivery
 	if c.delivery != nil {
 		v := *c.delivery
 		delivery = &v
 	}
-	return c.agent.Prompt(runCtx, session.BuildUserMessage(p.Text, p.Media, delivery))
+	r.result, r.err = c.agent.Prompt(runCtx, session.BuildUserMessage(p.Text, p.Media, delivery))
 }
 func (s *Session) cancel() {
 	c := s.core
@@ -379,7 +397,14 @@ func (s *Session) cancel() {
 	}
 }
 func (s *Session) watch(ctx context.Context, o WatchOptions) (Snapshot, <-chan Update, func()) {
-	snap, ch, stop := s.core.hub.Watch(o.Buffer)
+	var snap Snapshot
+	var ch <-chan Update
+	var stop func()
+	if o.Replay {
+		snap, ch, stop = s.core.hub.WatchReplay(o.Buffer)
+	} else {
+		snap, ch, stop = s.core.hub.Watch(o.Buffer)
+	}
 	stopContext := context.AfterFunc(ctx, stop)
 	return snap, ch, func() { stopContext(); stop() }
 }

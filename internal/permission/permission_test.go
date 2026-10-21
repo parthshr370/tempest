@@ -336,9 +336,9 @@ func TestGatePromptSourcesAndAlwaysOverrides(t *testing.T) {
 	}
 	for _, choice := range []Choice{AllowAlways, RejectAlways} {
 		calls := 0
-		policy := &Policy{Prompter: choicePrompter(func(context.Context, PromptRequest) (Choice, error) { calls++; return choice, nil })}
+		policy := &Policy{Overrides: map[string]Decision{"edit": DecidePrompt}, Prompter: choicePrompter(func(context.Context, PromptRequest) (Choice, error) { calls++; return choice, nil })}
 		for range 2 {
-			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("mkdir x"), policy, "c")
+			out := Gate(context.Background(), ModeDefault, "edit", nil, policy, "c")
 			if out.Allow != (choice == AllowAlways) {
 				t.Fatalf("choice=%s outcome=%+v", choice, out)
 			}
@@ -346,5 +346,63 @@ func TestGatePromptSourcesAndAlwaysOverrides(t *testing.T) {
 		if calls != 1 {
 			t.Fatalf("choice=%s prompted %d times", choice, calls)
 		}
+	}
+}
+
+func TestGuardAlwaysChoicesApplyOnlyOnce(t *testing.T) {
+	for _, choice := range []Choice{AllowAlways, RejectAlways} {
+		t.Run(string(choice), func(t *testing.T) {
+			calls := 0
+			policy := &Policy{Prompter: choicePrompter(func(_ context.Context, req PromptRequest) (Choice, error) {
+				calls++
+				if req.Reason == "" {
+					t.Errorf("guard ask has no reason: %+v", req)
+				}
+				return choice, nil
+			})}
+			for _, command := range []string{"mkdir first", "rm -rf second"} {
+				out := Gate(context.Background(), ModeDefault, "bash", commandArgs(command), policy)
+				if out.Allow != (choice == AllowAlways) || !out.Prompted || out.Source != SourcePrompt {
+					t.Fatalf("command=%q outcome=%+v", command, out)
+				}
+			}
+			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("echo harmless"), policy)
+			if !out.Allow || out.Prompted || out.Source != SourceMode || calls != 2 {
+				t.Fatalf("harmless outcome=%+v prompts=%d", out, calls)
+			}
+			if len(policy.Overrides) != 0 || len(policy.promptOverrides) != 0 {
+				t.Fatalf("guard ask changed policy: %+v", policy)
+			}
+		})
+	}
+}
+
+func TestSessionAlwaysChoicesNeverSkipGuard(t *testing.T) {
+	for _, choice := range []Choice{AllowAlways, RejectAlways} {
+		t.Run(string(choice), func(t *testing.T) {
+			calls := 0
+			policy := &Policy{
+				Overrides: map[string]Decision{"bash": DecidePrompt},
+				Prompter: choicePrompter(func(context.Context, PromptRequest) (Choice, error) {
+					calls++
+					return choice, nil
+				}),
+			}
+			for _, command := range []string{"echo first", "rm -rf second", "mkdir third", "echo last"} {
+				out := Gate(context.Background(), ModeDefault, "bash", commandArgs(command), policy)
+				if out.Allow != (choice == AllowAlways) {
+					t.Fatalf("command=%q outcome=%+v", command, out)
+				}
+				if command != "echo last" && (!out.Prompted || out.Source != SourcePrompt) {
+					t.Fatalf("command=%q skipped ask: %+v", command, out)
+				}
+				if command == "echo last" && (out.Prompted || out.Source != SourceOverride) {
+					t.Fatalf("session choice lost: %+v", out)
+				}
+			}
+			if calls != 3 {
+				t.Fatalf("prompted %d times, want 3", calls)
+			}
+		})
 	}
 }

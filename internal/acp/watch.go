@@ -36,7 +36,7 @@ func (c *Client) startWatch(ctx context.Context, s *tempest.Session, approver bo
 		return tempest.Snapshot{}, nil, failure(err)
 	}
 	watchCtx, cancel := context.WithCancel(ctx)
-	snapshot, updates, stopHub := s.Watch(watchCtx, tempest.WatchOptions{Buffer: buffer, Approver: approver})
+	snapshot, updates, stopHub := s.Watch(watchCtx, tempest.WatchOptions{Buffer: buffer, Approver: approver, Replay: replay})
 	removeApprover := func() {}
 	if approver {
 		removeApprover = c.broker.add(s.ID(), c.conn)
@@ -81,23 +81,11 @@ func (c *Client) startWatch(ctx context.Context, s *tempest.Session, approver bo
 	c.watches[s.ID()] = w
 	c.mu.Unlock()
 	if replay {
-		for offset := 0; offset < snapshot.HistoryLen; {
-			count := min(128, snapshot.HistoryLen-offset)
-			page, e := s.History(snapshot.HistoryEpoch, offset, count)
-			if e != nil {
+		for _, update := range snapshot.History {
+			if err := c.sendUpdate(watchCtx, update); err != nil {
 				c.stopWatch(s.ID())
-				return tempest.Snapshot{}, nil, failure(e)
+				return tempest.Snapshot{}, nil, failure(err)
 			}
-			if len(page) == 0 {
-				break
-			}
-			for _, u := range page {
-				if err := c.sendUpdate(watchCtx, u); err != nil {
-					c.stopWatch(s.ID())
-					return tempest.Snapshot{}, nil, failure(err)
-				}
-			}
-			offset += len(page)
 		}
 	}
 	after := func() {

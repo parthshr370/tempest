@@ -156,7 +156,8 @@ func (s *Server) Acquire(id string) (*tempest.Session, func(), error) {
 	return e.session, func() { once.Do(func() { s.mu.Lock(); e.refs--; e.lastActive = time.Now(); s.mu.Unlock() }) }, nil
 }
 
-// CloseSession aborts and closes a journal before making its ID reopenable.
+// CloseSession permanently retires a session, even if joining its run times out.
+// Its journal stays locked until that run finishes.
 func (s *Server) CloseSession(ctx context.Context, id string) error {
 	s.mu.Lock()
 	e := s.sessions[id]
@@ -168,11 +169,7 @@ func (s *Server) CloseSession(ctx context.Context, id string) error {
 	s.mu.Unlock()
 	err := e.session.Close(ctx)
 	s.mu.Lock()
-	if err == nil {
-		delete(s.sessions, id)
-	} else {
-		e.closing = false
-	}
+	delete(s.sessions, id)
 	s.mu.Unlock()
 	return err
 }
@@ -262,14 +259,11 @@ func (s *Server) reap(now time.Time) {
 	s.mu.Unlock()
 	for _, e := range stale {
 		ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
-		err := e.session.Close(ctx)
+		// Close permanently rejects admission, even when its wait expires.
+		_ = e.session.Close(ctx)
 		cancel()
 		s.mu.Lock()
-		if err == nil {
-			delete(s.sessions, e.session.ID())
-		} else {
-			e.closing = false
-		}
+		delete(s.sessions, e.session.ID())
 		s.mu.Unlock()
 	}
 }
@@ -417,12 +411,29 @@ func (s *Server) shutdown() {
 	default:
 	}
 	s.mu.Lock()
-	for c := range s.connections {
-		_ = c.Close()
+	connections := make([]*rpc.Conn, 0, len(s.connections))
+	for connection := range s.connections {
+		connections = append(connections, connection)
 	}
-	if s.http != nil {
-		_ = s.http.Close()
-	}
+	httpServer := s.http
 	s.mu.Unlock()
+	var drains sync.WaitGroup
+	drainErrors := make(chan error, len(connections))
+	for _, connection := range connections {
+		drains.Go(func() {
+			if err := connection.Drain(ctx); err != nil {
+				drainErrors <- err
+			}
+			_ = connection.Close()
+		})
+	}
+	drains.Wait()
+	close(drainErrors)
+	for err := range drainErrors {
+		s.closeErr = errors.Join(s.closeErr, err)
+	}
+	if httpServer != nil {
+		_ = httpServer.Close()
+	}
 	<-s.reaperDone
 }

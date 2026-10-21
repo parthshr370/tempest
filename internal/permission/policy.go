@@ -57,8 +57,8 @@ type Policy struct {
 	Overrides map[string]Decision
 	// Prompter resolves prompt decisions; nil denies them in headless sessions.
 	Prompter Prompter
-	// promptOverrides distinguishes interactive approval from a configured allow:
-	// only an explicit interactive choice can override the destructive guard.
+	// promptOverrides stores session choices for ordinary asks. Guard asks
+	// never use or set these overrides.
 	promptOverrides map[string]Decision
 }
 
@@ -71,11 +71,11 @@ type Choice string
 const (
 	// AllowOnce approves only the current tool invocation.
 	AllowOnce Choice = "allow_once"
-	// AllowAlways approves subsequent invocations of this tool in this process.
+	// AllowAlways approves subsequent invocations, except destructive guard asks.
 	AllowAlways Choice = "allow_always"
 	// RejectOnce denies only the current tool invocation.
 	RejectOnce Choice = "reject_once"
-	// RejectAlways denies subsequent invocations of this tool in this process.
+	// RejectAlways denies subsequent invocations, except destructive guard asks.
 	RejectAlways Choice = "reject_always"
 )
 

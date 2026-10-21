@@ -86,6 +86,11 @@ type Prompt struct {
 type WatchOptions struct {
 	Buffer   int
 	Approver bool
+	// Replay puts full history and the in-flight message's original chunks in
+	// Snapshot.History, reserving that many extra live queue slots for delivery.
+	// HistoryLen still counts only completed history. Don't append Streaming
+	// again when reconstructing this replay snapshot.
+	Replay bool
 }
 
 // Prompter resolves permission requests. Answer can also resolve a pending request;
@@ -169,11 +174,30 @@ func Open(ctx context.Context, o Options) (*Session, error) { return open(ctx, o
 // ID returns the durable session identifier.
 func (s *Session) ID() string { return s.core.id }
 
-// Prompt runs a new user message on the caller's goroutine.
-func (s *Session) Prompt(ctx context.Context, p Prompt) (RunResult, error) { return s.run(ctx, &p) }
+// Begin registers a prompt before starting its loop. Cancel can see the run as
+// soon as Begin returns; an earlier Cancel while idle doesn't affect it.
+func (s *Session) Begin(ctx context.Context, p Prompt) (*Run, error) { return s.begin(ctx, &p) }
+
+// BeginContinue registers a run without adding a user message.
+func (s *Session) BeginContinue(ctx context.Context) (*Run, error) { return s.begin(ctx, nil) }
+
+// Prompt waits for a newly admitted user message to finish.
+func (s *Session) Prompt(ctx context.Context, p Prompt) (RunResult, error) {
+	run, err := s.Begin(ctx, p)
+	if err != nil {
+		return RunResult{}, err
+	}
+	return run.Wait()
+}
 
 // Continue resumes the current transcript without adding a user message.
-func (s *Session) Continue(ctx context.Context) (RunResult, error) { return s.run(ctx, nil) }
+func (s *Session) Continue(ctx context.Context) (RunResult, error) {
+	run, err := s.BeginContinue(ctx)
+	if err != nil {
+		return RunResult{}, err
+	}
+	return run.Wait()
+}
 
 // Cancel idempotently cancels the session-owned run context.
 func (s *Session) Cancel() { s.cancel() }

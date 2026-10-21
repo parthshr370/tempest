@@ -248,6 +248,10 @@ Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
 permission, budget, and bash-timeout flags supply defaults for new sessions.
 Tools run on the server host, not the client.
 
+SIGINT or SIGTERM stops admission, cancels runs, and flushes journals before
+exit, even if a stdio client keeps stdin open. A second signal exits with
+code 130; `-shutdown-timeout` bounds the graceful wait.
+
 ### Protocol
 
 Initialize first, create or load a session, then prompt. A `session/prompt`
@@ -260,12 +264,17 @@ exact Tempest reason.
 Reconnect with `session/resume` and watch again: an accepted prompt keeps
 running after its connection closes. A slow watcher is dropped with
 `tempest/gap`, never allowed to stall the run; re-watch for a fresh snapshot.
-Use `tempest/history` to page older updates. Frames are limited to 1 MiB.
+Use `tempest/history` to page older updates. Frames are limited to 1 MiB;
+an oversized history page fails with `-32000`, so request a smaller page.
+After compaction, late-attach history shows the compacted view, not the full
+journal transcript.
 
 Permissions arrive as `session/request_permission` requests with
 `allow_once`, `allow_always`, `reject_once`, and `reject_always` choices.
-The first answer wins. Always-choices last only for this server process;
-unanswered asks deny after the permission timeout. Reconnecting approvers
+The first answer wins. Always-choices last only for this session in this
+server process. Destructive-command guard asks treat Always as Once: they
+ask again for each guarded command, regardless of earlier session choices.
+Unanswered asks deny after the permission timeout. Reconnecting approvers
 can watch with `approver:true` and answer pending asks with
 `tempest/permission`. `session/cancel` aborts the run.
 

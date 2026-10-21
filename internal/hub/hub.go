@@ -239,11 +239,24 @@ func (h *Hub) fold(u Update) {
 
 // Watch captures the view and registers the live queue under one lock.
 func (h *Hub) Watch(buf int) (Snapshot, <-chan Update, func()) {
+	return h.watch(buf, false)
+}
+
+// WatchReplay captures the complete replay under the subscription lock. Replay
+// delivery gets its own queue allowance, so it doesn't consume live slack.
+func (h *Hub) WatchReplay(buf int) (Snapshot, <-chan Update, func()) {
+	return h.watch(buf, true)
+}
+
+func (h *Hub) watch(buf int, replay bool) (Snapshot, <-chan Update, func()) {
 	if buf <= 0 {
 		buf = 256
 	}
 	h.mu.Lock()
-	snap := h.snapshot()
+	snap := h.snapshot(replay)
+	if replay {
+		buf += len(snap.History)
+	}
 	ch := make(chan Update, buf)
 	h.next++
 	id := h.next
@@ -267,12 +280,25 @@ func (h *Hub) Watch(buf int) (Snapshot, <-chan Update, func()) {
 }
 
 // Snapshot returns a detached view with at most 200 transcript updates.
-func (h *Hub) Snapshot() Snapshot { h.mu.Lock(); defer h.mu.Unlock(); return h.snapshot() }
-func (h *Hub) snapshot() Snapshot {
+func (h *Hub) Snapshot() Snapshot { h.mu.Lock(); defer h.mu.Unlock(); return h.snapshot(false) }
+func (h *Hub) snapshot(replay bool) Snapshot {
 	s := h.view
 	s.HistoryLen = len(h.history)
 	start := max(0, len(h.history)-200)
-	s.History = cloneUpdates(h.history[start:])
+	streaming := 0
+	if replay {
+		start = 0
+		streaming = len(h.streaming)
+	}
+	s.History = make([]Update, 0, len(h.history)-start+streaming)
+	for _, update := range h.history[start:] {
+		s.History = append(s.History, cloneUpdate(update))
+	}
+	if replay {
+		for _, update := range h.streaming {
+			s.History = append(s.History, cloneUpdate(update))
+		}
+	}
 	if s.Streaming != nil {
 		v := *s.Streaming
 		s.Streaming = &v

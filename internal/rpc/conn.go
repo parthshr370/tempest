@@ -10,6 +10,7 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // MaxFrame is the largest JSON frame we accept or send, excluding the line ending.
@@ -31,6 +32,9 @@ func NewError(code int, name, message string) *Error {
 
 // Handler handles requests and notifications. Its context ends on disconnect.
 type Handler func(context.Context, string, json.RawMessage) (any, *Error)
+
+// Deferred is the long-running part of a synchronously admitted request.
+type Deferred func() (any, *Error)
 
 // Response starts After only once its result has entered the writer queue.
 // Watch handlers use this to keep live events behind their snapshot response.
@@ -61,35 +65,78 @@ type message struct {
 
 // Conn owns one reader and one writer. Start Serve before making outbound calls.
 type Conn struct {
-	transport frameTransport
-	ctx       context.Context
-	cancel    context.CancelFunc
-	once      sync.Once
-	out       chan []byte
-	mu        sync.Mutex
-	pending   map[string]chan message
-	next      atomic.Uint64
+	transport  frameTransport
+	ctx        context.Context
+	cancel     context.CancelFunc
+	once       sync.Once
+	out        chan []byte
+	mu         sync.Mutex
+	pending    map[string]chan message
+	next       atomic.Uint64
+	accepting  bool
+	handlers   sync.WaitGroup
+	writerDone chan struct{}
 }
 
 func newConn(t frameTransport) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message)}
+	c := &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message), accepting: true, writerDone: make(chan struct{})}
+	go c.writeLoop()
+	return c
 }
 
 // Done closes when either transport direction shuts down.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
 
-// Close rejects pending calls and releases the transport.
+// Drain stops admitting requests and waits for their replies to enter the queue.
+// The reader continues correlating responses to outbound calls.
+func (c *Conn) Drain(ctx context.Context) error {
+	c.mu.Lock()
+	c.accepting = false
+	c.mu.Unlock()
+	done := make(chan struct{})
+	go func() { c.handlers.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Close rejects pending calls, drains queued frames for at most one second,
+// then releases the transport, including a blocked writer.
 func (c *Conn) Close() error {
 	var err error
-	c.once.Do(func() { c.cancel(); err = c.transport.close() })
+	c.once.Do(func() {
+		c.cancel()
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case <-c.writerDone:
+		case <-timer.C:
+		}
+		err = c.transport.close()
+	})
 	return err
 }
 
 // Serve reads until EOF. Malformed and oversized frames don't disconnect the peer.
 func (c *Conn) Serve(handler Handler) error {
+	return c.ServeOrdered(func(ctx context.Context, method string, params json.RawMessage) (any, *Error) {
+		return Deferred(func() (any, *Error) {
+			if handler == nil {
+				return nil, NewError(-32601, "method_not_found", "unknown method: "+method)
+			}
+			return handler(ctx, method, params)
+		}), nil
+	})
+}
+
+// ServeOrdered admits requests in read order. Handlers must return promptly;
+// return Deferred for work that can block, including writes and outbound calls.
+func (c *Conn) ServeOrdered(handler Handler) error {
 	defer c.Close()
-	go c.writeLoop()
 	for {
 		data, err := c.transport.read(c.ctx)
 		if errors.Is(err, errOversize) {
@@ -134,13 +181,18 @@ func (c *Conn) Serve(handler Handler) error {
 			_ = c.reply(m.ID, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC request"))
 			continue
 		}
-		go func(m message) {
-			var value any
-			var rpcErr *Error
-			if handler == nil {
-				rpcErr = NewError(-32601, "method_not_found", "unknown method: "+m.Method)
-			} else {
-				value, rpcErr = handler(c.ctx, m.Method, m.Params)
+		c.mu.Lock()
+		if !c.accepting {
+			c.mu.Unlock()
+			continue
+		}
+		c.handlers.Add(1)
+		c.mu.Unlock()
+		value, rpcErr := handler(c.ctx, m.Method, m.Params)
+		go func(m message, value any, rpcErr *Error) {
+			defer c.handlers.Done()
+			if work, ok := value.(Deferred); ok {
+				value, rpcErr = work()
 			}
 			var after func()
 			if response, ok := value.(Response); ok {
@@ -155,7 +207,7 @@ func (c *Conn) Serve(handler Handler) error {
 			if after != nil && c.ctx.Err() == nil {
 				after()
 			}
-		}(m)
+		}(m, value, rpcErr)
 	}
 }
 
@@ -175,19 +227,42 @@ func validID(id json.RawMessage) bool {
 }
 
 func (c *Conn) writeLoop() {
+	defer close(c.writerDone)
+	write := func(frame []byte) bool {
+		if c.transport.write(context.Background(), frame) != nil {
+			c.cancel()
+			_ = c.transport.close()
+			return false
+		}
+		return true
+	}
 	for {
 		select {
 		case <-c.ctx.Done():
-			return
+			for {
+				select {
+				case frame := <-c.out:
+					if !write(frame) {
+						return
+					}
+				default:
+					return
+				}
+			}
 		case frame := <-c.out:
-			if c.transport.write(c.ctx, frame) != nil {
-				_ = c.Close()
+			if !write(frame) {
 				return
 			}
 		}
 	}
 }
 func (c *Conn) send(ctx context.Context, frame []byte) error {
+	if c.ctx.Err() != nil {
+		return ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -271,18 +346,24 @@ func (c *Conn) Call(ctx context.Context, method string, params, result any) erro
 	if err = c.send(ctx, b); err != nil {
 		return err
 	}
+	var response message
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.ctx.Done():
-		return ErrClosed
-	case m := <-ch:
-		if m.Error != nil {
-			return m.Error
+		// EOF may follow the final reply before Call gets scheduled.
+		select {
+		case response = <-ch:
+		default:
+			return ErrClosed
 		}
-		if result == nil {
-			return nil
-		}
-		return json.Unmarshal(m.Result, result)
+	case response = <-ch:
 	}
+	if response.Error != nil {
+		return response.Error
+	}
+	if result == nil {
+		return nil
+	}
+	return json.Unmarshal(response.Result, result)
 }

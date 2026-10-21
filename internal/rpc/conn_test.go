@@ -131,3 +131,57 @@ func TestOutboundFrameReplacement(t *testing.T) {
 		t.Fatalf("response = %s", line)
 	}
 }
+
+func TestCloseDrainsQueuedFrames(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	conn := NewStream(a)
+	const frames = 20
+	for range frames {
+		if err := conn.Notify(context.Background(), "queued", nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	received := make(chan int, 1)
+	go func() {
+		scanner := bufio.NewScanner(b)
+		count := 0
+		for scanner.Scan() {
+			count++
+		}
+		if err := scanner.Err(); err != nil {
+			t.Error(err)
+		}
+		received <- count
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if count := <-received; count != frames {
+		t.Fatalf("received %d of %d queued frames", count, frames)
+	}
+}
+
+func TestCloseBoundsBlockedWriter(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	conn := NewStream(a)
+	if err := conn.Notify(context.Background(), "blocked", nil); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- conn.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hung on a non-reading peer")
+	}
+	select {
+	case <-conn.writerDone:
+	case <-time.After(time.Second):
+		t.Fatal("writer survived transport close")
+	}
+}
