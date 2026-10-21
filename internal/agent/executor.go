@@ -82,7 +82,9 @@ func executeToolCalls(ctx context.Context, currentContext AgentContext, assistan
 }
 
 // executeToolCallsSequential runs tool calls one at a time in source order,
-// emitting start/end per call and breaking early on ctx cancellation.
+// emitting start/end per call. After cancellation the remaining calls still
+// get an "Operation aborted" result without running, so every tool call in the
+// assistant message has exactly one result.
 func executeToolCallsSequential(ctx context.Context, currentContext AgentContext, assistantMessage types.AssistantMessage, toolCalls []types.ContentBlock, config AgentLoopConfig, emit AgentEventSink) (ExecutedToolCallBatch, error) {
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
@@ -110,10 +112,6 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 		}
 		finalizedCalls = append(finalizedCalls, finalized)
 		messages = append(messages, message)
-
-		if ctx.Err() != nil {
-			break
-		}
 	}
 
 	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls)}, nil
@@ -125,8 +123,10 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 //
 // Two-phase: prepare runs sequentially (it does validation + the BeforeToolCall
 // gate which callers may not expect to run concurrently), then the prepared
-// thunks run in parallel via a WaitGroup. safeEmit serializes listener calls
-// so the (single-threaded) event sink contract holds.
+// calls run in parallel and are all joined before this returns. safeEmit
+// serializes sink calls so the (single-threaded) event sink contract holds.
+// Calls prepared after cancellation get an immediate "Operation aborted"
+// result instead of running.
 func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, assistantMessage types.AssistantMessage, toolCalls []types.ContentBlock, config AgentLoopConfig, emit AgentEventSink) (ExecutedToolCallBatch, error) {
 	// safeEmit: parallel goroutines all call emit; the sink (e.g. a stream
 	// Push) is not guaranteed concurrency-safe, so serialize through a mutex.
@@ -140,9 +140,7 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	// slots[i] holds the result for toolCalls[i]; source-order indexing
 	// preserves message order regardless of completion order.
 	slots := make([]finalizedOutcome, len(toolCalls))
-	isPending := make([]bool, len(toolCalls))
 	preps := make([]*preparedToolCall, len(toolCalls))
-	reached := 0
 
 	for i, toolCall := range toolCalls {
 		if err := safeEmit(ctx, ToolExecutionStart(toolCall.ID, toolCall.Name, toolCall.Arguments)); err != nil {
@@ -153,22 +151,12 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		if immediate != nil {
 			finalized := finalizedOutcome{toolCall: toolCall, result: immediate.result, isError: immediate.isError}
 			slots[i] = finalized
-			reached = i + 1
 			if err := emitToolExecutionEnd(ctx, finalized, safeEmit); err != nil {
 				return ExecutedToolCallBatch{}, err
 			}
-			if ctx.Err() != nil {
-				break
-			}
 			continue
 		}
-
 		preps[i] = prepared
-		isPending[i] = true
-		reached = i + 1
-		if ctx.Err() != nil {
-			break
-		}
 	}
 
 	var wg sync.WaitGroup
@@ -185,8 +173,8 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		}
 	}
 
-	for i := 0; i < reached; i++ {
-		if !isPending[i] {
+	for i := range toolCalls {
+		if preps[i] == nil {
 			continue
 		}
 		wg.Add(1)
@@ -204,9 +192,9 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		return ExecutedToolCallBatch{}, firstErr
 	}
 
-	finalizedCalls := make([]finalizedOutcome, 0, reached)
-	messages := make([]types.ToolResultMessage, 0, reached)
-	for i := 0; i < reached; i++ {
+	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
+	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
+	for i := range toolCalls {
 		finalized := slots[i]
 		message := createToolResultMessage(finalized)
 		if err := emitToolResultMessage(ctx, message, safeEmit); err != nil {
@@ -258,6 +246,11 @@ func prepareToolCallArguments(tool AgentTool, toolCall types.ContentBlock) types
 // Panics from PrepareArguments/validation are recovered into an error result so
 // a misbehaving hook can't kill the loop.
 func prepareToolCall(ctx context.Context, currentContext AgentContext, assistantMessage types.AssistantMessage, toolCall types.ContentBlock, config AgentLoopConfig) (prepared *preparedToolCall, immediate *immediateOutcome) {
+	// After an abort, skip validation and the BeforeToolCall gate (which may
+	// prompt a user) for calls that were never going to run.
+	if ctx.Err() != nil {
+		return nil, &immediateOutcome{result: createErrorToolResult("Operation aborted"), isError: true}
+	}
 	var tool AgentTool
 	found := false
 	for _, candidate := range currentContext.Tools {

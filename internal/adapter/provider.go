@@ -163,7 +163,7 @@ func erroredStream(model types.Model, err error) *stream.AssistantStream {
 // slash-prefixed ids ("openai/gpt-4o") keep the Anthropic proxy route the
 // router has always given them, as does anything unrecognized.
 func ResolveProviderForModel(modelID string) string {
-	trimmed := strings.TrimSpace(strings.ToLower(modelID))
+	trimmed := strings.TrimSpace(modelID)
 	// Exact-id lookup first, so aggregator slugs ("z-ai/glm-latest") hit
 	// OpenRouter before the id-shape fallbacks run.
 	for _, prov := range []string{"anthropic", "openai", "google", "openrouter"} {

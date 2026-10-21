@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
@@ -130,9 +133,10 @@ type AgentLoopTurnUpdate struct {
 }
 
 // AgentLoopConfig configures the low-level loop. Hooks return plain values; the
-// loop edge recovers panics.
+// loop edge recovers panics. The embedded [Budget] caps the run.
 type AgentLoopConfig struct {
 	types.SimpleStreamOptions
+	Budget
 	Model         types.Model
 	ToolExecution ToolExecutionMode
 
@@ -145,6 +149,66 @@ type AgentLoopConfig struct {
 	GetFollowUpMessages func() []types.Message
 	BeforeToolCall      func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall       func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
+}
+
+// Budget caps one run. Zero fields are unlimited. The loop checks the budget
+// at turn boundaries (after a turn's tools finish, before the next model
+// call), so a single long turn can overrun MaxWallTime; Abort or a context
+// deadline is the hard stop.
+type Budget struct {
+	// MaxTurns caps model calls in the run.
+	MaxTurns int
+	// MaxCostUSD caps the summed Usage.Cost.Total of the run's model calls.
+	MaxCostUSD float64
+	// MaxWallTime caps elapsed time since the run started.
+	MaxWallTime time.Duration
+}
+
+// ErrUnknownPrice is returned when a cost budget is set for a model whose
+// price is unknown: the budget could never trip, so the run must not start.
+var ErrUnknownPrice = errors.New("model price is unknown")
+
+// Validate rejects negative limits and a cost budget that cannot be enforced
+// for model.
+func (b Budget) Validate(model types.Model) error {
+	if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallTime < 0 {
+		return fmt.Errorf("budget limits must not be negative (max turns %d, max cost %g, max wall time %s)", b.MaxTurns, b.MaxCostUSD, b.MaxWallTime)
+	}
+	if b.MaxCostUSD > 0 && model.Cost.Unknown {
+		return fmt.Errorf("cost budget $%g cannot be enforced for %s/%s: %w", b.MaxCostUSD, model.Provider, model.ID, ErrUnknownPrice)
+	}
+	return nil
+}
+
+// StopReason says why a run ended.
+type StopReason string
+
+const (
+	// StopCompleted: the model produced a turn with no tool calls and no
+	// queued messages were waiting (or ShouldStopAfterTurn asked to stop).
+	StopCompleted StopReason = "completed"
+	// StopAborted: Abort was called or the caller's context was canceled.
+	StopAborted StopReason = "aborted"
+	// StopMaxTurns, StopMaxCost, StopMaxWallTime: a [Budget] limit tripped.
+	StopMaxTurns    StopReason = "max_turns"
+	StopMaxCost     StopReason = "max_cost"
+	StopMaxWallTime StopReason = "max_wall_time"
+	// StopError: the provider failed, a listener failed, or the loop
+	// panicked. [RunResult.Err] carries the cause.
+	StopError StopReason = "error"
+)
+
+// RunResult is how one run ended. Prompt and Continue return it, and the run's
+// agent_end event carries it.
+type RunResult struct {
+	StopReason StopReason
+	// Err is set only when StopReason is StopError.
+	Err error
+	// Turns counts model calls made in this run.
+	Turns int
+	// Usage sums the usage of this run's model calls. Usage.Cost.Unknown is
+	// true when any call's price was unknown, so the total is a lower bound.
+	Usage types.Usage
 }
 
 // AgentEventType is the discriminant for AgentEvent.
@@ -164,9 +228,14 @@ const (
 )
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
-// Type are populated.
+// Type are populated, except Seq and At, which every event carries.
 type AgentEvent struct {
-	Type                  AgentEventType
+	Type AgentEventType
+	// Seq is assigned at emit time and strictly increases in delivery order:
+	// per Agent across all its runs, or per stream for [AgentLoop].
+	Seq uint64
+	// At is the emit time.
+	At                    time.Time
 	Message               types.Message
 	Messages              []types.Message
 	ToolResults           []types.ToolResultMessage
@@ -177,14 +246,20 @@ type AgentEvent struct {
 	Result                any
 	PartialResult         any
 	IsError               bool
+	// RunResult is set on agent_end only.
+	RunResult
 }
 
-// AgentStart constructs an agent_start event.
-func AgentStart() AgentEvent { return AgentEvent{Type: EventAgentStart} }
+// AgentStart constructs an agent_start event. prompts are the run's prompt
+// messages (nil when the run continues an existing transcript).
+func AgentStart(prompts []types.Message) AgentEvent {
+	return AgentEvent{Type: EventAgentStart, Messages: prompts}
+}
 
-// AgentEnd constructs an agent_end event.
-func AgentEnd(messages []types.Message) AgentEvent {
-	return AgentEvent{Type: EventAgentEnd, Messages: messages}
+// AgentEnd constructs an agent_end event carrying the run's new messages and
+// how the run ended.
+func AgentEnd(messages []types.Message, result RunResult) AgentEvent {
+	return AgentEvent{Type: EventAgentEnd, Messages: messages, RunResult: result}
 }
 
 // TurnStart constructs a turn_start event.
@@ -225,5 +300,7 @@ func ToolExecutionEnd(id, name string, result any, isError bool) AgentEvent {
 	return AgentEvent{Type: EventToolExecutionEnd, ToolCallID: id, ToolName: name, Result: result, IsError: isError}
 }
 
-// AgentEventSink consumes events in order; A9 awaits it serially for backpressure.
+// AgentEventSink consumes events in order. The loop calls it synchronously and
+// waits for it to return before continuing, which is what lets a listener
+// record tool_execution_start before the tool runs.
 type AgentEventSink func(ctx context.Context, ev AgentEvent) error

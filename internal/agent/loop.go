@@ -1,19 +1,57 @@
 // Package agent implements the owned agent loop. It runs turns (prompt →
 // assistant stream → tool calls → results → next turn) and surfaces every step
-// as an [AgentEvent] on a stream.
+// as an [AgentEvent]. See loop.go for the turn loop, executor.go for tool
+// dispatch, and runtime.go for the stateful [Agent] wrapper.
 //
-// The loop is self-owned (no framework owns it) and concurrency-native:
-// streaming is a channel, parallel tool dispatch is goroutines + errgroup,
-// and cancellation is [context.Context] threaded everywhere. See
-// internal/agent/loop.go for the turn loop,
-// internal/agent/executor.go for tool dispatch, and internal/agent/runtime.go
-// for the stateful [Agent] wrapper.
+// # Runs
+//
+// A run is one [Agent.Prompt] or [Agent.Continue]. The loop calls the model,
+// executes the tool calls in its reply, feeds the results back, and repeats.
+// The run completes ([StopCompleted]) when the model replies with no tool
+// calls and no steering or follow-up message is queued. It also ends on
+// Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
+// turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime]), or a
+// failure ([StopError]). A run that starts emits agent_start first and exactly
+// one agent_end last; agent_end carries the [RunResult].
+//
+// # Goroutine ownership
+//
+// Context cancellation is a cooperative signal, not a join, so every
+// goroutine a run starts is also joined before the run moves past the step
+// that started it. Nothing a run started can therefore emit after agent_end.
+//
+//   - The run. [Agent.Prompt] and [Agent.Continue] run the loop on the
+//     caller's goroutine; Abort cancels the run context derived from the
+//     caller's. [AgentLoop] and [AgentLoopContinue] start one goroutine that
+//     runs the loop and ends the returned stream after agent_end; the caller
+//     joins it by draining Events or awaiting Result.
+//   - The provider stream. StreamFn starts the provider's producer. It gets a
+//     context derived from the run's, so Abort cancels it, and
+//     streamAssistantResponse drains the stream to its terminal event before
+//     returning, cancelling it first when a listener failure cuts the turn
+//     short. The result is the turn's final assistant message.
+//   - Parallel tools. executeToolCallsParallel starts one goroutine per
+//     prepared call with the run context, each writing its result into a slot
+//     indexed by source order, and waits for all of them before returning.
+//     A tool that ignores its context blocks that wait: the loop waits rather
+//     than leak a goroutine that could still touch the run. Sequential tools
+//     run on the loop goroutine.
+//   - Tool progress. A tool may call onUpdate from goroutines it starts.
+//     executePreparedToolCall stops accepting updates when Execute returns and
+//     waits for in-flight updates, so no update outlives tool_execution_end.
+//
+// Event delivery is serialized: [Agent] holds one emit lock across stamping
+// Seq/At and the listener fan-out, so listeners are never called concurrently
+// and see Seq in strictly increasing order.
 package agent
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
@@ -34,24 +72,30 @@ func createAgentStream() *stream.Stream[AgentEvent, []types.Message] {
 	)
 }
 
-// AgentLoop runs a fresh agent run from prompts, returning a stream of events
-// that terminates with an agent_end carrying the new messages. It is the
-// primary entry point; the loop body runs on a goroutine and the caller ranges
-// over Events() / awaits Result.
-func AgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentContext, config AgentLoopConfig, streamFn StreamFn) *stream.Stream[AgentEvent, []types.Message] {
-	s := createAgentStream()
-	emit := func(ctx context.Context, ev AgentEvent) error {
+// streamSink returns a sink that stamps Seq/At and pushes onto s. The mutex
+// keeps stamping and pushing atomic so Seq order matches delivery order when
+// parallel tools emit.
+func streamSink(s *stream.Stream[AgentEvent, []types.Message]) AgentEventSink {
+	var mu sync.Mutex
+	var seq uint64
+	return func(ctx context.Context, ev AgentEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seq++
+		ev.Seq = seq
+		ev.At = time.Now()
 		s.Push(ev)
 		return nil
 	}
+}
 
-	go func() {
-		messages, _ := runAgentLoop(ctx, prompts, agentContext, config, emit, streamFn)
-		// EndWith, not End, resolves the stream with the message list (so
-		// Result() returns it). A plain End would resolve to ErrNoResult.
-		s.EndWith(messages)
-	}()
-
+// AgentLoop runs a fresh agent run from prompts, returning a stream of events
+// that terminates with an agent_end carrying the new messages. The loop body
+// runs on a goroutine and the caller ranges over Events() / awaits Result;
+// the run always emits agent_end, which ends the stream.
+func AgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentContext, config AgentLoopConfig, streamFn StreamFn) *stream.Stream[AgentEvent, []types.Message] {
+	s := createAgentStream()
+	go runAgentLoop(ctx, prompts, agentContext, config, streamSink(s), streamFn)
 	return s
 }
 
@@ -60,89 +104,168 @@ func AgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentC
 // immediately try to stream another assistant response from nothing). Returns
 // an error up front when the resume precondition is violated.
 func AgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, streamFn StreamFn) (*stream.Stream[AgentEvent, []types.Message], error) {
-	if len(agentContext.Messages) == 0 {
-		return nil, errors.New("Cannot continue: no messages in context")
+	if err := checkContinuable(agentContext.Messages); err != nil {
+		return nil, err
 	}
-	if agentContext.Messages[len(agentContext.Messages)-1].Role() == "assistant" {
-		return nil, errors.New("Cannot continue from message role: assistant")
-	}
-
 	s := createAgentStream()
-	emit := func(ctx context.Context, ev AgentEvent) error {
-		s.Push(ev)
-		return nil
-	}
-
-	go func() {
-		messages, _ := runAgentLoopContinue(ctx, agentContext, config, emit, streamFn)
-		s.EndWith(messages)
-	}()
-
+	go runAgentLoopContinue(ctx, agentContext, config, streamSink(s), streamFn)
 	return s, nil
 }
 
-// runAgentLoop is the synchronous core behind [AgentLoop]: emits agent_start,
-// seeds the prompt messages, then enters [runLoop].
-func runAgentLoop(ctx context.Context, prompts []types.Message, context AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, error) {
-	newMessages := append([]types.Message{}, prompts...)
-	currentContext := context
-	currentContext.Messages = append(append([]types.Message{}, context.Messages...), prompts...)
-
-	if err := emit(ctx, AgentStart()); err != nil {
-		return newMessages, err
+// checkContinuable rejects transcripts a continuation cannot resume from.
+func checkContinuable(messages []types.Message) error {
+	if len(messages) == 0 {
+		return errors.New("Cannot continue: no messages in context")
 	}
-	if err := emit(ctx, TurnStart()); err != nil {
-		return newMessages, err
+	if messages[len(messages)-1].Role() == "assistant" {
+		return errors.New("Cannot continue from message role: assistant")
 	}
-	for _, prompt := range prompts {
-		if err := emit(ctx, MessageStart(prompt)); err != nil {
-			return newMessages, err
-		}
-		if err := emit(ctx, MessageEnd(prompt)); err != nil {
-			return newMessages, err
-		}
-	}
-
-	return runLoop(ctx, currentContext, newMessages, config, emit, streamFn)
+	return nil
 }
 
-// runAgentLoopContinue is the synchronous core behind [AgentLoopContinue].
-func runAgentLoopContinue(ctx context.Context, context AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, error) {
-	if len(context.Messages) == 0 {
-		return nil, errors.New("Cannot continue: no messages in context")
-	}
-	if context.Messages[len(context.Messages)-1].Role() == "assistant" {
-		return nil, errors.New("Cannot continue from message role: assistant")
-	}
-
-	newMessages := []types.Message{}
-	currentContext := context
-
-	if err := emit(ctx, AgentStart()); err != nil {
-		return newMessages, err
-	}
-	if err := emit(ctx, TurnStart()); err != nil {
-		return newMessages, err
-	}
-
-	return runLoop(ctx, currentContext, newMessages, config, emit, streamFn)
+// runAgentLoop is the synchronous core behind [AgentLoop] and [Agent.Prompt]:
+// one run that starts by appending prompts to the transcript.
+func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
+	run := &loopRun{config: config, emit: emit, streamFn: streamFn, started: time.Now()}
+	return run.execute(ctx, prompts, func() error {
+		current := agentContext
+		current.Messages = append([]types.Message{}, agentContext.Messages...)
+		if err := emit(ctx, TurnStart()); err != nil {
+			return err
+		}
+		if err := run.appendMessages(ctx, &current, prompts); err != nil {
+			return err
+		}
+		return run.turns(ctx, current)
+	})
 }
 
-// runLoop is the core outer/inner turn loop.
+// runAgentLoopContinue is the synchronous core behind [AgentLoopContinue] and
+// [Agent.Continue]: one run over the existing transcript. Callers ensure the
+// transcript is non-empty and does not end with an assistant message.
+func runAgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
+	run := &loopRun{config: config, emit: emit, streamFn: streamFn, started: time.Now()}
+	return run.execute(ctx, nil, func() error {
+		if err := emit(ctx, TurnStart()); err != nil {
+			return err
+		}
+		return run.turns(ctx, agentContext)
+	})
+}
+
+// loopRun is the state of one run inside the loop.
+type loopRun struct {
+	config   AgentLoopConfig
+	emit     AgentEventSink
+	streamFn StreamFn
+	started  time.Time
+	// messages are the messages this run added to the transcript.
+	messages []types.Message
+	result   RunResult
+}
+
+// execute emits agent_start, runs body, then emits the run's single agent_end.
+// body records how the run ended in run.result.StopReason or returns the
+// error that ended it. A panic in body is converted to StopError (the loop
+// edge is the one place hooks and providers can take the run down), so
+// agent_end is still emitted.
+func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body func() error) ([]types.Message, RunResult) {
+	err := run.emit(ctx, AgentStart(prompts))
+	if err == nil {
+		err = runRecoveringPanic(body)
+	}
+	switch {
+	case err == nil:
+	case ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
+		run.result.StopReason = StopAborted
+	default:
+		run.result.StopReason = StopError
+		run.result.Err = err
+	}
+	// agent_end must reach listeners after an abort too, so it is delivered
+	// under a context that is not canceled.
+	if err := run.emit(context.WithoutCancel(ctx), AgentEnd(run.messages, run.result)); err != nil {
+		// The run's outcome is already published, but a failed agent_end
+		// listener (e.g. the journal) must not report success to the caller.
+		run.result.StopReason = StopError
+		run.result.Err = errors.Join(run.result.Err, fmt.Errorf("agent_end listener: %w", err))
+	}
+	return run.messages, run.result
+}
+
+// runRecoveringPanic runs body and converts a panic into an error carrying the
+// panic value.
+func runRecoveringPanic(body func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("agent loop panic: %s", recoveredMessage(recovered))
+		}
+	}()
+	return body()
+}
+
+// appendMessages emits start/end for messages and adds them to the transcript.
+func (run *loopRun) appendMessages(ctx context.Context, current *AgentContext, messages []types.Message) error {
+	for _, message := range messages {
+		if err := run.emit(ctx, MessageStart(message)); err != nil {
+			return err
+		}
+		if err := run.emit(ctx, MessageEnd(message)); err != nil {
+			return err
+		}
+		current.Messages = append(current.Messages, message)
+		run.messages = append(run.messages, message)
+	}
+	return nil
+}
+
+// boundaryStop decides at a turn boundary whether the run must end before the
+// next model call. Cancellation wins over budgets because it is the caller's
+// explicit intent.
+func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
+	if ctx.Err() != nil {
+		return StopAborted, nil
+	}
+	budget := run.config.Budget
+	if budget.MaxTurns > 0 && run.result.Turns >= budget.MaxTurns {
+		return StopMaxTurns, nil
+	}
+	if budget.MaxCostUSD > 0 {
+		// PrepareNextTurn can switch to a model whose price is unknown; the
+		// budget can no longer be enforced, which is a failure, not free.
+		if run.result.Usage.Cost.Unknown {
+			return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", budget.MaxCostUSD, ErrUnknownPrice)
+		}
+		if run.result.Usage.Cost.Total >= budget.MaxCostUSD {
+			return StopMaxCost, nil
+		}
+	}
+	if budget.MaxWallTime > 0 && time.Since(run.started) >= budget.MaxWallTime {
+		return StopMaxWallTime, nil
+	}
+	return "", nil
+}
+
+// turns is the core outer/inner turn loop.
 //
 // Outer loop: turns grouped by tool-batch termination; an inner turn streams an
 // assistant response, executes its tool calls, appends results, then either
 // continues (more tool calls expected) or hands control to follow-up messages.
-// Steering messages are drained at the top of each inner iteration; follow-ups
+// Steering messages are drained at the end of each inner iteration; follow-ups
 // at the bottom of each outer iteration. PrepareNextTurn can swap the context/
 // model/thinking between turns; ShouldStopAfterTurn can short-circuit the run.
 //
-// An error/aborted stop reason on the assistant message terminates immediately
-// (no tool execution) so a truncated stream doesn't leave dangling tool calls.
-func runLoop(ctx context.Context, currentContext AgentContext, newMessages []types.Message, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, error) {
-	turn := 0
+// Every turn after the first starts at a boundary where cancellation and the
+// budget are checked. Messages already drained from the queues are appended
+// to the transcript even when the boundary ends the run, so accepted input is
+// never dropped; Continue picks them up.
+//
+// An error/aborted stop reason on the assistant message ends the run without
+// executing tools, so a truncated stream doesn't run half-formed tool calls.
+func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
+	config := &run.config
 	firstTurn := true
-	pendingMessages := []types.Message(nil)
+	var pendingMessages []types.Message
 	if config.GetSteeringMessages != nil {
 		pendingMessages = config.GetSteeringMessages()
 	}
@@ -151,137 +274,135 @@ func runLoop(ctx context.Context, currentContext AgentContext, newMessages []typ
 		hasMoreToolCalls := true
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
-			turn++
-			slog.Info("agent turn", "turn", turn)
 			if !firstTurn {
-				if err := emit(ctx, TurnStart()); err != nil {
-					return newMessages, err
-				}
-			} else {
-				firstTurn = false
-			}
-
-			if len(pendingMessages) > 0 {
-				for _, message := range pendingMessages {
-					if err := emit(ctx, MessageStart(message)); err != nil {
-						return newMessages, err
+				stop, err := run.boundaryStop(ctx)
+				if stop != "" || err != nil {
+					if appendErr := run.appendMessages(ctx, &current, pendingMessages); appendErr != nil {
+						return appendErr
 					}
-					if err := emit(ctx, MessageEnd(message)); err != nil {
-						return newMessages, err
-					}
-					currentContext.Messages = append(currentContext.Messages, message)
-					newMessages = append(newMessages, message)
+					run.result.StopReason = stop
+					return err
 				}
-				pendingMessages = nil
+				if err := run.emit(ctx, TurnStart()); err != nil {
+					return err
+				}
 			}
+			firstTurn = false
+			run.result.Turns++
+			slog.Info("agent turn", "turn", run.result.Turns)
 
-			message, err := streamAssistantResponse(ctx, &currentContext, config, emit, streamFn)
+			if err := run.appendMessages(ctx, &current, pendingMessages); err != nil {
+				return err
+			}
+			pendingMessages = nil
+
+			message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn)
+			run.result.Usage.Add(message.Usage)
 			if err != nil {
-				return newMessages, err
+				return err
 			}
-			newMessages = append(newMessages, message)
+			run.messages = append(run.messages, message)
 
 			if message.StopReason == types.StopError || message.StopReason == types.StopAborted {
-				// Truncated/aborted stream: end the turn AND the run without
-				// attempting tool execution — the assistant message may be
-				// incomplete and its tool calls would be half-formed.
-				if err := emit(ctx, TurnEnd(message, []types.ToolResultMessage{})); err != nil {
-					return newMessages, err
+				if err := run.emit(ctx, TurnEnd(message, []types.ToolResultMessage{})); err != nil {
+					return err
 				}
-				if err := emit(ctx, AgentEnd(newMessages)); err != nil {
-					return newMessages, err
+				if message.StopReason == types.StopAborted {
+					run.result.StopReason = StopAborted
+					return nil
 				}
-				return newMessages, nil
-			}
-
-			toolCalls := []types.ContentBlock{}
-			for _, content := range message.Content {
-				if content.Type == types.BlockToolCall {
-					toolCalls = append(toolCalls, content)
-				}
+				return providerError(message)
 			}
 
 			toolResults := []types.ToolResultMessage{}
 			hasMoreToolCalls = false
-			if len(toolCalls) > 0 {
-				executedToolBatch, err := executeToolCalls(ctx, currentContext, message, config, emit)
+			if hasToolCalls(message) {
+				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
 				if err != nil {
-					return newMessages, err
+					return err
 				}
-				toolResults = append(toolResults, executedToolBatch.Messages...)
+				toolResults = executedToolBatch.Messages
 				// A batch terminates the turn only when EVERY result sets
 				// Terminate — a single non-terminating result means the model
 				// expects another round.
 				hasMoreToolCalls = !executedToolBatch.Terminate
-
 				for _, result := range toolResults {
-					currentContext.Messages = append(currentContext.Messages, result)
-					newMessages = append(newMessages, result)
+					current.Messages = append(current.Messages, result)
+					run.messages = append(run.messages, result)
 				}
 			}
 
-			if err := emit(ctx, TurnEnd(message, toolResults)); err != nil {
-				return newMessages, err
+			if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
+				return err
 			}
 
-			if config.PrepareNextTurn != nil {
-				nextTurnSnapshot := config.PrepareNextTurn(ShouldStopAfterTurnContext{
-					Message:     message,
-					ToolResults: toolResults,
-					Context:     currentContext,
-					NewMessages: newMessages,
-				})
-				if nextTurnSnapshot != nil {
-					if nextTurnSnapshot.Context != nil {
-						currentContext = *nextTurnSnapshot.Context
-					}
-					if nextTurnSnapshot.Model != nil {
-						config.Model = *nextTurnSnapshot.Model
-					}
-					// ThinkingOff explicitly clears reasoning (not the same as
-					// leaving it unset, which would preserve the prior level).
-					if nextTurnSnapshot.ThinkingLevel == ThinkingOff {
-						config.Reasoning = ""
-					} else if nextTurnSnapshot.ThinkingLevel != "" {
-						config.Reasoning = string(nextTurnSnapshot.ThinkingLevel)
-					}
-				}
-			}
-
-			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(ShouldStopAfterTurnContext{
+			turnContext := ShouldStopAfterTurnContext{
 				Message:     message,
 				ToolResults: toolResults,
-				Context:     currentContext,
-				NewMessages: newMessages,
-			}) {
-				if err := emit(ctx, AgentEnd(newMessages)); err != nil {
-					return newMessages, err
+				Context:     current,
+				NewMessages: run.messages,
+			}
+			if config.PrepareNextTurn != nil {
+				if update := config.PrepareNextTurn(turnContext); update != nil {
+					applyTurnUpdate(config, &current, update)
+					turnContext.Context = current
 				}
-				return newMessages, nil
 			}
 
-			pendingMessages = nil
+			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(turnContext) {
+				run.result.StopReason = StopCompleted
+				return nil
+			}
+
 			if config.GetSteeringMessages != nil {
 				pendingMessages = config.GetSteeringMessages()
 			}
 		}
 
-		followUpMessages := []types.Message(nil)
 		if config.GetFollowUpMessages != nil {
-			followUpMessages = config.GetFollowUpMessages()
+			pendingMessages = config.GetFollowUpMessages()
 		}
-		if len(followUpMessages) > 0 {
-			pendingMessages = followUpMessages
-			continue
+		if len(pendingMessages) == 0 {
+			run.result.StopReason = StopCompleted
+			return nil
 		}
-
-		break
 	}
+}
 
-	if err := emit(ctx, AgentEnd(newMessages)); err != nil {
-		return newMessages, err
+// applyTurnUpdate applies a PrepareNextTurn update to the next turn's state.
+func applyTurnUpdate(config *AgentLoopConfig, current *AgentContext, update *AgentLoopTurnUpdate) {
+	if update.Context != nil {
+		*current = *update.Context
 	}
-	return newMessages, nil
+	if update.Model != nil {
+		config.Model = *update.Model
+	}
+	// ThinkingOff explicitly clears reasoning (not the same as leaving it
+	// unset, which would preserve the prior level).
+	if update.ThinkingLevel == ThinkingOff {
+		config.Reasoning = ""
+	} else if update.ThinkingLevel != "" {
+		config.Reasoning = string(update.ThinkingLevel)
+	}
+}
+
+// hasToolCalls reports whether the assistant message requests any tool call.
+func hasToolCalls(message types.AssistantMessage) bool {
+	for _, content := range message.Content {
+		if content.Type == types.BlockToolCall {
+			return true
+		}
+	}
+	return false
+}
+
+// providerError is the run error for an assistant message that ended in
+// StopError.
+func providerError(message types.AssistantMessage) error {
+	if message.ErrorMessage == "" {
+		return fmt.Errorf("provider %s/%s failed without an error message", message.Provider, message.Model)
+	}
+	return fmt.Errorf("provider %s/%s: %s", message.Provider, message.Model, message.ErrorMessage)
 }
 
 // snapshotAssistant returns a copy of m whose Content slice (and each tool-call's
@@ -312,6 +433,10 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // [AssistantMessage], and emits message_start/update/end events. The partial
 // is appended to the context messages on start and overwritten on each update
 // so a downstream turn sees the live, growing message.
+//
+// The provider stream is always drained to its end before this returns. When
+// a listener failure cuts the turn short, the stream is cancelled first so the
+// provider's producer stops instead of running on unobserved.
 func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) (types.AssistantMessage, error) {
 	messages := cctx.Messages
 	if config.TransformContext != nil {
@@ -338,7 +463,13 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 
 	options := config.SimpleStreamOptions
 	options.APIKey = resolvedAPIKey
-	response := streamFn(ctx, config.Model, llmContext, &options)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	response := streamFn(streamCtx, config.Model, llmContext, &options)
+	defer func() {
+		cancelStream()
+		for range response.Events() {
+		}
+	}()
 
 	builder := types.NewAssistantBuilder(config.Model.API, config.Model.Provider, config.Model.ID)
 	addedPartial := false

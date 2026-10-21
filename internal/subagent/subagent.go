@@ -230,10 +230,9 @@ func (r *Runner) Execute(ctx context.Context, _ string, params json.RawMessage, 
 	})
 	defer unsubscribe()
 
-	if err := child.PromptText(ctx, input.Prompt); err != nil {
+	if _, err := child.PromptText(ctx, input.Prompt); err != nil {
 		return agent.AgentToolResult{}, err
 	}
-	child.WaitForIdle()
 	state := child.State()
 	if state.ErrorMessage != "" {
 		return agent.AgentToolResult{}, errors.New(state.ErrorMessage)

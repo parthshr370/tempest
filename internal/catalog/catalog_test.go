@@ -1,12 +1,48 @@
 package catalog
 
-import "testing"
+import (
+	"encoding/json"
+	"net/url"
+	"testing"
+	"time"
+)
 
 // TestEmbeddedCatalogParses guards the invariant that a runtime call can
 // never fail: the embedded JSON must unmarshal and carry real content. The
 // accessors swallow parse errors by design, so this test is the only place a
 // malformed models.json surfaces.
 func TestEmbeddedCatalogParses(t *testing.T) {
+	var decoded file
+	if err := json.Unmarshal(embedded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := time.Parse(time.DateOnly, decoded.Provenance.AsOf); err != nil {
+		t.Fatalf("invalid provenance as_of: %v", err)
+	}
+	if u, err := url.ParseRequestURI(decoded.Provenance.GeneratedFrom); err != nil || u.Scheme != "https" {
+		t.Fatal("missing provenance generated_from URL")
+	}
+	var raw struct {
+		Models []struct {
+			Cost map[string]*float64 `json:"cost"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(embedded, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range decoded.Models {
+		if u, err := url.ParseRequestURI(m.Source); err != nil || u.Scheme != "https" {
+			t.Fatalf("%s: missing source URL", m.ID)
+		}
+		if _, err := time.Parse(time.DateOnly, m.VerifiedAt); err != nil {
+			t.Fatalf("%s: invalid verified_at: %v", m.ID, err)
+		}
+		for _, component := range []string{"input", "output", "cacheRead", "cacheWrite"} {
+			if raw.Models[i].Cost[component] == nil {
+				t.Fatalf("%s: missing %s price", m.ID, component)
+			}
+		}
+	}
 	if AsOf() == "" {
 		t.Fatal("catalog as_of stamp is empty")
 	}

@@ -99,7 +99,13 @@ type AgentOptions struct {
 	FollowUpMode  QueueMode
 	SessionID     string
 	ToolExecution ToolExecutionMode
+	// Budget caps each run; see [Agent.SetBudget].
+	Budget Budget
 }
+
+// ErrRunActive is returned by Prompt and Continue while a run is in progress.
+// Queue input with Steer or FollowUp, or wait with WaitForIdle.
+var ErrRunActive = errors.New("agent: a run is already active")
 
 // activeRun represents one in-flight agent run. done closes when the run
 // settles (finishRun); cancel aborts it (Abort). Both always set or always nil
@@ -118,17 +124,17 @@ type agentListener struct {
 }
 
 // Agent is the stateful wrapper around the low-level loop. It implements the
-// public runtime API: Prompt (start a new turn), Continue (resume from a
-// transcript), Abort (cancel the in-flight turn), Reset (clear conversation),
+// public runtime API: Prompt (start a run), Continue (resume from a
+// transcript), Abort (cancel the in-flight run), Reset (clear conversation),
 // and State (snapshot public observables).
 //
-// Concurrency: mu guards ALL mutable state (state, queues, activeRun,
-// listeners, eventErr). An active run is enforced by a nil check under mu
-// (single-run guard — a second Prompt/Continue while active returns a busy
-// error). Listener fan-out happens OUTSIDE mu (processEvents copies the
-// listener slice under mu, then iterates without holding the lock) so a slow
-// listener cannot block state mutations. Abort cancels the run context without
-// needing mu (the cancel func is immutable after startRunLocked).
+// Concurrency: mu guards all mutable state (state, queues, activeRun,
+// listeners, budget). A second Prompt/Continue while a run is active returns
+// [ErrRunActive]. emitMu serializes event delivery: it is held across
+// stamping Seq/At and the listener fan-out, so listeners never run
+// concurrently and see Seq in delivery order. mu is released before the
+// fan-out, so a listener may call State and the other mu-guarded methods.
+// A listener must not start a run (Prompt/Continue return ErrRunActive).
 type Agent struct {
 	mu            sync.Mutex
 	state         MutableAgentState
@@ -137,7 +143,11 @@ type Agent struct {
 	steeringQueue PendingMessageQueue
 	followUpQueue PendingMessageQueue
 	activeRun     *activeRun
-	eventErr      error
+	budget        Budget
+
+	emitMu sync.Mutex
+	// seq is the last Seq handed out; guarded by emitMu.
+	seq uint64
 
 	ConvertToLlm               func([]types.Message) []types.Message
 	TransformContext           func(ctx context.Context, msgs []types.Message) []types.Message
@@ -235,6 +245,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		followUpQueue:              PendingMessageQueue{Mode: followUpMode},
 		SessionID:                  opts.SessionID,
 		ToolExecution:              toolExecution,
+		budget:                     opts.Budget,
 	}
 }
 
@@ -331,8 +342,10 @@ func (a *Agent) HasQueuedMessages() bool {
 	return a.steeringQueue.HasItems() || a.followUpQueue.HasItems()
 }
 
-// Abort cancels the in-flight run by calling its context's CancelFunc. Safe
-// to call without holding mu (the cancel func is immutable after being set).
+// Abort cancels the in-flight run's context. The run's Prompt/Continue
+// returns only after the loop has joined everything the run started (provider
+// stream, tool goroutines) and emitted agent_end with [StopAborted]; tools
+// that ignore their context delay that return.
 func (a *Agent) Abort() {
 	a.mu.Lock()
 	active := a.activeRun
@@ -340,6 +353,14 @@ func (a *Agent) Abort() {
 	if active != nil {
 		active.cancel()
 	}
+}
+
+// SetBudget sets the budget for runs started after the call. The zero Budget
+// is unlimited.
+func (a *Agent) SetBudget(budget Budget) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.budget = budget
 }
 
 // WaitForIdle blocks until the current run finishes (or returns immediately
@@ -424,17 +445,26 @@ func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 	a.state.ThinkingLevel = level
 }
 
-// Prompt starts a new run with the given messages as the prompt. Returns
-// immediately if the agent is already processing (uses the provided busy
-// error). Blocks the calling goroutine until the run settles.
-func (a *Agent) Prompt(ctx context.Context, messages ...types.Message) error {
-	return a.runPromptMessages(ctx, messages, false, errors.New("Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion."))
+// Prompt runs one run with messages as the prompt and blocks until it ends.
+// The error is non-nil only when no run started: [ErrRunActive], a nil
+// StreamFn, or a budget that cannot be enforced ([Budget.Validate]). How a
+// started run ended, including [StopError], is in the [RunResult].
+func (a *Agent) Prompt(ctx context.Context, messages ...types.Message) (RunResult, error) {
+	a.mu.Lock()
+	if err := a.startableLocked(); err != nil {
+		a.mu.Unlock()
+		return RunResult{}, err
+	}
+	return a.runLocked(ctx, false, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+		_, result := runAgentLoop(runCtx, messages, snapshot, config, a.processEvents, streamFn)
+		return result
+	})
 }
 
 // PromptText is a convenience wrapper that wraps a text string in a user
 // message and calls [Agent.Prompt]. Optional image blocks are appended to
 // the content.
-func (a *Agent) PromptText(ctx context.Context, text string, images ...types.ContentBlock) error {
+func (a *Agent) PromptText(ctx context.Context, text string, images ...types.ContentBlock) (RunResult, error) {
 	content := []types.ContentBlock{types.NewText(text)}
 	if len(images) > 0 {
 		content = append(content, images...)
@@ -442,148 +472,112 @@ func (a *Agent) PromptText(ctx context.Context, text string, images ...types.Con
 	return a.Prompt(ctx, types.UserMessage{Content: types.BlockContent(content...), Timestamp: time.Now().UnixMilli()})
 }
 
-// Continue resumes from the current transcript. If the last message is an
-// assistant message, it checks for queued steering/follow-up messages and
-// feeds them as new turns; otherwise it runs [AgentLoopContinue]. Returns
-// an error immediately if a run is already in progress.
-func (a *Agent) Continue(ctx context.Context) error {
+// Continue runs one run from the current transcript. When the last message is
+// from the assistant, queued steering (else follow-up) messages become the
+// run's prompt; with nothing queued that is an error. The error contract
+// matches [Agent.Prompt].
+func (a *Agent) Continue(ctx context.Context) (RunResult, error) {
 	a.mu.Lock()
-	if a.activeRun != nil {
+	if err := a.startableLocked(); err != nil {
 		a.mu.Unlock()
-		return errors.New("Agent is already processing. Wait for completion before continuing.")
+		return RunResult{}, err
 	}
 	if len(a.state.Messages) == 0 {
 		a.mu.Unlock()
-		return errors.New("No messages to continue from")
+		return RunResult{}, errors.New("No messages to continue from")
 	}
-	lastMessage := a.state.Messages[len(a.state.Messages)-1]
-	if lastMessage.Role() == "assistant" {
-		queuedSteering := a.steeringQueue.Drain()
-		if len(queuedSteering) > 0 {
-			runCtx := a.startRunLocked(ctx)
-			a.mu.Unlock()
-			return a.runStarted(runCtx, func(runCtx context.Context) error {
-				if a.StreamFn == nil {
-					return errors.New("Agent streamFn is nil")
-				}
-				_, err := runAgentLoop(runCtx, queuedSteering, a.createContextSnapshot(), a.createLoopConfig(true), a.processEvents, a.StreamFn)
-				if err != nil {
-					return err
-				}
-				return a.takeEventErr()
-			})
-		}
+	if a.state.Messages[len(a.state.Messages)-1].Role() != "assistant" {
+		return a.runLocked(ctx, false, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+			_, result := runAgentLoopContinue(runCtx, snapshot, config, a.processEvents, streamFn)
+			return result
+		})
+	}
 
-		queuedFollowUps := a.followUpQueue.Drain()
-		if len(queuedFollowUps) > 0 {
-			runCtx := a.startRunLocked(ctx)
-			a.mu.Unlock()
-			return a.runStarted(runCtx, func(runCtx context.Context) error {
-				if a.StreamFn == nil {
-					return errors.New("Agent streamFn is nil")
-				}
-				_, err := runAgentLoop(runCtx, queuedFollowUps, a.createContextSnapshot(), a.createLoopConfig(false), a.processEvents, a.StreamFn)
-				if err != nil {
-					return err
-				}
-				return a.takeEventErr()
-			})
-		}
-
+	// Steering drained here must not be polled again as the run's first
+	// steering check, hence skipInitialSteeringPoll.
+	queued, skipInitialSteeringPoll := a.steeringQueue.Drain(), true
+	if len(queued) == 0 {
+		queued, skipInitialSteeringPoll = a.followUpQueue.Drain(), false
+	}
+	if len(queued) == 0 {
 		a.mu.Unlock()
-		return errors.New("Cannot continue from message role: assistant")
+		return RunResult{}, errors.New("Cannot continue from message role: assistant")
 	}
-	a.mu.Unlock()
-
-	return a.runContinuation(ctx)
-}
-
-// runPromptMessages is the implementation behind Prompt: acquires the run slot
-// via runWithLifecycle, then runs the low-level loop. skipInitialSteeringPoll
-// suppresses the first steering-message poll so the initial prompt doesn't
-// consume queued steering messages before the run begins.
-func (a *Agent) runPromptMessages(ctx context.Context, messages []types.Message, skipInitialSteeringPoll bool, busyErr error) error {
-	return a.runWithLifecycle(ctx, busyErr, func(runCtx context.Context) error {
-		if a.StreamFn == nil {
-			return errors.New("Agent streamFn is nil")
-		}
-		_, err := runAgentLoop(runCtx, messages, a.createContextSnapshot(), a.createLoopConfig(skipInitialSteeringPoll), a.processEvents, a.StreamFn)
-		if err != nil {
-			return err
-		}
-		return a.takeEventErr()
+	return a.runLocked(ctx, skipInitialSteeringPoll, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+		_, result := runAgentLoop(runCtx, queued, snapshot, config, a.processEvents, streamFn)
+		return result
 	})
 }
 
-// runContinuation runs [AgentLoopContinue] under the lifecycle wrapper.
-func (a *Agent) runContinuation(ctx context.Context) error {
-	return a.runWithLifecycle(ctx, errors.New("Agent is already processing. Wait for completion before continuing."), func(runCtx context.Context) error {
-		if a.StreamFn == nil {
-			return errors.New("Agent streamFn is nil")
-		}
-		_, err := runAgentLoopContinue(runCtx, a.createContextSnapshot(), a.createLoopConfig(false), a.processEvents, a.StreamFn)
-		if err != nil {
-			return err
-		}
-		return a.takeEventErr()
-	})
+// startableLocked reports why a run cannot start now, or nil. Caller holds mu.
+func (a *Agent) startableLocked() error {
+	if a.activeRun != nil {
+		return ErrRunActive
+	}
+	if a.StreamFn == nil {
+		return errors.New("Agent streamFn is nil")
+	}
+	return a.budget.Validate(a.state.Model)
 }
 
-// createContextSnapshot captures a copy of the current state for the loop.
-// Called under Agent.mu.
-func (a *Agent) createContextSnapshot() AgentContext {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return AgentContext{
+// runBody runs the loop for one run under the claimed run slot.
+type runBody func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult
+
+// runLocked claims the run slot, releases mu, and runs body to completion.
+// Caller holds mu and has checked startableLocked. The run context derives
+// from ctx so Abort cancels the run without canceling the caller's context.
+func (a *Agent) runLocked(ctx context.Context, skipInitialSteeringPoll bool, body runBody) (RunResult, error) {
+	snapshot := AgentContext{
 		SystemPrompt: a.state.SystemPrompt,
 		Messages:     copyAgentMessages(a.state.Messages),
 		Tools:        copyAgentTools(a.state.Tools),
 	}
-}
-
-// createLoopConfig builds the [AgentLoopConfig] for one run. It reads the
-// current state values under mu, then constructs closures that drain the
-// steering/follow-up queues on each turn.
-//
-// skipInitialSteeringPoll suppresses the first GetSteeringMessages call so
-// the initial prompt isn't accompanied by queued steering. The suppression
-// is a one-shot bool captured by the GetSteeringMessages closure — it flips
-// to false after the first drain.
-func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
-	a.mu.Lock()
-	model := a.state.Model
-	thinkingLevel := a.state.ThinkingLevel
-	toolExecution := a.ToolExecution
-	convertToLlm := a.ConvertToLlm
-	transformContext := a.TransformContext
-	getAPIKey := a.GetApiKey
-	beforeToolCall := a.BeforeToolCall
-	afterToolCall := a.AfterToolCall
-	prepareNextTurn := a.PrepareNextTurn
-	prepareNextTurnWithContext := a.PrepareNextTurnWithContext
-	sessionID := a.SessionID
+	config := a.loopConfigLocked(skipInitialSteeringPoll)
+	streamFn := a.StreamFn
+	runCtx, cancel := context.WithCancel(ctx)
+	a.activeRun = &activeRun{done: make(chan struct{}), cancel: cancel}
+	a.state.IsStreaming = true
+	a.state.StreamingMessage = nil
+	a.state.ErrorMessage = ""
 	a.mu.Unlock()
 
+	defer a.finishRun()
+	return body(runCtx, snapshot, config, streamFn), nil
+}
+
+// loopConfigLocked builds the [AgentLoopConfig] for one run from the current
+// state, with closures that drain the steering/follow-up queues on each turn.
+// Caller holds mu.
+//
+// skipInitialSteeringPoll suppresses the first GetSteeringMessages call. The
+// suppression is a one-shot bool captured by the closure; it flips to false
+// after the first poll.
+func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
+	convertToLlm := a.ConvertToLlm
 	if convertToLlm == nil {
 		convertToLlm = defaultConvertToLlm
 	}
+	toolExecution := a.ToolExecution
 	if toolExecution == "" {
 		toolExecution = ExecParallel
 	}
 
 	config := AgentLoopConfig{
-		Model:            model,
+		Budget:           a.budget,
+		Model:            a.state.Model,
 		ToolExecution:    toolExecution,
-		BeforeToolCall:   beforeToolCall,
-		AfterToolCall:    afterToolCall,
+		BeforeToolCall:   a.BeforeToolCall,
+		AfterToolCall:    a.AfterToolCall,
 		ConvertToLlm:     convertToLlm,
-		TransformContext: transformContext,
-		GetAPIKey:        getAPIKey,
+		TransformContext: a.TransformContext,
+		GetAPIKey:        a.GetApiKey,
 	}
-	if thinkingLevel != "" && thinkingLevel != ThinkingOff {
+	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)
 	}
-	config.SessionID = sessionID
+	config.SessionID = a.SessionID
+	prepareNextTurn := a.PrepareNextTurn
+	prepareNextTurnWithContext := a.PrepareNextTurnWithContext
 	if prepareNextTurnWithContext != nil || prepareNextTurn != nil {
 		config.PrepareNextTurn = func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate {
 			if prepareNextTurnWithContext != nil {
@@ -609,99 +603,10 @@ func (a *Agent) createLoopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 	return config
 }
 
-// runWithLifecycle enforces the single-run guard, starts a run, and returns
-// its result. busyErr is returned immediately when a run is already active
-// (different callers use different busy messages). The executor runs under a
-// derived context so Abort cancels it without canceling the caller's context.
-func (a *Agent) runWithLifecycle(ctx context.Context, busyErr error, executor func(context.Context) error) error {
-	a.mu.Lock()
-	if a.activeRun != nil {
-		a.mu.Unlock()
-		if busyErr != nil {
-			return busyErr
-		}
-		return errors.New("Agent is already processing.")
-	}
-	runCtx := a.startRunLocked(ctx)
-	a.mu.Unlock()
-
-	return a.runStarted(runCtx, executor)
-}
-
-// startRunLocked creates a fresh run context and marks the agent as active.
-// Caller holds mu.
-func (a *Agent) startRunLocked(ctx context.Context) context.Context {
-	runCtx, cancel := context.WithCancel(ctx)
-	a.activeRun = &activeRun{done: make(chan struct{}), cancel: cancel}
-	a.eventErr = nil
-	a.state.IsStreaming = true
-	a.state.StreamingMessage = nil
-	a.state.ErrorMessage = ""
-	return runCtx
-}
-
-// runStarted runs the executor, recovers panics, and defers finishRun.
-// finishRun always runs (even after a panic) so the run's done channel closes
-// and WaitForIdle unblocks.
-func (a *Agent) runStarted(runCtx context.Context, executor func(context.Context) error) error {
-	defer a.finishRun()
-
-	var execErr error
-	func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				execErr = errors.New(recoveredMessage(recovered))
-			}
-		}()
-		execErr = executor(runCtx)
-	}()
-	if execErr != nil {
-		if err := a.handleRunFailure(runCtx, execErr, runCtx.Err() != nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// handleRunFailure synthesizes failure events so listeners see a complete
-// start→end cycle even when the loop itself threw. Without this, a loop panic
-// would leave listeners waiting for events that never come.
-func (a *Agent) handleRunFailure(ctx context.Context, err error, aborted bool) error {
-	a.mu.Lock()
-	model := a.state.Model
-	a.mu.Unlock()
-
-	stopReason := types.StopError
-	if aborted {
-		stopReason = types.StopAborted
-	}
-	failureMessage := types.AssistantMessage{
-		Content:      []types.ContentBlock{types.NewText("")},
-		API:          model.API,
-		Provider:     model.Provider,
-		Model:        model.ID,
-		Usage:        types.Usage{},
-		StopReason:   stopReason,
-		ErrorMessage: err.Error(),
-		Timestamp:    time.Now().UnixMilli(),
-	}
-	if eventErr := a.processEvents(ctx, MessageStart(failureMessage)); eventErr != nil {
-		return eventErr
-	}
-	if eventErr := a.processEvents(ctx, MessageEnd(failureMessage)); eventErr != nil {
-		return eventErr
-	}
-	if eventErr := a.processEvents(ctx, TurnEnd(failureMessage, []types.ToolResultMessage{})); eventErr != nil {
-		return eventErr
-	}
-	return a.processEvents(ctx, AgentEnd([]types.Message{failureMessage}))
-}
-
 // finishRun marks the run as settled. IMPORTANT: close(done) happens before
 // cancel() — WaitForIdle reads done under mu then unlocks, so a racing
-// WaitForIdle must see the closed channel before cancel kills in-flight work.
-// The cancel() at the end is a safety net; the run context is usually already
-// done by this point unless the run leaked a goroutine.
+// WaitForIdle must see the closed channel before cancel. The loop has already
+// joined everything the run started, so cancel() only releases the context.
 func (a *Agent) finishRun() {
 	a.mu.Lock()
 	active := a.activeRun
@@ -718,18 +623,29 @@ func (a *Agent) finishRun() {
 	}
 }
 
-// processEvents is the single event sink wired into the loop config.
-// It mutates the streaming/pending state under mu, then fans out to
-// listeners OUTSIDE mu so a slow listener can't block state mutations.
+// processEvents is the single event sink wired into the loop config. Under
+// emitMu it stamps Seq/At, mutates the streaming/pending state under mu, then
+// fans out to listeners with mu released.
 //
-// State mutations that need to happen:
+// State mutations:
 //   - message_start/update: set StreamingMessage so State() shows it live
 //   - message_end: commit the message to history, clear StreamingMessage
 //   - tool_execution_start/end: track PendingToolCalls (in-flight tool set)
 //   - turn_end: capture error message from assistant messages
-//   - agent_end: clear StreamingMessage
+//   - agent_end: clear StreamingMessage; record a run error not already
+//     captured from an assistant message
 func (a *Agent) processEvents(ctx context.Context, ev AgentEvent) error {
+	a.emitMu.Lock()
+	defer a.emitMu.Unlock()
+
 	a.mu.Lock()
+	if a.activeRun == nil {
+		a.mu.Unlock()
+		return errors.New("Agent listener invoked outside active run")
+	}
+	a.seq++
+	ev.Seq = a.seq
+	ev.At = time.Now()
 	switch ev.Type {
 	case EventMessageStart, EventMessageUpdate:
 		a.state.StreamingMessage = ev.Message
@@ -750,48 +666,19 @@ func (a *Agent) processEvents(ctx context.Context, ev AgentEvent) error {
 		}
 	case EventAgentEnd:
 		a.state.StreamingMessage = nil
+		if ev.Err != nil && a.state.ErrorMessage == "" {
+			a.state.ErrorMessage = ev.Err.Error()
+		}
 	}
-
 	listeners := append([]agentListener(nil), a.listeners...)
-	if a.activeRun == nil {
-		a.mu.Unlock()
-		return errors.New("Agent listener invoked outside active run")
-	}
 	a.mu.Unlock()
 
 	for _, listener := range listeners {
 		if err := listener.fn(ctx, ev); err != nil {
-			a.setEventErr(err)
 			return err
 		}
 	}
 	return nil
-}
-
-// setEventErr records the first listener error so the run can surface it
-// after all tool calls complete (via takeEventErr).
-func (a *Agent) setEventErr(err error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.eventErr == nil {
-		a.eventErr = err
-	}
-}
-
-// takeEventErr returns and clears the stored listener error.
-func (a *Agent) takeEventErr() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	err := a.eventErr
-	a.eventErr = nil
-	return err
-}
-
-// isActive reports whether a run is in progress (nil-safe).
-func (a *Agent) isActive() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.activeRun != nil
 }
 
 // assistantErrorMessage extracts an error message from an assistant message.

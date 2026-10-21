@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -89,7 +90,7 @@ func TestCLITextOutput(t *testing.T) {
 		t.Fatalf("build harness: %v\n%s", err, out)
 	}
 	script := filepath.Join(tmp, "faux.json")
-	if err := os.WriteFile(script, []byte(`[{"text":"done\n<promise>WORKFLOW_COMPLETE</promise>"}]`), 0o644); err != nil {
+	if err := os.WriteFile(script, []byte(`[{"text":"done"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(exe, "-p", "create hello", "-faux-script", script)
@@ -126,7 +127,7 @@ func TestCLIDiscoversSkillAssetAndFailsBeforeProviderOnFatalContext(t *testing.T
 	script := filepath.Join(tmp, "faux.json")
 	if err := os.WriteFile(script, []byte(`[
 		{"toolCalls":[{"id":"read-asset","name":"read","arguments":{"path":"skill://alpha/reference.md"}}]},
-		{"text":"CLI DISCOVERED ASSET\n<promise>WORKFLOW_COMPLETE</promise>"}
+		{"text":"CLI DISCOVERED ASSET"}
 	]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -230,38 +231,110 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 	}
 }
 
-func TestPersistNewMessagesRejectsDivergentHistory(t *testing.T) {
-	ctx := context.Background()
-	seed := []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent("seed")}}
-	for _, test := range []struct {
-		name  string
-		final []ptypes.Message
-	}{
-		{name: "shorter", final: nil},
-		{name: "equal-length divergent", final: []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent("replacement")}}},
-		{name: "longer post-compaction", final: []ptypes.Message{
-			ptypes.UserMessage{Content: ptypes.StringContent("compacted summary")},
-			ptypes.AssistantMessage{Content: []ptypes.ContentBlock{ptypes.NewText("completed")}},
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store, err := journal.Create(ctx, t.TempDir(), "/workspace/project", journal.Options{})
-			if err != nil {
-				t.Fatal(err)
-			}
-			persistNewMessages(ctx, store, test.final, seed)
-			if err := store.Close(); err != nil {
-				t.Fatal(err)
-			}
-			loaded, err := journal.Load(ctx, store.Path())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(loaded.Messages) != 0 {
-				t.Fatalf("persisted divergent messages = %#v", loaded.Messages)
-			}
-		})
+// runReportOutput is the subset of the json run report the tests assert on.
+type runReportOutput struct {
+	StopReason string   `json:"stop_reason"`
+	Error      string   `json:"error"`
+	Turns      int      `json:"turns"`
+	CostUSD    *float64 `json:"cost_usd"`
+	ElapsedMS  *int64   `json:"elapsed_ms"`
+	Text       string   `json:"text"`
+	Message    struct {
+		Role string `json:"role"`
+	} `json:"message"`
+}
+
+func TestCLIRunLifecycle(t *testing.T) {
+	tmp := t.TempDir()
+	exe := filepath.Join(tmp, "harness-test")
+	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build harness: %v\n%s", err, out)
 	}
+	if err := os.WriteFile(filepath.Join(tmp, "note.txt"), []byte("note body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readThenAnswer := `[{"toolCalls":[{"id":"read-1","name":"read","arguments":{"path":"note.txt"}}]},{"text":"answered"}]`
+	readOnly := `[{"toolCalls":[{"id":"read-1","name":"read","arguments":{"path":"note.txt"}}]}]`
+
+	run := func(t *testing.T, script string, args ...string) (runReportOutput, string, int) {
+		t.Helper()
+		scriptPath := filepath.Join(t.TempDir(), "faux.json")
+		if err := os.WriteFile(scriptPath, []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sessionDir := filepath.Join(t.TempDir(), "sessions")
+		cmd := exec.Command(exe, append([]string{"-p", "go", "-faux-script", scriptPath, "-session-dir", sessionDir, "-output-format", "json"}, args...)...)
+		cmd.Dir = tmp
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		stdout, err := cmd.Output()
+		exitCode := 0
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else if err != nil {
+			t.Fatalf("run harness: %v", err)
+		}
+		var report runReportOutput
+		if err := json.Unmarshal(stdout, &report); err != nil {
+			t.Fatalf("decode run report %q: %v\nstderr: %s", stdout, err, stderr.String())
+		}
+		return report, sessionDir, exitCode
+	}
+
+	t.Run("completes when the assistant stops calling tools", func(t *testing.T) {
+		report, sessionDir, code := run(t, readThenAnswer)
+		if code != 0 || report.StopReason != "completed" || report.Turns != 2 || report.Text != "answered" || report.CostUSD == nil || report.ElapsedMS == nil {
+			t.Fatalf("exit %d report %+v, want completed run with cost and elapsed", code, report)
+		}
+		loaded := loadOnlyJournal(t, sessionDir)
+		if loaded.LastRun == nil || !loaded.LastRun.Finished || loaded.LastRun.StopReason != "completed" {
+			t.Fatalf("journal last run = %+v, want finished completed run", loaded.LastRun)
+		}
+		if got := len(loaded.Messages); got != 4 {
+			t.Fatalf("journal messages = %d, want user, tool call, tool result, answer", got)
+		}
+	})
+
+	t.Run("max turns stops after the turn's tools finish", func(t *testing.T) {
+		report, sessionDir, code := run(t, readThenAnswer, "-max-turns", "1")
+		if code != 0 || report.StopReason != "max_turns" || report.Turns != 1 || report.Message.Role != "toolResult" {
+			t.Fatalf("exit %d report %+v, want max_turns ending on the tool result", code, report)
+		}
+		if loaded := loadOnlyJournal(t, sessionDir); loaded.LastRun == nil || loaded.LastRun.StopReason != "max_turns" {
+			t.Fatalf("journal last run = %+v, want max_turns", loaded.LastRun)
+		}
+	})
+
+	t.Run("provider failure exits non-zero with the error", func(t *testing.T) {
+		report, _, code := run(t, readOnly)
+		if code != 1 || report.StopReason != "error" || report.Error == "" {
+			t.Fatalf("exit %d report %+v, want error stop with exit 1", code, report)
+		}
+	})
+
+	t.Run("cost budget is refused for an unknown price", func(t *testing.T) {
+		cmd := exec.Command(exe, "-p", "go", "-model", "openai:not-a-cataloged-model@http://127.0.0.1:1/v1", "-max-cost", "1", "-session-dir", filepath.Join(t.TempDir(), "sessions"))
+		cmd.Dir = tmp
+		out, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "price is unknown") {
+			t.Fatalf("output = %q, err = %v; want refusal before the run", out, err)
+		}
+	})
+}
+
+// loadOnlyJournal loads the single session journal written under sessionDir.
+func loadOnlyJournal(t *testing.T, sessionDir string) *journal.Loaded {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(sessionDir, "*", "*.jsonl"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("journals under %s = %v (err %v), want exactly one", sessionDir, paths, err)
+	}
+	loaded, err := journal.Load(context.Background(), paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return loaded
 }
 
 func countEntryType(t *testing.T, path, entryType string) int {

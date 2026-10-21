@@ -274,6 +274,7 @@ func TestStreamSimple(t *testing.T) {
 
 	model := baseModel()
 	model.BaseURL = server.URL
+	model.Reasoning = true
 	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}, Reasoning: "high"}))
 
 	if reqBody["reasoning_effort"] != "high" {
@@ -410,6 +411,7 @@ func TestStreamSimpleNoneEffortDisable(t *testing.T) {
 	model := baseModel()
 	model.BaseURL = server.URL
 	model.OpenAICompat = &types.OpenAICompat{ReasoningDisableMode: types.ReasoningDisableNoneEffort}
+	model.Reasoning = true
 	drainAssistantStream(t, StreamSimple(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{APIKey: "sk-test"}}))
 	if reqBody["reasoning_effort"] != "none" {
 		t.Fatalf("reasoning_effort = %v, want none", reqBody["reasoning_effort"])

@@ -172,14 +172,12 @@ func TestCompactionPersistsAcrossPrompts(t *testing.T) {
 	})
 
 	ctx := context.Background()
-	if err := agt.PromptText(ctx, strings.Repeat("first ", 200)); err != nil {
+	if _, err := agt.PromptText(ctx, strings.Repeat("first ", 200)); err != nil {
 		t.Fatal(err)
 	}
-	agt.WaitForIdle()
-	if err := agt.PromptText(ctx, strings.Repeat("second ", 200)); err != nil {
+	if _, err := agt.PromptText(ctx, strings.Repeat("second ", 200)); err != nil {
 		t.Fatal(err)
 	}
-	agt.WaitForIdle()
 
 	msgs := agt.State().Messages
 	if !containsMarker(msgs, summaryMarker) {

@@ -91,8 +91,12 @@ func TestAgentPromptTextSingleTurnUpdatesStateAndNotifiesListeners(t *testing.T)
 	})
 	defer unsubscribe()
 
-	if err := a.PromptText(context.Background(), "hello"); err != nil {
+	result, err := a.PromptText(context.Background(), "hello")
+	if err != nil {
 		t.Fatalf("PromptText error: %v", err)
+	}
+	if result.StopReason != StopCompleted || result.Turns != 1 {
+		t.Fatalf("result = %+v, want completed after 1 turn", result)
 	}
 
 	state := a.State()
@@ -139,12 +143,17 @@ func TestAgentPromptBusyGuard(t *testing.T) {
 	})
 	done := make(chan error, 1)
 
-	go func() { done <- a.PromptText(context.Background(), "start") }()
+	go func() {
+		_, err := a.PromptText(context.Background(), "start")
+		done <- err
+	}()
 	waitRuntimeEvent(t, started)
 
-	err := a.PromptText(context.Background(), "second")
-	if err == nil || err.Error() != "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion." {
-		t.Fatalf("busy err = %v", err)
+	if _, err := a.PromptText(context.Background(), "second"); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("busy Prompt err = %v, want ErrRunActive", err)
+	}
+	if _, err := a.Continue(context.Background()); !errors.Is(err, ErrRunActive) {
+		t.Fatalf("busy Continue err = %v, want ErrRunActive", err)
 	}
 	close(release)
 	if err := waitRuntimeErr(t, done); err != nil {
@@ -172,7 +181,7 @@ func TestAgentSteerAndFollowUpQueuesInjectMessages(t *testing.T) {
 	if !a.HasQueuedMessages() {
 		t.Fatal("HasQueuedMessages = false before prompt")
 	}
-	if err := a.PromptText(context.Background(), "start"); err != nil {
+	if _, err := a.PromptText(context.Background(), "start"); err != nil {
 		t.Fatalf("PromptText error: %v", err)
 	}
 
@@ -205,7 +214,10 @@ func TestAgentAbortWaitForIdleClearsRuntimeState(t *testing.T) {
 	})
 	done := make(chan error, 1)
 
-	go func() { done <- a.PromptText(context.Background(), "start") }()
+	go func() {
+		_, err := a.PromptText(context.Background(), "start")
+		done <- err
+	}()
 	waitRuntimeEvent(t, assistantStarted)
 	a.Abort()
 	a.WaitForIdle()
@@ -230,17 +242,17 @@ func TestAgentContinueGuardsAndRunsFromLastUser(t *testing.T) {
 	f := faux.New(faux.Options{})
 	a := newRuntimeAgent(f)
 
-	if err := a.Continue(context.Background()); err == nil || err.Error() != "No messages to continue from" {
+	if _, err := a.Continue(context.Background()); err == nil || err.Error() != "No messages to continue from" {
 		t.Fatalf("empty Continue err = %v", err)
 	}
 	a.SetMessages([]types.Message{types.AssistantMessage{Content: []types.ContentBlock{types.NewText("done")}}})
-	if err := a.Continue(context.Background()); err == nil || err.Error() != "Cannot continue from message role: assistant" {
+	if _, err := a.Continue(context.Background()); err == nil || err.Error() != "Cannot continue from message role: assistant" {
 		t.Fatalf("assistant Continue err = %v", err)
 	}
 
 	f.SetResponses(faux.Respond(faux.Text("continued")))
 	a.SetMessages([]types.Message{userMessage("resume")})
-	if err := a.Continue(context.Background()); err != nil {
+	if _, err := a.Continue(context.Background()); err != nil {
 		t.Fatalf("Continue error: %v", err)
 	}
 	state := a.State()
@@ -259,7 +271,7 @@ func TestAgentContinueFromAssistantDrainsQueuedPromptMessages(t *testing.T) {
 	a.SetMessages([]types.Message{types.AssistantMessage{Content: []types.ContentBlock{types.NewText("done")}}})
 	a.Steer(userMessage("steered"))
 
-	if err := a.Continue(context.Background()); err != nil {
+	if _, err := a.Continue(context.Background()); err != nil {
 		t.Fatalf("Continue with queued steering error: %v", err)
 	}
 	state := a.State()
@@ -275,7 +287,7 @@ func TestAgentResetClearsTranscriptRuntimeStateAndQueues(t *testing.T) {
 	f := faux.New(faux.Options{})
 	f.SetResponses(faux.Respond(faux.Text("hi")))
 	a := newRuntimeAgent(f)
-	if err := a.PromptText(context.Background(), "hello"); err != nil {
+	if _, err := a.PromptText(context.Background(), "hello"); err != nil {
 		t.Fatalf("PromptText error: %v", err)
 	}
 	a.Steer(userMessage("steer"))
@@ -307,7 +319,10 @@ func TestAgentRuntimeConcurrentAccessRaceClean(t *testing.T) {
 	done := make(chan error, 1)
 	stop := make(chan struct{})
 
-	go func() { done <- a.PromptText(context.Background(), "start") }()
+	go func() {
+		_, err := a.PromptText(context.Background(), "start")
+		done <- err
+	}()
 	go func() {
 		for {
 			select {
@@ -329,7 +344,7 @@ func TestAgentRuntimeConcurrentAccessRaceClean(t *testing.T) {
 	a.Abort()
 	a.WaitForIdle()
 	close(stop)
-	if err := waitRuntimeErr(t, done); err != nil && !errors.Is(err, context.Canceled) {
+	if err := waitRuntimeErr(t, done); err != nil {
 		t.Fatalf("PromptText error = %v", err)
 	}
 }

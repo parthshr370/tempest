@@ -537,7 +537,7 @@ func TestExecuteToolCallsParallelEndCompletionOrderAndMessagesSourceOrder(t *tes
 	})
 }
 
-func TestExecuteToolCallsParallelCancelShortCircuitsPreflightAndRunsReachedPending(t *testing.T) {
+func TestExecuteToolCallsParallelCancelGivesEveryCallAResultAndRunsOnlyReachedPending(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -573,16 +573,18 @@ func TestExecuteToolCallsParallelCancelShortCircuitsPreflightAndRunsReachedPendi
 	if err != nil {
 		t.Fatalf("executeToolCalls error: %v", err)
 	}
-	assertStrings(t, toolStartIDs(recorder.snapshot()), []string{"tc1", "tc2"})
+	assertStrings(t, toolStartIDs(recorder.snapshot()), []string{"tc1", "tc2", "tc3"})
 	mu.Lock()
 	assertStrings(t, executed, []string{"tc1"})
 	mu.Unlock()
-	assertStrings(t, toolResultIDsFromMessages(batch.Messages), []string{"tc1", "tc2"})
+	assertStrings(t, toolResultIDsFromMessages(batch.Messages), []string{"tc1", "tc2", "tc3"})
 	if !batch.Messages[0].IsError || !strings.Contains(resultText(t, batch.Messages[0].Content), "context canceled") {
 		t.Fatalf("first message = %#v, want canceled in-flight result", batch.Messages[0])
 	}
-	if !batch.Messages[1].IsError || resultText(t, batch.Messages[1].Content) != "Operation aborted" {
-		t.Fatalf("second message = %#v, want aborted immediate result", batch.Messages[1])
+	for _, skipped := range batch.Messages[1:] {
+		if !skipped.IsError || resultText(t, skipped.Content) != "Operation aborted" {
+			t.Fatalf("message %s = %#v, want aborted immediate result", skipped.ToolCallID, skipped)
+		}
 	}
 }
 

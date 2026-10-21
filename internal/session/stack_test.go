@@ -154,10 +154,9 @@ func TestGenericRulesReachEveryProviderContextAcrossCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range []string{strings.Repeat("first ", 50_000), strings.Repeat("second ", 50_000)} {
-		if err := stack.Agent.PromptText(context.Background(), text); err != nil {
+		if _, err := stack.Agent.PromptText(context.Background(), text); err != nil {
 			t.Fatal(err)
 		}
-		stack.Agent.WaitForIdle()
 	}
 	mu.Lock()
 	defer mu.Unlock()

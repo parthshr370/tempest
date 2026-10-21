@@ -3,6 +3,7 @@ package adapter
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -109,7 +110,7 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 	if prov == "" {
 		prov = "anthropic"
 	}
-	model := types.Model{ID: spec.ModelID, Name: spec.ModelID, MaxTokens: maxTokens}
+	model := types.Model{ID: spec.ModelID, Name: spec.ModelID, MaxTokens: maxTokens, Cost: types.ModelCost{Unknown: true}}
 	var api, apiKey, authToken string
 	switch prov {
 	case "anthropic":
@@ -152,6 +153,8 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		}
 		model.Cost = cm.Cost
 		model.OpenAICompat = cm.OpenAICompat
+		model.Compat = cm.AnthropicCompat
+		model.Reasoning = slices.Contains(cm.Capabilities, "thinking")
 		if maxTokens <= 0 && cm.MaxTokens > 0 {
 			model.MaxTokens = cm.MaxTokens
 		}

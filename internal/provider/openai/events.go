@@ -18,6 +18,7 @@ type openAIStreamChunk struct {
 	Model   string               `json:"model"`
 	Choices []openAIStreamChoice `json:"choices"`
 	Usage   json.RawMessage      `json:"usage"`
+	Error   json.RawMessage      `json:"error"`
 }
 
 // openAIStreamChoice keeps each delta beside its finish reason, which the stream
@@ -83,6 +84,9 @@ func iterateOpenAIEvents(ctx context.Context, r io.Reader, onActivity func(), fn
 		var chunk openAIStreamChunk
 		if err := jsonrepair.ParseJsonWithRepair(data, &chunk); err != nil {
 			return fmt.Errorf("could not parse OpenAI SSE chunk: %s; data=%s", err.Error(), data)
+		}
+		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			return fmt.Errorf("OpenAI stream error: %s", chunk.Error)
 		}
 		return fn(&chunk)
 	})

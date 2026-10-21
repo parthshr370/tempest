@@ -1,0 +1,4 @@
+data: {"id":"chat_fixture","choices":[{"delta":{"content":"hello"}}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}
+

@@ -39,21 +39,54 @@ That produces a single self-contained `tempest` binary you can drop on your `PAT
 ANTHROPIC_API_KEY=... ./tempest -p "Create hello.txt with hi"
 ```
 
-`-model` selects the model: a bare name, `anthropic:model`, `google:model` (Gemini
-via `GEMINI_API_KEY`), or `openrouter:<vendor/model>` via `OPENROUTER_API_KEY`;
-`openai:model@baseURL` targets any OpenAI-compatible endpoint with that base URL
-(OpenRouter, Together, Groq, Ollama, vLLM all work this way).
-Output is text by default; `-output-format json` prints the final message as JSON.
+`-model` selects the model: a bare Anthropic route ID, `anthropic:<id>`,
+`google:<id>` (via `GEMINI_API_KEY` or `GOOGLE_API_KEY`), or
+`openrouter:~google/gemini-flash-latest` (via `OPENROUTER_API_KEY`).
+`openai:<id>@<base-url>` targets an OpenAI Chat Completions-compatible endpoint;
+use `OPENAI_API_KEY` for that route. The ID is opaque and endpoint-specific:
+`claude-fable-5-1` on Anthropic differs from `anthropic/claude-fable-5.1`
+on OpenRouter, whose aliases include a literal `~` prefix.
+Output is text by default; `-output-format json` prints a run report (see
+[Runs](#runs)).
 
 ## Features
 
 ### 01 · One binary, every provider
 
-Anthropic, OpenAI, Google Gemini, and OpenRouter, plus any OpenAI-compatible
-endpoint by base URL — chosen per run, mixed per role. A bare model name resolves
-against the embedded catalog; an unknown provider is a configuration error, never
-a silent fallback. No SDK zoo, no wrapper processes: the provider layer speaks
-each wire protocol directly.
+Keep four concepts separate:
+
+- **Model:** the endpoint's exact route ID, never rewritten or normalized.
+- **Endpoint:** the HTTP service and credential that serve that ID; an explicit
+  `openai:<id>@<base-url>` overrides the configured OpenAI endpoint.
+- **Protocol adapter:** Anthropic Messages, OpenAI Chat Completions, or Google
+  Generative AI. OpenRouter uses the OpenAI adapter with its own endpoint/key.
+  Responses, Bedrock, and Vertex protocols aren't implemented.
+- **Catalog metadata:** embedded context/output limits, capabilities, compatibility
+  controls, and USD-per-million prices. Catalog membership isn't proof of endpoint
+  access, protocol compatibility, or account permission.
+
+Unknown model IDs still run with provider-default limits and **unknown price**,
+not a fabricated free price. Computed JSON costs encode `{"unknown":true}` rather
+than zero-dollar components. A cost budget requires known pricing. Unknown provider
+prefixes are configuration errors; bare IDs use the Anthropic route.
+
+`internal/catalog/models.json` records import provenance (`generated_from`, `as_of`)
+and each entry's `source` URL and `verified_at` date. Most direct-provider entries
+retain the imported snapshot's date; GPT-5.6 Luna's route and metadata were checked
+against OpenAI's model page on 2026-10-21. OpenRouter entries use the public discovery
+snapshot from that date. Discovery confirms exact IDs and advertised metadata, not
+a successful generation request. To validate the embedded JSON and the live IDs:
+
+```sh
+go test ./internal/catalog/...
+TEMPEST_LIVE=1 go test ./internal/catalog/ -run TestVerifyOpenRouter
+```
+
+`./tempest doctor` is offline and never prints credentials. `./tempest doctor --ping`
+makes one billable request per configured provider: prompt `hi`, output cap 1 token,
+using the catalog model with the lowest input-plus-output price. It reports the
+model and latency on success, or a typed failure code. Endpoint/account restrictions
+can still reject a discovered model.
 
 ### 02 · Hash-anchored edits that never corrupt a file
 
@@ -74,10 +107,13 @@ re-anchors, and course-corrects on the next turn instead of corrupting state.
 
 ### 04 · Resumable sessions
 
-Every run is journaled to an append-only JSONL file. `-continue` picks up the most
-recent session for the current directory; `-resume <id>` restores a specific one. The
-prior transcript seeds the agent and only new messages are appended — and sessions
-are isolated by working directory, so a resume never bleeds another project's history
+Every run is journaled to an append-only JSONL file as it happens: each message, each
+tool call's start and finish, per-call usage, and how the run ended. A tool's start is
+on disk before the tool runs. `-continue` picks up the most recent session for the
+current directory; `-resume <id>` restores a specific one. If the process died mid-run,
+a tool call that had started but not finished comes back to the model as "outcome
+unknown" and is never re-run automatically; a torn final line is trimmed. Sessions are
+isolated by working directory, so a resume never bleeds another project's history
 into yours.
 
 ### 05 · Tiered permissions with a destructive-command guard
@@ -149,10 +185,47 @@ fall back to pure Go when `rg`/`fd` are absent.
 - `web_search` — one query against the configured search endpoint.
 - `web_fetch` — fetch a URL as bounded, structured text.
 
+## Runs
+
+A run is one `-p` prompt. The model calls tools, sees their results, and keeps
+going until it replies with no tool calls; that reply completes the run. There is
+no completion tag and no re-prompting. Every run ends with a stop reason:
+
+| Stop reason | Meaning | Exit code |
+|---|---|---|
+| `completed` | The model replied without calling a tool. | 0 |
+| `max_turns`, `max_cost`, `max_wall_time` | A budget tripped. | 0 |
+| `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
+| `error` | The provider failed, or the session journal could not be written. | 1 |
+
+Budgets are checked at turn boundaries: after a turn's tools finish and before
+the next model call. A budget-stopped run therefore ends on a complete turn, and
+`-continue` picks the session up from there. One long turn can overrun
+`-max-wall-time`.
+
+- `-max-turns N` caps model calls.
+- `-max-cost USD` caps the summed cost of the run's model calls. When the
+  model's price is unknown the run is refused at startup: an unknown price is
+  not a zero price.
+- `-max-wall-time D` caps elapsed time, as a Go duration such as `10m`.
+
+`-output-format json` prints a run report:
+
+```json
+{"stop_reason": "max_turns", "turns": 3, "usage": {"input": 5120, "output": 410, "...": "..."},
+ "cost_usd": 0.0213, "elapsed_ms": 18450, "text": "last assistant text", "message": {"role": "toolResult", "...": "..."}}
+```
+
+`cost_usd` is `null` when any call's price was unknown, and `error` appears on
+`error` stops. `message` is the transcript's last message. In text mode the last
+assistant text goes to stdout, and a stop reason other than `completed` goes to
+stderr.
+
 ## Flags
 
 | Flag | Purpose |
 |---|---|
+| `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](#runs). Zero means unlimited. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
 | `-plan` | Run the read-only plan stack on the `plan` role model. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |

@@ -28,6 +28,7 @@ import (
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
+	"go.harness.dev/harness/internal/provider/base"
 )
 
 // Stream sends a streaming request to the Anthropic Messages API and returns an
@@ -52,7 +53,7 @@ func StreamSimple(ctx context.Context, model types.Model, c types.Context, opts 
 		blobReader = opts.BlobReader
 	}
 	base := buildBaseOptions(model, c, opts, apiKey)
-	if opts == nil || opts.Reasoning == "" {
+	if opts == nil || opts.Reasoning == "" || !model.Reasoning {
 		return Stream(ctx, model, c, &Options{
 			StreamOptions:   base,
 			BlobReader:      blobReader,
@@ -187,7 +188,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		responseBody, _ := io.ReadAll(resp.Body)
-		pushError(s, output, fmt.Errorf("Anthropic API error: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(responseBody))), parent.Err() != nil)
+		pushError(s, output, base.ResponseError(resp, responseBody), parent.Err() != nil)
 		return
 	}
 
@@ -240,7 +241,7 @@ func newOutputMessage(model types.Model) *types.AssistantMessage {
 		API:        model.API,
 		Provider:   model.Provider,
 		Model:      model.ID,
-		Usage:      types.Usage{Cost: types.Cost{}},
+		Usage:      types.Usage{Cost: types.Cost{Unknown: model.Cost.Unknown}},
 		StopReason: types.StopStop,
 		Timestamp:  time.Now().UnixMilli(),
 	}
@@ -255,14 +256,7 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 	} else {
 		output.StopReason = types.StopError
 	}
-	if err != nil {
-		output.ErrorMessage = err.Error()
-		var se types.StructuredError
-		if errors.As(err, &se) {
-			output.ErrorCode = se.ErrorCode()
-			output.ErrorDetails = se.ErrorDetails()
-		}
-	}
+	base.ApplyError(output, err)
 	s.Push(types.StreamEvent{Type: types.EvError, Reason: output.StopReason, Err: output})
 }
 
