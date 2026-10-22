@@ -184,3 +184,36 @@ func awaitSignal(t *testing.T, signal <-chan struct{}) {
 		t.Fatal("background synchronization timed out")
 	}
 }
+
+func TestDefaultStackHonorsConfiguredTaskOptIn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, configured := range []struct {
+		value   string
+		enabled bool
+	}{{"false", false}, {"true", true}} {
+		t.Run(configured.value, func(t *testing.T) {
+			t.Setenv("HARNESS_ENABLE_TASK", configured.value)
+			cwd := t.TempDir()
+			script := filepath.Join(cwd, "faux.json")
+			if err := os.WriteFile(script, []byte(`[{"text":"done"}]`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{MCPServers: []MCPServerConfig{}}, FauxScript: script})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := owner.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			}()
+			hasTask := false
+			for _, tool := range owner.core.agent.State().Tools {
+				hasTask = hasTask || tool.Name == "task"
+			}
+			if hasTask != configured.enabled {
+				t.Fatalf("HARNESS_ENABLE_TASK=%s registered task=%t", configured.value, hasTask)
+			}
+		})
+	}
+}

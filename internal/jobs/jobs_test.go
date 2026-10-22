@@ -361,8 +361,8 @@ func TestRecoveryOnlyExecutesOnContinueAndNeverRestartsBash(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if calls.Load() != 0 || !manager.RecoveryRequired() {
-		t.Fatal("opening executed recovery")
+	if calls.Load() != 0 || !manager.RecoveryRequired() || !manager.Pending() {
+		t.Fatal("opening executed recovery or hid pending work")
 	}
 	if err = manager.Start(context.Background(), work.RunInfo{RunID: "new"}); !errors.Is(err, ErrRecoveryRequired) {
 		t.Fatal(err)
@@ -384,6 +384,31 @@ func TestRecoveryOnlyExecutesOnContinueAndNeverRestartsBash(t *testing.T) {
 	}
 	if err = manager.Finish(context.Background(), "completed"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPendingIncludesUndeliveredCompletions(t *testing.T) {
+	for _, test := range []struct {
+		state    string
+		delivery bool
+		want     bool
+	}{
+		{"recovering", false, true},
+		{"unknown", true, true},
+		{"completed", true, true},
+		{"failed", true, true},
+		{"cancelled", true, true},
+		{"completed", false, false},
+		{"unknown", false, false},
+	} {
+		t.Run(fmt.Sprintf("%s/delivery=%v", test.state, test.delivery), func(t *testing.T) {
+			manager := &Manager{entries: map[string]*entry{
+				"job": {recovery: work.Recovery{Job: work.Job{State: test.state}, DeliveryPending: test.delivery}},
+			}}
+			if got := manager.Pending(); got != test.want {
+				t.Fatalf("Pending()=%v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

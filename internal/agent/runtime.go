@@ -490,18 +490,22 @@ func (a *Agent) PromptText(ctx context.Context, text string, images ...types.Con
 }
 
 // Continue runs one run from the current transcript. When the last message is
-// from the assistant, queued steering (else follow-up) messages become the
-// run's prompt; with nothing queued that is an error. The error contract
-// matches [Agent.Prompt].
+// from the assistant, queued steering (else follow-up) messages or recovered
+// job completions become the run's prompt. With neither input nor recoverable
+// work, that's an error. The error contract matches [Agent.Prompt].
 func (a *Agent) Continue(ctx context.Context) (RunResult, error) {
 	a.mu.Lock()
 	if err := a.startableLocked(); err != nil {
 		a.mu.Unlock()
 		return RunResult{}, err
 	}
-	if a.QueueSource != nil {
-		pending, _ := a.QueueSource.Pending()
-		if !pending && (len(a.state.Messages) == 0 || a.state.Messages[len(a.state.Messages)-1].Role() == "assistant") {
+	pendingWork := a.Work != nil && a.Work.Pending()
+	if a.QueueSource != nil || pendingWork {
+		pending := false
+		if a.QueueSource != nil {
+			pending, _ = a.QueueSource.Pending()
+		}
+		if !pending && !pendingWork && (len(a.state.Messages) == 0 || a.state.Messages[len(a.state.Messages)-1].Role() == "assistant") {
 			a.mu.Unlock()
 			return RunResult{}, errors.New("Cannot continue without pending input")
 		}

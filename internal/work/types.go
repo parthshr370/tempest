@@ -53,6 +53,7 @@ type RunInfo struct {
 	Resume       bool
 }
 type RunHooks interface {
+	Pending() bool // recoverable jobs or completions not yet enqueued
 	Start(context.Context, RunInfo) error
 	Idle(context.Context) (bool, error)   // true: poll queues again; false: no owned work
 	Finish(context.Context, string) error // stop reason; close admission, cancel/join

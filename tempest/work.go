@@ -254,6 +254,8 @@ type sessionWork struct {
 	recoveries []work.Recovery
 }
 
+func (hooks *sessionWork) Pending() bool { return hooks.core.jobs.Pending() }
+
 func (hooks *sessionWork) Start(ctx context.Context, info work.RunInfo) error {
 	for _, recovery := range hooks.recoveries {
 		if recovery.Task == nil {

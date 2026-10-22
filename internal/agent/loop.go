@@ -100,16 +100,16 @@ func AgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentC
 	return s
 }
 
-// AgentLoopContinue resumes a run from an existing transcript (the last message
-// must be a user/toolResult — never an assistant message, since the loop would
-// immediately try to stream another assistant response from nothing). Returns
-// an error up front when the resume precondition is violated.
+// AgentLoopContinue resumes a run from an existing transcript. An empty or
+// assistant-ended transcript needs queued input or recoverable work first.
+// It returns an error up front when neither can supply the next turn's input.
 func AgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, streamFn StreamFn) (*stream.Stream[AgentEvent, []types.Message], error) {
 	if err := checkContinuable(agentContext.Messages); err != nil {
-		if config.QueueSource == nil {
-			return nil, err
+		pending := false
+		if config.QueueSource != nil {
+			pending, _ = config.QueueSource.Pending()
 		}
-		if pending, _ := config.QueueSource.Pending(); !pending {
+		if !pending && (config.Work == nil || !config.Work.Pending()) {
 			return nil, err
 		}
 	}
@@ -148,8 +148,8 @@ func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext Age
 }
 
 // runAgentLoopContinue is the synchronous core behind [AgentLoopContinue] and
-// [Agent.Continue]: one run over the existing transcript. Callers ensure the
-// transcript is non-empty and does not end with an assistant message.
+// [Agent.Continue]. Quiescent transcripts wait for queued input or recovered
+// job completions before calling the provider.
 func runAgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
 	ctx, run := newLoopRun(ctx, config, emit, streamFn)
 	return run.execute(ctx, nil, func(ctx context.Context) error {
@@ -373,11 +373,12 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 	config := &run.config
 	firstTurn := true
+	quiescentResume := config.Resume && (len(current.Messages) == 0 || current.Messages[len(current.Messages)-1].Role() == "assistant")
 	pendingMessages, err := run.take(ctx, work.Steer)
 	if err != nil {
 		return err
 	}
-	if config.Resume && (len(current.Messages) == 0 || current.Messages[len(current.Messages)-1].Role() == "assistant") && len(pendingMessages) == 0 {
+	if quiescentResume && len(pendingMessages) == 0 {
 		pendingMessages, err = run.take(ctx, work.FollowUp)
 		if err != nil {
 			return err
@@ -385,7 +386,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 	}
 
 	for {
-		hasMoreToolCalls := true
+		hasMoreToolCalls := !firstTurn || !quiescentResume
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			if firstTurn && (run.enforceFirst || ctx.Err() != nil) {

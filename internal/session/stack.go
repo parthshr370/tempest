@@ -10,6 +10,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/compaction"
+	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
@@ -81,6 +82,16 @@ type StackConfig struct {
 	AttachmentRegistry *document.AttachmentRegistry
 	AttachmentReader   *document.CacheRootBlobReader
 	Sanitize           func(string) string
+}
+
+// StackConfigFromConfig keeps config-backed tool options together across hosts.
+func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
+	return StackConfig{
+		EnableTask:   cfg.EnableTask(),
+		EnableWeb:    cfg.EnableWeb(),
+		WebSearchURL: cfg.WebSearchURL(),
+		BashTimeout:  cfg.BashTimeout(),
+	}
 }
 
 // AgentStack is the assembled result: a configured agent ready for Prompt/

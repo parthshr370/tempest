@@ -151,6 +151,10 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if dir == "" {
 			dir = defaults.SessionDir()
 		}
+		if o.Stack == nil {
+			cfg = session.StackConfigFromConfig(defaults)
+			cfg.Cwd = cwd
+		}
 	}
 	if selectedMCP == nil && defaults != nil {
 		selectedMCP = defaults.MCPServers()
@@ -263,9 +267,6 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	if cfg.SmolModel.ID == "" {
 		cfg.SmolModel = cfg.Model
-	}
-	if o.Stack == nil {
-		cfg.BashTimeout = defaults.BashTimeout()
 	}
 	if needsDiscovery {
 		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: defaults.SkillPaths(), IncludeDefaultSkills: true})

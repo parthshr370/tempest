@@ -272,6 +272,18 @@ func (manager *Manager) RecoveryRequired() bool {
 	return false
 }
 
+// Pending reports whether Continue has jobs to recover or completions to enqueue.
+func (manager *Manager) Pending() bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	for _, record := range manager.entries {
+		if record.recovery.Job.State == "recovering" || record.recovery.DeliveryPending {
+			return true
+		}
+	}
+	return false
+}
+
 // Snapshot returns owned copies; callers choose their own bounded projection.
 func (manager *Manager) Snapshot() []work.Job {
 	manager.mu.Lock()

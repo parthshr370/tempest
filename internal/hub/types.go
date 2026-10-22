@@ -47,7 +47,7 @@ type Update struct {
 	At        time.Time       `json:"at"`
 	SessionID string          `json:"sessionId"`
 	Update    json.RawMessage `json:"update"`
-	Kind      string          `json:"-"`
+	Kind      string          `json:"kind"`
 }
 
 // RunState describes the session's currently admitted run.

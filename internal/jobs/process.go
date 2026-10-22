@@ -19,6 +19,7 @@ import (
 
 const pipeBytes = 4096
 const outputTailBytes = 64 << 10
+
 // Logs also sync once a second; the byte trigger only bounds unsynced data for
 // fast writers. Darwin fsync is a full flush, so 64 KiB made 16 MiB cost ~256 flushes.
 const outputSyncBytes = 1 << 20

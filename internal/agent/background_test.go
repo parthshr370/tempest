@@ -13,10 +13,13 @@ import (
 )
 
 type testRunHooks struct {
-	start  func(context.Context, work.RunInfo) error
-	idle   func(context.Context) (bool, error)
-	finish func(context.Context, string) error
+	pending bool
+	start   func(context.Context, work.RunInfo) error
+	idle    func(context.Context) (bool, error)
+	finish  func(context.Context, string) error
 }
+
+func (h testRunHooks) Pending() bool { return h.pending }
 
 func (h testRunHooks) Start(ctx context.Context, info work.RunInfo) error {
 	if h.start != nil {
@@ -193,4 +196,81 @@ func TestCompactorAdmissionPreservesBudgetStopReason(t *testing.T) {
 	if err != nil || result.StopReason != StopMaxCost || result.Err != nil || f.CallCount() != 1 {
 		t.Fatalf("result=%+v err=%v calls=%d", result, err, f.CallCount())
 	}
+}
+
+func TestContinueQuiescentWorkWaitsForCompletion(t *testing.T) {
+	for _, delayed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "undelivered", true: "recovering"}[delayed], func(t *testing.T) {
+			f := faux.New(faux.Options{})
+			f.SetResponses(faux.Respond(faux.Text("recovered")))
+			var a *Agent
+			queue := &testWorkQueue{}
+			started, delivered := false, false
+			deliver := func() {
+				delivered = true
+				queue.messages = append(queue.messages, work.QueuedMessage{ID: "completion", Message: userMessage("job completion")})
+			}
+			hooks := testRunHooks{
+				pending: true,
+				start: func(_ context.Context, info work.RunInfo) error {
+					if !info.Resume {
+						return errors.New("work recovery requires Continue")
+					}
+					started = true
+					if !delayed {
+						deliver()
+					}
+					return nil
+				},
+				idle: func(context.Context) (bool, error) {
+					if !delivered {
+						if f.CallCount() != 0 {
+							return false, errors.New("provider called before recovered completion")
+						}
+						deliver()
+						return true, nil
+					}
+					return false, nil
+				},
+			}
+			a = newRuntimeAgent(f, func(o *AgentOptions) { o.Work = hooks; o.QueueSource = queue })
+			a.SetMessages([]types.Message{types.AssistantMessage{Content: []types.ContentBlock{types.NewText("root quiescent")}}})
+			result, err := a.Continue(context.Background())
+			if err != nil || result.Err != nil || result.StopReason != StopCompleted || !started || !delivered || f.CallCount() != 1 {
+				t.Fatalf("result=%+v err=%v started=%v delivered=%v calls=%d", result, err, started, delivered, f.CallCount())
+			}
+			if got := runtimeRoles(a.State().Messages); got != "assistant,user,assistant" {
+				t.Fatalf("roles=%s", got)
+			}
+		})
+	}
+}
+
+func TestContinueDurableQueueWithoutWorkStillRejectsQuiescence(t *testing.T) {
+	f := faux.New(faux.Options{})
+	a := newRuntimeAgent(f, func(o *AgentOptions) {
+		o.QueueSource = &testWorkQueue{}
+		o.Work = testRunHooks{}
+	})
+	a.SetMessages([]types.Message{types.AssistantMessage{}})
+	if _, err := a.Continue(context.Background()); err == nil || err.Error() != "Cannot continue without pending input" {
+		t.Fatalf("Continue error=%v", err)
+	}
+	if f.CallCount() != 0 {
+		t.Fatal("idle Continue called the provider")
+	}
+}
+
+type testWorkQueue struct {
+	messages []work.QueuedMessage
+}
+
+func (q *testWorkQueue) Pending() (bool, <-chan struct{}) { return len(q.messages) > 0, nil }
+func (q *testWorkQueue) Take(_ context.Context, kind work.QueueKind) ([]work.QueuedMessage, error) {
+	if kind != work.FollowUp {
+		return nil, nil
+	}
+	messages := q.messages
+	q.messages = nil
+	return messages, nil
 }
