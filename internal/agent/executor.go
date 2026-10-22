@@ -411,7 +411,7 @@ func executePreparedToolCall(ctx context.Context, prepared *preparedToolCall, em
 	}
 	slog.Info("tool call ok", "tool", prepared.toolCall.Name, "id", prepared.toolCall.ID, "duration_ms", durMs, "result_bytes", contentBytes(result.Content))
 	slog.Debug("tool call result", "tool", prepared.toolCall.Name, "id", prepared.toolCall.ID, "preview", logPreview(result.Content, 400))
-	return executedOutcome{result: result, isError: false}
+	return executedOutcome{result: result, isError: result.IsError}
 }
 
 // finalizeExecutedToolCall applies the AfterToolCall hook's field-by-field

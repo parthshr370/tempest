@@ -26,14 +26,16 @@ func TestResolveOutputFormat(t *testing.T) {
 	}{
 		{"", "text", "text"},
 		{"json", "text", "json"},
+		{"stream-json", "json", "stream-json"},
+		{"", "stream-json", "stream-json"},
 	} {
 		got, err := resolveOutputFormat(test.output, test.legacy)
 		if err != nil || got != test.want {
 			t.Fatalf("resolveOutputFormat(%q, %q) = %q, %v; want %q, nil", test.output, test.legacy, got, err, test.want)
 		}
 	}
-	if _, err := resolveOutputFormat("stream-json", ""); err == nil {
-		t.Fatal("stream-json unexpectedly accepted")
+	if _, err := resolveOutputFormat("invalid", ""); err == nil {
+		t.Fatal("invalid output unexpectedly accepted")
 	}
 }
 

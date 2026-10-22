@@ -11,12 +11,24 @@ import (
 
 // NewStream wraps a line-delimited stream. Close must unblock Read and Write.
 func NewStream(stream io.ReadWriteCloser) *Conn {
-	return newConn(&lineTransport{stream: stream, reader: bufio.NewReaderSize(stream, 32<<10)})
+	return NewStreamWithLimit(stream, MaxFrame)
+}
+
+// NewStreamWithLimit applies maxFrame to inbound and outbound JSON frames.
+func NewStreamWithLimit(stream io.ReadWriteCloser, maxFrame int) *Conn {
+	if maxFrame <= 0 {
+		maxFrame = MaxFrame
+	}
+	c := newConn(&lineTransport{stream: stream, reader: bufio.NewReaderSize(stream, 32<<10), maxFrame: maxFrame})
+	c.maxFrame = maxFrame
+	return c
 }
 
 type lineTransport struct {
-	stream io.ReadWriteCloser
-	reader *bufio.Reader
+	stream         io.ReadWriteCloser
+	reader         *bufio.Reader
+	maxFrame       int
+	stopOnOversize bool
 }
 
 func (t *lineTransport) close() error { return t.stream.Close() }
@@ -44,9 +56,12 @@ func (t *lineTransport) read(_ context.Context) ([]byte, error) {
 			content = content[:len(content)-1]
 		}
 		if !oversized {
-			if len(frame)+len(content) > MaxFrame {
+			if len(frame)+len(content) > t.maxFrame {
 				oversized = true
 				frame = nil
+				if t.stopOnOversize {
+					return nil, errOversize
+				}
 			} else {
 				frame = append(frame, content...)
 			}

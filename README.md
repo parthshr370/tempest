@@ -46,8 +46,9 @@ ANTHROPIC_API_KEY=... ./bin/tempest -p "Create hello.txt with hi"
 use `OPENAI_API_KEY` for that route. The ID is opaque and endpoint-specific:
 `claude-fable-5-1` on Anthropic differs from `anthropic/claude-fable-5.1`
 on OpenRouter, whose aliases include a literal `~` prefix.
-Output is text by default; `-output-format json` prints a run report (see
-[Runs](#runs)).
+Output is text by default; `-output-format json` prints a run report and
+`-output-format stream-json` streams NDJSON updates followed by that report
+(see [Runs](#runs)).
 
 ## Features
 
@@ -221,6 +222,78 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
 assistant text goes to stdout, and a stop reason other than `completed` goes to
 stderr.
 
+The three output modes are `text`, `json` (a pretty-printed report), and
+`stream-json` (one compact JSON object per line). `-print` remains a legacy
+alias; `-output-format` wins when both are supplied.
+
+```sh
+./bin/tempest -p "Explain this package" -output-format stream-json
+```
+
+Stream event lines are the existing Tempest Update envelope:
+`{"seq":1,"at":"...","sessionId":"...","update":{...}}`. The last line is
+the existing report above, compact, identified by `stop_reason`, with no
+extra wrapper or sequence number. Resuming streams only the new run, not
+old conversation history. A slow consumer never blocks the agent: if the
+256-update queue overflows, stdout contains the actual `tempest/gap`
+marker and the final report, stderr explains the incomplete stream, and
+the command exits 1. A broken pipe cancels and joins the run.
+
+## MCP tools
+
+Select trusted MCP servers explicitly with `-mcp-config PATH` on one-shot,
+`serve`, or `mcp`; `HARNESS_MCP_CONFIG` and the `mcp_config` settings key
+are also supported (flags win). An explicit empty path disables MCP.
+Settings may instead supply `mcp_servers`; a selected file replaces that
+array completely. Repository `.mcp.json` files are never auto-loaded.
+
+```json
+{
+  "mcpServers": [
+    {"name":"issues","transport":"stdio","command":"issue-mcp","args":["--stdio"],"permission":"prompt"},
+    {"name":"docs","transport":"http","url":"https://docs.example/mcp","permission":"deny"}
+  ]
+}
+```
+
+Both stdio and Streamable HTTP clients support MCP `2025-11-25`
+(preferred) and `2025-06-18`. The handshake-free `2026-07-28` era, legacy
+HTTP+SSE, OAuth, sampling, and resource browsing aren't supported.
+Discovered tools use names such as `mcp__issues__lookup`. They default to
+prompt/exec-tier regardless of read-only annotations; without an approver,
+headless runs **deny** them. Opt into one exact tool with
+`-allow-tool mcp__issues__lookup`, or trust all current and future tools of
+a locally configured server with `"permission":"allow"`. `-deny-tool`
+always wins. Server startup itself executes arbitrary code before tool
+approval: configuration and credentials must come from a trusted operator.
+Environment/header values aren't interpolated or stored in the journal;
+resume must resupply runtime MCP configuration. Unknown-outcome MCP calls
+are never automatically replayed.
+
+## MCP server
+
+```sh
+./bin/tempest mcp -model anthropic:claude-opus-4-8 -max-turns 10
+```
+
+`tempest mcp` is a **stdio-only** MCP server, distinct from ACP `serve`;
+there's no MCP HTTP endpoint. Initialize with `2025-11-25` or `2025-06-18`,
+then send `notifications/initialized`. Its one tool, `tempest_run`, accepts
+`prompt`, optional absolute `cwd`, `sessionId`, `model`, and a `budget`
+(`maxTurns`, `maxCostUsd`, `maxWallSeconds`). Per-call budgets may tighten
+but not relax host caps. Results include final text, structured run/session
+ids, usage, stop reason and nullable cost. Reuse `sessionId` for continuity;
+busy sessions fail immediately instead of queuing.
+
+Clients may request tokened progress and cancel by the original JSON-RPC
+request id. A cancelled call's reply is suppressed; its journal can still
+resume by session id. With client form-elicitation support, host tool
+prompts become an allow-once boolean form; absent support, decline,
+malformed answers and timeout deny. There are no always approvals over
+MCP. Idle sessions close after 30m. EOF or signals cancel/join accepted
+runs; stdout contains protocol frames only.
+
+
 ## Serve
 
 `tempest serve` exposes the same durable sessions over JSON-RPC 2.0 with the
@@ -242,6 +315,25 @@ or `?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required
 off loopback; when one is configured, loopback connections need it too.
 `GET /healthz` is unauthenticated and reports session and running counts.
 WebSocket mode doesn't also serve stdio.
+
+HTTP mode also mounts the A2A **1.0 JSON-RPC** endpoint `POST /a2a` and
+public discovery at `GET /.well-known/agent-card.json`. Use
+`A2A-Version: 1.0`, `Content-Type: application/json`, and the same bearer
+token as ACP; new A2A routes don't accept query tokens. `SendMessage`,
+`SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, and
+`SubscribeToTask` operate on runs in the server's fixed startup workspace.
+Set `-a2a-base-url https://agent.example` behind a proxy or for a
+non-loopback listener; numeric loopback derives the actual bound address.
+
+Pending host permissions appear as `TASK_STATE_INPUT_REQUIRED`.
+**A2A cannot approve them**: text saying “yes” isn't permission. Answer
+through authenticated ACP `/acp`: `tempest/watch` with `approver:true`,
+then `tempest/permission` with the session id, tool-call id, and
+`optionId:"allow_once"`; otherwise cancel the task or let the host timeout
+deny. A2A task projections live only in this server process (bounded
+retention); durable session ids remain resumable after restart. No push
+notifications, task follow-up, uploaded-file input, or file-change
+artifacts are implemented.
 
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
 (30m), `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model,

@@ -227,10 +227,15 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 	policyMu.Lock()
 	decision, overridden := policy.Overrides[toolName]
 	sessionDecision, sessionOverride := policy.promptOverrides[toolName]
+	mcpDefault, hasMCPDefault := policy.MCPDefaults[toolName]
 	policyMu.Unlock()
 	deny := "Tool " + toolName + " denied by policy"
 	if overridden && decision == DecideDeny {
 		return Outcome{Reason: deny, Source: SourceOverride}
+	}
+	isMCP := strings.HasPrefix(toolName, "mcp__")
+	if isMCP && mode == ModePlan {
+		return Outcome{Reason: "Plan mode: MCP tools are disabled", Source: SourceMode}
 	}
 	if mode == ModeBypass {
 		return Outcome{Allow: true, Source: SourceBypass}
@@ -275,6 +280,15 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 			reason = "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: " + command
 		}
 		return Outcome{Reason: reason, Source: SourceMode}
+	}
+	if isMCP {
+		if hasMCPDefault && mcpDefault == DecideAllow {
+			return Outcome{Allow: true, Source: SourceMode}
+		}
+		if hasMCPDefault && mcpDefault == DecideDeny {
+			return Outcome{Reason: deny, Source: SourceMode}
+		}
+		return resolvePrompt(ctx, policy, req)
 	}
 	return Outcome{Allow: true, Source: SourceMode}
 }
