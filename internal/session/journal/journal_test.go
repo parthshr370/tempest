@@ -218,6 +218,49 @@ func TestResolveAndRecent(t *testing.T) {
 	}
 }
 
+func TestResolveJournalFilenameForms(t *testing.T) {
+	dir := t.TempDir()
+	store := newTestStore(t, dir)
+	path, id := store.Path(), store.ID()
+	closeStore(t, store)
+	name := filepath.Base(path)
+	for _, input := range []string{id, name, strings.TrimSuffix(name, ".jsonl")} {
+		t.Run(input, func(t *testing.T) {
+			got, err := Resolve(testContext, dir, "/workspace/project", input)
+			if err != nil || got != path {
+				t.Fatalf("Resolve(%q) = %q, %v; want %q", input, got, err, path)
+			}
+		})
+	}
+	if _, err := Resolve(testContext, dir, "/another/project", name); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("cross-workspace filename error = %v", err)
+	}
+}
+
+func TestResolveRejectsAmbiguousIDWithFilenameHint(t *testing.T) {
+	dir := t.TempDir()
+	store := newTestStore(t, dir)
+	path, id := store.Path(), store.ID()
+	closeStore(t, store)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(filepath.Dir(path), "20240103T030405Z_"+id+".jsonl")
+	if err := os.WriteFile(other, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Resolve(testContext, dir, "/workspace/project", id); err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "-resume "+filepath.Base(path)) || !strings.Contains(err.Error(), "-resume "+filepath.Base(other)) {
+		t.Fatalf("ambiguous id error = %v", err)
+	}
+	for _, want := range []string{path, other} {
+		got, err := Resolve(testContext, dir, "/workspace/project", filepath.Base(want))
+		if err != nil || got != want {
+			t.Fatalf("filename disambiguation = %q, %v; want %q", got, err, want)
+		}
+	}
+}
+
 func TestUnknownEntryTypeSkipped(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "unknown.jsonl")
 	headerJSON, err := json.Marshal(testHeader())

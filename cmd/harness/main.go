@@ -51,7 +51,12 @@ type skillPathsFlag struct {
 	input *config.StringsInput
 }
 
-func (f skillPathsFlag) String() string { return strings.Join(f.input.Values, ",") }
+func (f skillPathsFlag) String() string {
+	if f.input == nil {
+		return ""
+	}
+	return strings.Join(f.input.Values, ",")
+}
 
 func (f skillPathsFlag) Set(value string) error {
 	f.input.Values = append(f.input.Values, value)
@@ -150,13 +155,14 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		selectedModel = fauxModel
+		planSelected = fauxModel
 		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
 		stackStreamFn = streamFn
 	} else if !providerCredentialPresent(selectedModel.Provider, opts.Secrets) {
 		fmt.Fprintf(stderr, "warning: no %s credential resolved; model calls will fail until one is present\n", selectedModel.Provider)
 	}
-	if opts.Config.Plan() {
+	if opts.Config.Plan() && opts.Config.FauxScript() == "" {
 		// The plan flag routes the whole run through the read-only stack on the
 		// plan role, not just the plan-agent model.
 		stackModel = roles.Plan.Model
@@ -251,6 +257,9 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stderr, formatted)
 		}
 	}
+	if mode == "text" {
+		fmt.Fprintf(stderr, "session: %s (resume with -resume %s)\n", sess.ID(), sess.ID())
+	}
 	switch outcome.StopReason {
 	case agent.StopError:
 		return 1
@@ -263,12 +272,14 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 
 type runOutcome struct {
 	tempest.RunResult
+	SessionID         string
 	Elapsed           time.Duration
 	LastAssistantText string
 }
 
 // runReport is the -output-format json result of one run.
 type runReport struct {
+	SessionID  string           `json:"session_id"`
 	StopReason agent.StopReason `json:"stop_reason"`
 	Error      string           `json:"error,omitempty"`
 	Turns      int              `json:"turns"`
@@ -313,7 +324,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 }
 
 func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
-	report := runReport{StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last}
+	report := runReport{SessionID: outcome.SessionID, StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last}
 	if outcome.Err != nil {
 		report.Error = outcome.Err.Error()
 	}

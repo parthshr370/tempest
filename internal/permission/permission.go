@@ -1,10 +1,5 @@
-// Package permission provides the built-in tool gate used for plan, acceptEdits,
-// and bypass permission modes.
-// Package permission implements the permission modes and destructive-command
-// guard. Modes: plan (block mutating tools, collect a plan), acceptEdits
-// (auto-allow edits, block destructive cmds), bypass (allow all), default
-// (=acceptEdits headless). The guard blocks known-dangerous bash patterns
-// (rm -rf, git clean, mkfs, fork bombs) with documented regex limitations.
+// Package permission provides tool approval modes and a destructive-command
+// guard. The guard recognizes common shell operations, not arbitrary scripts.
 package permission
 
 import (
@@ -38,28 +33,12 @@ const (
 )
 
 var destructivePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\brm\b`),
-	regexp.MustCompile(`(?i)\brmdir\b`),
-	regexp.MustCompile(`(?i)\bmv\b`),
-	regexp.MustCompile(`(?i)\bcp\b`),
-	regexp.MustCompile(`(?i)\bmkdir\b`),
-	regexp.MustCompile(`(?i)\btouch\b`),
-	regexp.MustCompile(`(?i)\bchmod\b`),
-	regexp.MustCompile(`(?i)\bchown\b`),
-	regexp.MustCompile(`(?i)\bchgrp\b`),
-	regexp.MustCompile(`(?i)\bln\b`),
-	regexp.MustCompile(`(?i)\btee\b`),
-	regexp.MustCompile(`(?i)\btruncate\b`),
-	regexp.MustCompile(`(?i)\bdd\b`),
-	regexp.MustCompile(`(?i)\bshred\b`),
-	regexp.MustCompile(`>>`),
 	regexp.MustCompile(`(?i)\bnpm\s+(install|uninstall|update|ci|link|publish)`),
 	regexp.MustCompile(`(?i)\byarn\s+(add|remove|install|publish)`),
 	regexp.MustCompile(`(?i)\bpnpm\s+(add|remove|install|publish)`),
 	regexp.MustCompile(`(?i)\bpip\s+(install|uninstall)`),
 	regexp.MustCompile(`(?i)\bapt(-get)?\s+(install|remove|purge|update|upgrade)`),
 	regexp.MustCompile(`(?i)\bbrew\s+(install|uninstall|upgrade)`),
-	regexp.MustCompile(`(?i)\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone|clean\b)`),
 	regexp.MustCompile(`(?i)\bsudo\b`),
 	regexp.MustCompile(`(?i)\bsu\b`),
 	regexp.MustCompile(`(?i)\bkill\b`),
@@ -218,6 +197,11 @@ func ParseMode(value string) (Mode, error) {
 
 // Gate decides whether a tool invocation is allowed under the mode and policy.
 func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, toolCallID ...string) Outcome {
+	return GateInDirectory(ctx, mode, toolName, args, policy, "", toolCallID...)
+}
+
+// GateInDirectory evaluates shell destinations relative to the tool's workspace.
+func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, cwd string, toolCallID ...string) Outcome {
 	if ctx.Err() != nil {
 		return Outcome{Reason: "Operation aborted", Source: SourcePromptCancelled}
 	}
@@ -254,10 +238,10 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 		command = commandFromArgs(args)
 	}
 	guardReason := ""
-	if toolName == "bash" && IsDestructiveCommand(command) {
-		guardReason = "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): " + command
+	if toolName == "bash" && isDestructiveCommand(command, cwd) {
+		guardReason = "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): " + command
 	}
-	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Reason: guardReason}
+	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Reason: guardReason, Cwd: cwd}
 	if len(toolCallID) != 0 {
 		req.ToolCallID = toolCallID[0]
 	}
@@ -337,6 +321,9 @@ func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outco
 // a safe (read-only / allowlisted) pattern.
 func IsSafeCommand(command string) bool {
 	if IsDestructiveCommand(command) {
+		return false
+	}
+	if !hasReadOnlyShellSyntax(command) {
 		return false
 	}
 	for _, pattern := range safePatterns {
@@ -425,69 +412,6 @@ func MarkCompletedSteps(text string, items []TodoItem) int {
 	return len(doneSteps)
 }
 
-// IsDestructiveCommand reports whether command matches destructive
-// patterns (rm -rf, git clean, mkfs, single-output redirect, fork bombs).
-func IsDestructiveCommand(command string) bool {
-	// This intentionally remains a regex/scanner guard rather than a shell parser.
-	// It can false-positive on redirects inside awk/jq text and does not
-	// de-obfuscate every quoting trick.
-	if hasSingleOutputRedirect(command) {
-		return true
-	}
-	if mkfsCommandPattern.MatchString(command) {
-		return true
-	}
-	for _, pattern := range destructivePatterns {
-		if pattern.MatchString(command) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasSingleOutputRedirect treats unrecognized writes as destructive outside the regex guard.
-func hasSingleOutputRedirect(command string) bool {
-	for i := range len(command) {
-		if command[i] != '>' {
-			continue
-		}
-		if i > 0 && command[i-1] == '<' {
-			continue
-		}
-		if i+1 < len(command) && command[i+1] == '>' {
-			continue
-		}
-		if i+1 < len(command) && command[i+1] == '&' {
-			continue
-		}
-		if isSafeRedirectSink(redirectTarget(command, i)) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-// redirectTarget reads just enough shell syntax to recognize harmless device sinks.
-func redirectTarget(command string, from int) string {
-	start := from + 1
-	if start < len(command) && command[start] == '&' {
-		start++
-	}
-	for start < len(command) && unicode.IsSpace(rune(command[start])) {
-		start++
-	}
-	end := start
-	for end < len(command) && !unicode.IsSpace(rune(command[end])) && !strings.ContainsRune("|;&><", rune(command[end])) {
-		end++
-	}
-	target := command[start:end]
-	if len(target) >= 2 && ((target[0] == '"' && target[len(target)-1] == '"') || (target[0] == '\'' && target[len(target)-1] == '\'')) {
-		return target[1 : len(target)-1]
-	}
-	return target
-}
-
 func isSafeRedirectSink(target string) bool {
 	switch target {
 	case "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/zero", "/dev/tty":
@@ -498,10 +422,11 @@ func isSafeRedirectSink(target string) bool {
 }
 
 func commandFromArgs(args json.RawMessage) string {
-	var decoded map[string]any
+	var decoded struct {
+		Command string `json:"command"`
+	}
 	if json.Unmarshal(args, &decoded) != nil {
 		return ""
 	}
-	command, _ := decoded["command"].(string)
-	return command
+	return decoded.Command
 }

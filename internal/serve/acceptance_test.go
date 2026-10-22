@@ -37,7 +37,7 @@ func TestPermissionWireAndTimeoutJournal(t *testing.T) {
 	for _, timeout := range []bool{false, true} {
 		t.Run(fmt.Sprint(timeout), func(t *testing.T) {
 			f := faux.New(faux.Options{})
-			f.SetResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"touch approved"}`), "permission-call")), faux.Respond(faux.Text("done")))
+			f.SetResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"rm -f approval-target && touch approved"}`), "permission-call")), faux.Respond(faux.Text("done")))
 			clock := &testClock{created: make(chan *testTimer, 1)}
 			s := newServer(t, f, nil, permission.ModeDefault, clock)
 			a, b := net.Pipe()

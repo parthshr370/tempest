@@ -103,7 +103,7 @@ func TestMCPSessionsIndependentPermissions(t *testing.T) {
 	f := faux.New(faux.Options{})
 	opts := options(t, f)
 	for range 2 {
-		f.AppendResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"mkdir -p approval-test"}`), "same-call")), faux.Respond(faux.Text("done")))
+		f.AppendResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"rm -f approval-test"}`), "same-call")), faux.Respond(faux.Text("done")))
 	}
 	var askCount int
 	c := connect(t, opts, "2025-11-25", map[string]any{"elicitation": map[string]any{}}, func(_ context.Context, method string, _ json.RawMessage) (any, *rpc.Error) {
@@ -129,7 +129,7 @@ func TestMCPSessionsIndependentPermissions(t *testing.T) {
 func TestMCPSignalContextCancelsPendingElicitation(t *testing.T) {
 	f := faux.New(faux.Options{})
 	opts := options(t, f)
-	f.AppendResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"mkdir -p must-not-exist"}`), "pending")))
+	f.AppendResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"rm -f must-not-exist"}`), "pending")))
 	asked := make(chan struct{})
 	c := connect(t, opts, "2025-11-25", map[string]any{"elicitation": map[string]any{}}, func(ctx context.Context, method string, _ json.RawMessage) (any, *rpc.Error) {
 		if method == "elicitation/create" {

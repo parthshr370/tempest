@@ -60,12 +60,12 @@ func (p *decisionProbe) Approve(_ context.Context, r PromptRequest) (Choice, err
 	p.request = &r
 	return AllowOnce, nil
 }
-func evaluate(ctx context.Context, mode Mode, tool string, args json.RawMessage, policy *Policy) (Outcome, *PromptRequest) {
+func evaluate(ctx context.Context, mode Mode, tool string, args json.RawMessage, policy *Policy, cwd string) (Outcome, *PromptRequest) {
 	saved := CaptureCeiling(mode, nil, policy)
 	copy := ceilingPolicy(saved)
 	probe := &decisionProbe{}
 	copy.Prompter = probe
-	out := Gate(ctx, mode, tool, args, copy)
+	out := GateInDirectory(ctx, mode, tool, args, copy, cwd)
 	return out, probe.request
 }
 
@@ -81,8 +81,8 @@ func GateChild(ctx context.Context, ceiling work.Ceiling, liveMode Mode, liveToo
 	if (liveMode == ModePlan || Mode(ceiling.Mode) == ModePlan) && ClassifyTool(tool) != TierRead && !(tool == "bash" && IsSafeCommand(commandFromArgs(args))) {
 		return denied
 	}
-	launch, askLaunch := evaluate(ctx, Mode(ceiling.Mode), tool, args, ceilingPolicy(ceiling))
-	live, askLive := evaluate(ctx, liveMode, tool, args, policy)
+	launch, askLaunch := evaluate(ctx, Mode(ceiling.Mode), tool, args, ceilingPolicy(ceiling), scope.Cwd)
+	live, askLive := evaluate(ctx, liveMode, tool, args, policy, scope.Cwd)
 	if !launch.Allow || !live.Allow {
 		return denied
 	}

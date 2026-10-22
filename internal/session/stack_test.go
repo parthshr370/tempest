@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"go.harness.dev/harness/internal/compaction"
+	"go.harness.dev/harness/internal/config"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/provider/faux"
@@ -41,6 +42,35 @@ func TestBuildPlanStackReadOnly(t *testing.T) {
 		if !allowed[tool.Name] {
 			t.Fatalf("plan stack exposed non-read-only tool %q", tool.Name)
 		}
+	}
+}
+
+func TestStackConfigFromConfigPreservesReadOnlyPlan(t *testing.T) {
+	resolved, err := (config.Config{
+		SettingsPath: filepath.Join(t.TempDir(), "settings.json"),
+		LookupEnv:    func(string) string { return "" },
+		Flags: config.FlagValues{
+			Plan:       config.BoolInput{Value: true, Set: true},
+			EnableTask: config.BoolInput{Value: true, Set: true},
+		},
+	}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := StackConfigFromConfig(resolved)
+	provider := faux.New(faux.Options{})
+	cfg.Cwd, cfg.SpillDir = t.TempDir(), t.TempDir()
+	cfg.Model, cfg.StreamFn = provider.Model(), provider.StreamSimple
+	stack, err := BuildAgentStack(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range stack.Agent.State().Tools {
+		names = append(names, tool.Name)
+	}
+	if got := strings.Join(names, ","); got != "read,grep,find,ls" {
+		t.Fatalf("config-backed plan tools = %q, want read,grep,find,ls", got)
 	}
 }
 

@@ -40,6 +40,65 @@ func (h testRunHooks) Finish(ctx context.Context, reason string) error {
 	return nil
 }
 
+func TestWorkMaxTurnsDistinguishesQuiescenceFromPendingWork(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		steps     []faux.ResponseStep
+		maxTurns  int
+		followUp  bool
+		liveWork  bool
+		idleError bool
+		want      StopReason
+	}{
+		{name: "final text", steps: []faux.ResponseStep{faux.Respond(faux.Text("OK"))}, maxTurns: 1, want: StopCompleted},
+		{name: "tool then final text", steps: []faux.ResponseStep{toolCallStep("one"), faux.Respond(faux.Text("OK"))}, maxTurns: 2, want: StopCompleted},
+		{name: "tool needs another turn", steps: []faux.ResponseStep{toolCallStep("one")}, maxTurns: 1, want: StopMaxTurns},
+		{name: "follow-up needs another turn", steps: []faux.ResponseStep{faux.Respond(faux.Text("OK"))}, maxTurns: 1, followUp: true, want: StopMaxTurns},
+		{name: "live work at cap", steps: []faux.ResponseStep{faux.Respond(faux.Text("OK"))}, maxTurns: 1, liveWork: true, want: StopMaxTurns},
+		{name: "idle failure at cap", steps: []faux.ResponseStep{faux.Respond(faux.Text("OK"))}, maxTurns: 1, idleError: true, want: StopError},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := faux.New(faux.Options{})
+			f.SetResponses(test.steps...)
+			queue := &testWorkQueue{}
+			idleCalls := 0
+			failure := errors.New("idle failed")
+			hooks := testRunHooks{idle: func(ctx context.Context) (bool, error) {
+				idleCalls++
+				if test.idleError {
+					return false, failure
+				}
+				if test.liveWork {
+					if ctx.Err() == nil {
+						return false, errors.New("waited for work beyond the turn cap")
+					}
+					return false, ctx.Err()
+				}
+				if test.followUp {
+					queue.messages = append(queue.messages, work.QueuedMessage{ID: "next", Message: userMessage("next")})
+					return true, nil
+				}
+				return false, nil
+			}}
+			a := newRuntimeAgent(f, func(o *AgentOptions) {
+				o.Work, o.QueueSource = hooks, queue
+				o.Budget.MaxTurns = test.maxTurns
+				o.InitialState.Tools = []AgentTool{okTool("work")}
+			})
+			result, err := a.PromptText(context.Background(), "go")
+			if err != nil || result.StopReason != test.want || result.Turns != test.maxTurns || f.CallCount() != test.maxTurns {
+				t.Fatalf("result=%+v err=%v calls=%d", result, err, f.CallCount())
+			}
+			if test.want == StopCompleted && idleCalls != 1 {
+				t.Fatalf("idle calls=%d, want atomic quiescence check", idleCalls)
+			}
+			if test.idleError && !errors.Is(result.Err, failure) {
+				t.Fatalf("idle error=%v, want %v", result.Err, failure)
+			}
+		})
+	}
+}
+
 func TestWorkIdleWallDeadlineJoinsBeforeAgentEnd(t *testing.T) {
 	f := faux.New(faux.Options{})
 	f.SetResponses(faux.Respond(faux.Text("done")))

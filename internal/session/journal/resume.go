@@ -272,7 +272,7 @@ func (l *Loaded) diagnose(format string, args ...any) {
 	l.Diagnostics = append(l.Diagnostics, Diagnostic{Message: fmt.Sprintf(format, args...)})
 }
 
-// Resolve returns the journal path for id under dir and cwd.
+// Resolve accepts a session id or journal filename under dir and cwd.
 func Resolve(ctx context.Context, dir, cwd, id string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", fmt.Errorf("resolve journal: %w", err)
@@ -286,12 +286,14 @@ func Resolve(ctx context.Context, dir, cwd, id string) (string, error) {
 		return "", fmt.Errorf("read journal directory: %w", err)
 	}
 	suffix := "_" + id + ".jsonl"
+	filename := strings.TrimSuffix(id, ".jsonl") + ".jsonl"
+	var found, foundName string
 	var corruptErr error
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("resolve journal: %w", err)
 		}
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), suffix) {
+		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), suffix) && entry.Name() != filename) {
 			continue
 		}
 		path := filepath.Join(journalDir, entry.Name())
@@ -303,10 +305,16 @@ func Resolve(ctx context.Context, dir, cwd, id string) (string, error) {
 			corruptErr = fmt.Errorf("inspect journal %q: %w", entry.Name(), err)
 			continue
 		}
-		if header.Cwd != cwd {
+		if header.Cwd != cwd || (entry.Name() != filename && header.ID != id) {
 			continue
 		}
-		return path, nil
+		if found != "" {
+			return "", fmt.Errorf("ambiguous session %q: pass -resume %s or -resume %s", id, foundName, entry.Name())
+		}
+		found, foundName = path, entry.Name()
+	}
+	if found != "" {
+		return found, nil
 	}
 	if corruptErr != nil {
 		return "", corruptErr

@@ -228,6 +228,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if err != nil {
 			return nil, err
 		}
+		cfg.PlanModel = cfg.Model
 	}
 	if cfg.StreamFn == nil {
 		provider := o.Provider

@@ -108,7 +108,7 @@ func TestStreamJSONOrderAndImmediateDelta(t *testing.T) {
 	if err := json.Unmarshal(lines[len(lines)-1], &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Text != "final" || report.StopReason != "completed" {
+	if report.Text != "final" || report.StopReason != "completed" || report.SessionID != s.ID() {
 		t.Fatalf("report=%+v", report)
 	}
 }
