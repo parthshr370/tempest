@@ -419,7 +419,7 @@ func TestFailedCloseDoesNotLeaveClosedSessionRegistered(t *testing.T) {
 	if err := <-runDone; err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	resumed, err := s.Resume(context.Background(), cwd, session.ID())
+	resumed, err := s.Resume(context.Background(), cwd, session.ID(), nil)
 	if err != nil {
 		t.Fatalf("resume after failed close: %v", err)
 	}

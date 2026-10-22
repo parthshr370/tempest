@@ -69,6 +69,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
+		case "mcp":
+			return runMCP(args[1:], stdout, stderr)
 		case "doctor":
 			return runDoctor(args[1:], stdout, stderr)
 		case "version":
@@ -87,13 +89,23 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	if opts.Version {
 		return runVersion(stdout)
 	}
+	mode, err := resolveOutputFormat(opts.OutputFormat, opts.PrintMode)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if mode == "stream-json" {
+		// Let the encoder report EPIPE so it can cancel and join the durable run.
+		signal.Ignore(syscall.SIGPIPE)
+		defer signal.Reset(syscall.SIGPIPE)
+	}
 	if err := resolveCommandConfig(&opts); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
 	if opts.Prompt == "" {
-		fmt.Fprintln(stderr, "usage: harness -p <prompt> [-model <id>] [-output-format text|json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION]")
+		fmt.Fprintln(stderr, "usage: harness -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION]")
 		return 1
 	}
 	permissionMode, err := permission.ParseMode(opts.Config.PermissionModeDefault())
@@ -219,6 +231,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			Model:          selectedModel.ID,
 			Budget:         opts.Budget,
 			PermissionMode: permissionMode,
+			MCPServers:     opts.Config.MCPServers(),
 		},
 	}, opts.Resume, opts.Continue)
 	if err != nil {
@@ -230,19 +243,11 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			slog.Warn("session close failed", "error", err)
 		}
 	}()
-	mode, err := resolveOutputFormat(opts.OutputFormat, opts.PrintMode)
-	if err != nil {
-		fmt.Fprintln(stderr, err)
+	outcome, outputErr := executeOneShot(runCtx, sess, opts.Prompt, mode, stdout, stderr, 256)
+	if outputErr != nil {
+		fmt.Fprintf(stderr, "output error: %v\n", outputErr)
 		return 1
 	}
-	started := time.Now()
-	result, err := sess.Prompt(runCtx, tempest.Prompt{Text: opts.Prompt})
-	if err != nil {
-		fmt.Fprintf(stderr, "run error: %v\n", err)
-		return 1
-	}
-	outcome := runOutcome{RunResult: result, Elapsed: time.Since(started), LastAssistantText: sess.LastAssistantText()}
-	writeRunOutput(stdout, stderr, mode, outcome, sess.Messages())
 	if permissionMode == permission.ModePlan {
 		collector := permission.NewPlanCollector()
 		collector.Observe(outcome.LastAssistantText)
@@ -291,21 +296,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 		last = messages[len(messages)-1]
 	}
 	if mode == "json" {
-		report := runReport{
-			StopReason: outcome.StopReason,
-			Turns:      outcome.Turns,
-			Usage:      outcome.Usage,
-			ElapsedMS:  outcome.Elapsed.Milliseconds(),
-			Text:       outcome.LastAssistantText,
-			Message:    last,
-		}
-		if outcome.Err != nil {
-			report.Error = outcome.Err.Error()
-		}
-		if !outcome.Usage.Cost.Unknown {
-			cost := outcome.Usage.Cost.Total
-			report.CostUSD = &cost
-		}
+		report := makeRunReport(outcome, last)
 		data, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			fmt.Fprintf(stderr, "encode run report: %v\n", err)
@@ -324,6 +315,18 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 	default:
 		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)
 	}
+}
+
+func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
+	report := runReport{StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last}
+	if outcome.Err != nil {
+		report.Error = outcome.Err.Error()
+	}
+	if !outcome.Usage.Cost.Unknown {
+		cost := outcome.Usage.Cost.Total
+		report.CostUSD = &cost
+	}
+	return report
 }
 
 // parseCommandOptions tracks explicitly passed settings separately so config resolution can preserve precedence.
@@ -346,6 +349,7 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
 	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
+	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
 	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
 	fs.StringVar(&values.OpenAIBaseURL.Value, "openai-base-url", "", "OpenAI-compatible base URL")
 	fs.StringVar(&values.AnthropicAPIKey.Value, "anthropic-api-key", "", "Anthropic API key")
@@ -359,8 +363,8 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 	var resume string
 	var continueRecent bool
 	fs.StringVar(&prompt, "p", "", "single prompt to run (non-interactive)")
-	fs.StringVar(&printMode, "print", "text", "legacy output mode alias: text, json")
-	fs.StringVar(&outputFormat, "output-format", "", "output mode: text, json")
+	fs.StringVar(&printMode, "print", "text", "legacy output mode alias: text, json, stream-json")
+	fs.StringVar(&outputFormat, "output-format", "", "output mode: text, json, stream-json")
 	fs.StringVar(&excludeTools, "exclude-tools", "", "comma-separated tool names to exclude")
 	fs.BoolVar(&version, "version", false, "print build version")
 	fs.StringVar(&resume, "resume", "", "resume a session by id")
@@ -406,6 +410,8 @@ func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error
 			values.AgentDir.Set = true
 		case "session-dir":
 			values.SessionDir.Set = true
+		case "mcp-config":
+			values.MCPConfig.Set = true
 		case "anthropic-base-url":
 			values.AnthropicBaseURL.Set = true
 		case "openai-base-url":
@@ -500,10 +506,10 @@ func resolveOutputFormat(outputFormat, printMode string) (string, error) {
 		mode = "text"
 	}
 	switch mode {
-	case "text", "json":
+	case "text", "json", "stream-json":
 		return mode, nil
 	default:
-		return "", fmt.Errorf("unsupported output format %q (use text or json)", mode)
+		return "", fmt.Errorf("unsupported output format %q (use text, json or stream-json)", mode)
 	}
 }
 
@@ -543,6 +549,7 @@ func openSession(ctx context.Context, options tempest.Options, resumeID string, 
 			Model:          options.New.Model,
 			Budget:         options.New.Budget,
 			PermissionMode: options.New.PermissionMode,
+			MCPServers:     options.New.MCPServers,
 		}
 		if continueRecent {
 			path, err := journal.Recent(ctx, options.SessionDir, options.Cwd)

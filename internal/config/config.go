@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/mcpconfig"
 )
 
 const (
@@ -91,6 +92,7 @@ type FlagValues struct {
 	SkillPaths           StringsInput
 	PermissionAllowTools StringsInput
 	PermissionDenyTools  StringsInput
+	MCPConfig            StringInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -124,7 +126,8 @@ type Config struct {
 	SettingsPath string
 }
 
-// ResolvedConfig is the immutable, non-secret configuration used after startup.
+// ResolvedConfig is the immutable runtime configuration used after startup.
+// MCP endpoint credentials stay in memory; callers must not log its private fields.
 type ResolvedConfig struct {
 	model                 string
 	planModel             string
@@ -150,6 +153,7 @@ type ResolvedConfig struct {
 	permissionAllowTools  []string
 	permissionDenyTools   []string
 	retry                 RetrySettings
+	mcpServers            []mcpconfig.Server
 }
 
 // Model returns the default model specification.
@@ -247,35 +251,37 @@ func (e *Error) Unwrap() error { return e.Err }
 // fileSettings keeps scalar values as pointers so an omitted setting won't
 // shadow an environment value or built-in default.
 type fileSettings struct {
-	Model                 *string  `json:"model"`
-	PlanModel             *string  `json:"plan_model"`
-	SmolModel             *string  `json:"smol_model"`
-	MaxTokens             *int     `json:"max_tokens"`
-	PermissionModeDefault *string  `json:"permission_mode_default"`
-	BashTimeout           *string  `json:"bash_timeout"`
-	LogLevel              *string  `json:"log_level"`
-	LogFile               *string  `json:"log_file"`
-	LogFileMaxBytes       *int64   `json:"log_file_max_bytes"`
-	EnableWeb             *bool    `json:"enable_web"`
-	WebSearchURL          *string  `json:"web_search_url"`
-	AgentDir              *string  `json:"agent_dir"`
-	EnableTask            *bool    `json:"enable_task"`
-	Plan                  *bool    `json:"plan"`
-	Attach                []string `json:"attach"`
-	SessionDir            *string  `json:"session_dir"`
-	AnthropicBaseURL      *string  `json:"anthropic_base_url"`
-	OpenAIBaseURL         *string  `json:"openai_base_url"`
-	FauxScript            *string  `json:"faux_script"`
-	SkillPaths            []string `json:"skill_paths"`
-	PermissionAllowTools  []string `json:"permission_allow_tools"`
-	PermissionDenyTools   []string `json:"permission_deny_tools"`
-	RetryEnabled          *bool    `json:"retry_enabled"`
-	RetryMaxAttempts      *int     `json:"retry_max_attempts"`
-	RetryBaseDelayMS      *int     `json:"retry_base_delay_ms"`
-	RetryBackoffCapMS     *int     `json:"retry_backoff_cap_ms"`
-	RetryMaxDelayMS       *int     `json:"retry_max_delay_ms"`
-	RetryJitterMin        *float64 `json:"retry_jitter_min"`
-	RetryJitterMax        *float64 `json:"retry_jitter_max"`
+	Model                 *string            `json:"model"`
+	PlanModel             *string            `json:"plan_model"`
+	SmolModel             *string            `json:"smol_model"`
+	MaxTokens             *int               `json:"max_tokens"`
+	PermissionModeDefault *string            `json:"permission_mode_default"`
+	BashTimeout           *string            `json:"bash_timeout"`
+	LogLevel              *string            `json:"log_level"`
+	LogFile               *string            `json:"log_file"`
+	LogFileMaxBytes       *int64             `json:"log_file_max_bytes"`
+	EnableWeb             *bool              `json:"enable_web"`
+	WebSearchURL          *string            `json:"web_search_url"`
+	AgentDir              *string            `json:"agent_dir"`
+	EnableTask            *bool              `json:"enable_task"`
+	Plan                  *bool              `json:"plan"`
+	Attach                []string           `json:"attach"`
+	SessionDir            *string            `json:"session_dir"`
+	AnthropicBaseURL      *string            `json:"anthropic_base_url"`
+	OpenAIBaseURL         *string            `json:"openai_base_url"`
+	FauxScript            *string            `json:"faux_script"`
+	SkillPaths            []string           `json:"skill_paths"`
+	PermissionAllowTools  []string           `json:"permission_allow_tools"`
+	PermissionDenyTools   []string           `json:"permission_deny_tools"`
+	RetryEnabled          *bool              `json:"retry_enabled"`
+	RetryMaxAttempts      *int               `json:"retry_max_attempts"`
+	RetryBaseDelayMS      *int               `json:"retry_base_delay_ms"`
+	RetryBackoffCapMS     *int               `json:"retry_backoff_cap_ms"`
+	RetryMaxDelayMS       *int               `json:"retry_max_delay_ms"`
+	RetryJitterMin        *float64           `json:"retry_jitter_min"`
+	RetryJitterMax        *float64           `json:"retry_jitter_max"`
+	MCPConfig             *string            `json:"mcp_config"`
+	MCPServers            []mcpconfig.Server `json:"mcp_servers"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -305,7 +311,7 @@ func resolveToolList(flag StringsInput, env string, settings []string) []string 
 	return append([]string(nil), settings...)
 }
 
-// Resolve reads settings once and returns validated values with no secret data.
+// Resolve reads settings once and returns validated runtime values.
 func (c Config) Resolve() (*ResolvedConfig, error) {
 	lookup := c.LookupEnv
 	if lookup == nil {
@@ -318,6 +324,10 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	settings, err := loadSettings(settingsPath)
 	if err != nil {
 		return nil, err
+	}
+	mcpServers, err := resolveMCP(c.Flags.MCPConfig, lookup("HARNESS_MCP_CONFIG"), settings)
+	if err != nil {
+		return nil, &Error{Field: "mcp_config", Err: err}
 	}
 	if c.Flags.AnthropicAPIKey.Set && c.Flags.AnthropicAuthToken.Set {
 		return nil, &Error{Field: "credentials", Err: errors.New("-anthropic-api-key and -anthropic-auth-token cannot be used together")}
@@ -442,6 +452,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		skillPaths:            skillPaths,
 		permissionAllowTools:  permissionAllowTools,
 		permissionDenyTools:   permissionDenyTools,
+		mcpServers:            mcpServers,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,

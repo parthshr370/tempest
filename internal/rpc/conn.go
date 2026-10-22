@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // MaxFrame is the largest JSON frame we accept or send, excluding the line ending.
@@ -35,6 +36,17 @@ type Handler func(context.Context, string, json.RawMessage) (any, *Error)
 
 // Deferred is the long-running part of a synchronously admitted request.
 type Deferred func() (any, *Error)
+
+// NoResponse suppresses a cancelled request's reply, without skipping its join.
+type NoResponse struct{}
+
+type requestIDKey struct{}
+
+// RequestID returns a detached exact JSON ID for the inbound request.
+func RequestID(ctx context.Context) json.RawMessage {
+	id, _ := ctx.Value(requestIDKey{}).(json.RawMessage)
+	return append(json.RawMessage(nil), id...)
+}
 
 // Response starts After only once its result has entered the writer queue.
 // Watch handlers use this to keep live events behind their snapshot response.
@@ -65,28 +77,55 @@ type message struct {
 
 // Conn owns one reader and one writer. Start Serve before making outbound calls.
 type Conn struct {
-	transport  frameTransport
-	ctx        context.Context
-	cancel     context.CancelFunc
-	once       sync.Once
-	out        chan []byte
-	mu         sync.Mutex
-	pending    map[string]chan message
-	next       atomic.Uint64
-	accepting  bool
-	handlers   sync.WaitGroup
-	writerDone chan struct{}
+	transport     frameTransport
+	ctx           context.Context
+	cancel        context.CancelFunc
+	once          sync.Once
+	out           chan []byte
+	mu            sync.Mutex
+	pending       map[string]chan message
+	next          atomic.Uint64
+	accepting     bool
+	handlers      sync.WaitGroup
+	writerDone    chan struct{}
+	maxFrame      int
+	protocolError func(error)
+	lateIDs       map[string]bool
+	drainOnEOF    bool
 }
 
 func newConn(t frameTransport) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message), accepting: true, writerDone: make(chan struct{})}
+	c := &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message), accepting: true, writerDone: make(chan struct{}), maxFrame: MaxFrame}
 	go c.writeLoop()
 	return c
 }
 
-// Done closes when either transport direction shuts down.
+// Done closes when the connection shuts down, not on EOF with SetDrainOnEOF.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
+
+// SetProtocolErrorHandler selects strict client framing. Call it before Serve.
+// With no handler, malformed peer frames retain the server's recover-and-reply policy.
+func (c *Conn) SetProtocolErrorHandler(handler func(error)) {
+	c.protocolError = handler
+	if stream, ok := c.transport.(*lineTransport); ok {
+		stream.stopOnOversize = handler != nil
+	}
+}
+
+// SetDrainOnEOF keeps the writer and handler contexts alive after reader EOF.
+// Set it before Serve; the owner must then call Drain and Close.
+func (c *Conn) SetDrainOnEOF(enabled bool) {
+	c.drainOnEOF = enabled
+}
+
+func (c *Conn) rejectProtocol(err error) bool {
+	if c.protocolError == nil {
+		return false
+	}
+	c.protocolError(err)
+	return true
+}
 
 // Drain stops admitting requests and waits for their replies to enter the queue.
 // The reader continues correlating responses to outbound calls.
@@ -136,16 +175,25 @@ func (c *Conn) Serve(handler Handler) error {
 // ServeOrdered admits requests in read order. Handlers must return promptly;
 // return Deferred for work that can block, including writes and outbound calls.
 func (c *Conn) ServeOrdered(handler Handler) error {
-	defer c.Close()
+	readEOF := false
+	defer func() {
+		if !readEOF || !c.drainOnEOF {
+			c.Close()
+		}
+	}()
 	for {
 		data, err := c.transport.read(c.ctx)
 		if errors.Is(err, errOversize) {
-			if err = c.reply(nil, nil, NewError(-32600, "frame_too_large", "frame exceeds 1 MiB")); err != nil {
+			if c.rejectProtocol(errors.New("mcp_output_limit: MCP frame exceeds response cap; remote outcome may be unknown")) {
+				return err
+			}
+			if err = c.reply(nil, nil, NewError(-32600, "frame_too_large", fmt.Sprintf("frame exceeds %d bytes", c.maxFrame))); err != nil {
 				return err
 			}
 			continue
 		}
 		if err != nil {
+			readEOF = errors.Is(err, io.EOF)
 			if errors.Is(err, io.EOF) || c.ctx.Err() != nil {
 				return nil
 			}
@@ -153,22 +201,35 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 		}
 		data = bytes.TrimSpace(data)
 		var m message
-		if !json.Valid(data) {
+		if !utf8.Valid(data) || !json.Valid(data) {
+			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON or UTF-8")) {
+				return errors.New("invalid peer frame")
+			}
 			_ = c.reply(nil, nil, NewError(-32700, "parse_error", "invalid JSON"))
 			continue
 		}
 		if err = json.Unmarshal(data, &m); err != nil || m.JSONRPC != "2.0" || len(data) == 0 || data[0] != '{' || !validID(m.ID) {
+			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC envelope")) {
+				return errors.New("invalid peer frame")
+			}
 			_ = c.reply(nil, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC request"))
 			continue
 		}
 		if m.Method == "" {
 			if len(m.ID) == 0 || (len(m.Result) == 0) == (m.Error == nil) {
+				if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC response")) {
+					return errors.New("invalid peer response")
+				}
 				_ = c.reply(nil, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC response"))
 				continue
 			}
 			c.mu.Lock()
 			ch := c.pending[string(m.ID)]
+			isLate := c.lateIDs[string(m.ID)]
 			c.mu.Unlock()
+			if ch == nil && !isLate && c.rejectProtocol(errors.New("mcp_protocol: unexpected response ID")) {
+				return errors.New("unexpected response ID")
+			}
 			if ch != nil {
 				select {
 				case ch <- m:
@@ -178,6 +239,9 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 			continue
 		}
 		if len(m.Result) != 0 || m.Error != nil || (len(m.Params) > 0 && m.Params[0] != '{' && m.Params[0] != '[') {
+			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC request")) {
+				return errors.New("invalid peer request")
+			}
 			_ = c.reply(m.ID, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC request"))
 			continue
 		}
@@ -188,7 +252,8 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 		}
 		c.handlers.Add(1)
 		c.mu.Unlock()
-		value, rpcErr := handler(c.ctx, m.Method, m.Params)
+		requestCtx := context.WithValue(c.ctx, requestIDKey{}, append(json.RawMessage(nil), m.ID...))
+		value, rpcErr := handler(requestCtx, m.Method, m.Params)
 		go func(m message, value any, rpcErr *Error) {
 			defer c.handlers.Done()
 			if work, ok := value.(Deferred); ok {
@@ -199,7 +264,8 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 				value = response.Value
 				after = response.After
 			}
-			if len(m.ID) > 0 {
+			_, suppressed := value.(NoResponse)
+			if len(m.ID) > 0 && !suppressed {
 				if c.reply(m.ID, value, rpcErr) != nil {
 					return
 				}
@@ -289,9 +355,9 @@ func (c *Conn) reply(id json.RawMessage, result any, rpcErr *Error) error {
 	if err != nil {
 		return err
 	}
-	if len(b) > MaxFrame {
+	if len(b) > c.maxFrame {
 		m.Result = nil
-		m.Error = NewError(-32000, "frame_too_large", "response exceeds 1 MiB")
+		m.Error = NewError(-32000, "frame_too_large", "response exceeds frame cap")
 		b, _ = json.Marshal(m)
 	}
 	return c.send(c.ctx, b)
@@ -310,11 +376,11 @@ func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 	if err != nil {
 		return err
 	}
-	if len(b) > MaxFrame {
+	if len(b) > c.maxFrame {
 		size := len(b)
 		p, _ = json.Marshal(map[string]any{"method": method, "bytes": size})
 		b, _ = json.Marshal(message{JSONRPC: "2.0", Method: "tempest/frame_dropped", Params: p})
-		if len(b) > MaxFrame {
+		if len(b) > c.maxFrame {
 			return NewError(-32000, "frame_too_large", "notification method exceeds frame cap")
 		}
 	}
@@ -323,47 +389,63 @@ func (c *Conn) Notify(ctx context.Context, method string, params any) error {
 
 // Call sends a request and waits for its matching response or cancellation.
 func (c *Conn) Call(ctx context.Context, method string, params, result any) error {
+	var raw json.RawMessage
+	raw, err := c.CallWithID(ctx, fmt.Sprintf("tempest_%d", c.next.Add(1)), method, params)
+	if err != nil || result == nil {
+		return err
+	}
+	return json.Unmarshal(raw, result)
+}
+
+// CallWithID sends a string-ID request, rejecting duplicate pending IDs.
+func (c *Conn) CallWithID(ctx context.Context, id string, method string, params any) (json.RawMessage, error) {
 	p, err := json.Marshal(params)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if params == nil {
 		p = nil
 	}
-	id := json.RawMessage(fmt.Sprintf("\"tempest_%d\"", c.next.Add(1)))
-	b, err := json.Marshal(message{JSONRPC: "2.0", ID: id, Method: method, Params: p})
+	rawID, _ := json.Marshal(id)
+	b, err := json.Marshal(message{JSONRPC: "2.0", ID: rawID, Method: method, Params: p})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(b) > MaxFrame {
-		return NewError(-32000, "frame_too_large", "request exceeds 1 MiB")
+	if len(b) > c.maxFrame {
+		return nil, NewError(-32000, "frame_too_large", "request exceeds frame cap")
 	}
 	ch := make(chan message, 1)
 	c.mu.Lock()
-	c.pending[string(id)] = ch
+	if _, exists := c.pending[string(rawID)]; exists {
+		c.mu.Unlock()
+		return nil, errors.New("request ID already pending")
+	}
+	c.pending[string(rawID)] = ch
 	c.mu.Unlock()
-	defer func() { c.mu.Lock(); delete(c.pending, string(id)); c.mu.Unlock() }()
+	defer func() { c.mu.Lock(); delete(c.pending, string(rawID)); c.mu.Unlock() }()
 	if err = c.send(ctx, b); err != nil {
-		return err
+		return nil, err
 	}
 	var response message
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		c.mu.Lock()
+		if c.lateIDs == nil || len(c.lateIDs) >= 128 {
+			c.lateIDs = make(map[string]bool)
+		}
+		c.lateIDs[string(rawID)] = true
+		c.mu.Unlock()
+		return nil, ctx.Err()
 	case <-c.ctx.Done():
-		// EOF may follow the final reply before Call gets scheduled.
 		select {
 		case response = <-ch:
 		default:
-			return ErrClosed
+			return nil, ErrClosed
 		}
 	case response = <-ch:
 	}
 	if response.Error != nil {
-		return response.Error
+		return nil, response.Error
 	}
-	if result == nil {
-		return nil
-	}
-	return json.Unmarshal(response.Result, result)
+	return response.Result, nil
 }

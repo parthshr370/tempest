@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/mcpserver"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/serve"
 	"go.harness.dev/harness/tempest"
@@ -43,19 +44,29 @@ func (s stdioStream) Close() error {
 }
 
 func runServe(args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	return runServerCommand("serve", args, stdout, stderr)
+}
+
+func runServerCommand(command string, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var values config.FlagValues
-	var listen, token string
+	var listen, token, a2aBaseURL string
 	var idleTimeout, permissionTimeout, shutdownTimeout, maxWall time.Duration
 	var maxTurns int
 	var maxCost float64
-	fs.StringVar(&listen, "listen", "", "WebSocket listen address (empty serves stdio)")
-	fs.StringVar(&token, "token", os.Getenv("TEMPEST_TOKEN"), "WebSocket bearer token")
+	if command == "serve" {
+		fs.StringVar(&listen, "listen", "", "HTTP/WebSocket listen address (empty serves ACP stdio)")
+		fs.StringVar(&token, "token", os.Getenv("TEMPEST_TOKEN"), "HTTP/WebSocket bearer token")
+		fs.StringVar(&a2aBaseURL, "a2a-base-url", "", "absolute advertised A2A public base URL")
+	}
 	fs.DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "close idle sessions after this duration")
 	fs.DurationVar(&permissionTimeout, "permission-timeout", 5*time.Minute, "deny unanswered asks after this duration")
 	fs.DurationVar(&shutdownTimeout, "shutdown-timeout", 10*time.Second, "wait for runs during shutdown")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session journal directory")
+	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
+	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
+	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
 	fs.StringVar(&values.Model.Value, "model", "", "default model")
 	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "default permission mode")
 	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default shell command timeout")
@@ -69,13 +80,15 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "serve accepts flags only")
+		fmt.Fprintln(stderr, command+" accepts flags only")
 		return 1
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "session-dir":
 			values.SessionDir.Set = true
+		case "mcp-config":
+			values.MCPConfig.Set = true
 		case "model":
 			values.Model.Set = true
 		case "permission-mode":
@@ -101,7 +114,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	stack := &tempest.StackConfig{BashTimeout: cfg.BashTimeout()}
+	stack := &tempest.StackConfig{BashTimeout: cfg.BashTimeout(), PermissionPolicy: buildPermissionPolicy(cfg.PermissionAllowTools(), cfg.PermissionDenyTools())}
 	if cfg.FauxScript() != "" {
 		provider, model, err := loadFauxScript(cfg.FauxScript())
 		if err != nil {
@@ -116,7 +129,46 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "budget limits must not be negative")
 		return 1
 	}
-	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget}, Provider: tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL()}, Stack: stack})
+	if idleTimeout <= 0 || permissionTimeout <= 0 || shutdownTimeout <= 0 {
+		fmt.Fprintln(stderr, "server timeouts must be positive")
+		return 1
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers()}
+	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL()}
+	if command == "mcp" {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		signals := make(chan os.Signal, 2)
+		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(signals)
+		finished := make(chan struct{})
+		defer close(finished)
+		go func() {
+			select {
+			case <-signals:
+				cancel()
+			case <-finished:
+				return
+			}
+			select {
+			case <-signals:
+				os.Exit(exitAborted)
+			case <-finished:
+			}
+		}()
+		err := mcpserver.Serve(ctx, newStdioStream(os.Stdin, stdout), mcpserver.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, DefaultNew: defaults, Provider: provider, Stack: stack, PermissionTimeout: permissionTimeout, IdleTimeout: idleTimeout, ShutdownTimeout: shutdownTimeout})
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: stack})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

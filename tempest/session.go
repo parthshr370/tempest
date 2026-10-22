@@ -17,6 +17,8 @@ import (
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/mcpclient"
+	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
@@ -24,11 +26,17 @@ import (
 
 // Run is an admitted run. Wait may be called more than once.
 type Run struct {
-	cancel  context.CancelFunc
-	done    chan struct{}
-	started time.Time
-	result  RunResult
-	err     error
+	cancel     context.CancelFunc
+	done       chan struct{}
+	started    time.Time
+	result     RunResult
+	err        error
+	ready      chan struct{}
+	readyOnce  sync.Once
+	startID    string
+	text       string
+	last       Message
+	finishedAt time.Time
 }
 
 // Wait returns the run's terminal result.
@@ -37,31 +45,63 @@ func (r *Run) Wait() (RunResult, error) {
 	return r.result, r.err
 }
 
+// Cancel cancels only this run, even after the session starts another one.
+func (r *Run) Cancel() { r.cancel() }
+
+// Text returns this run's last nonempty assistant text after completion.
+func (r *Run) Text() string { <-r.done; return r.text }
+
+// LastMessage returns this run's final transcript message after completion.
+func (r *Run) LastMessage() Message { <-r.done; return r.last }
+
+// FinishedAt returns this run's terminal event time, or zero if no terminal event published.
+func (r *Run) FinishedAt() time.Time { <-r.done; return r.finishedAt }
+
+// Started waits for the durable start record. Cancelling the wait doesn't cancel the run.
+func (r *Run) Started(ctx context.Context) (string, error) {
+	select {
+	case <-r.ready:
+		if r.startID != "" {
+			return r.startID, nil
+		}
+		return "", r.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
 type approval struct{ result chan approvalResult }
 type approvalResult struct {
 	choice Choice
 	err    error
 }
 type sessionCore struct {
-	mu            sync.Mutex
-	id            string
-	agent         *agent.Agent
-	store         *journal.Store
-	hub           *hub.Hub
-	model         types.Model
-	budget        Budget
-	mode          PermissionMode
-	prompter      Prompter
-	pending       map[string]*approval
-	active        *Run
-	closed        bool
-	closeOnce     sync.Once
-	closeErr      error
-	detachJournal func()
-	detachHub     func()
-	lastText      string
-	runID         string
-	delivery      *session.MediaDelivery
+	mu               sync.Mutex
+	id               string
+	agent            *agent.Agent
+	store            *journal.Store
+	hub              *hub.Hub
+	model            types.Model
+	budget           Budget
+	mode             PermissionMode
+	prompter         Prompter
+	pending          map[string]*approval
+	active           *Run
+	closed           bool
+	closeOnce        sync.Once
+	closeErr         error
+	detachJournal    func()
+	detachHub        func()
+	lastText         string
+	runID            string
+	delivery         *session.MediaDelivery
+	mcp              *mcpclient.Manager
+	mcpEnabled       bool
+	permissionPolicy *permission.Policy
+	baseTools        []Tool
+	excludeTools     []string
+	plan             bool
+	baseMCPDefaults  map[string]permission.Decision
 }
 
 func open(ctx context.Context, o Options) (_ *Session, err error) {
@@ -82,6 +122,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if err != nil {
 		return nil, err
 	}
+	var selectedMCP []MCPServerConfig
+	if o.New != nil {
+		selectedMCP = o.New.MCPServers
+	} else {
+		selectedMCP = o.Resume.MCPServers
+	}
 	var cfg StackConfig
 	if o.Stack != nil {
 		cfg = *o.Stack
@@ -90,14 +136,21 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	needsDiscovery := cfg.ContextFiles == nil && cfg.Skills == nil && cfg.GenericRules == nil && cfg.Rules == nil
 	dir := o.SessionDir
 	var defaults *config.ResolvedConfig
-	if dir == "" || o.Stack == nil || needsDiscovery {
-		defaults, err = (config.Config{}).Resolve()
+	if dir == "" || o.Stack == nil || needsDiscovery || selectedMCP == nil {
+		defaults, err = (config.Config{Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
 		if err != nil {
 			return nil, err
 		}
 		if dir == "" {
 			dir = defaults.SessionDir()
 		}
+	}
+	if selectedMCP == nil && defaults != nil {
+		selectedMCP = defaults.MCPServers()
+	}
+	selectedMCP, err = mcpconfig.Normalize(selectedMCP)
+	if err != nil {
+		return nil, err
 	}
 	logger := o.Logger
 	if logger == nil {
@@ -306,18 +359,70 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if o.Prompter != nil {
 		cfg.PermissionPolicy.Prompter = gatePrompter{s}
 	}
+	c.baseMCPDefaults = make(map[string]permission.Decision, len(cfg.PermissionPolicy.MCPDefaults))
+	for name, decision := range cfg.PermissionPolicy.MCPDefaults {
+		c.baseMCPDefaults[name] = decision
+	}
+	cfg.PermissionPolicy.MCPDefaults = make(map[string]permission.Decision)
+	c.permissionPolicy = &cfg.PermissionPolicy
+	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(dir, "mcp-output", c.id), selectedMCP, logger)
+	if err != nil {
+		return nil, err
+	}
+	c.mcpEnabled = len(selectedMCP) != 0
+	defer func() {
+		if err != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = c.mcp.Close(closeCtx)
+		}
+	}()
+	c.installMCPDefaults()
+	cfg.ConfiguredTools = append(append([]Tool(nil), cfg.ConfiguredTools...), c.mcp.Tools()...)
+	c.excludeTools = append([]string(nil), cfg.ExcludeTools...)
+	c.plan = cfg.Plan
 	stack, e := session.BuildAgentStack(cfg)
 	if e != nil {
 		return nil, e
 	}
 	c.agent = stack.Agent
+	mcpNames := make(map[string]bool)
+	for _, tool := range c.mcp.Tools() {
+		mcpNames[tool.Name] = true
+	}
+	for _, tool := range c.agent.State().Tools {
+		if !mcpNames[tool.Name] {
+			c.baseTools = append(c.baseTools, tool)
+		}
+	}
 	c.agent.SetBudget(budget)
 	if cfg.AttachmentReader != nil || cfg.AttachmentRegistry != nil {
 		c.delivery = &session.MediaDelivery{Reader: cfg.AttachmentReader, Registry: cfg.AttachmentRegistry, ContextWindow: runtimeModel.ContextWindow, Sanitize: cfg.Sanitize}
 	}
 	c.detachJournal = session.AttachJournalWithRunID(c.agent, store, func(id string) { mapper.runID = id; c.mu.Lock(); c.runID = id; c.mu.Unlock() })
 	c.detachHub = c.agent.Subscribe(func(ctx context.Context, ev agent.AgentEvent) error {
+		if ev.Type == agent.EventAgentStart {
+			// The journal listener runs first. Its append must succeed before readiness.
+			c.mu.Lock()
+			if r := c.active; r != nil {
+				r.startID = c.runID
+				r.readyOnce.Do(func() { close(r.ready) })
+			}
+			c.mu.Unlock()
+		}
+		if ev.Type == agent.EventAgentEnd {
+			c.mu.Lock()
+			if c.active != nil {
+				c.active.finishedAt = ev.At
+			}
+			c.mu.Unlock()
+		}
 		if ev.Type == agent.EventMessageEnd {
+			c.mu.Lock()
+			if c.active != nil {
+				c.active.last = ev.Message
+			}
+			c.mu.Unlock()
 			if msg, ok := normalizeMessage(ev.Message).(types.AssistantMessage); ok {
 				var parts []string
 				for _, b := range msg.Content {
@@ -349,7 +454,7 @@ func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
 		return nil, ErrRunActive
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	r := &Run{cancel: cancel, done: make(chan struct{}), started: time.Now()}
+	r := &Run{cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), started: time.Now()}
 	c.active = r
 	c.lastText = ""
 	c.runID = ""
@@ -363,8 +468,13 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
 	defer func() {
 		r.cancel()
 		c.mu.Lock()
-		r.result.RunID = c.runID
+		r.result.RunID = r.startID
 		r.result.ElapsedMS = time.Since(r.started).Milliseconds()
+		r.text = c.lastText
+		if r.startID == "" && r.err == nil {
+			r.err = errors.New("run ended before durable start")
+		}
+		r.readyOnce.Do(func() { close(r.ready) })
 		c.active = nil
 		closed := c.closed
 		c.mu.Unlock()
@@ -373,6 +483,18 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
 		}
 		close(r.done)
 	}()
+	if c.mcpEnabled {
+		if err := c.mcp.Prepare(runCtx); err != nil {
+			r.err = err
+			return
+		}
+		if err := runCtx.Err(); err != nil {
+			r.err = err
+			return
+		}
+		c.installMCPDefaults()
+		c.agent.SetTools(c.selectedMCPTools())
+	}
 	if p == nil {
 		r.result, r.err = c.agent.Continue(runCtx)
 		return
@@ -466,7 +588,9 @@ func (c *sessionCore) finishClose() {
 			c.detachJournal()
 		}
 		c.hub.Close()
-		c.closeErr = c.store.Close()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		c.closeErr = errors.Join(c.mcp.Close(closeCtx), c.store.Close())
 	})
 }
 

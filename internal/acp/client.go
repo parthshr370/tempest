@@ -1,10 +1,12 @@
 package acp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,6 +16,8 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/build"
+	"go.harness.dev/harness/internal/mcpclient"
+	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
@@ -32,7 +36,7 @@ type SessionInfo struct {
 // Backend keeps registry ownership separate from per-connection protocol state.
 type Backend interface {
 	New(context.Context, string, *tempest.NewSession) (*tempest.Session, error)
-	Resume(context.Context, string, string) (*tempest.Session, error)
+	Resume(context.Context, string, string, []tempest.MCPServerConfig) (*tempest.Session, error)
 	Acquire(string) (*tempest.Session, func(), error)
 	CloseSession(context.Context, string) error
 	List(context.Context, string, string) ([]SessionInfo, string, error)
@@ -91,10 +95,16 @@ func decode(raw json.RawMessage, v any) *rpc.Error {
 }
 func failure(err error) *rpc.Error {
 	var wire *rpc.Error
+	var startup *mcpclient.StartupError
+	if errors.As(err, &startup) {
+		return rpc.NewError(-32013, "mcp_startup", fmt.Sprintf("MCP server %s %s failed", startup.Server, startup.Phase))
+	}
 	if errors.As(err, &wire) {
 		return wire
 	}
 	switch {
+	case errors.Is(err, tempest.ErrMCPConfigConflict):
+		return rpc.NewError(-32012, "mcp_config_conflict", err.Error())
 	case errors.Is(err, agent.ErrUnknownPrice):
 		return rpc.NewError(-32005, "budget_invalid", err.Error())
 	case errors.Is(err, tempest.ErrRunActive):
@@ -144,7 +154,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		c.initialized = true
 		c.notices = p.ClientCapabilities.Session.Notices
 		c.mu.Unlock()
-		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
+		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
 	}
 	c.mu.Lock()
 	initialized := c.initialized
@@ -342,10 +352,20 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 	panic("unhandled method")
 }
 
+type acpMCPServers []json.RawMessage
+
+func (servers *acpMCPServers) UnmarshalJSON(raw []byte) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("mcpServers must be an array")
+	}
+	type wireList acpMCPServers
+	return json.Unmarshal(raw, (*wireList)(servers))
+}
+
 type openParams struct {
-	SessionID  string            `json:"sessionId"`
-	Cwd        string            `json:"cwd"`
-	MCPServers []json.RawMessage `json:"mcpServers"`
+	SessionID  string        `json:"sessionId"`
+	Cwd        string        `json:"cwd"`
+	MCPServers acpMCPServers `json:"mcpServers"`
 	Meta       struct {
 		Tempest struct {
 			Model          string `json:"model"`
@@ -364,8 +384,9 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	if e := decode(raw, &p); e != nil {
 		return nil, e
 	}
-	if len(p.MCPServers) > 0 {
-		return nil, rpc.NewError(-32601, "unsupported", "unsupported: mcpServers")
+	servers, conversionErr := convertMCPServers(p.MCPServers)
+	if conversionErr != nil {
+		return nil, conversionErr
 	}
 	if p.Cwd == "" || !filepath.IsAbs(p.Cwd) {
 		return nil, rpc.NewError(-32602, "invalid_params", "cwd must be absolute")
@@ -375,6 +396,9 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	if method == "session/new" {
 		defaults := c.backend.Defaults()
 		n := &defaults
+		if p.MCPServers != nil {
+			n.MCPServers = servers
+		}
 		if p.Meta.Tempest.Model != "" {
 			n.Model = p.Meta.Tempest.Model
 		}
@@ -396,7 +420,7 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 		if p.SessionID == "" {
 			return nil, rpc.NewError(-32602, "invalid_params", "sessionId is required")
 		}
-		s, err = c.backend.Resume(ctx, p.Cwd, p.SessionID)
+		s, err = c.backend.Resume(ctx, p.Cwd, p.SessionID, servers)
 	}
 	if err != nil {
 		return nil, failure(err)
@@ -413,6 +437,89 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	}
 	// Replay precedes the response; live updates stay queued until after it.
 	return rpc.Response{Value: struct{}{}, After: after}, nil
+}
+
+func convertMCPServers(raw []json.RawMessage) ([]tempest.MCPServerConfig, *rpc.Error) {
+	if raw == nil {
+		return nil, nil
+	}
+	out := make([]tempest.MCPServerConfig, 0, len(raw))
+	for _, item := range raw {
+		var tag struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(item, &tag) != nil {
+			return nil, rpc.NewError(-32602, "invalid_params", "invalid MCP server")
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(item, &fields) != nil {
+			return nil, rpc.NewError(-32602, "invalid_params", "invalid MCP server")
+		}
+		if _, present := fields["type"]; present && tag.Type == "" {
+			return nil, rpc.NewError(-32602, "invalid_params", "ACP stdio omits the type discriminator")
+		}
+		if tag.Type == "sse" {
+			return nil, rpc.NewError(-32601, "unsupported", "SSE MCP transport is unsupported")
+		}
+		if tag.Type != "" && tag.Type != "http" {
+			return nil, rpc.NewError(-32602, "invalid_params", "invalid ACP MCP discriminator")
+		}
+		type pair struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}
+		var native struct {
+			Type    string   `json:"type,omitempty"`
+			Name    string   `json:"name"`
+			Command string   `json:"command,omitempty"`
+			Args    []string `json:"args,omitempty"`
+			Env     []pair   `json:"env,omitempty"`
+			URL     string   `json:"url,omitempty"`
+			Headers []pair   `json:"headers,omitempty"`
+		}
+		d := json.NewDecoder(bytes.NewReader(item))
+		d.DisallowUnknownFields()
+		if d.Decode(&native) != nil {
+			return nil, rpc.NewError(-32602, "invalid_params", "invalid ACP MCP fields")
+		}
+		var extra json.RawMessage
+		if d.Decode(&extra) != io.EOF {
+			return nil, rpc.NewError(-32602, "invalid_params", "trailing MCP data")
+		}
+		s := tempest.MCPServerConfig{Name: native.Name, Command: native.Command, Args: native.Args, URL: native.URL, Permission: "prompt", Transport: "stdio"}
+		if native.Type == "http" {
+			s.Transport = "http"
+		}
+		if (s.Transport == "stdio" && (native.URL != "" || native.Headers != nil)) || (s.Transport == "http" && (native.Command != "" || native.Args != nil || native.Env != nil)) {
+			return nil, rpc.NewError(-32602, "invalid_params", "mixed ACP MCP variants")
+		}
+		s.Env = make(map[string]string)
+		s.Headers = make(map[string]string)
+		for _, group := range []struct {
+			pairs  []pair
+			target map[string]string
+			fold   bool
+		}{{native.Env, s.Env, false}, {native.Headers, s.Headers, true}} {
+			seen := map[string]bool{}
+			for _, p := range group.pairs {
+				key := p.Name
+				if group.fold {
+					key = strings.ToLower(key)
+				}
+				if seen[key] {
+					return nil, rpc.NewError(-32602, "invalid_params", "duplicate MCP environment/header key")
+				}
+				seen[key] = true
+				group.target[p.Name] = p.Value
+			}
+		}
+		out = append(out, s)
+	}
+	normalized, err := mcpconfig.Normalize(out)
+	if err != nil {
+		return nil, rpc.NewError(-32602, "invalid_params", err.Error())
+	}
+	return normalized, nil
 }
 
 type contentBlock struct {

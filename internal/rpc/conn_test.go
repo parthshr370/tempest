@@ -27,6 +27,7 @@ func TestFramingRecovers(t *testing.T) {
 	}{
 		{strings.Repeat("x", 2<<20), -32600, "frame_too_large"},
 		{`{"bad":`, -32700, "parse_error"},
+		{"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"\xff\"}", -32700, "parse_error"},
 		{`{"jsonrpc":"2.0","id":7,"method":"missing"}`, -32601, "method_not_found"},
 		{`[]`, -32600, "invalid_request"},
 	}
@@ -38,13 +39,19 @@ func TestFramingRecovers(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var reply struct{ Error Error }
+		var reply struct {
+			ID    json.RawMessage
+			Error Error
+		}
 		if err = json.Unmarshal(line, &reply); err != nil {
 			t.Fatal(err)
 		}
 		data := reply.Error.Data.(map[string]any)
 		if reply.Error.Code != test.code || data["code"] != test.name {
 			t.Fatalf("reply = %s", line)
+		}
+		if test.code == -32700 && string(reply.ID) != "null" {
+			t.Fatalf("parse error must discard the request ID: %s", line)
 		}
 	}
 }

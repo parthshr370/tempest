@@ -3,7 +3,6 @@ package serve
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,8 +17,10 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"go.harness.dev/harness/internal/a2a"
 	"go.harness.dev/harness/internal/acp"
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
@@ -36,6 +37,8 @@ type Options struct {
 	Provider          tempest.ProviderConfig
 	Stack             *tempest.StackConfig
 	Clock             acp.Clock
+	A2ABaseURL        string
+	Cwd               string
 }
 
 type entry struct {
@@ -43,6 +46,7 @@ type entry struct {
 	refs       int
 	lastActive time.Time
 	closing    bool
+	mcpServers []tempest.MCPServerConfig
 }
 
 // Server owns all journal writers and accepted connections in this process.
@@ -51,6 +55,10 @@ type Server struct {
 	opts        Options
 	sessions    map[string]*entry
 	connections map[*rpc.Conn]struct{}
+	opening     map[string]*opening
+	openers     sync.WaitGroup
+	a2a         *a2a.Server
+	origin      string
 	http        *http.Server
 	listener    net.Listener
 	closed      bool
@@ -85,7 +93,11 @@ func New(opts Options) (*Server, error) {
 		opts.SessionDir = cfg.SessionDir()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{opts: opts, sessions: make(map[string]*entry), connections: make(map[*rpc.Conn]struct{}), ctx: ctx, cancel: cancel, closeDone: make(chan struct{}), reaperDone: make(chan struct{}), broker: acp.NewBroker(opts.PermissionTimeout, opts.Clock)}
+	s := &Server{opts: opts, sessions: make(map[string]*entry), opening: make(map[string]*opening), connections: make(map[*rpc.Conn]struct{}), ctx: ctx, cancel: cancel, closeDone: make(chan struct{}), reaperDone: make(chan struct{}), broker: acp.NewBroker(opts.PermissionTimeout, opts.Clock)}
+	if err := s.initInterop(); err != nil {
+		cancel()
+		return nil, err
+	}
 	go s.reaper()
 	return s, nil
 }
@@ -95,11 +107,6 @@ func (s *Server) RunContext() context.Context { return s.ctx }
 
 // New creates a session using defaults for fields omitted by the client.
 func (s *Server) New(ctx context.Context, cwd string, n *tempest.NewSession) (*tempest.Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, tempest.ErrClosed
-	}
 	settings := *n
 	if settings.Model == "" {
 		settings.Model = s.opts.DefaultNew.Model
@@ -107,39 +114,99 @@ func (s *Server) New(ctx context.Context, cwd string, n *tempest.NewSession) (*t
 	if settings.PermissionMode == "" {
 		settings.PermissionMode = s.opts.DefaultNew.PermissionMode
 	}
-	// New receives the merged budget from ACP; callers outside ACP use DefaultNew explicitly.
+	if settings.MCPServers == nil {
+		settings.MCPServers = s.opts.DefaultNew.MCPServers
+	}
+	servers, err := mcpconfig.Normalize(settings.MCPServers)
+	if err != nil {
+		return nil, err
+	}
+	settings.MCPServers = servers
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, tempest.ErrClosed
+	}
+	s.openers.Add(1)
+	s.mu.Unlock()
+	defer s.openers.Done()
+	ctx, cancel := s.openContext(ctx)
+	defer cancel()
 	session, err := tempest.Open(ctx, tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: s.broker})
 	if err != nil {
 		return nil, err
 	}
-	s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now()}
-	return session, nil
+	s.mu.Lock()
+	if !s.closed {
+		s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now(), mcpServers: servers}
+		s.mu.Unlock()
+		return session, nil
+	}
+	s.mu.Unlock()
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
+	defer closeCancel()
+	_ = session.Close(closeCtx)
+	return nil, tempest.ErrClosed
 }
 
 // Defaults returns the defaults used when session/new omits Tempest overrides.
-func (s *Server) Defaults() tempest.NewSession { return s.opts.DefaultNew }
+func (s *Server) Defaults() tempest.NewSession {
+	settings := s.opts.DefaultNew
+	settings.MCPServers, _ = mcpconfig.Normalize(settings.MCPServers)
+	return settings
+}
 
 // Resume reuses a live writer instead of reopening its journal.
-func (s *Server) Resume(ctx context.Context, cwd, id string) (*tempest.Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil, tempest.ErrClosed
+func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.MCPServerConfig) (*tempest.Session, error) {
+	explicit := servers != nil
+	var err error
+	if explicit {
+		servers, err = mcpconfig.Normalize(servers)
+		if err != nil {
+			return nil, err
+		}
 	}
-	if e := s.sessions[id]; e != nil {
-		if e.closing {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
 			return nil, tempest.ErrClosed
 		}
-		e.lastActive = time.Now()
-		return e.session, nil
+		if e := s.sessions[id]; e != nil {
+			if e.closing {
+				s.mu.Unlock()
+				return nil, tempest.ErrClosed
+			}
+			if explicit && !sameMCP(servers, e.mcpServers) {
+				s.mu.Unlock()
+				return nil, tempest.ErrMCPConfigConflict
+			}
+			if cwd != "" && e.session.Snapshot().Cwd != cwd {
+				s.mu.Unlock()
+				return nil, errors.New("workspace differs from live session")
+			}
+			e.lastActive = time.Now()
+			s.mu.Unlock()
+			return e.session, nil
+		}
+		if pending := s.opening[id]; pending != nil {
+			s.mu.Unlock()
+			select {
+			case <-pending.done:
+				if pending.err != nil {
+					return nil, pending.err
+				}
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		pending := &opening{done: make(chan struct{})}
+		s.opening[id] = pending
+		s.openers.Add(1)
+		s.mu.Unlock()
+		return s.resumeOpen(ctx, cwd, id, servers, explicit, pending)
 	}
-	r := tempest.ResumeSession{SessionID: id, Budget: s.opts.DefaultNew.Budget, PermissionMode: s.opts.DefaultNew.PermissionMode}
-	session, err := tempest.Open(ctx, tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, Resume: &r, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: s.broker})
-	if err != nil {
-		return nil, err
-	}
-	s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now()}
-	return session, nil
 }
 
 // Acquire prevents the idle reaper from closing a session until release.
@@ -301,30 +368,15 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]int{"sessions": sessions, "running": running})
 	})
-	mux.HandleFunc("/acp", func(w http.ResponseWriter, r *http.Request) {
-		if s.opts.Token != "" {
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if token == r.Header.Get("Authorization") {
-				token = r.URL.Query().Get("token")
-			}
-			if subtle.ConstantTimeCompare([]byte(token), []byte(s.opts.Token)) != 1 {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-		}
-		s.mu.Lock()
-		closed := s.closed
-		s.mu.Unlock()
-		if closed {
-			http.Error(w, "shutting down", http.StatusServiceUnavailable)
-			return
-		}
+	mux.Handle("/acp", s.authorize(true, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 		if err != nil {
 			return
 		}
 		_ = s.serveConn(rpc.NewWebSocket(ws))
-	})
+	})))
+	mux.Handle("/a2a", s.authorize(false, true, http.HandlerFunc(s.handleA2A)))
+	mux.Handle("/.well-known/agent-card.json", s.publicCard())
 	return mux
 }
 
@@ -338,9 +390,18 @@ func (s *Server) ListenAndServe(address string) error {
 	if s.opts.Token == "" && host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 		return errors.New("bearer token required when listening outside loopback")
 	}
+	if s.opts.A2ABaseURL == "" && (ip == nil || !ip.IsLoopback()) {
+		return errors.New("A2A base URL required outside numeric loopback")
+	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
+	}
+	if s.opts.A2ABaseURL == "" {
+		if err := s.configureA2A("http://" + listener.Addr().String()); err != nil {
+			_ = listener.Close()
+			return err
+		}
 	}
 	server := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	s.mu.Lock()
@@ -389,6 +450,13 @@ func (s *Server) shutdown() {
 	s.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 	defer cancel()
+	opened := make(chan struct{})
+	go func() { s.openers.Wait(); close(opened) }()
+	select {
+	case <-opened:
+	case <-ctx.Done():
+		s.closeErr = ctx.Err()
+	}
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(entries))
 	for _, e := range entries {
@@ -409,6 +477,9 @@ func (s *Server) shutdown() {
 	case err := <-errCh:
 		s.closeErr = errors.Join(s.closeErr, err)
 	default:
+	}
+	if s.a2a != nil {
+		s.closeErr = errors.Join(s.closeErr, s.a2a.Close(ctx))
 	}
 	s.mu.Lock()
 	connections := make([]*rpc.Conn, 0, len(s.connections))

@@ -10,6 +10,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
@@ -38,6 +39,8 @@ type NewSession struct {
 	Tools          []Tool
 	Budget         Budget
 	PermissionMode PermissionMode
+	// MCPServers replaces host defaults; a non-nil empty slice disables MCP.
+	MCPServers []MCPServerConfig
 }
 
 // ResumeSession identifies an existing conversation; runtime settings are optional.
@@ -47,6 +50,8 @@ type ResumeSession struct {
 	Model          string
 	Budget         Budget
 	PermissionMode PermissionMode
+	// MCPServers is runtime-only; credentials aren't restored from the journal.
+	MCPServers []MCPServerConfig
 }
 
 // ProviderConfig configures provider credentials and endpoint routing.
@@ -57,6 +62,12 @@ type StackConfig = session.StackConfig
 
 // Tool is an embeddable tool implementation.
 type Tool = agent.AgentTool
+
+// MCPServerConfig is an operator-selected MCP endpoint.
+type MCPServerConfig = mcpconfig.Server
+
+// ErrMCPConfigConflict rejects changes to a live session's MCP endpoints.
+var ErrMCPConfigConflict = errors.New("MCP configuration differs from live session")
 
 // Message is one transcript message.
 type Message = types.Message

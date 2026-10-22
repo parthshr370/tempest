@@ -77,7 +77,7 @@ func TestLoadReplayPagingAndErrors(t *testing.T) {
 	}{
 		{"tempest/history", map[string]any{"sessionId": id, "epoch": snapshot.HistoryEpoch + 1, "limit": 1}, -32010},
 		{"tempest/set_budget", map[string]any{"sessionId": id, "maxTurns": -1}, -32005},
-		{"session/new", map[string]any{"cwd": cwd, "mcpServers": []string{"unsupported"}}, -32601},
+		{"session/new", map[string]any{"cwd": cwd, "mcpServers": []string{"unsupported"}}, -32602},
 		{"session/prompt", map[string]any{"sessionId": id, "prompt": []any{map[string]string{"type": "audio"}}}, -32602},
 		{"tempest/get_state", map[string]any{"sessionId": "missing"}, -32001},
 		{"tempest/permission", map[string]any{"sessionId": id, "toolCallId": "missing", "optionId": "allow_once"}, -32006},

@@ -46,8 +46,10 @@ const (
 
 // AgentToolResult is the final or partial result produced by a tool.
 type AgentToolResult struct {
-	Content   []types.ContentBlock
-	Details   json.RawMessage
+	Content []types.ContentBlock
+	Details json.RawMessage
+	// IsError preserves protocol-level failures without discarding their content.
+	IsError   bool
 	Terminate bool
 }
 

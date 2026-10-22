@@ -350,7 +350,7 @@ func TestRegistryLeaseReaperAndConcurrentResume(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 30 {
 		wg.Go(func() {
-			other, err := s.Resume(context.Background(), cwd, session.ID())
+			other, err := s.Resume(context.Background(), cwd, session.ID(), nil)
 			if err != nil || other != session {
 				t.Errorf("resume = %p, %v", other, err)
 			}

@@ -55,6 +55,8 @@ type Prompter interface {
 type Policy struct {
 	// Overrides stores per-tool allow, deny, or prompt decisions.
 	Overrides map[string]Decision
+	// MCPDefaults supplies trusted server defaults without replacing exact overrides.
+	MCPDefaults map[string]Decision
 	// Prompter resolves prompt decisions; nil denies them in headless sessions.
 	Prompter Prompter
 	// promptOverrides stores session choices for ordinary asks. Guard asks
@@ -64,6 +66,20 @@ type Policy struct {
 
 // policyMu protects in-memory overrides. Approval never holds it while waiting.
 var policyMu sync.Mutex
+
+// ReplaceMCPDefaults installs a complete catalog's defaults between runs.
+// Copies of Policy share this session-owned map, just like exact overrides.
+func (p *Policy) ReplaceMCPDefaults(defaults map[string]Decision) {
+	policyMu.Lock()
+	defer policyMu.Unlock()
+	if p.MCPDefaults == nil {
+		p.MCPDefaults = make(map[string]Decision)
+	}
+	clear(p.MCPDefaults)
+	for name, decision := range defaults {
+		p.MCPDefaults[name] = decision
+	}
+}
 
 // Choice is the selected scope and decision of an approval.
 type Choice string
