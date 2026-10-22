@@ -21,6 +21,15 @@ const (
 )
 
 func (s *Server) stream(w http.ResponseWriter, r *http.Request, id json.RawMessage, t *task, history *int, rejectTerminal bool) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		writeResponse(w, id, nil, protocolError(-32004, "shutdown", nil))
+		return
+	}
+	s.streams.Add(1)
+	s.mu.Unlock()
+	defer s.streams.Done()
 	t.refreshAsks()
 	t.mu.Lock()
 	if rejectTerminal && t.value.Status.State.Terminal() {

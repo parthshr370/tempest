@@ -94,6 +94,11 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	if mode == "stream-json" {
+		// Let the encoder report EPIPE so it can cancel and join the durable run.
+		signal.Ignore(syscall.SIGPIPE)
+		defer signal.Reset(syscall.SIGPIPE)
+	}
 	if err := resolveCommandConfig(&opts); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

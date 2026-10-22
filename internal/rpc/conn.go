@@ -91,6 +91,7 @@ type Conn struct {
 	maxFrame      int
 	protocolError func(error)
 	lateIDs       map[string]bool
+	drainOnEOF    bool
 }
 
 func newConn(t frameTransport) *Conn {
@@ -100,7 +101,7 @@ func newConn(t frameTransport) *Conn {
 	return c
 }
 
-// Done closes when either transport direction shuts down.
+// Done closes when the connection shuts down, not on EOF with SetDrainOnEOF.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
 
 // SetProtocolErrorHandler selects strict client framing. Call it before Serve.
@@ -110,6 +111,12 @@ func (c *Conn) SetProtocolErrorHandler(handler func(error)) {
 	if stream, ok := c.transport.(*lineTransport); ok {
 		stream.stopOnOversize = handler != nil
 	}
+}
+
+// SetDrainOnEOF keeps the writer and handler contexts alive after reader EOF.
+// Set it before Serve; the owner must then call Drain and Close.
+func (c *Conn) SetDrainOnEOF(enabled bool) {
+	c.drainOnEOF = enabled
 }
 
 func (c *Conn) rejectProtocol(err error) bool {
@@ -168,7 +175,12 @@ func (c *Conn) Serve(handler Handler) error {
 // ServeOrdered admits requests in read order. Handlers must return promptly;
 // return Deferred for work that can block, including writes and outbound calls.
 func (c *Conn) ServeOrdered(handler Handler) error {
-	defer c.Close()
+	readEOF := false
+	defer func() {
+		if !readEOF || !c.drainOnEOF {
+			c.Close()
+		}
+	}()
 	for {
 		data, err := c.transport.read(c.ctx)
 		if errors.Is(err, errOversize) {
@@ -181,6 +193,7 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 			continue
 		}
 		if err != nil {
+			readEOF = errors.Is(err, io.EOF)
 			if errors.Is(err, io.EOF) || c.ctx.Err() != nil {
 				return nil
 			}

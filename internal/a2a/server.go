@@ -56,6 +56,7 @@ type Server struct {
 	serial    uint64
 	closed    bool
 	observers sync.WaitGroup
+	streams   sync.WaitGroup
 	cursorKey [32]byte
 	now       func() time.Time
 	capacity  int
@@ -97,13 +98,17 @@ func (s *Server) Card() *model.AgentCard { copy := *s.card; return &copy }
 // Handler serves the A2A JSON-RPC endpoint. Authentication belongs to the HTTP host.
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.handle) }
 
-// Close prevents new tasks and waits for observers to capture accepted runs.
+// Close prevents new tasks and streams, then joins observers and stream writers.
 func (s *Server) Close(ctx context.Context) error {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
 	done := make(chan struct{})
-	go func() { s.observers.Wait(); close(done) }()
+	go func() {
+		s.observers.Wait()
+		s.streams.Wait()
+		close(done)
+	}()
 	select {
 	case <-done:
 		return nil

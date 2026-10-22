@@ -53,6 +53,7 @@ type Client struct {
 	callTimeout time.Duration
 	mu          sync.Mutex
 	closed      bool
+	redactor    credentialRedactor
 }
 
 // Version returns the negotiated protocol revision.
@@ -72,7 +73,9 @@ func (c *Client) Alive() bool {
 }
 
 // Dial starts the transport and completes initialize/initialized without guessing revisions.
-func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers) (*Client, error) {
+func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers) (_ *Client, err error) {
+	redactor := newCredentialRedactor(cfg)
+	defer func() { err = redactor.err(err) }()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -85,6 +88,12 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 	startupCtx, cancel := context.WithTimeout(ctx, startup)
 	defer cancel()
 	root := (&url.URL{Scheme: "file", Path: cwd}).String()
+	notify := handlers.Notify
+	if notify != nil {
+		handlers.Notify = func(method string, params json.RawMessage) {
+			notify(redactor.text(method), redactor.json(params))
+		}
+	}
 	supplied := handlers.Request
 	handlers.Request = func(ctx context.Context, method string, params json.RawMessage) (any, *rpc.Error) {
 		switch method {
@@ -102,14 +111,14 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 			}{{URI: root, Name: "Workspace"}}}, nil
 		default:
 			if supplied != nil {
-				return supplied(ctx, method, params)
+				return supplied(ctx, redactor.text(method), redactor.json(params))
 			}
 			return nil, rpc.NewError(-32601, "method_not_found", "unsupported MCP server request")
 		}
 	}
 	var wire transport
 	if cfg.Transport == "stdio" {
-		wire, err = dialStdio(startupCtx, cfg, cwd, handlers)
+		wire, err = dialStdio(startupCtx, cfg, cwd, handlers, redactor)
 	} else {
 		wire, err = dialHTTP(cfg, handlers)
 	}
@@ -117,7 +126,7 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 		return nil, fmt.Errorf("mcp_startup: server %s transport: %w", cfg.Name, err)
 	}
 	callTimeout, _ := time.ParseDuration(cfg.CallTimeout)
-	client := &Client{transport: wire, callTimeout: callTimeout}
+	client := &Client{transport: wire, callTimeout: callTimeout, redactor: redactor}
 	fail := func(cause error) (*Client, error) {
 		closeCtx, stop := context.WithTimeout(context.Background(), 3*time.Second)
 		defer stop()
@@ -140,7 +149,7 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 	params.ClientInfo.Version = build.Current().Version
 	raw, err := wire.call(startupCtx, "mcp_1", "initialize", params)
 	if err != nil {
-		return fail(err)
+		return fail(redactor.err(err))
 	}
 	client.next.Store(1)
 	var result struct {
@@ -186,11 +195,16 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 }
 
 // Call sends one request. Cancellation never replays it and retires uncertain tool calls.
-func (c *Client) Call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+func (c *Client) Call(ctx context.Context, method string, params any) (raw json.RawMessage, err error) {
+	defer func() {
+		raw = c.redactor.json(raw)
+		err = c.redactor.err(err)
+	}()
 	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
 	defer cancel()
 	id := fmt.Sprintf("mcp_%d", c.next.Add(1))
-	raw, err := c.transport.call(callCtx, id, method, params)
+	raw, err = c.transport.call(callCtx, id, method, params)
+	err = c.redactor.err(err)
 	if err == nil {
 		return raw, nil
 	}
@@ -221,7 +235,7 @@ func (c *Client) Call(ctx context.Context, method string, params any) (json.RawM
 
 // Notify sends a notification with this connection's negotiated headers.
 func (c *Client) Notify(ctx context.Context, method string, params any) error {
-	return c.transport.notify(ctx, method, params)
+	return c.redactor.err(c.transport.notify(ctx, method, params))
 }
 
 // Close stops all streams and child processes. It doesn't delete result spills.
@@ -229,5 +243,5 @@ func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	c.closed = true
 	c.mu.Unlock()
-	return c.transport.close(ctx)
+	return c.redactor.err(c.transport.close(ctx))
 }

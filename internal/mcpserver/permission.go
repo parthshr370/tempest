@@ -64,8 +64,7 @@ func (p *routingPrompter) Approve(ctx context.Context, ask tempest.Ask) (tempest
 	if err := approveCtx.Err(); err != nil {
 		return "", err
 	}
-	message := fmt.Sprintf("Tempest session %s requests allow-once for %s (call %s). Tools run in the host workspace. Deny if you don't trust this operation.", safeLabel(ask.SessionID), safeLabel(ask.Tool), safeLabel(ask.ToolCallID))
-	params := map[string]any{"message": message, "requestedSchema": map[string]any{"type": "object", "properties": map[string]any{"allow": map[string]any{"type": "boolean", "title": "Allow this one tool call?", "default": false}}, "required": []string{"allow"}}}
+	params := map[string]any{"message": approvalMessage(ask), "requestedSchema": map[string]any{"type": "object", "properties": map[string]any{"allow": map[string]any{"type": "boolean", "title": "Allow this one tool call?", "default": false}}, "required": []string{"allow"}}}
 	if c.revision != "2025-06-18" {
 		params["mode"] = "form"
 	}
@@ -101,7 +100,23 @@ func (p *routingPrompter) Approve(ctx context.Context, ask tempest.Ask) (tempest
 	return "reject_once", nil
 }
 
+func approvalMessage(ask tempest.Ask) string {
+	const (
+		identityLimit  = 64
+		toolLimit      = 128
+		operationLimit = 256
+		argumentsLimit = 1024
+	)
+	return fmt.Sprintf("Tempest session %s requests allow-once for %s (call %s).\nTitle: %s\nArguments: %s\nGuard reason: %s\nTools run in the host workspace. Deny if you don't trust this operation.",
+		boundedLabel(ask.SessionID, identityLimit), boundedLabel(ask.Tool, toolLimit), boundedLabel(ask.ToolCallID, identityLimit),
+		boundedLabel(ask.Title, operationLimit), boundedLabel(string(ask.RawInput), argumentsLimit), boundedLabel(ask.Reason, operationLimit))
+}
+
 func safeLabel(text string) string {
+	return boundedLabel(text, 1024)
+}
+
+func boundedLabel(text string, limit int) string {
 	text = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return -1
@@ -109,12 +124,13 @@ func safeLabel(text string) string {
 		return r
 	}, text)
 	text = obs.Redact(text)
-	if len(text) > 1024 {
-		n := 1024
-		for n > 0 && !utf8.RuneStart(text[n]) {
-			n--
+	if len(text) > limit {
+		const marker = "[truncated]"
+		end := limit - len(marker)
+		for end > 0 && !utf8.RuneStart(text[end]) {
+			end--
 		}
-		text = text[:n] + "[truncated]"
+		text = text[:end] + marker
 	}
 	return text
 }

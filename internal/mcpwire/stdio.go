@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -60,20 +59,20 @@ func (s *childStream) Close() error {
 }
 
 type stdioTransport struct {
-	conn       *rpc.Conn
-	cmd        *exec.Cmd
-	stream     *childStream
-	exited     chan struct{}
-	served     chan struct{}
-	stderr     tailBuffer
-	closeOnce  sync.Once
-	closeErr   error
-	faultMu    sync.Mutex
-	fault      error
-	redactions []string
+	conn      *rpc.Conn
+	cmd       *exec.Cmd
+	stream    *childStream
+	exited    chan struct{}
+	served    chan struct{}
+	stderr    tailBuffer
+	closeOnce sync.Once
+	closeErr  error
+	faultMu   sync.Mutex
+	fault     error
+	redactor  credentialRedactor
 }
 
-func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers) (*stdioTransport, error) {
+func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers, redactor credentialRedactor) (*stdioTransport, error) {
 	command := exec.Command(cfg.Command, cfg.Args...)
 	command.Dir = cwd
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -101,21 +100,7 @@ func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers H
 		return nil, err
 	}
 	command.Stdout = stdoutWriter
-	wire := &stdioTransport{cmd: command, stream: &childStream{stdout: stdout, stdin: stdin}, exited: make(chan struct{}), served: make(chan struct{})}
-	for _, value := range cfg.Env {
-		if value != "" {
-			wire.redactions = append(wire.redactions, value)
-		}
-	}
-	for _, argument := range cfg.Args {
-		if argument != "" {
-			wire.redactions = append(wire.redactions, argument)
-		}
-		if _, value, ok := strings.Cut(argument, "="); ok && value != "" {
-			wire.redactions = append(wire.redactions, value)
-		}
-	}
-	sort.Slice(wire.redactions, func(i, j int) bool { return len(wire.redactions[i]) > len(wire.redactions[j]) })
+	wire := &stdioTransport{cmd: command, stream: &childStream{stdout: stdout, stdin: stdin}, exited: make(chan struct{}), served: make(chan struct{}), redactor: redactor}
 	// os/exec drains this writer and joins its pipe goroutine in Wait.
 	command.Stderr = &wire.stderr
 	if err = ctx.Err(); err != nil {
@@ -185,10 +170,7 @@ func (s *stdioTransport) call(ctx context.Context, id, method string, params any
 			s.stderr.mu.Lock()
 			tail := strings.ToValidUTF8(string(s.stderr.bytes), "\uFFFD")
 			s.stderr.mu.Unlock()
-			for _, secret := range s.redactions {
-				tail = strings.ReplaceAll(tail, secret, "[REDACTED]")
-			}
-			tail = obs.RedactTruncate(tail, diagnosticTailRunes)
+			tail = obs.RedactTruncate(s.redactor.text(tail), diagnosticTailRunes)
 			if tail != "" {
 				return nil, fmt.Errorf("%w; server stderr tail: %s", err, tail)
 			}

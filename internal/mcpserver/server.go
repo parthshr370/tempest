@@ -86,6 +86,7 @@ func Serve(ctx context.Context, stream io.ReadWriteCloser, opts Options) error {
 		opts.Logger = slog.Default()
 	}
 	s := &server{opts: opts, conn: rpc.NewStream(stream), sessions: map[string]*entry{}, calls: map[string]*call{}}
+	s.conn.SetDrainOnEOF(true)
 	stopping := make(chan struct{})
 	stopped := make(chan struct{})
 	go func() {
