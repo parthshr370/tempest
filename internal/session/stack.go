@@ -10,13 +10,16 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/compaction"
+	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/prompt"
+	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/subagent"
 	"go.harness.dev/harness/internal/tools"
+	"go.harness.dev/harness/internal/work"
 )
 
 // PermissionModeFunc is a live-mode accessor called from the permission gate
@@ -53,13 +56,24 @@ type StackConfig struct {
 	PermissionMode     permission.Mode
 	PermissionModeFunc PermissionModeFunc
 	PermissionPolicy   permission.Policy
-	ExcludeTools       []string
-	EnableTask         bool
-	EnableWeb          bool
-	WebSearchURL       string
-	ConfiguredTools    []agent.AgentTool
-	PromptAdditions    []string
-	BashTimeout        time.Duration
+	// PermissionPolicyRef shares live interactive choices with child admission.
+	PermissionPolicyRef *permission.Policy
+	ExcludeTools        []string
+	EnableTask          bool
+	EnableWeb           bool
+	WebSearchURL        string
+	ConfiguredTools     []agent.AgentTool
+	PromptAdditions     []string
+	BashTimeout         time.Duration
+	// Work and QueueSource bind the session-owned durable runtime.
+	Work           work.RunHooks
+	Controller     work.Controller
+	QueueSource    work.QueueSource
+	Journal        *journal.Store
+	Loaded         *journal.Loaded
+	Child          bool
+	AllowedTools   []string
+	BeforeToolCall func(context.Context, agent.BeforeToolCallContext) *agent.BeforeToolCallResult
 
 	// Plan selects a read-only stack. Zero PlanModel uses Model.
 	Plan bool
@@ -68,6 +82,16 @@ type StackConfig struct {
 	AttachmentRegistry *document.AttachmentRegistry
 	AttachmentReader   *document.CacheRootBlobReader
 	Sanitize           func(string) string
+}
+
+// StackConfigFromConfig keeps config-backed tool options together across hosts.
+func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
+	return StackConfig{
+		EnableTask:   cfg.EnableTask(),
+		EnableWeb:    cfg.EnableWeb(),
+		WebSearchURL: cfg.WebSearchURL(),
+		BashTimeout:  cfg.BashTimeout(),
+	}
 }
 
 // AgentStack is the assembled result: a configured agent ready for Prompt/
@@ -99,14 +123,21 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		mode := cfg.PermissionMode
 		modeFunc = func() permission.Mode { return mode }
 	}
+	policy := cfg.PermissionPolicyRef
+	if policy == nil {
+		policy = &cfg.PermissionPolicy
+	}
 
 	beforeToolCall := func(ctx context.Context, c agent.BeforeToolCallContext) *agent.BeforeToolCallResult {
 		rawArgs, err := json.Marshal(c.Args)
 		if err != nil {
 			rawArgs = nil
 		}
-		outcome := permission.Gate(ctx, modeFunc(), c.ToolCall.Name, rawArgs, &cfg.PermissionPolicy, c.ToolCall.ID)
+		outcome := permission.Gate(ctx, modeFunc(), c.ToolCall.Name, rawArgs, policy, c.ToolCall.ID)
 		return &agent.BeforeToolCallResult{Block: !outcome.Allow, Reason: outcome.Reason, Permission: &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}}
+	}
+	if cfg.BeforeToolCall != nil {
+		beforeToolCall = cfg.BeforeToolCall
 	}
 
 	if cfg.SpillDir == "" {
@@ -117,36 +148,9 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		cfg.SpillDir = dir
 	}
 	transformContext := compaction.Transform(compaction.TransformOptions{Cwd: cwd, SpillToolResults: true, SpillDir: cfg.SpillDir})
-	// Children compact against the default role; the parent keeps its own
-	// plan-adjusted runner further below.
-	childCompact := func(agent.ShouldStopAfterTurnContext) *agent.AgentLoopTurnUpdate { return nil }
-	if runner := newCompactionRunner(cfg.Model, cfg.StreamFn); runner != nil {
-		childCompact = runner.hook(nil)
-	}
 	var taskTool agent.AgentTool
-	if cfg.EnableTask && !cfg.Plan {
-		// The read-only plan stack never delegates: every registered child type
-		// would be able to write, which Plan exists to prevent.
-		registry := subagent.Registry{
-			"explore": subagent.Definition{
-				Description: "Read-only investigation: read files, grep, find, and list without changing anything.",
-				Tools:       tools.ReadOnlyTools(cwd, tools.ToolsOptions{EnableWeb: cfg.EnableWeb, SearchURL: cfg.WebSearchURL, BashTimeout: cfg.BashTimeout}),
-				Model:       cfg.SmolModel,
-				StreamFn:    cfg.SmolStreamFn,
-			},
-			"general": subagent.Definition{
-				Description: "Full coding task with the complete tool set.",
-				Tools:       append(tools.CodingTools(cwd, tools.ToolsOptions{BashTimeout: cfg.BashTimeout}), tools.ReadOnlyTools(cwd, tools.ToolsOptions{BashTimeout: cfg.BashTimeout})...),
-			},
-		}
-		taskTool = subagent.NewTool(subagent.Options{
-			Model:            cfg.Model,
-			StreamFn:         cfg.StreamFn,
-			Registry:         registry,
-			TransformContext: transformContext,
-			PrepareNextTurn:  childCompact,
-			BeforeToolCall:   beforeToolCall,
-		})
+	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
+		taskTool = subagent.NewTool(cfg.Controller)
 	}
 	var readResolver tools.ReadResourceResolver
 	if len(cfg.Skills) > 0 {
@@ -167,6 +171,8 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		Sanitize:           cfg.Sanitize,
 		Skills:             cfg.Skills,
 		ReadResolver:       readResolver,
+		Work:               cfg.Controller,
+		Child:              cfg.Child,
 	}
 	allTools := BuildToolRegistry(cwd, options)
 	var active []agent.AgentTool
@@ -177,7 +183,10 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		}
 		active = SelectActive(allTools, []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment"}, cfg.ExcludeTools, "")
 	} else {
-		active = SelectActive(allTools, nil, cfg.ExcludeTools, "")
+		active = SelectActive(allTools, cfg.AllowedTools, cfg.ExcludeTools, "")
+	}
+	if cfg.Child && len(cfg.AllowedTools) == 0 {
+		active = nil
 	}
 
 	appendPrompt := strings.Join(cfg.PromptAdditions, "\n\n")
@@ -195,21 +204,24 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		ActiveTools:        active,
 	})
 	var agt *agent.Agent
-	var compact func(agent.ShouldStopAfterTurnContext) *agent.AgentLoopTurnUpdate
+	var compact func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error)
 	if runner := newCompactionRunner(model, cfg.StreamFn); runner != nil {
-		compact = runner.hook(func(messages []ptypes.Message) {
+		compact = runner.hookE(func(messages []ptypes.Message) {
 			agt.SetMessages(messages)
 			if cfg.OnMessagesChanged != nil {
 				cfg.OnMessagesChanged(messages)
 			}
 		})
+		defer func() { runner.configureJournal(cfg.Journal, cfg.Loaded, agt) }()
 	}
 	agt = agent.NewAgent(agent.AgentOptions{
-		InitialState:               &agent.AgentState{SystemPrompt: systemPrompt, Model: model, Tools: active, Messages: cfg.InitialMessages},
-		StreamFn:                   cfg.StreamFn,
-		TransformContext:           transformContext,
-		PrepareNextTurnWithContext: compact,
-		BeforeToolCall:             beforeToolCall,
+		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, Tools: active, Messages: cfg.InitialMessages},
+		StreamFn:         cfg.StreamFn,
+		TransformContext: transformContext,
+		PrepareNextTurnE: compact,
+		QueueSource:      cfg.QueueSource,
+		Work:             cfg.Work,
+		BeforeToolCall:   beforeToolCall,
 	})
 	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd}, nil
 }

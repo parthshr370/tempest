@@ -5,6 +5,7 @@ import (
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // InterruptedTool is a tool call whose intent was recorded but whose result
@@ -24,9 +25,12 @@ type RunSummary struct {
 	StopReason string
 	// Finished is false when the run has no run_finished record: the process
 	// ended mid-run.
-	Finished   bool
-	Error      string
-	FinishedAt time.Time
+	Finished       bool
+	Error          string
+	FinishedAt     time.Time
+	LogicalRunID   string
+	ContinuationOf string
+	StartedAt      time.Time
 }
 
 // Synthesized tool-result wording. The model reads these, so they state what
@@ -52,6 +56,7 @@ type toolKey struct {
 type toolState struct {
 	started  *ToolStartedRecord
 	finished *ToolFinishedRecord
+	job      *work.Job
 }
 
 type replayTool struct {
@@ -98,7 +103,14 @@ func reduce(loaded *Loaded, entries []Entry) {
 				loaded.Role = "default"
 			}
 		case CompactionEntry:
-			messages = applyCompaction(messages, e)
+			if e.Snapshot != nil {
+				messages = nil
+				for _, message := range loaded.snapshots[e.ID] {
+					messages = append(messages, replayMessage{message: message})
+				}
+			} else {
+				messages = applyCompaction(messages, e)
+			}
 		case PermissionRecord:
 			// A decision isn't an execution intent and changes no reconciliation state.
 		case RunStartedRecord:
@@ -108,7 +120,11 @@ func reduce(loaded *Loaded, entries []Entry) {
 				continue
 			}
 			runIndex[e.RunID] = len(runs)
-			runs = append(runs, RunSummary{RunID: e.RunID})
+			logical := e.LogicalRunID
+			if logical == "" {
+				logical = e.RunID
+			}
+			runs = append(runs, RunSummary{RunID: e.RunID, LogicalRunID: logical, ContinuationOf: e.ContinuationOf, StartedAt: e.Timestamp})
 		case RunFinishedRecord:
 			index, ok := runIndex[e.RunID]
 			if !ok {
@@ -130,10 +146,23 @@ func reduce(loaded *Loaded, entries []Entry) {
 			}
 			record := e
 			state.started = &record
+			for _, recovery := range loaded.Recoveries {
+				if recovery.Invocation.RunID == e.RunID && recovery.Invocation.CallID == e.CallID && e.CallID != "" {
+					job := recovery.Job
+					state.job = &job
+					break
+				}
+			}
 			startOrder = append(startOrder, state)
+			if e.CallID != "" {
+				key.toolCallID = e.CallID
+			}
 			unfinished[key] = append(unfinished[key], state)
 		case ToolFinishedRecord:
 			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
+			if e.CallID != "" {
+				key.toolCallID = e.CallID
+			}
 			queue := unfinished[key]
 			if len(queue) == 0 {
 				loaded.diagnose("seq %d: tool_finished for %s without tool_started", e.Seq, e.ToolCallID)
@@ -143,7 +172,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 			queue[0].finished = &record
 			unfinished[key] = queue[1:]
 		case UsageRecord:
-			loaded.UsageTotal.Add(e.Usage)
+			// reduceWork has already deduplicated receipts and metered fallback.
 		}
 	}
 
@@ -224,6 +253,10 @@ func reconcile(messages []replayMessage) []ptypes.Message {
 // from version 1 or external writers are left untouched.
 func synthesizeResult(call ptypes.ContentBlock, runID string, state *toolState, timestamp int64) (ptypes.ToolResultMessage, bool) {
 	var text string
+	if state != nil && state.job != nil {
+		job := state.job
+		return ptypes.ToolResultMessage{ToolCallID: call.ID, ToolName: call.Name, Content: []ptypes.ContentBlock{ptypes.NewText("Existing background job " + job.ID + " (" + job.Kind + ", " + job.State + "); this is its durable handle, not a new launch.")}, Timestamp: timestamp}, true
+	}
 	switch {
 	case state != nil && state.started != nil && state.finished == nil:
 		text = textOutcomeUnknown

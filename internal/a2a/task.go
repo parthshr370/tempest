@@ -29,10 +29,13 @@ const (
 )
 
 type pendingAsk struct {
-	ToolCallID string `json:"toolCallId"`
-	Tool       string `json:"tool"`
-	Title      string `json:"title"`
-	Reason     string `json:"reason"`
+	ToolCallID      string `json:"toolCallId"`
+	Tool            string `json:"tool"`
+	Title           string `json:"title"`
+	Reason          string `json:"reason"`
+	JobID           string `json:"jobId,omitempty"`
+	ChildSessionID  string `json:"childSessionId,omitempty"`
+	ChildToolCallID string `json:"childToolCallId,omitempty"`
 }
 type runMetadata struct {
 	StopReason tempest.StopReason `json:"stopReason"`
@@ -43,11 +46,16 @@ type runMetadata struct {
 	Error      string             `json:"error,omitempty"`
 }
 type taskMetadata struct {
-	RunID               string       `json:"runId"`
-	SessionID           string       `json:"sessionId"`
-	PendingAsks         []pendingAsk `json:"pendingAsks,omitempty"`
-	ProgressInterrupted bool         `json:"progressInterrupted,omitempty"`
-	ArtifactTruncated   bool         `json:"artifactTruncated,omitempty"`
+	RunID                string       `json:"runId"`
+	SessionID            string       `json:"sessionId"`
+	PendingAsks          []pendingAsk `json:"pendingAsks,omitempty"`
+	ProgressInterrupted  bool         `json:"progressInterrupted,omitempty"`
+	ArtifactTruncated    bool         `json:"artifactTruncated,omitempty"`
+	HistoryReconstructed bool         `json:"historyReconstructed,omitempty"`
+	Interrupted          bool         `json:"interrupted,omitempty"`
+	Recoverable          bool         `json:"recoverable,omitempty"`
+	Jobs                 []jobSummary `json:"jobs,omitempty"`
+	JobsTruncated        bool         `json:"jobsTruncated,omitempty"`
 	*runMetadata
 }
 
@@ -137,6 +145,7 @@ func (t *task) observe(initial tempest.Snapshot, updates <-chan tempest.Update, 
 	resultCh := make(chan tempest.RunResult, 1)
 	go func() { result, _ := t.run.Wait(); resultCh <- result }()
 	t.projectAsks(initial, time.Now().UTC())
+	t.projectJobs(initial)
 	for {
 		select {
 		case result := <-resultCh:
@@ -168,6 +177,7 @@ func (t *task) observe(initial tempest.Snapshot, updates <-chan tempest.Update, 
 				updates = next
 				stop = nextStop
 				t.markGap()
+				t.projectJobs(snap)
 				t.projectAsks(snap, time.Now().UTC())
 				continue
 			}
@@ -190,6 +200,29 @@ func (t *task) consume(u tempest.Update) {
 	}
 	if u.Kind == "tool_call" || u.Kind == "tool_call_update" || u.Kind == "tempest/run" {
 		t.projectAsks(t.session.Snapshot(), u.At)
+	}
+	if u.Kind == "tempest/job" || u.Kind == "tempest/job_output" || u.Kind == "tempest/queue" || u.Kind == "tempest/compaction" {
+		snapshot := t.session.Snapshot()
+		t.projectAsks(snapshot, u.At)
+		t.projectJobs(snapshot)
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.value.Status.State != model.TaskStateWorking || u.At.Sub(t.lastProgress) < progressInterval {
+			return
+		}
+		t.lastProgress = u.At
+		summary := "Background work state changed"
+		switch u.Kind {
+		case "tempest/job_output":
+			summary = "Background command output is available"
+		case "tempest/queue":
+			summary = "Durable input queue changed"
+		case "tempest/compaction":
+			summary = "Conversation compaction in progress"
+		}
+		t.value.Status.Message = t.message("work", summary)
+		t.statusLocked()
+		return
 	}
 	if u.Kind == "agent_message_chunk" && p.Content.Text != "" {
 		t.mu.Lock()
@@ -233,7 +266,7 @@ func (t *task) projectAsks(snap tempest.Snapshot, at time.Time) {
 	var pending []pendingAsk
 	for _, ask := range asks {
 		title, reason := approvalSummary(ask)
-		pending = append(pending, pendingAsk{ToolCallID: ask.ToolCallID, Tool: bounded(ask.Tool, maxApprovalToolBytes), Title: title, Reason: reason})
+		pending = append(pending, pendingAsk{ToolCallID: ask.ToolCallID, Tool: bounded(ask.Tool, maxApprovalToolBytes), Title: title, Reason: reason, JobID: ask.JobID, ChildSessionID: ask.ChildSessionID, ChildToolCallID: ask.ChildToolCallID})
 	}
 	state := model.TaskStateWorking
 	if len(pending) > 0 {
@@ -368,4 +401,29 @@ func splitText(text string, n int) []string {
 		parts = append(parts, text)
 	}
 	return parts
+}
+
+type jobSummary struct {
+	ID             string        `json:"id"`
+	Kind           string        `json:"kind"`
+	State          string        `json:"state"`
+	ChildSessionID string        `json:"childSessionId,omitempty"`
+	Isolation      string        `json:"isolation,omitempty"`
+	BaseCommit     string        `json:"baseCommit,omitempty"`
+	Usage          tempest.Usage `json:"usage"`
+}
+
+func (t *task) projectJobs(snapshot tempest.Snapshot) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if snapshot.Run.RunID != string(t.value.ID) || t.value.Status.State.Terminal() {
+		return
+	}
+	jobs := make([]jobSummary, 0, len(snapshot.Jobs))
+	for _, job := range snapshot.Jobs {
+		jobs = append(jobs, jobSummary{ID: job.ID, Kind: job.Kind, State: job.State, ChildSessionID: job.ChildSessionID, Isolation: job.Isolation, BaseCommit: job.BaseCommit, Usage: job.Usage})
+	}
+	t.metadata.Jobs = jobs
+	t.metadata.JobsTruncated = snapshot.JobsTruncated
+	t.publishMetadataLocked()
 }

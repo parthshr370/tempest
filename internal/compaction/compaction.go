@@ -969,6 +969,20 @@ Be concise. Focus on what's needed to understand the kept suffix.`
 // model's structured summary. When previousSummary is non-empty it uses the
 // update prompt so the new summary supersedes the old one.
 func GenerateSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (string, error) {
+	return meterSummary(ctx, model, func() (SummaryResult, error) {
+		return GenerateSummaryResult(ctx, streamFn, model, settings, messages, previousSummary)
+	})
+}
+
+// SummaryResult retains usage even when the provider returns an error.
+type SummaryResult struct {
+	Text  string
+	Usage ptypes.Usage
+}
+
+// GenerateSummaryResult returns a summary and its receipt data. Durable callers
+// hold shared admission until they've persisted and forwarded this receipt.
+func GenerateSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (SummaryResult, error) {
 	basePrompt := summarizationPrompt
 	if strings.TrimSpace(previousSummary) != "" {
 		basePrompt = updateSummarizationPrompt
@@ -983,13 +997,33 @@ func GenerateSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.
 		promptText.WriteString("\n</previous-summary>\n\n")
 	}
 	promptText.WriteString(basePrompt)
-	return runSummarization(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText.String())
+	return runSummarizationResult(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText.String())
 }
 
 // GenerateTurnPrefixSummary summarizes the dropped prefix of a split turn.
 func GenerateTurnPrefixSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (string, error) {
+	return meterSummary(ctx, model, func() (SummaryResult, error) {
+		return GenerateTurnPrefixSummaryResult(ctx, streamFn, model, settings, messages)
+	})
+}
+
+// GenerateTurnPrefixSummaryResult retains the split-prefix call's usage.
+func GenerateTurnPrefixSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (SummaryResult, error) {
 	promptText := "<conversation>\n" + SerializeConversation(messages) + "\n</conversation>\n\n" + turnPrefixSummarizationPrompt
-	return runSummarization(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText)
+	return runSummarizationResult(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText)
+}
+
+func meterSummary(ctx context.Context, model ptypes.Model, call func() (SummaryResult, error)) (string, error) {
+	release, err := agent.AdmitProvider(ctx, model)
+	defer release()
+	if err != nil {
+		return "", err
+	}
+	result, callErr := call()
+	if err := agent.AccountProviderUsage(ctx, "", model.ID, result.Usage); err != nil {
+		return "", err
+	}
+	return result.Text, callErr
 }
 
 // summaryMaxTokens caps a summarization response at 80% of the reserve budget,
@@ -1004,43 +1038,55 @@ func summaryMaxTokens(model ptypes.Model, settings CompactionSettings) int {
 
 // runSummarization issues a single stateless summarization request and joins the
 // returned text blocks. An error stop reason surfaces as an error.
-func runSummarization(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, promptText string) (string, error) {
+func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, promptText string) (SummaryResult, error) {
 	if streamFn == nil {
-		return "", errors.New("compaction: streamFn is nil")
+		return SummaryResult{}, errors.New("compaction: streamFn is nil")
 	}
-	reqCtx := ptypes.Context{
-		SystemPrompt: SummarizationSystemPrompt,
-		Messages:     []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(promptText), Timestamp: time.Now().UnixMilli()}},
-	}
+	reqCtx := ptypes.Context{SystemPrompt: SummarizationSystemPrompt, Messages: []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(promptText), Timestamp: time.Now().UnixMilli()}}}
 	opts := &ptypes.SimpleStreamOptions{}
 	opts.MaxTokens = maxTokens
-	final, err := streamFn(ctx, model, reqCtx, opts).Result(ctx)
+	streamCtx, cancel := context.WithCancel(ctx)
+	response := streamFn(streamCtx, model, reqCtx, opts)
+	if response == nil {
+		cancel()
+		return SummaryResult{}, errors.New("compaction: nil stream")
+	}
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel() }()
+	for range response.Events() {
+	}
+	final, err := response.Result(context.WithoutCancel(ctx))
 	if err != nil {
-		return "", err
+		return SummaryResult{}, err
 	}
 	if final == nil {
-		return "", errors.New("compaction: nil summarization result")
+		return SummaryResult{}, errors.New("compaction: nil summarization result")
 	}
+	result := SummaryResult{Usage: final.Usage}
 	if final.StopReason == ptypes.StopError || final.StopReason == ptypes.StopAborted {
 		msg := final.ErrorMessage
 		if msg == "" {
 			msg = string(final.StopReason)
 		}
-		return "", fmt.Errorf("compaction: summarization failed: %s", msg)
+		return result, fmt.Errorf("compaction: summarization failed: %s", msg)
 	}
 	var b strings.Builder
 	for _, block := range final.Content {
 		if block.Type == ptypes.BlockText {
+			if b.Len()+len(block.Text)+1 > 512<<10 {
+				return result, errors.New("compaction: summary exceeds 512 KiB")
+			}
 			if b.Len() > 0 {
-				b.WriteString("\n")
+				b.WriteByte('\n')
 			}
 			b.WriteString(block.Text)
 		}
 	}
-	if strings.TrimSpace(b.String()) == "" {
-		return "", errors.New("compaction: summarization produced empty output")
+	result.Text = b.String()
+	if strings.TrimSpace(result.Text) == "" {
+		return result, errors.New("compaction: summarization produced empty output")
 	}
-	return b.String(), nil
+	return result, nil
 }
 
 // Compact runs the summarization turn(s) for a prepared compaction and returns

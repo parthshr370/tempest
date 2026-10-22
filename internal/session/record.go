@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -11,6 +12,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/work"
 )
 
 // summaryRunes bounds the prompt summary and tool error text kept in records;
@@ -32,91 +34,159 @@ func AttachJournal(agt *agent.Agent, store *journal.Store) (detach func()) {
 // AttachJournalWithRunID also reports the journal's run id before later listeners
 // see agent_start, keeping public run identifiers equal to durable identifiers.
 func AttachJournalWithRunID(agt *agent.Agent, store *journal.Store, started func(string)) func() {
-	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: started}
+	return AttachJournalWithOptions(agt, store, RecordOptions{Started: started})
+}
+
+// RecordOptions connects durable run identity and queue consumption to recording.
+type RecordOptions struct {
+	Started func(string)
+	Queues  *DurableQueues
+}
+
+// AttachJournalWithOptions installs the durable recorder before public listeners.
+func AttachJournalWithOptions(agt *agent.Agent, store *journal.Store, opts RecordOptions) func() {
+	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: opts.Started, queues: opts.Queues, sources: map[string]ptypes.Usage{}}
 	return agt.Subscribe(r.record)
 }
 
 type recorder struct {
-	agt     *agent.Agent
-	store   *journal.Store
-	runID   string
-	started func(string)
-	// toolStarts holds the start time of each in-flight tool call for its
-	// duration.
+	agt        *agent.Agent
+	store      *journal.Store
+	runID      string
+	started    func(string)
+	queues     *DurableQueues
 	toolStarts map[string]time.Time
+	sources    map[string]ptypes.Usage
 }
 
 func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
-	// Cancellation must not stop the journal: an aborted run still has to
-	// record its last messages and its outcome. Writes are local and short.
 	ctx = context.WithoutCancel(ctx)
 	meta := journal.Meta{RunID: r.runID, EventSeq: ev.Seq}
+	invocation, _ := work.InvocationFromContext(ctx)
+	callKey := invocation.CallID
+	if callKey == "" {
+		callKey = ev.ToolCallID
+	}
 	var err error
 	switch ev.Type {
 	case agent.EventAgentStart:
-		r.runID = r.store.NewRunID()
-		if r.started != nil {
-			r.started(r.runID)
+		loaded, loadErr := journal.Load(ctx, r.store.Path())
+		if loadErr != nil {
+			return loadErr
 		}
+		r.sources = loaded.UsageSources
+		state := agent.RunState{SessionID: r.store.ID(), RunID: r.store.NewRunID(), StartedAt: time.Now(), UsageSources: r.sources}
+		state.LogicalRunID = state.RunID
+		if ev.Resume && loaded.LastRun != nil && !loaded.LastRun.Finished {
+			state.ContinuationOf = loaded.LastRun.RunID
+			state.LogicalRunID = loaded.LastRun.LogicalRunID
+			state.Usage, state.Turns, state.StartedAt = loaded.LogicalUsage(state.LogicalRunID)
+		}
+		r.runID = state.RunID
 		clear(r.toolStarts)
 		meta.RunID = r.runID
 		model := r.agt.State().Model
-		err = r.store.Append(ctx, journal.RunStartedRecord{
-			Meta:          meta,
-			Model:         model.ID,
-			Provider:      model.Provider,
-			PromptSummary: promptSummary(ev.Messages),
-		})
+		err = r.store.Append(ctx, journal.RunStartedRecord{Meta: meta, Model: model.ID, Provider: model.Provider, PromptSummary: promptSummary(ev.Messages), LogicalRunID: state.LogicalRunID, ContinuationOf: state.ContinuationOf})
+		if err == nil {
+			r.agt.SetRunState(state)
+			if r.started != nil {
+				r.started(r.runID)
+			}
+		}
 	case agent.EventMessageEnd:
-		err = r.store.Append(ctx, journal.MessageEntry{Meta: meta, Message: ev.Message})
-		if assistant, ok := ev.Message.(ptypes.AssistantMessage); ok && err == nil {
-			err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: assistant.Model, Usage: assistant.Usage})
+		assistant, isAssistant := recordAssistant(ev.Message)
+		assigned, appendErr := r.store.AppendAssigned(ctx, journal.MessageEntry{Meta: meta, Message: ev.Message, QueueID: ev.QueueID, Metered: isAssistant})
+		err = appendErr
+		if err == nil && ev.QueueID != "" && r.queues != nil {
+			err = r.queues.Acknowledge(ev.QueueID)
+		}
+		if err == nil && isAssistant {
+			source := "message:" + r.store.ID() + ":" + assigned.ID
+			err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: assistant.Model, Usage: assistant.Usage, SourceRef: source, MessageID: assigned.ID})
+			if err == nil {
+				r.sources[source] = assistant.Usage
+				r.agt.BindMessage(assigned.ID, source, assistant)
+			}
 		}
 	case agent.EventUsage:
-		err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: ev.Model, Usage: ev.Usage})
+		source := ev.UsageSource
+		if ev.UsageRunID != "" {
+			meta.RunID = ev.UsageRunID
+		}
+		if prior, ok := r.sources[source]; source != "" && ok {
+			if !reflect.DeepEqual(prior, ev.Usage) {
+				err = fmt.Errorf("conflicting usage source %q", source)
+			}
+			break
+		}
+		// Compaction's finished fact is already the local receipt.
+		if source != "" {
+			if prior, ok := r.store.UsageSource(source); ok {
+				if !reflect.DeepEqual(prior, ev.Usage) {
+					return fmt.Errorf("conflicting usage source %q", source)
+				}
+				r.sources[source] = prior
+				break
+			}
+		}
+		err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: ev.Model, Usage: ev.Usage, SourceRef: source, ChildSessionID: ev.ChildSessionID})
+		if err == nil && source != "" {
+			r.sources[source] = ev.Usage
+		}
 	case agent.EventToolPermission:
 		if ev.Permission != nil {
 			decision := "deny"
 			if ev.Permission.Allow {
 				decision = "allow"
 			}
-			err = r.store.Append(ctx, journal.PermissionRecord{Meta: meta, ToolCallID: ev.ToolCallID, Tool: ev.ToolName, Decision: decision, Source: string(ev.Permission.Source), WaitMS: ev.Permission.Wait.Milliseconds()})
+			err = r.store.Append(ctx, journal.PermissionRecord{Meta: meta, ToolCallID: ev.ToolCallID, Tool: ev.ToolName, Decision: decision, Source: string(ev.Permission.Source), WaitMS: ev.Permission.Wait.Milliseconds(), AskID: ev.Permission.AskID})
 		}
 	case agent.EventToolExecutionStart:
-		r.toolStarts[ev.ToolCallID] = ev.At
-		err = r.store.Append(ctx, journal.ToolStartedRecord{
-			Meta:       meta,
-			ToolCallID: ev.ToolCallID,
-			Tool:       ev.ToolName,
-			Args:       rawArgs(ev.Args),
-		})
+		r.toolStarts[callKey] = ev.At
+		err = r.store.Append(ctx, journal.ToolStartedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args)})
 	case agent.EventToolExecutionEnd:
-		finished := journal.ToolFinishedRecord{Meta: meta, ToolCallID: ev.ToolCallID, OK: !ev.IsError}
-		if started, ok := r.toolStarts[ev.ToolCallID]; ok {
+		finished := journal.ToolFinishedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, OK: !ev.IsError}
+		if started, ok := r.toolStarts[callKey]; ok {
 			finished.DurationMS = ev.At.Sub(started).Milliseconds()
-			delete(r.toolStarts, ev.ToolCallID)
+			delete(r.toolStarts, callKey)
 		}
 		if ev.IsError {
 			finished.Error = toolErrorText(ev.Result)
 		}
 		err = r.store.Append(ctx, finished)
 	case agent.EventAgentEnd:
-		finished := journal.RunFinishedRecord{
-			Meta:       meta,
-			StopReason: string(ev.StopReason),
-			Turns:      ev.Turns,
-			UsageTotal: ev.Usage,
+		if r.queues != nil {
+			r.queues.ReleaseClaims()
 		}
+		state := agent.RunState{}
+		if r.agt != nil {
+			state = r.agt.RunState()
+		}
+		finished := journal.RunFinishedRecord{Meta: meta, StopReason: string(ev.StopReason), Turns: ev.Turns, UsageTotal: ev.Usage, ElapsedMS: ev.ElapsedMS, LogicalCalls: state.Turns + ev.Turns}
 		if ev.Err != nil {
 			finished.Error = ev.Err.Error()
 		}
 		err = r.store.Append(ctx, finished)
 		r.runID = ""
+	case agent.EventWork:
+		// Publication follows an already committed fact.
 	}
 	if err != nil {
 		return fmt.Errorf("journal %s: %w", ev.Type, err)
 	}
 	return nil
+}
+
+func recordAssistant(message ptypes.Message) (ptypes.AssistantMessage, bool) {
+	switch m := message.(type) {
+	case ptypes.AssistantMessage:
+		return m, true
+	case *ptypes.AssistantMessage:
+		if m != nil {
+			return *m, true
+		}
+	}
+	return ptypes.AssistantMessage{}, false
 }
 
 // promptSummary is the start of the prompt's text, enough to recognize a run

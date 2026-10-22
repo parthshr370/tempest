@@ -28,7 +28,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +42,7 @@ import (
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/truncate"
+	"go.harness.dev/harness/internal/work"
 )
 
 // ToolName identifies a coding tool by its canonical name.
@@ -77,10 +77,14 @@ const (
 	WebSearch      ToolName = "web_search"
 	WebFetch       ToolName = "web_fetch"
 	AttachmentTool ToolName = "attachment"
+	JobsTool       ToolName = "jobs"
+	WaitTool       ToolName = "wait"
+	CancelTool     ToolName = "cancel"
+	LogsTool       ToolName = "logs"
 )
 
 // AllToolNames is the set of every known ToolName.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true}
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true}
 
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
@@ -105,6 +109,9 @@ type ToolsOptions struct {
 	AttachmentRegistry *document.AttachmentRegistry
 	AttachmentReader   *document.CacheRootBlobReader
 	Sanitize           func(string) string
+	// Work is installed only on a journaled root session.
+	Work  work.Controller
+	Child bool
 }
 
 // ReadResourceResolver resolves non-filesystem read resources. It is defined
@@ -213,6 +220,11 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 			return agent.AgentTool{}, fmt.Errorf("task tool not configured")
 		}
 		return options.TaskTool, nil
+	case JobsTool, WaitTool, CancelTool, LogsTool:
+		if options.Work == nil || options.Child {
+			return agent.AgentTool{}, fmt.Errorf("background management requires a durable root session")
+		}
+		return newManagementTool(toolName, options.Work), nil
 	case SkillTool:
 		if len(options.Skills) == 0 {
 			return agent.AgentTool{}, fmt.Errorf("skill tool has no skills")
@@ -247,7 +259,7 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 // options, returning only the ones that were successfully created.
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch} {
+	for _, name := range []ToolName{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -795,23 +807,39 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	if timeoutDefault <= 0 {
 		timeoutDefault = 10 * time.Minute
 	}
+	parameters := schema.JSON{"command": schema.String(), "timeout": schema.Number()}
+	if options.Work != nil && !options.Child {
+		parameters["async"] = schema.Bool()
+	}
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(BashTool),
 			Description: fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024),
-			Parameters: schema.Object(schema.JSON{
-				"command": schema.String(),
-				"timeout": schema.Number(),
-			}, "command"),
+			Parameters:  schema.Object(parameters, "command"),
 		},
 		Label: string(BashTool),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
 				Command string `json:"command"`
 				Timeout *int   `json:"timeout"`
+				Async   bool   `json:"async"`
 			}
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
+			}
+			if input.Async {
+				if options.Work == nil || options.Child {
+					return agent.AgentToolResult{}, errors.New("async bash requires a durable root session; child bash is synchronous only")
+				}
+				timeoutSeconds := int(timeoutDefault / time.Second)
+				if input.Timeout != nil && *input.Timeout > 0 {
+					timeoutSeconds = *input.Timeout
+				}
+				job, err := options.Work.StartBash(ctx, work.BashSpec{Command: input.Command, TimeoutSeconds: timeoutSeconds})
+				if err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				return jobHandleResult(job)
 			}
 			if _, err := os.Stat(cwd); err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Working directory does not exist: %s\nCannot execute bash commands.", cwd)
@@ -832,6 +860,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			cmd := exec.CommandContext(execCtx, shell, "-c", command)
 			cmd.Dir = cwd
 			if runtime.GOOS != "windows" {
+				cmd.WaitDelay = 2 * time.Second
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 				cmd.Cancel = func() error {
 					err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -841,48 +870,23 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 					return err
 				}
 			}
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
 			acc := toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{TempFilePrefix: "harness-bash"})
-			var accMu sync.Mutex
-			appendPipe := func(r io.Reader, wg *sync.WaitGroup) {
-				defer wg.Done()
-				buf := make([]byte, 4096)
-				for {
-					n, readErr := r.Read(buf)
-					if n > 0 {
-						accMu.Lock()
-						_ = acc.Append(buf[:n])
-						accMu.Unlock()
-					}
-					if readErr != nil {
-						return
-					}
-				}
-			}
+			writer := &bashOutputWriter{accumulator: acc, cancel: cancel}
+			cmd.Stdout = writer
+			cmd.Stderr = writer
 			if onUpdate != nil {
 				onUpdate(agent.AgentToolResult{Content: []types.ContentBlock{}})
 			}
 			if err := cmd.Start(); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			var wg sync.WaitGroup
-			wg.Add(2)
-			go appendPipe(stdout, &wg)
-			go appendPipe(stderr, &wg)
-			wg.Wait()
 			waitErr := cmd.Wait()
-			accMu.Lock()
-			_ = acc.Finish()
-			snapshot, _ := acc.Snapshot(toolio.SnapshotOptions{PersistIfTruncated: true})
-			_ = acc.CloseTempFile()
-			accMu.Unlock()
+			finishErr := acc.Finish()
+			snapshot, snapshotErr := acc.Snapshot(toolio.SnapshotOptions{PersistIfTruncated: true})
+			closeErr := acc.CloseTempFile()
+			if outputErr := errors.Join(writer.err, finishErr, snapshotErr, closeErr); outputErr != nil {
+				return agent.AgentToolResult{}, outputErr
+			}
 			text, details := formatBashOutput(snapshot, acc, "(no output)")
 			if execCtx.Err() == context.DeadlineExceeded {
 				return agent.AgentToolResult{}, errors.New(appendStatus(text, fmt.Sprintf("Command timed out after %g seconds", timeout.Seconds())))

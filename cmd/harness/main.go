@@ -203,26 +203,21 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	stack := tempest.StackConfig{
-		Cwd:                cwd,
-		Model:              stackModel,
-		PlanModel:          planSelected,
-		SmolModel:          roles.Smol.Model,
-		StreamFn:           stackStreamFn,
-		SmolStreamFn:       roles.Smol.StreamFn,
-		PermissionMode:     permissionMode,
-		PermissionPolicy:   permissionPolicy,
-		ExcludeTools:       splitCSV(opts.ExcludeTools),
-		EnableTask:         opts.Config.EnableTask(),
-		EnableWeb:          opts.Config.EnableWeb(),
-		WebSearchURL:       opts.Config.WebSearchURL(),
-		BashTimeout:        opts.Config.BashTimeout(),
-		ContextFiles:       inputs.ContextFiles,
-		Skills:             inputs.Skills,
-		GenericRules:       inputs.GenericRules,
-		AttachmentRegistry: attachRegistry,
-		AttachmentReader:   attachReader,
-	}
+	stack := session.StackConfigFromConfig(opts.Config)
+	stack.Cwd = cwd
+	stack.Model = stackModel
+	stack.PlanModel = planSelected
+	stack.SmolModel = roles.Smol.Model
+	stack.StreamFn = stackStreamFn
+	stack.SmolStreamFn = roles.Smol.StreamFn
+	stack.PermissionMode = permissionMode
+	stack.PermissionPolicy = permissionPolicy
+	stack.ExcludeTools = splitCSV(opts.ExcludeTools)
+	stack.ContextFiles = inputs.ContextFiles
+	stack.Skills = inputs.Skills
+	stack.GenericRules = inputs.GenericRules
+	stack.AttachmentRegistry = attachRegistry
+	stack.AttachmentReader = attachReader
 	sess, err := openSession(runCtx, tempest.Options{
 		SessionDir: opts.Config.SessionDir(),
 		Cwd:        cwd,

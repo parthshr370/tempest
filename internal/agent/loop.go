@@ -55,6 +55,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // createAgentStream builds the event stream for one agent run. The stream's
@@ -99,14 +100,20 @@ func AgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentC
 	return s
 }
 
-// AgentLoopContinue resumes a run from an existing transcript (the last message
-// must be a user/toolResult — never an assistant message, since the loop would
-// immediately try to stream another assistant response from nothing). Returns
-// an error up front when the resume precondition is violated.
+// AgentLoopContinue resumes a run from an existing transcript. An empty or
+// assistant-ended transcript needs queued input or recoverable work first.
+// It returns an error up front when neither can supply the next turn's input.
 func AgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, streamFn StreamFn) (*stream.Stream[AgentEvent, []types.Message], error) {
 	if err := checkContinuable(agentContext.Messages); err != nil {
-		return nil, err
+		pending := false
+		if config.QueueSource != nil {
+			pending, _ = config.QueueSource.Pending()
+		}
+		if !pending && (config.Work == nil || !config.Work.Pending()) {
+			return nil, err
+		}
 	}
+	config.Resume = true
 	s := createAgentStream()
 	go runAgentLoopContinue(ctx, agentContext, config, streamSink(s), streamFn)
 	return s, nil
@@ -127,7 +134,7 @@ func checkContinuable(messages []types.Message) error {
 // one run that starts by appending prompts to the transcript.
 func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
 	ctx, run := newLoopRun(ctx, config, emit, streamFn)
-	return run.execute(ctx, prompts, func() error {
+	return run.execute(ctx, prompts, func(ctx context.Context) error {
 		current := agentContext
 		current.Messages = append([]types.Message{}, agentContext.Messages...)
 		if err := emit(ctx, TurnStart()); err != nil {
@@ -141,11 +148,11 @@ func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext Age
 }
 
 // runAgentLoopContinue is the synchronous core behind [AgentLoopContinue] and
-// [Agent.Continue]: one run over the existing transcript. Callers ensure the
-// transcript is non-empty and does not end with an assistant message.
+// [Agent.Continue]. Quiescent transcripts wait for queued input or recovered
+// job completions before calling the provider.
 func runAgentLoopContinue(ctx context.Context, agentContext AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) ([]types.Message, RunResult) {
 	ctx, run := newLoopRun(ctx, config, emit, streamFn)
-	return run.execute(ctx, nil, func() error {
+	return run.execute(ctx, nil, func(ctx context.Context) error {
 		if err := emit(ctx, TurnStart()); err != nil {
 			return err
 		}
@@ -160,10 +167,12 @@ type loopRun struct {
 	streamFn StreamFn
 	started  time.Time
 	// messages are the messages this run added to the transcript.
-	messages   []types.Message
-	result     RunResult
-	accounting *runAccounting
-	root       bool
+	messages     []types.Message
+	result       RunResult
+	accounting   *runAccounting
+	root         bool
+	initialTurns int
+	enforceFirst bool
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -171,20 +180,71 @@ type loopRun struct {
 // error that ended it. A panic in body is converted to StopError (the loop
 // edge is the one place hooks and providers can take the run down), so
 // agent_end is still emitted.
-func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body func() error) ([]types.Message, RunResult) {
-	err := run.emit(ctx, AgentStart(prompts))
+func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body func(context.Context) error) ([]types.Message, RunResult) {
+	start := AgentStart(prompts)
+	start.Resume = run.config.Resume
+	err := run.emit(ctx, start)
 	if err == nil {
-		err = runRecoveringPanic(body)
+		state := run.config.bindings.snapshot()
+		if !state.StartedAt.IsZero() {
+			run.started = state.StartedAt
+		}
+		run.initialTurns = state.Turns
+		if !run.root {
+			run.result.Usage = state.Usage
+		}
+		run.enforceFirst = !state.StartedAt.IsZero() || state.Turns > 0 || state.Usage != (types.Usage{}) || run.config.Work != nil
+		if run.root {
+			run.accounting.mu.Lock()
+			run.accounting.usage = state.Usage
+			for source, usage := range state.UsageSources {
+				run.accounting.sources[source] = usage
+			}
+			run.accounting.mu.Unlock()
+		}
+		var cancel context.CancelFunc
+		if run.config.MaxWallTime > 0 && (!state.StartedAt.IsZero() || run.config.Work != nil) {
+			ctx, cancel = context.WithDeadline(ctx, run.started.Add(run.config.MaxWallTime))
+			defer cancel()
+		}
+		err = runRecoveringPanic(func() error {
+			if run.config.Work != nil {
+				if err := run.config.Work.Start(ctx, work.RunInfo{SessionID: run.config.SessionID, RunID: state.RunID, LogicalRunID: state.LogicalRunID, Resume: run.config.Resume}); err != nil {
+					return err
+				}
+			}
+			return body(ctx)
+		})
 	}
 	err = errors.Join(err, run.accounting.failure())
+	var budgetStop *providerBudgetStop
 	switch {
 	case err == nil:
+	case errors.As(err, &budgetStop):
+		run.result.StopReason = budgetStop.reason
+		if budgetStop.reason == StopAborted && ctx.Err() != nil {
+			run.result.StopReason, _ = run.boundaryStop(ctx)
+		}
 	case ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)):
-		run.result.StopReason = StopAborted
+		run.result.StopReason, _ = run.boundaryStop(ctx)
 	default:
 		run.result.StopReason = StopError
 		run.result.Err = err
 	}
+	if run.result.StopReason == "" {
+		run.result.StopReason = StopCompleted
+	}
+	if run.config.Work != nil {
+		if finishErr := runRecoveringPanic(func() error { return run.config.Work.Finish(context.WithoutCancel(ctx), string(run.result.StopReason)) }); finishErr != nil {
+			run.result.StopReason = StopError
+			run.result.Err = errors.Join(run.result.Err, finishErr)
+		}
+	}
+	if failure := run.accounting.failure(); failure != nil {
+		run.result.StopReason = StopError
+		run.result.Err = errors.Join(run.result.Err, failure)
+	}
+	run.result.ElapsedMS = time.Since(run.started).Milliseconds()
 	if run.root {
 		run.result.Usage = run.accounting.total()
 	}
@@ -225,15 +285,54 @@ func (run *loopRun) appendMessages(ctx context.Context, current *AgentContext, m
 	return nil
 }
 
+func (run *loopRun) take(ctx context.Context, kind work.QueueKind) ([]work.QueuedMessage, error) {
+	if run.config.QueueSource != nil {
+		return run.config.QueueSource.Take(ctx, kind)
+	}
+	var messages []types.Message
+	if kind == work.Steer && run.config.GetSteeringMessages != nil {
+		messages = run.config.GetSteeringMessages()
+	}
+	if kind == work.FollowUp && run.config.GetFollowUpMessages != nil {
+		messages = run.config.GetFollowUpMessages()
+	}
+	out := make([]work.QueuedMessage, 0, len(messages))
+	for _, message := range messages {
+		out = append(out, work.QueuedMessage{Message: message})
+	}
+	return out, nil
+}
+
+func (run *loopRun) appendQueued(ctx context.Context, current *AgentContext, messages []work.QueuedMessage) error {
+	for _, queued := range messages {
+		start := MessageStart(queued.Message)
+		start.QueueID = queued.ID
+		if err := run.emit(ctx, start); err != nil {
+			return err
+		}
+		end := MessageEnd(queued.Message)
+		end.QueueID = queued.ID
+		if err := run.emit(ctx, end); err != nil {
+			return err
+		}
+		current.Messages = append(current.Messages, queued.Message)
+		run.messages = append(run.messages, queued.Message)
+	}
+	return nil
+}
+
 // boundaryStop decides at a turn boundary whether the run must end before the
 // next model call. Cancellation wins over budgets because it is the caller's
 // explicit intent.
 func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 	if ctx.Err() != nil {
+		if run.config.MaxWallTime > 0 && !time.Now().Before(run.started.Add(run.config.MaxWallTime)) {
+			return StopMaxWallTime, nil
+		}
 		return StopAborted, nil
 	}
 	budget := run.config.Budget
-	if budget.MaxTurns > 0 && run.result.Turns >= budget.MaxTurns {
+	if budget.MaxTurns > 0 && run.initialTurns+run.result.Turns >= budget.MaxTurns {
 		return StopMaxTurns, nil
 	}
 	if stop, err := run.accounting.costStop(); stop != "" || err != nil {
@@ -274,23 +373,33 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 	config := &run.config
 	firstTurn := true
-	var pendingMessages []types.Message
-	if config.GetSteeringMessages != nil {
-		pendingMessages = config.GetSteeringMessages()
+	quiescentResume := config.Resume && (len(current.Messages) == 0 || current.Messages[len(current.Messages)-1].Role() == "assistant")
+	pendingMessages, err := run.take(ctx, work.Steer)
+	if err != nil {
+		return err
+	}
+	if quiescentResume && len(pendingMessages) == 0 {
+		pendingMessages, err = run.take(ctx, work.FollowUp)
+		if err != nil {
+			return err
+		}
 	}
 
 	for {
-		hasMoreToolCalls := true
+		hasMoreToolCalls := !firstTurn || !quiescentResume
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
-			if firstTurn && ctx.Err() != nil {
-				run.result.StopReason = StopAborted
-				return nil
+			if firstTurn && (run.enforceFirst || ctx.Err() != nil) {
+				stop, err := run.boundaryStop(ctx)
+				if stop != "" || err != nil {
+					run.result.StopReason = stop
+					return err
+				}
 			}
 			if !firstTurn {
 				stop, err := run.boundaryStop(ctx)
 				if stop != "" || err != nil {
-					if appendErr := run.appendMessages(ctx, &current, pendingMessages); appendErr != nil {
+					if appendErr := run.appendQueued(ctx, &current, pendingMessages); appendErr != nil {
 						return appendErr
 					}
 					run.result.StopReason = stop
@@ -300,15 +409,28 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return err
 				}
 			}
+			prepareResume := firstTurn && config.Resume && config.PrepareNextTurnE != nil
 			firstTurn = false
 			if err := config.Budget.Validate(config.Model); err != nil {
 				return err
 			}
 
-			if err := run.appendMessages(ctx, &current, pendingMessages); err != nil {
+			if err := run.appendQueued(ctx, &current, pendingMessages); err != nil {
 				return err
 			}
 			pendingMessages = nil
+			if prepareResume {
+				update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages})
+				if err != nil {
+					return err
+				}
+				if update != nil {
+					applyTurnUpdate(config, &current, update)
+				}
+				if err := config.Budget.Validate(config.Model); err != nil {
+					return err
+				}
+			}
 			release, stop, err := run.accounting.admit(ctx, config.Model)
 			if stop != "" || err != nil {
 				release()
@@ -334,6 +456,9 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 				if message.StopReason == types.StopAborted {
 					run.result.StopReason = StopAborted
+					if ctx.Err() != nil {
+						run.result.StopReason, _ = run.boundaryStop(ctx)
+					}
 					return nil
 				}
 				return providerError(message)
@@ -367,7 +492,16 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				Context:     current,
 				NewMessages: run.messages,
 			}
-			if config.PrepareNextTurn != nil {
+			if config.PrepareNextTurnE != nil {
+				update, err := config.PrepareNextTurnE(ctx, turnContext)
+				if err != nil {
+					return err
+				}
+				if update != nil {
+					applyTurnUpdate(config, &current, update)
+					turnContext.Context = current
+				}
+			} else if config.PrepareNextTurn != nil {
 				if update := config.PrepareNextTurn(turnContext); update != nil {
 					applyTurnUpdate(config, &current, update)
 					turnContext.Context = current
@@ -379,17 +513,43 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				return nil
 			}
 
-			if config.GetSteeringMessages != nil {
-				pendingMessages = config.GetSteeringMessages()
+			pendingMessages, err = run.take(ctx, work.Steer)
+			if err != nil {
+				return err
 			}
 		}
 
-		if config.GetFollowUpMessages != nil {
-			pendingMessages = config.GetFollowUpMessages()
-		}
-		if len(pendingMessages) == 0 {
-			run.result.StopReason = StopCompleted
-			return nil
+		for {
+			pendingMessages, err = run.take(ctx, work.FollowUp)
+			if err != nil {
+				return err
+			}
+			if len(pendingMessages) > 0 {
+				break
+			}
+			if config.Work == nil {
+				run.result.StopReason = StopCompleted
+				return nil
+			}
+			if stop, err := run.boundaryStop(ctx); stop != "" || err != nil {
+				run.result.StopReason = stop
+				return err
+			}
+			again, err := config.Work.Idle(ctx)
+			if err != nil {
+				return err
+			}
+			if !again {
+				run.result.StopReason = StopCompleted
+				return nil
+			}
+			pendingMessages, err = run.take(ctx, work.Steer)
+			if err != nil {
+				return err
+			}
+			if len(pendingMessages) > 0 {
+				break
+			}
 		}
 	}
 }

@@ -51,6 +51,10 @@ func TestClassifyToolTiers(t *testing.T) {
 		tools.WebSearch:      TierRead,
 		tools.WebFetch:       TierRead,
 		tools.AttachmentTool: TierRead,
+		tools.JobsTool:       TierExec,
+		tools.WaitTool:       TierRead,
+		tools.CancelTool:     TierExec,
+		tools.LogsTool:       TierRead,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))

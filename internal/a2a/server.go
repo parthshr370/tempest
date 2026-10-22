@@ -37,6 +37,7 @@ type Backend interface {
 	Acquire(string) (*tempest.Session, func(), error)
 	RunContext() context.Context
 	Defaults() tempest.NewSession
+	LookupRun(context.Context, string) (tempest.RunDetail, error)
 }
 
 // Options fixes the advertised address and host-selected workspace.
@@ -287,6 +288,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		t := s.lookup(p.ID)
+		if t == nil && req.Method == "GetTask" {
+			value, lookupError := s.lookupDurable(r.Context(), string(p.ID), p.HistoryLength)
+			writeResponse(w, req.ID, value, lookupError)
+			return
+		}
 		if t == nil {
 			writeResponse(w, req.ID, nil, protocolError(-32001, "", nil))
 			return
@@ -300,7 +306,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			terminal := t.value.Status.State.Terminal()
 			run := t.run
 			t.mu.Unlock()
-			if terminal {
+			if terminal || run == nil {
 				writeResponse(w, req.ID, nil, protocolError(-32002, "", nil))
 				return
 			}

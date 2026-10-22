@@ -14,6 +14,7 @@ import (
 	"go.harness.dev/harness/internal/mcpserver"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/serve"
+	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/tempest"
 )
 
@@ -114,7 +115,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	stack := &tempest.StackConfig{BashTimeout: cfg.BashTimeout(), PermissionPolicy: buildPermissionPolicy(cfg.PermissionAllowTools(), cfg.PermissionDenyTools())}
+	stack := session.StackConfigFromConfig(cfg)
+	stack.PermissionPolicy = buildPermissionPolicy(cfg.PermissionAllowTools(), cfg.PermissionDenyTools())
 	if cfg.FauxScript() != "" {
 		provider, model, err := loadFauxScript(cfg.FauxScript())
 		if err != nil {
@@ -161,14 +163,14 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			case <-finished:
 			}
 		}()
-		err := mcpserver.Serve(ctx, newStdioStream(os.Stdin, stdout), mcpserver.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, DefaultNew: defaults, Provider: provider, Stack: stack, PermissionTimeout: permissionTimeout, IdleTimeout: idleTimeout, ShutdownTimeout: shutdownTimeout})
+		err := mcpserver.Serve(ctx, newStdioStream(os.Stdin, stdout), mcpserver.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, DefaultNew: defaults, Provider: provider, Stack: &stack, PermissionTimeout: permissionTimeout, IdleTimeout: idleTimeout, ShutdownTimeout: shutdownTimeout})
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
 		return 0
 	}
-	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: stack})
+	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

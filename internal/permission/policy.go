@@ -35,8 +35,9 @@ const (
 
 // PromptRequest describes an approval prompt for a tool call.
 type PromptRequest struct {
-	ToolCallID string
-	Args       json.RawMessage
+	ToolCallID                                  string
+	JobID, ChildSessionID, ChildToolCallID, Cwd string
+	Args                                        json.RawMessage
 	// Tool names the tool requesting approval.
 	Tool string
 	// Tier is the approval tier for Tool.
@@ -115,6 +116,8 @@ const (
 	SourcePromptCancelled Source = "prompt_cancelled"
 	// SourceNoPrompter identifies an approval requirement with no prompt surface.
 	SourceNoPrompter Source = "no_prompter"
+	// SourceInherited identifies a child policy intersection.
+	SourceInherited Source = "inherited"
 )
 
 // Outcome is the decision and, for interactive decisions, its wait time.
@@ -129,7 +132,7 @@ type Outcome struct {
 // ClassifyTool returns the approval tier for toolName.
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
-	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill":
+	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs":
 		return TierRead
 	case "write", "edit", "todo_write":
 		return TierWrite

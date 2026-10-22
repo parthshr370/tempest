@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 const (
@@ -47,8 +49,19 @@ type Loaded struct {
 	// run records (version 1 files).
 	LastRun *RunSummary
 	// UsageTotal folds every usage record in the file.
-	UsageTotal  ptypes.Usage
-	Diagnostics []Diagnostic
+	UsageTotal      ptypes.Usage
+	Diagnostics     []Diagnostic
+	Queued          []work.QueueItem
+	QueueReceipts   []work.QueueItem
+	QueueCancelled  map[string]bool
+	QueueConsumed   map[string]bool
+	Jobs            []work.Job
+	Recoveries      []work.Recovery
+	Runs            []RunDetail
+	UsageSources    map[string]ptypes.Usage
+	CompactionParts map[string]CompactionPart
+	StopRequests    map[string]string
+	snapshots       map[string][]ptypes.Message
 
 	// lastSeq is where a resumed store continues numbering lines.
 	lastSeq uint64
@@ -77,6 +90,10 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("load journal: %w", err)
 	}
+	return loadContents(ctx, path, contents, true)
+}
+
+func loadContents(ctx context.Context, path string, contents []byte, withSnapshots bool) (*Loaded, error) {
 	lines := bytes.Split(contents, []byte{'\n'})
 	if len(lines) == 0 || len(lines[0]) == 0 {
 		return nil, fmt.Errorf("read journal header: missing header")
@@ -136,6 +153,12 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 	// Version 1 lines carry no seq; counting them keeps a resumed file's
 	// numbering past every existing line.
 	loaded.lastSeq = max(maxSeq, uint64(decoded))
+	if err := loaded.reduceWork(ctx, entries, path, withSnapshots); err != nil {
+		return nil, err
+	}
+	if !withSnapshots {
+		return loaded, nil
+	}
 	reduce(loaded, entries)
 	return loaded, nil
 }
@@ -146,7 +169,7 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 	if err := ctx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
@@ -163,19 +186,29 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 		_ = file.Close()
 		return nil, nil, err
 	}
+	if err := upgradeHeader(file, loaded.Header.Version); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	loaded.Header.Version = JournalVersion
+	if _, err := file.Seek(0, 2); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		_ = file.Close()
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
 	clock, newID := resolveOptions(opts)
 	store := &Store{
-		path:   path,
-		id:     loaded.Header.ID,
-		file:   file,
-		lastID: loaded.LastID,
-		seq:    loaded.lastSeq,
-		clock:  clock,
-		newID:  newID,
+		path:         path,
+		id:           loaded.Header.ID,
+		file:         file,
+		lastID:       loaded.LastID,
+		seq:          loaded.lastSeq,
+		clock:        clock,
+		newID:        newID,
+		usageSources: maps.Clone(loaded.UsageSources),
 	}
 	return store, loaded, nil
 }
@@ -226,6 +259,9 @@ func repairTail(ctx context.Context, file *os.File) error {
 }
 
 func appendNewline(file *os.File) error {
+	if _, err := file.Seek(0, 2); err != nil {
+		return fmt.Errorf("seek journal tail: %w", err)
+	}
 	if _, err := file.Write([]byte{'\n'}); err != nil {
 		return fmt.Errorf("repair journal tail: %w", err)
 	}

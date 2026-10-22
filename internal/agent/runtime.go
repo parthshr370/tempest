@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // PendingMessageQueue is the queued steering/follow-up buffer. The Agent mutex
@@ -91,6 +92,9 @@ type AgentOptions struct {
 	// PrepareNextTurnWithContext is the stateful variant — preferred when set;
 	// it receives turn context and can inspect the last message + tool results.
 	PrepareNextTurnWithContext func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
+	PrepareNextTurnE           func(context.Context, ShouldStopAfterTurnContext) (*AgentLoopTurnUpdate, error)
+	QueueSource                work.QueueSource
+	Work                       work.RunHooks
 	// SteeringMode controls how queued steering messages are drained:
 	// QueueAll drains everything, QueueOneAtATime hands out one per turn.
 	SteeringMode QueueMode
@@ -144,6 +148,8 @@ type Agent struct {
 	followUpQueue PendingMessageQueue
 	activeRun     *activeRun
 	budget        Budget
+	bindings      *runtimeBindings
+	ended         bool
 
 	emitMu sync.Mutex
 	// seq is the last Seq handed out; guarded by emitMu.
@@ -157,6 +163,9 @@ type Agent struct {
 	AfterToolCall              func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
 	PrepareNextTurn            func() *AgentLoopTurnUpdate
 	PrepareNextTurnWithContext func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
+	PrepareNextTurnE           func(context.Context, ShouldStopAfterTurnContext) (*AgentLoopTurnUpdate, error)
+	QueueSource                work.QueueSource
+	Work                       work.RunHooks
 	SessionID                  string
 	ToolExecution              ToolExecutionMode
 }
@@ -241,6 +250,10 @@ func NewAgent(opts AgentOptions) *Agent {
 		AfterToolCall:              opts.AfterToolCall,
 		PrepareNextTurn:            opts.PrepareNextTurn,
 		PrepareNextTurnWithContext: opts.PrepareNextTurnWithContext,
+		PrepareNextTurnE:           opts.PrepareNextTurnE,
+		QueueSource:                opts.QueueSource,
+		Work:                       opts.Work,
+		bindings:                   &runtimeBindings{},
 		steeringQueue:              PendingMessageQueue{Mode: steeringMode},
 		followUpQueue:              PendingMessageQueue{Mode: followUpMode},
 		SessionID:                  opts.SessionID,
@@ -339,6 +352,10 @@ func (a *Agent) ClearAllQueues() {
 func (a *Agent) HasQueuedMessages() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.QueueSource != nil {
+		pending, _ := a.QueueSource.Pending()
+		return pending
+	}
 	return a.steeringQueue.HasItems() || a.followUpQueue.HasItems()
 }
 
@@ -473,21 +490,39 @@ func (a *Agent) PromptText(ctx context.Context, text string, images ...types.Con
 }
 
 // Continue runs one run from the current transcript. When the last message is
-// from the assistant, queued steering (else follow-up) messages become the
-// run's prompt; with nothing queued that is an error. The error contract
-// matches [Agent.Prompt].
+// from the assistant, queued steering (else follow-up) messages or recovered
+// job completions become the run's prompt. With neither input nor recoverable
+// work, that's an error. The error contract matches [Agent.Prompt].
 func (a *Agent) Continue(ctx context.Context) (RunResult, error) {
 	a.mu.Lock()
 	if err := a.startableLocked(); err != nil {
 		a.mu.Unlock()
 		return RunResult{}, err
 	}
+	pendingWork := a.Work != nil && a.Work.Pending()
+	if a.QueueSource != nil || pendingWork {
+		pending := false
+		if a.QueueSource != nil {
+			pending, _ = a.QueueSource.Pending()
+		}
+		if !pending && !pendingWork && (len(a.state.Messages) == 0 || a.state.Messages[len(a.state.Messages)-1].Role() == "assistant") {
+			a.mu.Unlock()
+			return RunResult{}, errors.New("Cannot continue without pending input")
+		}
+		return a.runLocked(ctx, false, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+			config.Resume = true
+			_, result := runAgentLoopContinue(runCtx, snapshot, config, a.processEvents, streamFn)
+			return result
+		})
+	}
 	if len(a.state.Messages) == 0 {
 		a.mu.Unlock()
 		return RunResult{}, errors.New("No messages to continue from")
 	}
 	if a.state.Messages[len(a.state.Messages)-1].Role() != "assistant" {
+		// Durable continuation provenance is carried independently of the transcript.
 		return a.runLocked(ctx, false, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+			config.Resume = true
 			_, result := runAgentLoopContinue(runCtx, snapshot, config, a.processEvents, streamFn)
 			return result
 		})
@@ -504,6 +539,7 @@ func (a *Agent) Continue(ctx context.Context) (RunResult, error) {
 		return RunResult{}, errors.New("Cannot continue from message role: assistant")
 	}
 	return a.runLocked(ctx, skipInitialSteeringPoll, func(runCtx context.Context, snapshot AgentContext, config AgentLoopConfig, streamFn StreamFn) RunResult {
+		config.Resume = true
 		_, result := runAgentLoop(runCtx, queued, snapshot, config, a.processEvents, streamFn)
 		return result
 	})
@@ -537,6 +573,7 @@ func (a *Agent) runLocked(ctx context.Context, skipInitialSteeringPoll bool, bod
 	runCtx, cancel := context.WithCancel(ctx)
 	a.activeRun = &activeRun{done: make(chan struct{}), cancel: cancel}
 	a.state.IsStreaming = true
+	a.ended = false
 	a.state.StreamingMessage = nil
 	a.state.ErrorMessage = ""
 	a.mu.Unlock()
@@ -571,6 +608,10 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		ConvertToLlm:     convertToLlm,
 		TransformContext: a.TransformContext,
 		GetAPIKey:        a.GetApiKey,
+		QueueSource:      a.QueueSource,
+		Work:             a.Work,
+		PrepareNextTurnE: a.PrepareNextTurnE,
+		bindings:         a.bindings,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)
@@ -639,9 +680,9 @@ func (a *Agent) processEvents(ctx context.Context, ev AgentEvent) error {
 	defer a.emitMu.Unlock()
 
 	a.mu.Lock()
-	if a.activeRun == nil {
+	if a.activeRun == nil || a.ended {
 		a.mu.Unlock()
-		return errors.New("Agent listener invoked outside active run")
+		return ErrNoActiveRun
 	}
 	a.seq++
 	ev.Seq = a.seq
@@ -665,6 +706,7 @@ func (a *Agent) processEvents(ctx context.Context, ev AgentEvent) error {
 			a.state.ErrorMessage = errorMessage
 		}
 	case EventAgentEnd:
+		a.ended = true
 		a.state.StreamingMessage = nil
 		if ev.Err != nil && a.state.ErrorMessage == "" {
 			a.state.ErrorMessage = ev.Err.Error()

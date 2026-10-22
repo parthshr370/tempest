@@ -10,6 +10,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // StreamFn is the loop's provider entry. It never throws: failures are encoded
@@ -100,6 +101,7 @@ type PermissionOutcome struct {
 	Source   string
 	Prompted bool
 	Wait     time.Duration
+	AskID    string
 }
 
 // AfterToolCallResult is a field-by-field override for a completed tool result.
@@ -158,6 +160,11 @@ type AgentLoopConfig struct {
 	GetAPIKey           func(provider string) string
 	ShouldStopAfterTurn func(c ShouldStopAfterTurnContext) bool
 	PrepareNextTurn     func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
+	PrepareNextTurnE    func(context.Context, ShouldStopAfterTurnContext) (*AgentLoopTurnUpdate, error)
+	QueueSource         work.QueueSource
+	Work                work.RunHooks
+	Resume              bool
+	bindings            *runtimeBindings
 	GetSteeringMessages func() []types.Message
 	GetFollowUpMessages func() []types.Message
 	BeforeToolCall      func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
@@ -247,6 +254,7 @@ const (
 	EventToolExecutionEnd    AgentEventType = "tool_execution_end"
 	// EventUsage reports a delegated model call without adding its transcript.
 	EventUsage AgentEventType = "usage"
+	EventWork  AgentEventType = "work"
 )
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
@@ -269,6 +277,12 @@ type AgentEvent struct {
 	PartialResult         any
 	IsError               bool
 	Permission            *PermissionOutcome
+	Work                  *work.Event
+	QueueID               string
+	UsageSource           string
+	ChildSessionID        string
+	UsageRunID            string
+	Resume                bool
 	// Model and Usage are set on usage events for delegated model calls.
 	Model string
 	// RunResult is set on agent_end; Usage is also set on usage events.

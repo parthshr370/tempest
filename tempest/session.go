@@ -17,11 +17,13 @@ import (
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/jobs"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/work"
 )
 
 // Run is an admitted run. Wait may be called more than once.
@@ -70,7 +72,10 @@ func (r *Run) Started(ctx context.Context) (string, error) {
 	}
 }
 
-type approval struct{ result chan approvalResult }
+type approval struct {
+	result chan approvalResult
+	child  bool
+}
 type approvalResult struct {
 	choice Choice
 	err    error
@@ -102,6 +107,8 @@ type sessionCore struct {
 	excludeTools     []string
 	plan             bool
 	baseMCPDefaults  map[string]permission.Decision
+	queues           *session.DurableQueues
+	jobs             *jobs.Manager
 }
 
 func open(ctx context.Context, o Options) (_ *Session, err error) {
@@ -143,6 +150,10 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 		if dir == "" {
 			dir = defaults.SessionDir()
+		}
+		if o.Stack == nil {
+			cfg = session.StackConfigFromConfig(defaults)
+			cfg.Cwd = cwd
 		}
 	}
 	if selectedMCP == nil && defaults != nil {
@@ -257,9 +268,6 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if cfg.SmolModel.ID == "" {
 		cfg.SmolModel = cfg.Model
 	}
-	if o.Stack == nil {
-		cfg.BashTimeout = defaults.BashTimeout()
-	}
 	if needsDiscovery {
 		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: defaults.SkillPaths(), IncludeDefaultSkills: true})
 		if e != nil {
@@ -299,6 +307,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	seed := Snapshot{SessionID: c.id, Cwd: cwd, Model: runtimeModel.ID, PermissionMode: string(mode), Budget: budget, Usage: mapper.usage}
 	if loaded != nil {
 		seed.Interrupted = loaded.Interrupted
+		seed.Queues = append([]work.QueueItem(nil), loaded.Queued...)
+		seed.Jobs = append([]work.Job(nil), loaded.Jobs...)
 		if loaded.LastRun != nil {
 			r := loaded.LastRun
 			seed.LastRun = &RunSummary{RunID: r.RunID, StopReason: r.StopReason, Finished: r.Finished, Error: r.Error, FinishedAt: r.FinishedAt}
@@ -379,8 +389,32 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}()
 	c.installMCPDefaults()
 	cfg.ConfiguredTools = append(append([]Tool(nil), cfg.ConfiguredTools...), c.mcp.Tools()...)
+	cfg.PermissionPolicyRef = c.permissionPolicy
 	c.excludeTools = append([]string(nil), cfg.ExcludeTools...)
 	c.plan = cfg.Plan
+	cfg.Journal, cfg.Loaded = store, loaded
+	c.queues = session.NewDurableQueues(store, loaded, c.publishWork)
+	cfg.QueueSource = c.queues
+	var recoveries []work.Recovery
+	if loaded != nil {
+		recoveries = loaded.Recoveries
+	}
+	c.jobs, err = jobs.New(work.Host{
+		SessionID: c.id, JournalPath: store.Path(), Cwd: cwd, Queues: c.queues,
+		Append:  func(ctx context.Context, f work.Fact) error { return session.AppendWorkFact(ctx, store, f) },
+		Enqueue: c.queues.Enqueue, Publish: c.publishWork,
+		PrepareTask: func(ctx context.Context, spec work.TaskSpec) (work.TaskEnvironment, error) {
+			return c.prepareTask(ctx, cfg, spec)
+		},
+		RunTask: func(ctx context.Context, launch work.TaskLaunch) (work.TaskResult, error) {
+			return c.runTask(ctx, cfg, launch)
+		},
+	}, jobs.Options{BashTimeout: cfg.BashTimeout, OnError: func(error) { s.Cancel() }}, recoveries)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Work = &sessionWork{core: c, recoveries: recoveries}
+	cfg.Controller = c.jobs
 	stack, e := session.BuildAgentStack(cfg)
 	if e != nil {
 		return nil, e
@@ -399,7 +433,17 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if cfg.AttachmentReader != nil || cfg.AttachmentRegistry != nil {
 		c.delivery = &session.MediaDelivery{Reader: cfg.AttachmentReader, Registry: cfg.AttachmentRegistry, ContextWindow: runtimeModel.ContextWindow, Sanitize: cfg.Sanitize}
 	}
-	c.detachJournal = session.AttachJournalWithRunID(c.agent, store, func(id string) { mapper.runID = id; c.mu.Lock(); c.runID = id; c.mu.Unlock() })
+	c.detachJournal = session.AttachJournalWithOptions(c.agent, store, session.RecordOptions{Queues: c.queues, Started: func(id string) {
+		state := c.agent.RunState()
+		mapper.mu.Lock()
+		mapper.runID = id
+		mapper.logicalRunID = state.LogicalRunID
+		mapper.continuationOf = state.ContinuationOf
+		mapper.mu.Unlock()
+		c.mu.Lock()
+		c.runID = id
+		c.mu.Unlock()
+	}})
 	c.detachHub = c.agent.Subscribe(func(ctx context.Context, ev agent.AgentEvent) error {
 		if ev.Type == agent.EventAgentStart {
 			// The journal listener runs first. Its append must succeed before readiness.
@@ -452,6 +496,10 @@ func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
 	if c.active != nil {
 		c.mu.Unlock()
 		return nil, ErrRunActive
+	}
+	if p != nil && c.jobs.RecoveryRequired() {
+		c.mu.Unlock()
+		return nil, ErrRecoveryRequired
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &Run{cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), started: time.Now()}
@@ -581,6 +629,7 @@ func (s *Session) close(ctx context.Context) error {
 }
 func (c *sessionCore) finishClose() {
 	c.closeOnce.Do(func() {
+		c.closeErr = errors.Join(c.closeErr, c.jobs.Close(context.Background()))
 		if c.detachHub != nil {
 			c.detachHub()
 		}
@@ -590,7 +639,7 @@ func (c *sessionCore) finishClose() {
 		c.hub.Close()
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		c.closeErr = errors.Join(c.mcp.Close(closeCtx), c.store.Close())
+		c.closeErr = errors.Join(c.closeErr, c.mcp.Close(closeCtx), c.store.Close())
 	})
 }
 
@@ -601,7 +650,12 @@ func (g gatePrompter) Approve(ctx context.Context, req permission.PromptRequest)
 	c := s.core
 	title, kind := toolDescription(req.Tool, req.Args)
 	ask := Ask{SessionID: c.id, ToolCallID: req.ToolCallID, Tool: req.Tool, Title: title, Kind: kind, RawInput: req.Args, Reason: req.Reason, Options: PermissionChoices()}
-	a := &approval{result: make(chan approvalResult, 1)}
+	ask.JobID, ask.ChildSessionID, ask.ChildToolCallID, ask.Cwd = req.JobID, req.ChildSessionID, req.ChildToolCallID, req.Cwd
+	if req.ChildSessionID != "" {
+		ask.Options = []Option{{OptionID: "allow_once", Name: "Allow once", Kind: "allow_once"}, {OptionID: "reject_once", Name: "Reject once", Kind: "reject_once"}}
+		ask.Title = "Child " + req.ChildSessionID + " (" + req.Cwd + "): " + title
+	}
+	a := &approval{result: make(chan approvalResult, 1), child: req.ChildSessionID != ""}
 	c.mu.Lock()
 	if _, exists := c.pending[req.ToolCallID]; exists {
 		c.mu.Unlock()
@@ -649,6 +703,9 @@ func (s *Session) answer(id string, choice Choice) error {
 	a := c.pending[id]
 	if a == nil {
 		return ErrNoPendingAsk
+	}
+	if a.child && choice != permission.AllowOnce && choice != permission.RejectOnce && choice != "" {
+		return errors.New("child approvals only allow once or reject once")
 	}
 	delete(c.pending, id)
 	c.hub.RemoveAsk(id)

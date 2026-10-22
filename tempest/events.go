@@ -4,28 +4,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/work"
 )
 
 type eventMapper struct {
-	sessionID string
-	model     types.Model
-	counter   int
-	messageID string
-	text      string
-	thought   string
-	runID     string
-	started   time.Time
-	turn      int
-	usage     UsageState
-	announced map[string]bool
+	mu             sync.Mutex
+	logicalRunID   string
+	continuationOf string
+	sessionID      string
+	model          types.Model
+	counter        int
+	messageID      string
+	text           string
+	thought        string
+	runID          string
+	started        time.Time
+	turn           int
+	usage          UsageState
+	announced      map[string]bool
+	childJobs      map[string]string
 }
 
 func newMapper(id string, model types.Model) *eventMapper {
-	return &eventMapper{sessionID: id, model: model, announced: make(map[string]bool), usage: UsageState{ContextSize: model.ContextWindow}}
+	return &eventMapper{sessionID: id, model: model, announced: make(map[string]bool), childJobs: make(map[string]string), usage: UsageState{ContextSize: model.ContextWindow}}
 }
 func (m *eventMapper) nextMessage() string { m.counter++; return fmt.Sprintf("msg_%d", m.counter) }
 func update(kind string, p map[string]any, at time.Time) Update {
@@ -44,13 +51,23 @@ func (m *eventMapper) chunk(kind, text string, at time.Time) Update {
 
 // mapEvent is the only agent-to-public-event conversion, shared by all surfaces.
 func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	at := ev.At
 	switch ev.Type {
+	case agent.EventWork:
+		if ev.Work == nil {
+			return nil
+		}
+		if ev.Work.Job != nil && ev.Work.Job.ChildSessionID != "" {
+			m.childJobs[ev.Work.Job.ChildSessionID] = ev.Work.Job.ID
+		}
+		return []Update{mapWorkUpdate(*ev.Work, at)}
 	case agent.EventAgentStart:
 		m.started = at
 		m.turn = 0
 		clear(m.announced)
-		return []Update{update("tempest/run", map[string]any{"status": "started", "runId": m.runID, "model": m.model.ID}, at)}
+		return []Update{update("tempest/run", map[string]any{"status": "started", "runId": m.runID, "logicalRunId": m.logicalRunID, "continuationOf": m.continuationOf, "model": m.model.ID}, at)}
 	case agent.EventTurnStart, agent.EventTurnEnd:
 		phase := "end"
 		if ev.Type == agent.EventTurnStart {
@@ -92,6 +109,9 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			for _, b := range blocks {
 				out = append(out, update("user_message_chunk", map[string]any{"messageId": id, "content": b}, at))
 			}
+			if ev.QueueID != "" {
+				out = append(out, mapWorkUpdate(work.Event{Kind: "queue", Action: "consumed", Queue: &work.QueueItem{ID: ev.QueueID}}, at))
+			}
 			return out
 		case types.AssistantMessage:
 			if m.messageID == "" {
@@ -132,7 +152,20 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 	case agent.EventUsage:
 		m.usage.Total.Add(ev.Usage)
 		m.usage.CostUnknown = m.usage.Total.Cost.Unknown
-		return []Update{update("tempest/usage", map[string]any{"model": ev.Model, "usage": ev.Usage, "total": m.usage.Total, "usageState": m.usage}, at)}
+		payload := struct {
+			Model          string     `json:"model"`
+			Usage          Usage      `json:"usage"`
+			Total          Usage      `json:"total"`
+			UsageState     UsageState `json:"usageState"`
+			SourceRef      string     `json:"sourceRef,omitempty"`
+			ChildSessionID string     `json:"childSessionId,omitempty"`
+			JobID          string     `json:"jobId,omitempty"`
+		}{ev.Model, ev.Usage, m.usage.Total, m.usage, ev.UsageSource, ev.ChildSessionID, m.childJobs[ev.ChildSessionID]}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			panic(fmt.Sprintf("invalid usage event: %v", err))
+		}
+		return []Update{{At: at, Kind: "tempest/usage", Update: raw}}
 	case agent.EventToolPermission:
 		if ev.Permission == nil {
 			return nil
@@ -275,4 +308,46 @@ func toolContent(v any) []map[string]any {
 		out = append(out, map[string]any{"type": "content", "content": b})
 	}
 	return out
+}
+
+type workPayload struct {
+	Action          string          `json:"action,omitempty"`
+	Item            *work.QueueItem `json:"item,omitempty"`
+	Job             *work.Job       `json:"job,omitempty"`
+	JobID           string          `json:"jobId,omitempty"`
+	RunID           string          `json:"runId,omitempty"`
+	Bytes           int64           `json:"bytes,omitempty"`
+	CompactionID    string          `json:"compactionId,omitempty"`
+	SourceHash      string          `json:"sourceHash,omitempty"`
+	Reason          string          `json:"reason,omitempty"`
+	ChildSessionID  string          `json:"childSessionId,omitempty"`
+	ChildToolCallID string          `json:"childToolCallId,omitempty"`
+	Title           string          `json:"title,omitempty"`
+}
+
+func mapWorkUpdate(event work.Event, at time.Time) Update {
+	payload := workPayload{Action: event.Action, RunID: event.RunID, ChildSessionID: event.ChildSessionID, ChildToolCallID: event.ChildToolCallID, Title: event.ChildTitle}
+	switch event.Kind {
+	case "queue":
+		payload.Item = event.Queue
+	case "job":
+		if event.Job != nil {
+			summary := hub.SummarizeJob(*event.Job)
+			payload.Job = &summary
+		}
+	case "job_output":
+		if event.Job != nil {
+			payload.JobID = event.Job.ID
+		}
+		payload.Bytes = event.Bytes
+	case "compaction":
+		payload.CompactionID = event.CompactionID
+		payload.SourceHash = event.SourceHash
+		payload.Reason = event.Reason
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		panic(fmt.Sprintf("invalid work event: %v", err))
+	}
+	return Update{At: at, Kind: "tempest/" + event.Kind, Update: raw}
 }
