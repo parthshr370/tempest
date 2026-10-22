@@ -273,7 +273,7 @@ func TestUnknownRecordKindAndSeqRegressionAreDiagnosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	future := `{"type":"queue_enqueued","seq":2,"timestamp":"2024-01-02T03:04:09Z","lane":"main","run_id":"r","payload":{}}` + "\n"
+	future := `{"type":"future_record","seq":2,"timestamp":"2024-01-02T03:04:09Z","lane":"main","run_id":"r","payload":{}}` + "\n"
 	replayed := `{"type":"run_finished","seq":2,"timestamp":"2024-01-02T03:04:10Z","lane":"main","run_id":"` + run.RunID + `","payload":{"stop_reason":"completed","turns":0,"usage_total":{}}}` + "\n"
 	if err := os.WriteFile(store.Path(), append(contents, future+replayed...), 0o600); err != nil {
 		t.Fatal(err)
@@ -284,7 +284,7 @@ func TestUnknownRecordKindAndSeqRegressionAreDiagnosed(t *testing.T) {
 	}
 	var sawUnknown, sawSeq bool
 	for _, diagnostic := range loaded.Diagnostics {
-		sawUnknown = sawUnknown || strings.Contains(diagnostic.Message, `"queue_enqueued"`)
+		sawUnknown = sawUnknown || strings.Contains(diagnostic.Message, `"future_record"`)
 		sawSeq = sawSeq || strings.Contains(diagnostic.Message, "seq 2 does not increase")
 	}
 	if !sawUnknown || !sawSeq || loaded.LastRun == nil || !loaded.LastRun.Finished {

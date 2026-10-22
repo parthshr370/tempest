@@ -241,6 +241,14 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 		return Outcome{Allow: true, Source: SourceBypass}
 	}
 	tier := ClassifyTool(toolName)
+	if toolName == "jobs" {
+		var request struct {
+			Action string `json:"action"`
+		}
+		if json.Unmarshal(args, &request) == nil && (request.Action == "" || request.Action == "list") {
+			tier = TierRead
+		}
+	}
 	command := ""
 	if toolName == "bash" {
 		command = commandFromArgs(args)

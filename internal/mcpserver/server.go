@@ -502,6 +502,24 @@ func (p *progressWriter) send(message string, flush bool) {
 
 func progressMessage(update tempest.Update) string {
 	switch update.Kind {
+	case "tempest/job":
+		var lifecycle struct {
+			Action string `json:"action"`
+			Job    struct {
+				ID    string `json:"id"`
+				Kind  string `json:"kind"`
+				State string `json:"state"`
+			} `json:"job"`
+		}
+		if json.Unmarshal(update.Update, &lifecycle) == nil {
+			return "Background " + lifecycle.Job.Kind + " " + lifecycle.Job.ID + ": " + lifecycle.Job.State
+		}
+	case "tempest/job_output":
+		return "Background command output is available"
+	case "tempest/queue":
+		return "Durable input queue changed"
+	case "tempest/compaction":
+		return "Conversation compaction in progress"
 	case "tempest/run":
 		return "Run state changed"
 	case "tool_call", "tool_call_update":

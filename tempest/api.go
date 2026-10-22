@@ -5,15 +5,18 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/jobs"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/work"
 )
 
 // Options selects a new or existing journal and its runtime configuration.
@@ -154,6 +157,30 @@ type InterruptedTool = journal.InterruptedTool
 // RunResult is the terminal result of a run.
 type RunResult = agent.RunResult
 
+// QueuedInput is text retained until delivered or explicitly withdrawn.
+type QueuedInput struct {
+	Text string
+	Key  string
+}
+
+// QueuedItem is a durable queue receipt.
+type QueuedItem = work.QueueItem
+
+// Job describes a supervised child or background command.
+type Job = work.Job
+
+// JobPage is a bounded listing of job summaries.
+type JobPage = work.JobPage
+
+// LogPage contains a page of raw output and byte cursors.
+type LogPage = work.LogPage
+
+// Artifact identifies a durable host-local result.
+type Artifact = work.Artifact
+
+// RunDetail is a read-only reconstruction of a durable run.
+type RunDetail = journal.RunDetail
+
 // StopReason is the exact reason the loop stopped.
 type StopReason = agent.StopReason
 
@@ -174,6 +201,26 @@ var (
 	ErrNoPendingAsk = errors.New("no pending permission ask")
 	// ErrClosed means the session has been closed.
 	ErrClosed = errors.New("session closed")
+	// ErrQueueFull means the durable input queue is at capacity.
+	ErrQueueFull = session.ErrQueueFull
+	// ErrQueueConflict means an idempotency key was reused with different input.
+	ErrQueueConflict = session.ErrQueueConflict
+	// ErrQueueNotFound means the queue id doesn't belong to this session.
+	ErrQueueNotFound = session.ErrQueueNotFound
+	// ErrQueueTooLate means delivery already claimed or consumed the item.
+	ErrQueueTooLate = session.ErrQueueTooLate
+	// ErrJobNotFound means the job doesn't belong to this session.
+	ErrJobNotFound = jobs.ErrJobNotFound
+	// ErrJobLimit means a supervision or delivery capacity is exhausted.
+	ErrJobLimit = jobs.ErrJobLimit
+	// ErrJobNotCleanupable means retained work can't safely be removed.
+	ErrJobNotCleanupable = jobs.ErrJobNotCleanupable
+	// ErrRecoveryRequired means Continue or explicit cancellation must settle children first.
+	ErrRecoveryRequired = jobs.ErrRecoveryRequired
+	// ErrInvalidQueueInput rejects malformed queue text or keys.
+	ErrInvalidQueueInput = session.ErrInvalidQueueInput
+	// ErrInvalidJobInput rejects malformed job ids, paging or wait bounds.
+	ErrInvalidJobInput = jobs.ErrInvalidInput
 )
 
 // Session owns one journal, agent and reduced event stream.
@@ -237,6 +284,64 @@ func (s *Session) SetPermissionMode(m PermissionMode) error { return s.setPermis
 
 // Close prevents admission, cancels and joins the run, then closes the journal.
 func (s *Session) Close(ctx context.Context) error { return s.close(ctx) }
+
+// Steer retains input for the next safe checkpoint; idle input waits for a run.
+func (s *Session) Steer(ctx context.Context, in QueuedInput) (QueuedItem, error) {
+	return s.enqueue(ctx, work.Steer, in)
+}
+
+// FollowUp retains input for quiescence; it never starts a run by itself.
+func (s *Session) FollowUp(ctx context.Context, in QueuedInput) (QueuedItem, error) {
+	return s.enqueue(ctx, work.FollowUp, in)
+}
+
+// CancelQueued explicitly withdraws a pending durable input.
+func (s *Session) CancelQueued(ctx context.Context, id string) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	return s.core.queues.Cancel(ctx, id)
+}
+
+// Jobs returns bounded summaries with a stable id cursor.
+func (s *Session) Jobs(ctx context.Context, cursor string, limit int) (JobPage, error) {
+	if err := s.checkOpen(); err != nil {
+		return JobPage{}, err
+	}
+	return s.core.jobs.Jobs(ctx, cursor, limit)
+}
+
+// WaitJobs waits for any requested job; cancelling the wait doesn't cancel jobs.
+func (s *Session) WaitJobs(ctx context.Context, ids []string, timeout time.Duration) ([]Job, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	return s.core.jobs.Wait(ctx, ids, timeout)
+}
+
+// CancelJob durably requests cancellation of one session-owned job.
+func (s *Session) CancelJob(ctx context.Context, id string) (Job, error) {
+	if err := s.checkOpen(); err != nil {
+		return Job{}, err
+	}
+	return s.core.jobs.Cancel(ctx, id)
+}
+
+// JobLogs pages the bounded output of a background command.
+func (s *Session) JobLogs(ctx context.Context, id string, offset int64, limit int) (LogPage, error) {
+	if err := s.checkOpen(); err != nil {
+		return LogPage{}, err
+	}
+	return s.core.jobs.Logs(ctx, id, offset, limit)
+}
+
+// CleanupJob removes only safely exported, owned retained work.
+func (s *Session) CleanupJob(ctx context.Context, id string) (Job, error) {
+	if err := s.checkOpen(); err != nil {
+		return Job{}, err
+	}
+	return s.core.jobs.Cleanup(ctx, id)
+}
 
 // Messages returns a copied transcript slice for reporting. Treat its message
 // contents as read-only; Snapshot and History provide fully detached wire views.

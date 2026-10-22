@@ -105,6 +105,9 @@ type OutputAccumulatorOptions struct {
 	MaxLines       int
 	MaxBytes       int
 	TempFilePrefix string
+	// SpillPath opens a private, exclusive log before the first byte is accepted.
+	SpillPath     string
+	MaxTotalBytes int64
 }
 
 // OutputSnapshot is a point-in-time view of the accumulated output.
@@ -112,6 +115,7 @@ type OutputSnapshot struct {
 	Content        string
 	Truncation     truncate.Result
 	FullOutputPath string
+	Truncated      bool
 }
 
 // SnapshotOptions controls snapshot behavior.
@@ -139,6 +143,9 @@ type OutputAccumulator struct {
 	finished                 bool
 	tempFilePath             string
 	tempFile                 *os.File
+	spillPath                string
+	maxTotalBytes            int64
+	limitReached             bool
 }
 
 // NewOutputAccumulator starts a rolling output buffer with the supplied limits.
@@ -156,10 +163,24 @@ func NewOutputAccumulator(options OutputAccumulatorOptions) *OutputAccumulator {
 		prefix = "harness-output"
 	}
 	maxRollingBytes := maxBytes * 2
+	if options.SpillPath != "" {
+		maxRollingBytes = maxBytes
+	}
 	if maxRollingBytes < 1 {
 		maxRollingBytes = 1
 	}
-	return &OutputAccumulator{maxLines: maxLines, maxBytes: maxBytes, maxRollingBytes: maxRollingBytes, tempFilePrefix: prefix, tailStartsAtLineBoundary: true}
+	return &OutputAccumulator{maxLines: maxLines, maxBytes: maxBytes, maxRollingBytes: maxRollingBytes, tempFilePrefix: prefix, tailStartsAtLineBoundary: true, spillPath: options.SpillPath, maxTotalBytes: options.MaxTotalBytes}
+}
+
+// ErrOutputLimit means the retained prefix reached the configured disk bound.
+var ErrOutputLimit = errors.New("output limit")
+
+// OpenSpill creates the selected private log before a command is launched.
+func (a *OutputAccumulator) OpenSpill() error {
+	if a.spillPath == "" {
+		return nil
+	}
+	return a.ensureTempFile()
 }
 
 // Append feeds raw bytes into the accumulator.
@@ -167,26 +188,53 @@ func (a *OutputAccumulator) Append(data []byte) error {
 	if a.finished {
 		return errors.New("Cannot append to a finished output accumulator")
 	}
-	a.totalRawBytes += len(data)
-	a.appendDecodedText(a.decode(data, false))
-	if a.tempFile != nil || a.shouldUseTempFile() {
+	if a.limitReached {
+		return ErrOutputLimit
+	}
+	if a.spillPath != "" {
 		if err := a.ensureTempFile(); err != nil {
 			return err
 		}
-		if a.tempFile == nil {
-			return nil
-		}
-		_, err := a.tempFile.Write(data)
-		if err != nil {
-			a.cleanupTempFile()
-		}
-		return err
 	}
-	if len(data) > 0 {
-		copyData := append([]byte(nil), data...)
-		a.rawChunks = append(a.rawChunks, copyData)
+	if a.maxTotalBytes > 0 && int64(a.totalRawBytes)+int64(len(data)) >= a.maxTotalBytes {
+		data = data[:int(a.maxTotalBytes)-a.totalRawBytes]
+		a.limitReached = true
+	}
+	if a.tempFile != nil {
+		n, err := a.tempFile.Write(data)
+		a.totalRawBytes += n
+		a.appendDecodedText(a.decode(data[:n], false))
+		if err != nil {
+			return err
+		}
+		if n != len(data) {
+			return errors.New("short output write")
+		}
+	} else {
+		a.totalRawBytes += len(data)
+		a.appendDecodedText(a.decode(data, false))
+		a.rawChunks = append(a.rawChunks, append([]byte(nil), data...))
+		if a.shouldUseTempFile() {
+			if err := a.ensureTempFile(); err != nil {
+				return err
+			}
+		}
+	}
+	if a.limitReached {
+		return ErrOutputLimit
 	}
 	return nil
+}
+
+// Bytes reports the raw prefix retained so far.
+func (a *OutputAccumulator) Bytes() int64 { return int64(a.totalRawBytes) }
+
+// Sync commits available log bytes before a terminal record.
+func (a *OutputAccumulator) Sync() error {
+	if a.tempFile == nil {
+		return nil
+	}
+	return a.tempFile.Sync()
 }
 
 // Finish marks the accumulator complete and drains pending bytes.
@@ -225,7 +273,7 @@ func (a *OutputAccumulator) Snapshot(options SnapshotOptions) (OutputSnapshot, e
 			return OutputSnapshot{}, err
 		}
 	}
-	return OutputSnapshot{Content: tailTruncation.Content, Truncation: tailTruncation, FullOutputPath: a.tempFilePath}, nil
+	return OutputSnapshot{Content: tailTruncation.Content, Truncation: tailTruncation, FullOutputPath: a.tempFilePath, Truncated: a.limitReached}, nil
 }
 
 // CloseTempFile closes the spill temp file if one was opened.
@@ -275,7 +323,11 @@ func (a *OutputAccumulator) appendDecodedText(text string) {
 	a.totalDecodedBytes += bytes
 	a.tailText += text
 	a.tailBytes += bytes
-	if a.tailBytes > a.maxRollingBytes*2 {
+	rollingLimit := a.maxRollingBytes * 2
+	if a.spillPath != "" {
+		rollingLimit = a.maxRollingBytes
+	}
+	if a.tailBytes > rollingLimit {
 		a.trimTail()
 	}
 
@@ -347,7 +399,13 @@ func (a *OutputAccumulator) ensureTempFile() error {
 	if a.tempFilePath != "" {
 		return nil
 	}
-	file, err := os.CreateTemp("", a.tempFilePrefix+"-*.log")
+	var file *os.File
+	var err error
+	if a.spillPath != "" {
+		file, err = os.OpenFile(a.spillPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	} else {
+		file, err = os.CreateTemp("", a.tempFilePrefix+"-*.log")
+	}
 	if err != nil {
 		return err
 	}

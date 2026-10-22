@@ -21,7 +21,7 @@ One prompt in, real work out. Tempest reads and edits your files, runs commands,
 drives itself turn by turn until the job is done — as a single static Go binary with
 no Node runtime, no interpreter, and nothing to install but the executable.
 
-**3** provider families · **13** built-in tools (**8** on by default) · **one** static binary · **zero** runtime deps.
+**3** provider families · **17** built-in tools (**12** on by default) · **one** static binary · **zero** runtime deps.
 
 ## Install
 
@@ -117,6 +117,12 @@ unknown" and is never re-run automatically; a torn final line is trimmed. Sessio
 isolated by working directory, so a resume never bleeds another project's history
 into yours.
 
+Journals now use format **v3**. Opening a v1/v2 journal upgrades it in place under
+the writer lock before new facts are written. Older binaries refuse v3: this is
+an intentional on-disk downgrade barrier, not a protocol-version change.
+Back up or move each `.jsonl` together with its `.jsonl.d` directory; committed
+compaction snapshots and child journals are required recovery data, not caches.
+
 ### 05 · Tiered permissions with a destructive-command guard
 
 Every tool call passes one chokepoint. Each tool carries a `read`, `write`, or `exec`
@@ -141,9 +147,30 @@ tool or a `skill://` read — nothing bloats the prompt until it's needed.
 
 ### 08 · Subagents, behind `-enable-task`
 
-`-enable-task` registers the `task` tool with two built-in subagent types: `explore`,
-read-only investigation on the `smol` role, and `general`, full coding on the default
-role. Children never get the `task` tool, so delegation never recurses.
+`-enable-task` registers the asynchronous `task` tool with two built-in subagent
+types: `explore`, read-only investigation on the `smol` role, and `general`, full
+coding on the default role. It returns a durable job handle immediately rather
+than waiting for the child's answer. Children have their own durable journals,
+can't delegate again, and inherit only selected built-ins. Their launch-time
+permission ceiling intersects the parent's live policy at every call. Child
+approval requests route to the root prompter with allow-once/reject-once only.
+
+A general child in an eligible git repository gets a detached worktree. A clean
+tree pins HEAD; a dirty tree pins a snapshot of tracked, staged and nonignored
+untracked content using a temporary private index. Parent files and index aren't
+changed. The snapshot stays reachable through `refs/tempest/jobs/<jobID>` until
+cleanup. Non-git, unborn, bare, sparse or submodule workspaces (including missing
+git) run **unfenced in the parent cwd**, with `isolation:"shared"` and at most one
+active shared general child per session. Explore remains read-only in the live cwd.
+Worktrees fence cooperative writes, not arbitrary shell commands or hostile code.
+
+Children export binary-capable patches against their pinned base; they never
+merge into the parent. Inspect the full job through `WaitJobs` or `tempest/wait`
+and explicitly apply its patch through ordinary gated bash/edit. Dirty worktrees
+are retained; `CleanupJob`, `tempest/cleanup_job`, or `jobs` with `action:"cleanup"`
+remove only owned, safely exported trees. Missing/corrupt patches, unique ignored
+files, or an uncertain surviving crash process block cleanup. Shared jobs have no
+patch and no worktree cleanup.
 
 ### 09 · Reads that summarize, not dump
 
@@ -153,8 +180,8 @@ window on lines it doesn't need yet.
 
 ## Every tool, in one namespace
 
-Thirteen built-in tools live beside `read` and `bash`, **8 of them on by default**; pin
-the active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
+Seventeen built-in tools share one namespace, **12 of them on by default**; pin the
+active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
 All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
 fall back to pure Go when `rg`/`fd` are absent.
 
@@ -169,11 +196,15 @@ fall back to pure Go when `rg`/`fd` are absent.
 
 **Runtime**
 
-- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout.
+- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `async:true` starts a supervised background job.
+- `jobs` — page durable job summaries, or explicitly clean one exported worktree.
+- `wait` — wait for any requested job, without cancelling it on wait timeout.
+- `cancel` — cancel one task or background bash job.
+- `logs` — page a background command's bounded stdout/stderr by byte offset.
 
 **Coordination**
 
-- `task` — fan out subagents and collect their results *(behind `-enable-task`)*.
+- `task` — admit asynchronous children and return job handles *(behind `-enable-task`)*.
 - `todo_write` — ordered task list with phase tracking.
 
 **Context**
@@ -188,9 +219,10 @@ fall back to pure Go when `rg`/`fd` are absent.
 
 ## Runs
 
-A run is one `-p` prompt. The model calls tools, sees their results, and keeps
-going until it replies with no tool calls; that reply completes the run. There is
-no completion tag and no re-prompting. Every run ends with a stop reason:
+A run is one `-p` prompt. The model calls tools, sees their results, and keeps going.
+A reply with no tool calls reaches quiescence: the run waits for owned background
+jobs and consumes their result follow-ups before completing. No detached next run
+is started automatically. Every run ends with a stop reason:
 
 | Stop reason | Meaning | Exit code |
 |---|---|---|
@@ -209,6 +241,13 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
   model's price is unknown the run is refused at startup: an unknown price is
   not a zero price.
 - `-max-wall-time D` caps elapsed time, as a Go duration such as `10m`.
+
+Background bash and the four management tools ship with ordinary bash; task
+remains opt-in. Cancellation, `Session.Close`, CLI signals and server shutdown
+cancel and join owned jobs before the root terminal event. This isn't a detached
+process service: no background command is intentionally kept alive after clean
+shutdown. SIGKILL can leave OS descendants running; recovery reports their outcome
+as unknown, never reruns the command and never signals a stale PID.
 
 `-output-format json` prints a run report:
 
@@ -238,6 +277,11 @@ old conversation history. A slow consumer never blocks the agent: if the
 256-update queue overflows, stdout contains the actual `tempest/gap`
 marker and the final report, stderr explains the incomplete stream, and
 the command exits 1. A broken pipe cancels and joins the run.
+
+Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output` and
+`tempest/compaction` updates as ACP/Go watchers. Output events only announce byte
+availability; read command logs separately. Child transcripts/thinking aren't
+forwarded into the parent stream, and the final run-report shape is unchanged.
 
 ## MCP tools
 
@@ -330,10 +374,17 @@ Pending host permissions appear as `TASK_STATE_INPUT_REQUIRED`.
 through authenticated ACP `/acp`: `tempest/watch` with `approver:true`,
 then `tempest/permission` with the session id, tool-call id, and
 `optionId:"allow_once"`; otherwise cancel the task or let the host timeout
-deny. A2A task projections live only in this server process (bounded
-retention); durable session ids remain resumable after restart. No push
-notifications, task follow-up, uploaded-file input, or file-change
-artifacts are implemented.
+deny. `GetTask` can reconstruct an exact historical run from journals after restart,
+without starting providers or resuming work. Interrupted runs are FAILED with
+`interrupted:true,recoverable:true`, not falsely WORKING. Reconstructed history is
+bounded and marked `historyReconstructed:true`; `historyLength:0` omits it.
+Lookup is limited to the configured workspace, 10,000 files, 256 MiB and two seconds;
+limits and a foreign live owner return explicit unsupported-operation errors.
+`ListTasks`, cursors, cancellation and subscription handles remain process-local
+with bounded retention; they don't list or control all durable history. Resume
+interrupted work through ACP/Go Continue with a new run/task id. No push
+notifications, task follow-up, uploaded-file input, or file-change artifacts are
+implemented.
 
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
 (30m), `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model,
@@ -369,6 +420,20 @@ ask again for each guarded command, regardless of earlier session choices.
 Unanswered asks deny after the permission timeout. Reconnecting approvers
 can watch with `approver:true` and answer pending asks with
 `tempest/permission`. `session/cancel` aborts the run.
+
+`tempest/steer` and `tempest/follow_up` accept `{sessionId,text,key?}` and return a
+durable `{item}` receipt. Steer waits for a safe checkpoint; follow-up waits for
+quiescence. Idle input stays pending until explicit Prompt/Continue. Accepted
+input **survives parent cancellation**; only `tempest/cancel_queued` with `queueId`
+withdraws it. Same-key retries recover the receipt, including after consumption;
+different text/kind conflicts. User input is text-only (16 KiB each, 32 pending).
+Snapshots include pending queues, the latest 20 job summaries and all active
+jobs (at most 28 total). If `jobsTruncated` is true, start `tempest/jobs` at the
+empty `jobsCursor`, page with returned `nextCursor`/`limit`, and deduplicate by
+job id; recent/active snapshots aren't a contiguous id page. Use `tempest/wait`
+with `jobIds` for full details, `tempest/cancel_job`, `tempest/logs` or
+`tempest/cleanup_job` for management. Cancelling or disconnecting a wait stops
+only the wait, not the jobs.
 
 Here's a short stdio exchange. `s1` stands for the returned session ID;
 responses show selected fields, and the watch snapshot and non-text

@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // Mapper runs under the hub lock, so its per-session counters need no other lock.
@@ -24,6 +28,7 @@ type Hub struct {
 	next      uint64
 	mapper    Mapper
 	closed    bool
+	jobs      map[string]work.Job
 }
 
 // New seeds a hub without consulting the agent's independently locked state.
@@ -32,6 +37,11 @@ func New(seed Snapshot, mapper Mapper) *Hub {
 		seed.Run.Status = "idle"
 	}
 	h := &Hub{view: seed, subs: make(map[uint64]chan Update), mapper: mapper}
+	h.jobs = make(map[string]work.Job)
+	for _, job := range seed.Jobs {
+		h.jobs[job.ID] = SummarizeJob(job)
+	}
+	h.refreshJobs()
 	h.history = cloneUpdates(seed.History)
 	h.view.History = nil
 	return h
@@ -115,26 +125,31 @@ func (h *Hub) emit(u Update) {
 }
 func (h *Hub) fold(u Update) {
 	var p struct {
-		SessionUpdate string          `json:"sessionUpdate"`
-		MessageID     string          `json:"messageId"`
-		Content       json.RawMessage `json:"content"`
-		Status        string          `json:"status"`
-		RunID         string          `json:"runId"`
-		Model         string          `json:"model"`
-		StopReason    string          `json:"stopReason"`
-		Error         string          `json:"error"`
-		Turns         int             `json:"turns"`
-		Index         int             `json:"index"`
-		Phase         string          `json:"phase"`
-		ToolCallID    string          `json:"toolCallId"`
-		Title         string          `json:"title"`
-		Kind          ToolKind        `json:"kind"`
-		RawInput      json.RawMessage `json:"rawInput"`
-		RawOutput     json.RawMessage `json:"rawOutput"`
-		Used          int             `json:"used"`
-		Size          int             `json:"size"`
-		Usage         *UsageState     `json:"usageState"`
-		Meta          struct {
+		SessionUpdate  string          `json:"sessionUpdate"`
+		MessageID      string          `json:"messageId"`
+		Content        json.RawMessage `json:"content"`
+		Status         string          `json:"status"`
+		RunID          string          `json:"runId"`
+		LogicalRunID   string          `json:"logicalRunId"`
+		ContinuationOf string          `json:"continuationOf"`
+		Action         string          `json:"action"`
+		Item           *work.QueueItem `json:"item"`
+		Job            *work.Job       `json:"job"`
+		Model          string          `json:"model"`
+		StopReason     string          `json:"stopReason"`
+		Error          string          `json:"error"`
+		Turns          int             `json:"turns"`
+		Index          int             `json:"index"`
+		Phase          string          `json:"phase"`
+		ToolCallID     string          `json:"toolCallId"`
+		Title          string          `json:"title"`
+		Kind           ToolKind        `json:"kind"`
+		RawInput       json.RawMessage `json:"rawInput"`
+		RawOutput      json.RawMessage `json:"rawOutput"`
+		Used           int             `json:"used"`
+		Size           int             `json:"size"`
+		Usage          *UsageState     `json:"usageState"`
+		Meta           struct {
 			Tempest struct {
 				Usage *UsageState `json:"usageState"`
 			} `json:"tempest"`
@@ -144,9 +159,33 @@ func (h *Hub) fold(u Update) {
 		return
 	}
 	switch u.Kind {
+	case "tempest/queue":
+		if p.Item == nil {
+			break
+		}
+		if p.Action == "enqueued" {
+			for _, item := range h.view.Queues {
+				if item.ID == p.Item.ID {
+					return
+				}
+			}
+			h.view.Queues = append(h.view.Queues, *p.Item)
+		} else {
+			for i, item := range h.view.Queues {
+				if item.ID == p.Item.ID {
+					h.view.Queues = append(h.view.Queues[:i], h.view.Queues[i+1:]...)
+					break
+				}
+			}
+		}
+	case "tempest/job":
+		if p.Job != nil {
+			h.jobs[p.Job.ID] = SummarizeJob(*p.Job)
+			h.refreshJobs()
+		}
 	case "tempest/run":
 		if p.Status == "started" {
-			h.view.Run = RunState{Status: "running", RunID: p.RunID, StartedAt: u.At}
+			h.view.Run = RunState{Status: "running", RunID: p.RunID, LogicalRunID: p.LogicalRunID, ContinuationOf: p.ContinuationOf, StartedAt: u.At}
 			h.view.Tools = nil
 			h.view.Interrupted = nil
 		} else if p.Status == "finished" {
@@ -324,6 +363,11 @@ func (h *Hub) snapshot(replay bool) Snapshot {
 	s.Usage.Total = cloneUsage(s.Usage.Total)
 	s.Usage.LastCall = cloneUsage(s.Usage.LastCall)
 	s.Diagnostics = append([]string{}, s.Diagnostics...)
+	s.Queues = append([]work.QueueItem{}, s.Queues...)
+	s.Jobs = append([]work.Job{}, s.Jobs...)
+	for i := range s.Jobs {
+		s.Jobs[i].Usage = cloneUsage(s.Jobs[i].Usage)
+	}
 	return s
 }
 
@@ -402,4 +446,59 @@ func cloneUsage(u types.Usage) types.Usage {
 		u.Reasoning = &v
 	}
 	return u
+}
+
+// SummarizeJob removes private paths and large results from shared list views.
+func SummarizeJob(j work.Job) work.Job {
+	j.Cwd = ""
+	j.Result = nil
+	j.Patch = nil
+	j.Output = nil
+	j.Value = nil
+	j.ValueInResult = false
+	if len(j.ResultText) > 512 {
+		n := 512
+		for n > 0 && !utf8.RuneStart(j.ResultText[n]) {
+			n--
+		}
+		j.ResultText = j.ResultText[:n]
+	}
+	return j
+}
+func (h *Hub) refreshJobs() {
+	const recentJobs = 20
+	latest := make([]work.Job, 0, recentJobs+8)
+	active := make([]work.Job, 0, 8)
+	for _, job := range h.jobs {
+		switch job.State {
+		case "starting", "running", "recovering":
+			active = append(active, job)
+		}
+		if len(latest) == recentJobs && compareRecentJobs(job, latest[recentJobs-1]) >= 0 {
+			continue
+		}
+		if len(latest) < recentJobs {
+			latest = append(latest, job)
+		} else {
+			latest[recentJobs-1] = job
+		}
+		slices.SortFunc(latest, compareRecentJobs)
+	}
+	for _, job := range active {
+		if !slices.ContainsFunc(latest, func(summary work.Job) bool { return summary.ID == job.ID }) {
+			latest = append(latest, job)
+		}
+	}
+	slices.SortFunc(latest, compareRecentJobs)
+	h.view.Jobs = latest
+	h.view.JobsTruncated = len(latest) < len(h.jobs)
+	// The recent/active selection isn't a contiguous id page. Start ordinary
+	// pagination at the empty cursor so older jobs can't be skipped.
+	h.view.JobsCursor = ""
+}
+func compareRecentJobs(first, second work.Job) int {
+	if order := second.StartedAt.Compare(first.StartedAt); order != 0 {
+		return order
+	}
+	return strings.Compare(second.ID, first.ID)
 }

@@ -9,11 +9,12 @@ import (
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/work"
 )
 
 // JournalVersion is the on-disk format version this package writes. Version 1
 // files (entries only, no seq or records) still load.
-const JournalVersion = 2
+const JournalVersion = 3
 
 // LaneMain is the only lane in M1. Every line carries it so adding lanes later
 // does not change the format.
@@ -81,7 +82,10 @@ const (
 // entry. Records stay out of the parent chain.
 func isRecord(kind EntryType) bool {
 	switch kind {
-	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission:
+	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission,
+		KindQueueEnqueued, KindQueueCancelled, KindJobStarted, KindJobRunning, KindJobAttached,
+		KindJobCancelRequested, KindJobFinished, KindJobCleaned, KindRunStopRequested,
+		KindCompactionCallStarted, KindCompactionCallFinished:
 		return true
 	}
 	return false
@@ -92,13 +96,16 @@ func isRecord(kind EntryType) bool {
 // power loss. Everything else reaches the OS on write and is fsynced at the
 // next sync point or Close.
 func syncsAfter(kind EntryType) bool {
-	return kind == KindRunStarted || kind == KindToolStarted || kind == KindRunFinished
+	return kind != KindModelChange && kind != KindPermission && kind != KindToolFinished && kind != KindJobRunning
 }
 
 // MessageEntry adds a transcript message.
 type MessageEntry struct {
 	Meta
-	Message ptypes.Message
+	Message         ptypes.Message
+	QueueID         string
+	Metered         bool
+	CallOccurrences []string
 }
 
 func (MessageEntry) kind() EntryType            { return KindMessage }
@@ -122,6 +129,9 @@ type CompactionEntry struct {
 	Summary      string
 	FirstKeptID  string
 	TokensBefore int
+	SourceHash   string
+	CompactionID string
+	Snapshot     *work.Artifact
 }
 
 func (CompactionEntry) kind() EntryType            { return KindCompaction }
@@ -133,10 +143,12 @@ func (e CompactionEntry) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 
 // RunStartedRecord opens a run.
 type RunStartedRecord struct {
-	Meta          `json:"-"`
-	Model         string `json:"model"`
-	Provider      string `json:"provider,omitempty"`
-	PromptSummary string `json:"prompt_summary,omitempty"`
+	Meta           `json:"-"`
+	Model          string `json:"model"`
+	Provider       string `json:"provider,omitempty"`
+	PromptSummary  string `json:"prompt_summary,omitempty"`
+	LogicalRunID   string `json:"logical_run_id,omitempty"`
+	ContinuationOf string `json:"continuation_of,omitempty"`
 }
 
 func (RunStartedRecord) kind() EntryType            { return KindRunStarted }
@@ -151,6 +163,7 @@ type ToolStartedRecord struct {
 	ToolCallID string          `json:"tool_call_id"`
 	Tool       string          `json:"tool"`
 	Args       json.RawMessage `json:"args,omitempty"`
+	CallID     string          `json:"call_id,omitempty"`
 }
 
 func (ToolStartedRecord) kind() EntryType            { return KindToolStarted }
@@ -165,6 +178,7 @@ type ToolFinishedRecord struct {
 	OK         bool   `json:"ok"`
 	Error      string `json:"error,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
+	CallID     string `json:"call_id,omitempty"`
 }
 
 func (ToolFinishedRecord) kind() EntryType            { return KindToolFinished }
@@ -174,9 +188,12 @@ func (e ToolFinishedRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e 
 // UsageRecord is one model call's usage, kept apart from the message so the
 // session total survives a crash that loses run_finished.
 type UsageRecord struct {
-	Meta  `json:"-"`
-	Model string       `json:"model"`
-	Usage ptypes.Usage `json:"usage"`
+	Meta           `json:"-"`
+	Model          string       `json:"model"`
+	Usage          ptypes.Usage `json:"usage"`
+	SourceRef      string       `json:"source_ref,omitempty"`
+	MessageID      string       `json:"message_id,omitempty"`
+	ChildSessionID string       `json:"child_session_id,omitempty"`
 }
 
 func (UsageRecord) kind() EntryType            { return KindUsage }
@@ -185,11 +202,13 @@ func (e UsageRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 
 // RunFinishedRecord closes a run.
 type RunFinishedRecord struct {
-	Meta       `json:"-"`
-	StopReason string       `json:"stop_reason"`
-	Turns      int          `json:"turns"`
-	UsageTotal ptypes.Usage `json:"usage_total"`
-	Error      string       `json:"error,omitempty"`
+	Meta         `json:"-"`
+	StopReason   string       `json:"stop_reason"`
+	Turns        int          `json:"turns"`
+	UsageTotal   ptypes.Usage `json:"usage_total"`
+	Error        string       `json:"error,omitempty"`
+	ElapsedMS    int64        `json:"elapsed_ms,omitempty"`
+	LogicalCalls int          `json:"logical_calls,omitempty"`
 }
 
 func (RunFinishedRecord) kind() EntryType            { return KindRunFinished }
@@ -204,6 +223,7 @@ type PermissionRecord struct {
 	Decision   string `json:"decision"`
 	Source     string `json:"source"`
 	WaitMS     int64  `json:"wait_ms"`
+	AskID      string `json:"ask_id,omitempty"`
 }
 
 func (PermissionRecord) kind() EntryType            { return KindPermission }
@@ -213,21 +233,27 @@ func (e PermissionRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 // wireEntry is the one JSONL envelope for entries and records. Message bodies
 // and record payloads stay raw until the kind says how to decode them.
 type wireEntry struct {
-	Type         EntryType       `json:"type"`
-	Seq          uint64          `json:"seq,omitempty"`
-	ID           string          `json:"id,omitempty"`
-	ParentID     string          `json:"parent_id,omitempty"`
-	Timestamp    time.Time       `json:"timestamp"`
-	Lane         string          `json:"lane,omitempty"`
-	RunID        string          `json:"run_id,omitempty"`
-	EventSeq     uint64          `json:"event_seq,omitempty"`
-	Message      json.RawMessage `json:"message,omitempty"`
-	Model        string          `json:"model,omitempty"`
-	Role         string          `json:"role,omitempty"`
-	Summary      string          `json:"summary,omitempty"`
-	FirstKeptID  string          `json:"first_kept_id,omitempty"`
-	TokensBefore int             `json:"tokens_before,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
+	Type            EntryType       `json:"type"`
+	Seq             uint64          `json:"seq,omitempty"`
+	ID              string          `json:"id,omitempty"`
+	ParentID        string          `json:"parent_id,omitempty"`
+	Timestamp       time.Time       `json:"timestamp"`
+	Lane            string          `json:"lane,omitempty"`
+	RunID           string          `json:"run_id,omitempty"`
+	EventSeq        uint64          `json:"event_seq,omitempty"`
+	Message         json.RawMessage `json:"message,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	Role            string          `json:"role,omitempty"`
+	Summary         string          `json:"summary,omitempty"`
+	FirstKeptID     string          `json:"first_kept_id,omitempty"`
+	TokensBefore    int             `json:"tokens_before,omitempty"`
+	Payload         json.RawMessage `json:"payload,omitempty"`
+	QueueID         string          `json:"queue_id,omitempty"`
+	Metered         bool            `json:"metered,omitempty"`
+	CallOccurrences []string        `json:"call_occurrences,omitempty"`
+	SourceHash      string          `json:"source_hash,omitempty"`
+	CompactionID    string          `json:"compaction_id,omitempty"`
+	Snapshot        *work.Artifact  `json:"snapshot,omitempty"`
 }
 
 // unknownEntryError lets [Load] retain a forward-compatible journal tail as a
@@ -268,10 +294,17 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 			return nil, fmt.Errorf("marshal message entry: %w", err)
 		}
 		wire.Message = message
+		wire.QueueID, wire.Metered, wire.CallOccurrences = e.QueueID, e.Metered, e.CallOccurrences
 	case ModelChangeEntry:
 		wire.Model, wire.Role = e.Model, e.Role
 	case CompactionEntry:
 		wire.Summary, wire.FirstKeptID, wire.TokensBefore = e.Summary, e.FirstKeptID, e.TokensBefore
+		wire.SourceHash, wire.CompactionID, wire.Snapshot = e.SourceHash, e.CompactionID, e.Snapshot
+	case WorkRecord:
+		if err := validateWorkRecord(e); err != nil {
+			return nil, err
+		}
+		wire.Payload = e.Payload
 	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord:
 		payload, err := json.Marshal(e)
 		if err != nil {
@@ -320,7 +353,7 @@ func decodeEntry(raw []byte) (Entry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode journal message: %w", err)
 		}
-		return MessageEntry{Meta: meta, Message: message}, nil
+		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences}, nil
 	case KindModelChange:
 		return ModelChangeEntry{Meta: meta, Model: wire.Model, Role: wire.Role}, nil
 	case KindCompaction:
@@ -329,6 +362,9 @@ func decodeEntry(raw []byte) (Entry, error) {
 			Summary:      wire.Summary,
 			FirstKeptID:  wire.FirstKeptID,
 			TokensBefore: wire.TokensBefore,
+			SourceHash:   wire.SourceHash,
+			CompactionID: wire.CompactionID,
+			Snapshot:     wire.Snapshot,
 		}, nil
 	default:
 		return nil, unknownEntryError{typeName: wire.Type, id: wire.ID, seq: wire.Seq}
@@ -338,6 +374,10 @@ func decodeEntry(raw []byte) (Entry, error) {
 // decodeRecord requires the fields reduction keys on, so a record that cannot
 // be attributed to a run or tool call is treated as a malformed line.
 func decodeRecord(kind EntryType, meta Meta, payload json.RawMessage) (Entry, error) {
+	if isWorkKind(kind) {
+		record := WorkRecord{Meta: meta, Type: kind, Payload: payload}
+		return record, validateWorkRecord(record)
+	}
 	if meta.RunID == "" {
 		return nil, fmt.Errorf("decode %s record: missing run_id", kind)
 	}

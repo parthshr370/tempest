@@ -103,6 +103,24 @@ func failure(err error) *rpc.Error {
 		return wire
 	}
 	switch {
+	case errors.Is(err, tempest.ErrQueueFull):
+		return rpc.NewError(-32014, "queue_full", err.Error())
+	case errors.Is(err, tempest.ErrQueueConflict):
+		return rpc.NewError(-32015, "queue_conflict", err.Error())
+	case errors.Is(err, tempest.ErrQueueNotFound):
+		return rpc.NewError(-32016, "queue_not_found", err.Error())
+	case errors.Is(err, tempest.ErrQueueTooLate):
+		return rpc.NewError(-32017, "queue_too_late", err.Error())
+	case errors.Is(err, tempest.ErrJobNotFound):
+		return rpc.NewError(-32018, "job_not_found", err.Error())
+	case errors.Is(err, tempest.ErrJobLimit):
+		return rpc.NewError(-32019, "job_limit", err.Error())
+	case errors.Is(err, tempest.ErrJobNotCleanupable):
+		return rpc.NewError(-32020, "job_not_cleanupable", err.Error())
+	case errors.Is(err, tempest.ErrRecoveryRequired):
+		return rpc.NewError(-32021, "recovery_required", err.Error())
+	case errors.Is(err, tempest.ErrInvalidQueueInput), errors.Is(err, tempest.ErrInvalidJobInput):
+		return rpc.NewError(-32602, "invalid_params", err.Error())
 	case errors.Is(err, tempest.ErrMCPConfigConflict):
 		return rpc.NewError(-32012, "mcp_config_conflict", err.Error())
 	case errors.Is(err, agent.ErrUnknownPrice):
@@ -122,11 +140,11 @@ func failure(err error) *rpc.Error {
 	}
 }
 
-// admit keeps run registration and cancellation on the ordered dispatch path.
-// Everything that can wait for disk, replay, a permission, or a writer runs later.
+// admit orders durable queue admission with run registration and cancellation.
+// Provider, wait, log and git work remain deferred.
 func (c *Client) admit(ctx context.Context, method string, raw json.RawMessage) (any, *rpc.Error) {
 	switch method {
-	case "initialize", "session/prompt", "tempest/continue", "session/cancel":
+	case "initialize", "session/prompt", "tempest/continue", "session/cancel", "tempest/steer", "tempest/follow_up", "tempest/cancel_queued":
 		return c.Handle(ctx, method, raw)
 	default:
 		return rpc.Deferred(func() (any, *rpc.Error) { return c.Handle(ctx, method, raw) }), nil
@@ -161,6 +179,10 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 	c.mu.Unlock()
 	if !initialized {
 		return nil, rpc.NewError(-32002, "not_initialized", "initialize must come first")
+	}
+	switch method {
+	case "tempest/steer", "tempest/follow_up", "tempest/cancel_queued", "tempest/jobs", "tempest/wait", "tempest/cancel_job", "tempest/logs", "tempest/cleanup_job":
+		return c.handleWork(ctx, method, raw)
 	}
 	switch method {
 	case "session/new", "session/load", "session/resume":

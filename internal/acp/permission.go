@@ -127,6 +127,9 @@ func (b *Broker) sendLocked(c *rpc.Conn, p *pendingAsk) {
 			options = tempest.PermissionChoices()
 		}
 		params := map[string]any{"sessionId": p.ask.SessionID, "toolCall": map[string]any{"toolCallId": p.ask.ToolCallID, "title": p.ask.Title, "kind": p.ask.Kind, "status": "pending", "rawInput": p.ask.RawInput}, "options": options}
+		if p.ask.ChildSessionID != "" {
+			params["_meta"] = map[string]any{"tempest": map[string]string{"jobId": p.ask.JobID, "childSessionId": p.ask.ChildSessionID, "childToolCallId": p.ask.ChildToolCallID, "cwd": p.ask.Cwd}}
+		}
 		var result struct {
 			Outcome struct {
 				Outcome  string `json:"outcome"`
@@ -143,6 +146,9 @@ func (b *Broker) sendLocked(c *rpc.Conn, p *pendingAsk) {
 				return
 			}
 			choice = tempest.Choice(result.Outcome.OptionID)
+			if p.ask.ChildSessionID != "" && choice != "allow_once" && choice != "reject_once" {
+				return
+			}
 		case "cancelled":
 			choice = ""
 		default:

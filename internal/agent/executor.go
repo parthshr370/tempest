@@ -91,7 +91,8 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
 
-	for _, toolCall := range toolCalls {
+	for index, toolCall := range toolCalls {
+		ctx := invocationContext(ctx, config, index)
 		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
 		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, emit); err != nil {
 			return ExecutedToolCallBatch{}, err
@@ -142,8 +143,11 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	// preserves message order regardless of completion order.
 	slots := make([]finalizedOutcome, len(toolCalls))
 	preps := make([]*preparedToolCall, len(toolCalls))
+	callContexts := make([]context.Context, len(toolCalls))
 
 	for i, toolCall := range toolCalls {
+		ctx := invocationContext(ctx, config, i)
+		callContexts[i] = ctx
 		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
 		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, safeEmit); err != nil {
 			return ExecutedToolCallBatch{}, err
@@ -180,10 +184,11 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			executed := executePreparedToolCall(ctx, preps[i], safeEmit)
-			finalized := finalizeExecutedToolCall(ctx, currentContext, assistantMessage, preps[i], executed, config)
+			callCtx := callContexts[i]
+			executed := executePreparedToolCall(callCtx, preps[i], safeEmit)
+			finalized := finalizeExecutedToolCall(callCtx, currentContext, assistantMessage, preps[i], executed, config)
 			slots[i] = finalized
-			setErr(emitToolExecutionEnd(ctx, finalized, safeEmit))
+			setErr(emitToolExecutionEnd(callCtx, finalized, safeEmit))
 		}(i)
 	}
 	wg.Wait()

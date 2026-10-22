@@ -41,9 +41,10 @@ type Store struct {
 	// failed is the first write or sync error. A failed write may have left a
 	// partial line, so the store refuses further appends rather than splice
 	// valid lines after it.
-	failed error
-	clock  func() time.Time
-	newID  func() string
+	failed       error
+	clock        func() time.Time
+	newID        func() string
+	usageSources map[string]ptypes.Usage
 }
 
 // Create opens a new journal for cwd under dir and writes its header.
@@ -98,6 +99,14 @@ func Create(ctx context.Context, dir, cwd string, opts Options) (*Store, error) 
 		cleanup()
 		return nil, fmt.Errorf("write journal header: %w", err)
 	}
+	if err := file.Sync(); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("sync journal header: %w", err)
+	}
+	if err := syncDirectory(journalDir); err != nil {
+		cleanup()
+		return nil, fmt.Errorf("sync journal directory: %w", err)
+	}
 	return &Store{path: path, id: id, file: file, clock: clock, newID: newID}, nil
 }
 
@@ -138,55 +147,63 @@ func (s *Store) AppendCompaction(ctx context.Context, summary, firstKeptID strin
 // and ParentID. Records named by the flush policy are fsynced before Append
 // returns. After any write or sync error the store refuses further appends.
 func (s *Store) Append(ctx context.Context, entry Entry) error {
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("append journal entry: %w", err)
-	}
+	_, err := s.AppendAssigned(ctx, entry)
+	return err
+}
+
+// AppendAssigned commits an entry and returns the exact durable envelope.
+func (s *Store) AppendAssigned(ctx context.Context, entry Entry) (Meta, error) {
 	if entry == nil {
-		return fmt.Errorf("append journal entry: nil entry")
+		return Meta{}, fmt.Errorf("append journal entry: nil entry")
+	}
+	if err := ctx.Err(); err != nil {
+		return Meta{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("append journal entry: %w", err)
+		return Meta{}, err
 	}
 	if s.file == nil {
-		return fmt.Errorf("append journal entry: store closed")
+		return Meta{}, fmt.Errorf("append journal entry: store closed")
 	}
 	if s.failed != nil {
-		return fmt.Errorf("append journal entry: journal failed earlier: %w", s.failed)
+		return Meta{}, fmt.Errorf("journal failed earlier: %w", s.failed)
 	}
-	kind := entry.kind()
-	given := entry.meta()
-	meta := Meta{
-		Timestamp: s.clock(),
-		Seq:       s.seq + 1,
-		Lane:      LaneMain,
-		RunID:     given.RunID,
-		EventSeq:  given.EventSeq,
-	}
+	kind, given := entry.kind(), entry.meta()
+	meta := Meta{Timestamp: s.clock(), Seq: s.seq + 1, Lane: LaneMain, RunID: given.RunID, EventSeq: given.EventSeq}
 	if !isRecord(kind) {
 		meta.ID = s.newID()
 		meta.ParentID = s.lastID
 	}
+	if e, ok := entry.(MessageEntry); ok && e.Metered {
+		for i, b := range assistantBlocks(e.Message) {
+			if b.Type == ptypes.BlockToolCall {
+				e.CallOccurrences = append(e.CallOccurrences, fmt.Sprintf("%s:%d", meta.ID, i))
+			}
+		}
+		entry = e
+	}
 	line, err := MarshalEntry(entry.withMeta(meta))
 	if err != nil {
-		return fmt.Errorf("marshal journal entry: %w", err)
+		return Meta{}, fmt.Errorf("marshal journal entry: %w", err)
 	}
 	if err := writeLine(s.file, line); err != nil {
 		s.failed = err
-		return fmt.Errorf("write journal entry: %w", err)
+		return Meta{}, fmt.Errorf("write journal entry: %w", err)
 	}
 	if syncsAfter(kind) {
 		if err := s.file.Sync(); err != nil {
 			s.failed = err
-			return fmt.Errorf("sync journal after %s: %w", kind, err)
+			return Meta{}, fmt.Errorf("sync journal after %s: %w", kind, err)
 		}
 	}
+	s.rememberUsage(entry, meta)
 	s.seq = meta.Seq
 	if meta.ID != "" {
 		s.lastID = meta.ID
 	}
-	return nil
+	return meta, nil
 }
 
 // Close flushes and closes the journal, releasing its exclusive writer lock.

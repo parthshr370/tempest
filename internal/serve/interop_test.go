@@ -437,8 +437,14 @@ func TestA2AListPagingAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer next.Close(context.Background())
-	if reply := a2aCall(t, next, "GetTask", map[string]any{"id": other.ID}); reply.Error == nil || reply.Error.Code != -32001 {
-		t.Fatal("old envelope survived restart")
+	restored := getTask(t, next, other.ID)
+	if restored.ID != other.ID || restored.ContextID != other.ContextID || restored.Status.State != model.TaskStateCompleted {
+		t.Fatal("durable exact run didn't survive restart", restored)
+	}
+	var restartedList model.ListTasksResponse
+	a2aOK(t, next, "ListTasks", map[string]any{"historyLength": 0}, &restartedList)
+	if restartedList.TotalSize != 0 {
+		t.Fatal("process-local list claimed durable history")
 	}
 	resumed := admitted(t, next, sendParams("after restart", one.ContextID, false))
 	if resumed.ContextID != one.ContextID || resumed.ID == one.ID {

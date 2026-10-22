@@ -9,6 +9,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/work"
 )
 
 // ErrStaleEpoch means a compaction replaced the requested transcript.
@@ -26,14 +27,18 @@ type Option struct {
 
 // Ask carries the input and available decisions of a pending tool approval.
 type Ask struct {
-	SessionID  string          `json:"sessionId"`
-	ToolCallID string          `json:"toolCallId"`
-	Tool       string          `json:"tool"`
-	Title      string          `json:"title"`
-	Kind       ToolKind        `json:"kind"`
-	RawInput   json.RawMessage `json:"rawInput"`
-	Reason     string          `json:"reason"`
-	Options    []Option        `json:"options"`
+	SessionID       string          `json:"sessionId"`
+	ToolCallID      string          `json:"toolCallId"`
+	Tool            string          `json:"tool"`
+	Title           string          `json:"title"`
+	Kind            ToolKind        `json:"kind"`
+	RawInput        json.RawMessage `json:"rawInput"`
+	Reason          string          `json:"reason"`
+	Options         []Option        `json:"options"`
+	JobID           string          `json:"jobId,omitempty"`
+	ChildSessionID  string          `json:"childSessionId,omitempty"`
+	ChildToolCallID string          `json:"childToolCallId,omitempty"`
+	Cwd             string          `json:"cwd,omitempty"`
 }
 
 // Update is one sequenced ACP or Tempest payload.
@@ -47,10 +52,12 @@ type Update struct {
 
 // RunState describes the session's currently admitted run.
 type RunState struct {
-	Status    string    `json:"status"`
-	RunID     string    `json:"runId,omitempty"`
-	StartedAt time.Time `json:"startedAt,omitempty"`
-	Turns     int       `json:"turns"`
+	Status         string    `json:"status"`
+	RunID          string    `json:"runId,omitempty"`
+	LogicalRunID   string    `json:"logicalRunId,omitempty"`
+	ContinuationOf string    `json:"continuationOf,omitempty"`
+	StartedAt      time.Time `json:"startedAt,omitempty"`
+	Turns          int       `json:"turns"`
 }
 
 // RunSummary describes the last durable run, including interrupted runs.
@@ -108,4 +115,8 @@ type Snapshot struct {
 	Usage          UsageState                `json:"usage"`
 	Interrupted    []journal.InterruptedTool `json:"interrupted"`
 	Diagnostics    []string                  `json:"diagnostics"`
+	Queues         []work.QueueItem          `json:"queues"`
+	Jobs           []work.Job                `json:"jobs"`
+	JobsTruncated  bool                      `json:"jobsTruncated"`
+	JobsCursor     string                    `json:"jobsCursor,omitempty"`
 }
