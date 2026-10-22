@@ -53,7 +53,10 @@ func TestSessionPermissionRoundTripAndJournalOrder(t *testing.T) {
 			})
 			s := openFaux(t, f, p)
 			target := filepath.Join(s.Snapshot().Cwd, "approved-directory")
-			command := "mkdir -p " + target
+			if err := os.Mkdir(target, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			command := "rmdir " + target
 			scriptBash(f, command)
 			result, err := s.Prompt(context.Background(), Prompt{Text: "use bash"})
 			if err != nil || result.StopReason != agent.StopCompleted {
@@ -63,7 +66,7 @@ func TestSessionPermissionRoundTripAndJournalOrder(t *testing.T) {
 				t.Fatalf("run ids result=%q snapshot=%+v", result.RunID, s.Snapshot().LastRun)
 			}
 			_, statErr := os.Stat(target)
-			if (statErr == nil) != (choice == permission.AllowOnce) {
+			if os.IsNotExist(statErr) != (choice == permission.AllowOnce) {
 				t.Fatalf("tool side effect stat=%v choice=%s", statErr, choice)
 			}
 			if choice == permission.RejectAlways {
@@ -115,7 +118,7 @@ func TestSessionCancelWhilePermissionPending(t *testing.T) {
 	f := faux.New(faux.Options{})
 	asked := make(chan Ask, 1)
 	s := openFaux(t, f, promptFunc(func(ctx context.Context, a Ask) (Choice, error) { asked <- a; <-ctx.Done(); return "", ctx.Err() }))
-	scriptBash(f, "mkdir -p "+filepath.Join(s.Snapshot().Cwd, "never"))
+	scriptBash(f, "rm -rf "+filepath.Join(s.Snapshot().Cwd, "never"))
 	done := make(chan RunResult, 1)
 	runErr := make(chan error, 1)
 	go func() { r, err := s.Prompt(context.Background(), Prompt{Text: "wait"}); done <- r; runErr <- err }()
@@ -149,7 +152,10 @@ func TestAnswerWinsAndCancelsSuppliedPrompter(t *testing.T) {
 		return "", ctx.Err()
 	}))
 	target := filepath.Join(s.Snapshot().Cwd, "allowed")
-	scriptBash(f, "mkdir -p "+target)
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptBash(f, "rmdir "+target)
 	done := make(chan error, 1)
 	go func() { _, err := s.Prompt(context.Background(), Prompt{Text: "ask"}); done <- err }()
 	a := <-asked
@@ -163,8 +169,8 @@ func TestAnswerWinsAndCancelsSuppliedPrompter(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(target); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("approved removal didn't run: %v", err)
 	}
 }
 func TestPreCancelledSessionHasZeroCallsAndDurableAbortedRun(t *testing.T) {
@@ -257,6 +263,56 @@ func TestOpenWithoutResolvedStackUsesDefaultDiscovery(t *testing.T) {
 	}
 	if s.LastAssistantText() != "hello" {
 		t.Fatalf("text=%q", s.LastAssistantText())
+	}
+}
+
+func TestOpenConfigPlanWithFauxScriptIsReadOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HARNESS_PLAN", "true")
+	t.Setenv("HARNESS_ENABLE_TASK", "true")
+	script := filepath.Join(t.TempDir(), "script.json")
+	if err := os.WriteFile(script, []byte(`[{"text":"plan"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(t.Context(), Options{
+		SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{},
+		FauxScript: script,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+	for _, tool := range s.core.agent.State().Tools {
+		switch tool.Name {
+		case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment":
+		default:
+			t.Fatalf("config plan exposed %q", tool.Name)
+		}
+	}
+	result, err := s.Prompt(t.Context(), Prompt{Text: "plan"})
+	if err != nil || result.StopReason != agent.StopCompleted || s.LastAssistantText() != "plan" {
+		t.Fatalf("result=%+v err=%v text=%q", result, err, s.LastAssistantText())
+	}
+}
+
+func TestOpenFauxScriptOverridesPlanModel(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "script.json")
+	if err := os.WriteFile(script, []byte(`[{"text":"faux plan"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(t.Context(), Options{
+		SessionDir: t.TempDir(), Cwd: t.TempDir(),
+		New:        &NewSession{Budget: Budget{MaxCostUSD: 1}},
+		Stack:      &StackConfig{Plan: true, PlanModel: types.Model{ID: "unknown-plan-model"}},
+		FauxScript: script,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+	result, err := s.Prompt(t.Context(), Prompt{Text: "plan"})
+	if err != nil || result.StopReason != agent.StopCompleted || s.LastAssistantText() != "faux plan" {
+		t.Fatalf("result=%+v err=%v text=%q", result, err, s.LastAssistantText())
 	}
 }
 func TestBudgetAndPermissionValidation(t *testing.T) {
@@ -416,7 +472,7 @@ func TestCloseJoinsRunRejectsAdmissionAndReleasesJournal(t *testing.T) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	}))
-	scriptBash(f, "mkdir -p "+filepath.Join(s.Snapshot().Cwd, "never"))
+	scriptBash(f, "rm -rf "+filepath.Join(s.Snapshot().Cwd, "never"))
 	done := make(chan RunResult, 1)
 	go func() { result, _ := s.Prompt(context.Background(), Prompt{Text: "wait"}); done <- result }()
 	<-asked
@@ -492,7 +548,7 @@ func TestBeginRegistersRunAndWaitIsRepeatable(t *testing.T) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	}))
-	scriptBash(f, "mkdir -p "+filepath.Join(s.Snapshot().Cwd, "never"))
+	scriptBash(f, "rm -rf "+filepath.Join(s.Snapshot().Cwd, "never"))
 	s.Cancel()
 	run, err := s.Begin(context.Background(), Prompt{Text: "wait"})
 	if err != nil {

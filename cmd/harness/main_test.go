@@ -89,6 +89,21 @@ func TestCommandRetryDefaultsAndDisabledConfig(t *testing.T) {
 	}
 }
 
+func TestCLIHelpPrintsZeroValueFlagsWithoutPanic(t *testing.T) {
+	for _, args := range [][]string{{"-help"}, {"serve", "-help"}, {"mcp", "-help"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr strings.Builder
+			run(args, &stdout, &stderr)
+			if text := stderr.String(); strings.Contains(text, "panic") || !strings.Contains(text, "-allow-tool") || !strings.Contains(text, "-deny-tool") {
+				t.Fatalf("help output = %q", text)
+			}
+		})
+	}
+	if got := (skillPathsFlag{}).String(); got != "" {
+		t.Fatalf("zero flag String() = %q", got)
+	}
+}
+
 func TestCLITextOutput(t *testing.T) {
 	tmp := t.TempDir()
 	exe := filepath.Join(tmp, "harness-test")
@@ -100,14 +115,22 @@ func TestCLITextOutput(t *testing.T) {
 	if err := os.WriteFile(script, []byte(`[{"text":"done"}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(exe, "-p", "create hello", "-faux-script", script)
+	sessionDir := filepath.Join(tmp, "sessions")
+	cmd := exec.Command(exe, "-p", "create hello", "-faux-script", script, "-session-dir", sessionDir)
 	cmd.Dir = tmp
-	out, err := cmd.CombinedOutput()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("one-shot run: %v\n%s", err, out)
+		t.Fatalf("one-shot run: %v\n%s\n%s", err, out, stderr.String())
 	}
-	if !strings.Contains(string(out), "done") {
-		t.Fatalf("output = %q, want completion", out)
+	if string(out) != "done\n" {
+		t.Fatalf("stdout = %q, want only completion text", out)
+	}
+	id := loadOnlyJournal(t, sessionDir).Header.ID
+	hint := "session: " + id + " (resume with -resume " + id + ")\n"
+	if !strings.HasSuffix(stderr.String(), hint) || strings.Count(stderr.String(), "session: ") != 1 {
+		t.Fatalf("stderr = %q, want one final session hint %q", stderr.String(), hint)
 	}
 }
 
@@ -252,6 +275,7 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 
 // runReportOutput is the subset of the json run report the tests assert on.
 type runReportOutput struct {
+	SessionID  string   `json:"session_id"`
 	StopReason string   `json:"stop_reason"`
 	Error      string   `json:"error"`
 	Turns      int      `json:"turns"`
@@ -307,7 +331,7 @@ func TestCLIRunLifecycle(t *testing.T) {
 			t.Fatalf("exit %d report %+v, want completed run with cost and elapsed", code, report)
 		}
 		loaded := loadOnlyJournal(t, sessionDir)
-		if loaded.LastRun == nil || !loaded.LastRun.Finished || loaded.LastRun.StopReason != "completed" {
+		if report.SessionID != loaded.Header.ID || loaded.LastRun == nil || !loaded.LastRun.Finished || loaded.LastRun.StopReason != "completed" {
 			t.Fatalf("journal last run = %+v, want finished completed run", loaded.LastRun)
 		}
 		if got := len(loaded.Messages); got != 4 {
@@ -321,10 +345,15 @@ func TestCLIRunLifecycle(t *testing.T) {
 			t.Fatalf("initial run exit = %d", code)
 		}
 		id := loadOnlyJournal(t, sessionDir).Header.ID
-		for index, flagArgs := range [][]string{{"-resume", id}, {"-continue"}} {
+		paths, err := filepath.Glob(filepath.Join(sessionDir, "*", "*.jsonl"))
+		if err != nil || len(paths) != 1 {
+			t.Fatalf("journal paths = %v, err = %v", paths, err)
+		}
+		name := filepath.Base(paths[0])
+		for index, flagArgs := range [][]string{{"-resume", id}, {"-resume", name}, {"-resume", strings.TrimSuffix(name, ".jsonl")}, {"-continue"}} {
 			args := append([]string{"-session-dir", sessionDir}, flagArgs...)
 			report, _, code := run(t, `[{"text":"resumed answer"}]`, args...)
-			if code != 0 || report.Text != "resumed answer" {
+			if code != 0 || report.Text != "resumed answer" || report.SessionID != id {
 				t.Fatalf("resume args %v: exit %d, report %+v", flagArgs, code, report)
 			}
 			loaded := loadOnlyJournal(t, sessionDir)
@@ -350,6 +379,42 @@ func TestCLIRunLifecycle(t *testing.T) {
 		result, ok := loaded.Messages[2].(ptypes.ToolResultMessage)
 		if !ok || result.IsError || len(result.Content) != 1 || !strings.Contains(result.Content[0].Text, "note body") {
 			t.Fatalf("attachment tool result = %#v", loaded.Messages[2])
+		}
+	})
+
+	t.Run("plan uses faux and exposes no mutating tools", func(t *testing.T) {
+		script := `[{"toolCalls":[{"id":"write-plan","name":"write","arguments":{"path":"plan-output.txt","content":"must not write"}},{"id":"todo-plan","name":"todo_write","arguments":{"todos":[]}}]},{"text":"read-only plan"}]`
+		report, sessionDir, code := run(t, script, "-plan", "-enable-task", "-max-cost", "1", "-plan-model", "openai:not-a-cataloged-model@http://127.0.0.1:1/v1")
+		if code != 0 || report.StopReason != "completed" || report.Text != "read-only plan" {
+			t.Fatalf("plan exit %d, report %+v", code, report)
+		}
+		loaded := loadOnlyJournal(t, sessionDir)
+		for _, message := range loaded.Messages {
+			if result, ok := message.(ptypes.ToolResultMessage); ok {
+				if !result.IsError || len(result.Content) != 1 || result.Content[0].Text != "Tool "+result.ToolName+" not found" {
+					t.Fatalf("plan tool result = %#v, want tool unavailable", result)
+				}
+			}
+		}
+		for _, path := range []string{"plan-output.txt", filepath.Join(".harness", "progress.md")} {
+			if _, err := os.Stat(filepath.Join(tmp, path)); !os.IsNotExist(err) {
+				t.Fatalf("plan created %s: %v", path, err)
+			}
+		}
+	})
+
+	t.Run("clean finish on the final allowed turn completes", func(t *testing.T) {
+		for _, test := range []struct{ script, turns string }{
+			{`[{"text":"OK"}]`, "1"},
+			{readThenAnswer, "2"},
+		} {
+			report, sessionDir, code := run(t, test.script, "-max-turns", test.turns)
+			if code != 0 || report.StopReason != "completed" {
+				t.Fatalf("max-turns %s: exit %d, report %+v", test.turns, code, report)
+			}
+			if loaded := loadOnlyJournal(t, sessionDir); loaded.LastRun == nil || loaded.LastRun.StopReason != "completed" {
+				t.Fatalf("journal last run = %+v, want completed", loaded.LastRun)
+			}
 		}
 	})
 

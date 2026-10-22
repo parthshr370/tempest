@@ -265,7 +265,7 @@ func TestMCPServerProgressPrecedesResponseAndBusy(t *testing.T) {
 	f := faux.New(faux.Options{})
 	opts := options(t, f)
 	target := filepath.Join(opts.Cwd, "done")
-	args, _ := json.Marshal(map[string]string{"command": "mkdir -p " + target})
+	args, _ := json.Marshal(map[string]string{"command": "rm -f " + target})
 	f.AppendResponses(faux.Respond(faux.ToolCall("bash", args, "ask")), faux.Respond(faux.Text("done")))
 	asking := make(chan struct{})
 	release := make(chan struct{})

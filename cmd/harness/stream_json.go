@@ -53,7 +53,7 @@ func executeOneShot(ctx context.Context, sess *tempest.Session, prompt, mode str
 		}()
 	}
 	result, waitErr := run.Wait()
-	outcome := runOutcome{RunResult: result, Elapsed: time.Duration(result.ElapsedMS) * time.Millisecond, LastAssistantText: run.Text()}
+	outcome := runOutcome{RunResult: result, SessionID: sess.ID(), Elapsed: time.Duration(result.ElapsedMS) * time.Millisecond, LastAssistantText: run.Text()}
 	// A setup failure has no durable run, so it has no terminal event/report.
 	if result.RunID == "" {
 		stop()

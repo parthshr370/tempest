@@ -87,6 +87,7 @@ type StackConfig struct {
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
 func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 	return StackConfig{
+		Plan:         cfg.Plan(),
 		EnableTask:   cfg.EnableTask(),
 		EnableWeb:    cfg.EnableWeb(),
 		WebSearchURL: cfg.WebSearchURL(),
@@ -133,7 +134,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		if err != nil {
 			rawArgs = nil
 		}
-		outcome := permission.Gate(ctx, modeFunc(), c.ToolCall.Name, rawArgs, policy, c.ToolCall.ID)
+		outcome := permission.GateInDirectory(ctx, modeFunc(), c.ToolCall.Name, rawArgs, policy, cwd, c.ToolCall.ID)
 		return &agent.BeforeToolCallResult{Block: !outcome.Allow, Reason: outcome.Reason, Permission: &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}}
 	}
 	if cfg.BeforeToolCall != nil {

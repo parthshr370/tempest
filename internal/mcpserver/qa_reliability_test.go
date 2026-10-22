@@ -129,7 +129,7 @@ func TestElicitationMessageBoundsAndFields(t *testing.T) {
 
 func TestMCPElicitationIncludesRequestedOperation(t *testing.T) {
 	provider := faux.New(faux.Options{})
-	const command = "mkdir approval-visible-operation"
+	const command = "rm -f approval-visible-operation"
 	arguments, err := json.Marshal(struct {
 		Command string `json:"command"`
 	}{Command: command})

@@ -531,11 +531,24 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				run.result.StopReason = StopCompleted
 				return nil
 			}
-			if stop, err := run.boundaryStop(ctx); stop != "" || err != nil {
+			stop, stopErr := run.boundaryStop(ctx)
+			if stopErr != nil || (stop != "" && (stop != StopMaxTurns || ctx.Err() != nil)) {
 				run.result.StopReason = stop
-				return err
+				return stopErr
 			}
-			again, err := config.Work.Idle(ctx)
+			idleCtx := ctx
+			if stop == StopMaxTurns {
+				// Idle seals an empty run atomically. Don't wait for live jobs
+				// when another turn would exceed the cap.
+				var cancel context.CancelFunc
+				idleCtx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			again, err := config.Work.Idle(idleCtx)
+			if stop == StopMaxTurns && (again || errors.Is(err, context.Canceled)) {
+				run.result.StopReason = stop
+				return nil
+			}
 			if err != nil {
 				return err
 			}

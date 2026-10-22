@@ -3,6 +3,7 @@ package permission
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -86,7 +87,7 @@ func TestGateModeTierMatrix(t *testing.T) {
 		{name: "bypass destructive bash", mode: ModeBypass, tool: "bash", args: commandArgs("rm -rf /tmp/example"), wantAllow: true},
 		{name: "default edit", mode: ModeDefault, tool: "edit", wantAllow: true},
 		{name: "accept edits edit", mode: ModeAcceptEdits, tool: "edit", wantAllow: true},
-		{name: "default destructive bash", mode: ModeDefault, tool: "bash", args: commandArgs("rm -rf /tmp/example"), wantReason: "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): rm -rf /tmp/example"},
+		{name: "default destructive bash", mode: ModeDefault, tool: "bash", args: commandArgs("rm -rf /tmp/example"), wantReason: "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): rm -rf /tmp/example"},
 		{name: "default safe bash", mode: ModeDefault, tool: "bash", args: commandArgs("ls"), wantAllow: true},
 		{name: "default read", mode: ModeDefault, tool: "read", wantAllow: true},
 		{name: "plan write", mode: ModePlan, tool: "write", wantReason: "Plan mode: write is disabled because it can mutate the workspace"},
@@ -151,7 +152,7 @@ func TestGatePolicyOverrides(t *testing.T) {
 		policy := Policy{Overrides: map[string]Decision{"bash": DecideAllow}}
 		out := Gate(context.Background(), ModeDefault, "bash", commandArgs("rm -rf /tmp/example"), &policy)
 		allow, reason := out.Allow, out.Reason
-		wantReason := "Command blocked by destructive-command guard (removals, moves, and file-clobbering redirects are blocked; read-only inspection such as cat/ls/grep and fd-dup redirects like 2>&1 or 2>/dev/null are fine): rm -rf /tmp/example"
+		wantReason := "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): rm -rf /tmp/example"
 		if allow || reason != wantReason {
 			t.Fatalf("destructive bash = allow %v, reason %q; want reason %q", allow, reason, wantReason)
 		}
@@ -225,7 +226,7 @@ func TestDestructiveCommandPatterns(t *testing.T) {
 		"git reset --hard",
 		"git clean -fd",
 		"npm install",
-		"grep x file > out",
+		"grep x file > /etc/passwd",
 		"sudo ls",
 		"mkfs /dev/sda1",
 		"mkfs.ext4 /dev/sda1",
@@ -250,6 +251,12 @@ func TestDestructiveCommandPatterns(t *testing.T) {
 }
 
 func TestIsDestructiveCommandRedirectTargets(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, name := range []string{"file.txt", "out.log"} {
+		if err := os.WriteFile(name, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, command := range []string{
 		"cat workflow.json 2>&1 | head -5",
 		"foo 2>/dev/null",
@@ -327,12 +334,12 @@ func TestGatePromptSourcesAndAlwaysOverrides(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			policy := &Policy{Prompter: choicePrompter(func(_ context.Context, req PromptRequest) (Choice, error) {
-				if req.ToolCallID != "c" || string(req.Args) != `{"command":"mkdir x"}` {
+				if req.ToolCallID != "c" || string(req.Args) != `{"command":"rm x"}` {
 					t.Errorf("request=%+v", req)
 				}
 				return tc.choice, tc.err
 			})}
-			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("mkdir x"), policy, "c")
+			out := Gate(context.Background(), ModeDefault, "bash", commandArgs("rm x"), policy, "c")
 			if out.Allow != tc.allow || out.Source != tc.source || !out.Prompted {
 				t.Fatalf("outcome=%+v", out)
 			}
@@ -364,7 +371,7 @@ func TestGuardAlwaysChoicesApplyOnlyOnce(t *testing.T) {
 				}
 				return choice, nil
 			})}
-			for _, command := range []string{"mkdir first", "rm -rf second"} {
+			for _, command := range []string{"rm first", "rm -rf second"} {
 				out := Gate(context.Background(), ModeDefault, "bash", commandArgs(command), policy)
 				if out.Allow != (choice == AllowAlways) || !out.Prompted || out.Source != SourcePrompt {
 					t.Fatalf("command=%q outcome=%+v", command, out)
@@ -392,7 +399,7 @@ func TestSessionAlwaysChoicesNeverSkipGuard(t *testing.T) {
 					return choice, nil
 				}),
 			}
-			for _, command := range []string{"echo first", "rm -rf second", "mkdir third", "echo last"} {
+			for _, command := range []string{"echo first", "rm -rf second", "rmdir third", "echo last"} {
 				out := Gate(context.Background(), ModeDefault, "bash", commandArgs(command), policy)
 				if out.Allow != (choice == AllowAlways) {
 					t.Fatalf("command=%q outcome=%+v", command, out)

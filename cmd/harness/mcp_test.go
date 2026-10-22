@@ -21,8 +21,11 @@ func TestCLIMCPRealBinary(t *testing.T) {
 	if output, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build tempest: %v\n%s", err, output)
 	}
+	if err := os.Mkdir(filepath.Join(tmp, "approval-target"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	script := filepath.Join(tmp, "faux.json")
-	if err := os.WriteFile(script, []byte(`[{"toolCalls":[{"id":"first-tool","name":"bash","arguments":{"command":"mkdir -p approved"}}]},{"text":"binary answer"},{"toolCalls":[{"id":"cancel-tool","name":"bash","arguments":{"command":"sleep 30"}}]},{"text":"must not finish"}]`), 0600); err != nil {
+	if err := os.WriteFile(script, []byte(`[{"toolCalls":[{"id":"first-tool","name":"bash","arguments":{"command":"rmdir approval-target && mkdir -p approved"}}]},{"text":"binary answer"},{"toolCalls":[{"id":"cancel-tool","name":"bash","arguments":{"command":"sleep 30"}}]},{"text":"must not finish"}]`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	sessionDir := filepath.Join(tmp, "sessions")

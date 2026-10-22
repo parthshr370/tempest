@@ -111,7 +111,10 @@ re-anchors, and course-corrects on the next turn instead of corrupting state.
 Every run is journaled to an append-only JSONL file as it happens: each message, each
 tool call's start and finish, per-call usage, and how the run ended. A tool's start is
 on disk before the tool runs. `-continue` picks up the most recent session for the
-current directory; `-resume <id>` restores a specific one. If the process died mid-run,
+current directory; `-resume <id>` restores a specific one. The CLI prints the id on
+stderr in text mode and as `session_id` in JSON reports. You can also pass the
+journal filename (with or without `.jsonl`) instead of the bare id; ambiguous ids
+are rejected with filename hints. If the process died mid-run,
 a tool call that had started but not finished comes back to the model as "outcome
 unknown" and is never re-run automatically; a torn final line is trimmed. Sessions are
 isolated by working directory, so a resume never bleeds another project's history
@@ -127,9 +130,31 @@ compaction snapshots and child journals are required recovery data, not caches.
 
 Every tool call passes one chokepoint. Each tool carries a `read`, `write`, or `exec`
 tier, and the permission mode sets the baseline: `plan` runs read-only, `default`
-allows edits and non-destructive shell, `bypass` opens everything you don't explicitly
-deny. `rm -rf`, fork bombs, and file-clobbering redirects are blocked outside `bypass`
-no matter the mode.
+and `acceptEdits` allow edits and non-destructive shell, and `bypass` opens everything
+you don't explicitly deny.
+
+Outside `bypass`, the shell guard requires approval for deleting files/directories,
+overwriting or truncating existing files, in-place edits, and destructive git
+operations (`reset --hard`, `clean -f`, `checkout -- <path>`, `restore`, force push,
+and `branch -D`). It catches direct removals, `find -delete`/`-exec rm`, `xargs rm`,
+`sed -i`/`perl -i`, `truncate`, `dd of=`, and `shred`. Existing protections for
+dangerous system commands, package-changing commands, and fork bombs remain.
+
+Appends (`>>`, `tee -a`) and writes to new redirect, `tee`, `cp`, or `mv` targets
+don't require guard approval. Targets resolve relative to the command's working
+directory; copying/moving into a directory checks the resulting destination file.
+If the guard can't determine whether a target exists, it asks. `git stash` is
+allowed because it's reversible (discarding stashes with `drop`/`clear` still asks).
+Plan mode still rejects non-destructive writes.
+
+The guard also recognizes obvious deletion/overwrite calls in `python -c`,
+`python3 -c`, `node -e`, `perl -e`, and `ruby -e` code, including `rmtree`,
+`os.remove`, `unlink`, `rmdir`, `fs.rm`, `unlinkSync`, and `open(..., 'w')`.
+Arbitrary scripts, obfuscated code, and shell expansions can't be fully classified:
+this is a guardrail, **not a sandbox**, and existence checks aren't atomic with
+execution. Guard approval runs before ordinary allow/Always choices; even an
+Always answer applies only once and the next destructive call asks again.
+Without an interactive prompter, guarded commands are denied.
 
 ### 06 · Model roles, routed by intent
 
@@ -237,6 +262,8 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
 `-max-wall-time`.
 
 - `-max-turns N` caps model calls.
+  Finishing naturally on call N still reports `completed`; the cap stops a run
+  only when another turn or outstanding work remains.
 - `-max-cost USD` caps the summed cost of the run's model calls. When the
   model's price is unknown the run is refused at startup: an unknown price is
   not a zero price.
@@ -252,14 +279,14 @@ as unknown, never reruns the command and never signals a stale PID.
 `-output-format json` prints a run report:
 
 ```json
-{"stop_reason": "max_turns", "turns": 3, "usage": {"input": 5120, "output": 410, "...": "..."},
+{"session_id": "d6b6fcd56cee7675", "stop_reason": "max_turns", "turns": 3, "usage": {"input": 5120, "output": 410, "...": "..."},
  "cost_usd": 0.0213, "elapsed_ms": 18450, "text": "last assistant text", "message": {"role": "toolResult", "...": "..."}}
 ```
 
 `cost_usd` is `null` when any call's price was unknown, and `error` appears on
 `error` stops. `message` is the transcript's last message. In text mode the last
 assistant text goes to stdout, and a stop reason other than `completed` goes to
-stderr.
+stderr. Text mode ends with `session: <id> (resume with -resume <id>)` on stderr.
 
 The three output modes are `text`, `json` (a pretty-printed report), and
 `stream-json` (one compact JSON object per line). `-print` remains a legacy
@@ -503,7 +530,7 @@ The example is a separate module with a local `replace`; build it with
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](#runs). Zero means unlimited. |
 | `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
-| `-plan` | Run the read-only plan stack on the `plan` role model. |
+| `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools (and enabled read-only web/attachment tools) are available; `-faux-script` still overrides the model provider. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
 | `-skill <path>` | Additional skill location; repeatable. |
