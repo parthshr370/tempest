@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
 )
@@ -61,6 +62,8 @@ type JobEnvironment struct {
 		Tools       []string          `json:"tools"`
 		Overrides   map[string]string `json:"overrides"`
 		Interactive map[string]string `json:"interactive"`
+		// CloudRules is additive to v3: absent in older records (no grants).
+		CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 	} `json:"ceiling"`
 	Model    string `json:"model"`
 	Provider string `json:"provider"`
@@ -185,6 +188,13 @@ func strictPayload(raw json.RawMessage, value any) error {
 	return nil
 }
 func validDigest(s string) bool { b, e := hex.DecodeString(s); return e == nil && len(b) == 32 }
+
+// validCloudRules accepts only rules NormalizeRules accepts; a missing list
+// (records before M5) is valid and restores no grants.
+func validCloudRules(rules []cloudcmd.Rule) bool {
+	_, err := cloudcmd.NormalizeRules(rules)
+	return err == nil
+}
 func terminal(s string) bool {
 	return s == "completed" || s == "failed" || s == "cancelled" || s == "unknown"
 }
@@ -233,7 +243,7 @@ func validateWorkRecord(r WorkRecord) error {
 		if v.Kind == "task" {
 			var s work.TaskSpec
 			err := strictPayload(v.Spec, &s)
-			valid = valid && err == nil && strings.TrimSpace(s.Prompt) != "" && len(s.Prompt) <= 32<<10 && len(s.Description) <= 512 && len(s.OutputSchema) <= 16<<10 && (s.SubagentType == "general" || s.SubagentType == "explore") && v.ChildSessionID != "" && v.ChildJournal != "" && v.Environment != nil
+			valid = valid && err == nil && strings.TrimSpace(s.Prompt) != "" && len(s.Prompt) <= 32<<10 && len(s.Description) <= 512 && len(s.OutputSchema) <= 16<<10 && (s.SubagentType == "general" || s.SubagentType == "explore") && v.ChildSessionID != "" && v.ChildJournal != "" && v.Environment != nil && validCloudRules(v.Environment.Ceiling.CloudRules)
 		} else if v.Kind == "bash" {
 			var s work.BashSpec
 			err := strictPayload(v.Spec, &s)

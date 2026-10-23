@@ -153,11 +153,13 @@ func collectKeys(document json.RawMessage, keys map[string]bool) {
 // tools accept, and no argument name mixes in the wire's camelCase.
 func TestModelToolSurfaceIsSnakeCase(t *testing.T) {
 	controller := populatedController{}
-	registry := AllTools(t.TempDir(), ToolsOptions{
+	cwd := t.TempDir()
+	registry := AllTools(cwd, ToolsOptions{
 		Work: controller, EnableWeb: true, Skills: []skills.Skill{{Name: "x"}}, TaskTool: subagent.NewTool(controller),
 		AttachmentRegistry: document.NewAttachmentRegistry(), AttachmentReader: document.NewCacheRootBlobReader(t.TempDir()), Sanitize: func(s string) string { return s },
+		LSP: newInertLSPManager(t, cwd),
 	})
-	for _, name := range []ToolName{TaskTool, AttachmentTool, WebFetch, WebSearch, SkillTool, JobsTool} {
+	for _, name := range []ToolName{TaskTool, AttachmentTool, WebFetch, WebSearch, SkillTool, JobsTool, LSPRenameTool, ManifestDiffTool} {
 		if _, ok := registry[name]; !ok {
 			t.Fatalf("%s not built", name)
 		}

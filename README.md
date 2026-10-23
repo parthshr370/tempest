@@ -161,6 +161,57 @@ execution. Guard approval runs before ordinary allow/Always choices; even an
 Always answer applies only once and the next destructive call asks again.
 Without an interactive prompter, guarded commands are denied.
 
+**Cloud commands get their own intent check.** Inside the same bash gate,
+`kubectl`, `helm`, `terraform` and `kustomize` invocations are classified as
+read, write, destructive or opaque, without running anything or reading your
+kubeconfig. Proven reads (`kubectl get`, `helm list`, `terraform show`, …) are
+allowed as before. Writes (`kubectl apply`, `helm upgrade --install`,
+`terraform plan`/`apply`, any `--dry-run`) **prompt per call in `default` and
+`acceptEdits`, even with `-allow-tool bash`**: accepting code edits is not consent
+to deploy. Destructive forms (`kubectl delete`, `helm uninstall`,
+`terraform destroy`, …) need per-call guard approval. Literal wrappers and
+inline shells are looked through: `timeout 30 kubectl get pods` and
+`bash -c 'kubectl get pods'` are reads, `timeout 5 kubectl delete pod x` is
+destructive. Opaque forms prompt too: unknown verbs or flags, `kustomize build`,
+environment changes in front of a cloud tool (`KUBECONFIG=x kubectl …`), shell
+syntax the classifier can't resolve (substitutions, here-documents, loops,
+`xargs`, `sudo`, …) **when the command names a cloud tool anywhere**, and code it
+can't see at all: a dynamic command word (`$K get pods`), `eval "$x"`,
+`bash -c "$CMD"`, or `curl … | sh`. Commands that name no cloud tool keep their
+previous behavior whatever syntax they use, so `go test $(go list ./...)`,
+`cat <<EOF > main.go`, `timeout 30 make` and `find . | xargs grep x` run as
+before. Compound commands are judged by their riskiest part, and an Always
+answer never covers a later cloud call. Without an approver, all of these are
+denied.
+
+An operator can pre-approve or forbid exact kube contexts with
+`-cloud-policy FILE` (`HARNESS_CLOUD_POLICY`, settings `cloud_policy`):
+
+```json
+{"rules":[
+  {"tool":"kubectl","context":"kind-dev","action":"allow_write"},
+  {"tool":"helm","context":"kind-dev","action":"allow_write"},
+  {"tool":"kubectl","context":"production","action":"deny"}
+]}
+```
+
+`allow_write` lets a non-destructive write run without a prompt only when the
+command itself names that context literally (`kubectl --context kind-dev apply …`,
+`helm --kube-context kind-dev upgrade …`); an ambient current context, a
+`--kubeconfig`/`--server`/credential override, a dynamic value, or a call made
+through a wrapper, substitution or `bash -c` never matches.
+`deny` wins over everything, including `bypass`, and also blocks reads; when a
+deny rule exists for a tool and the target context can't be established, that
+call is denied too. Contexts are exact names, not patterns; at most 256 rules,
+1 MiB file. Rules cover `kubectl` and `helm` only, and a context name is policy
+within your trusted kubeconfig, not a verified cluster identity.
+
+**Plan mode can't be overridden.** `plan` now denies every mutation before any
+allow rule, remembered approval or cloud grant is consulted: `-allow-tool bash`
+no longer lets a plan run write. Only commands proven read-only in every part
+run in plan mode, in plain syntax: substitutions, here-documents, wrappers and
+`bash -c` are refused there even when they name no cloud tool.
+
 ### 06 · Model roles, routed by intent
 
 A `default` agent for normal turns, a read-only `plan` model (used by `-plan`), and a
@@ -260,7 +311,7 @@ window on lines it doesn't need yet.
 
 ## Every tool, in one namespace
 
-Seventeen built-in tools share one namespace, **12 of them on by default**; pin the
+Twenty-two built-in tools share one namespace, **13 of them on by default**; pin the
 active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
 All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
 fall back to pure Go when `rg`/`fd` are absent. Both search hidden files, honor
@@ -308,6 +359,96 @@ wire methods use camelCase (`jobId`, `jobIds`).
 
 - `web_search` — one query against the configured search endpoint.
 - `web_fetch` — fetch a URL as bounded, structured text.
+
+**Code & manifest intelligence** *(see [Code and manifest intelligence](#code-and-manifest-intelligence))*
+
+- `manifest_diff` — compare two rendered Kubernetes manifest snapshots resource by resource; never runs a renderer.
+- `lsp_definition`, `lsp_references` — semantic navigation through a language server *(behind `-enable-lsp`)*.
+- `lsp_rename` — a rename **plan** of anchored edits for the ordinary `edit` tool; it writes nothing *(behind `-enable-lsp`)*.
+- `lsp_diagnostics` — a file's diagnostics with an explicit freshness verdict *(behind `-enable-lsp`)*.
+
+## Code and manifest intelligence
+
+### Language servers
+
+`-enable-lsp` (`HARNESS_ENABLE_LSP`, settings `enable_lsp`) registers the four
+`lsp_*` tools. It is off by default because a language server is installed code
+that Tempest executes for you: enabling it is a trust grant, not a sandbox. Nothing
+starts when a session opens; each server starts on the first query that needs it,
+is reused for the rest of the session, retires after five idle minutes, and stops
+when the session closes. Only the root session gets language servers; `task`
+children don't.
+
+| Route | Default command | Files |
+|---|---|---|
+| `go` | `gopls` | `.go` |
+| `yaml` | `yaml-language-server --stdio` | `.yaml`, `.yml` outside a Helm chart's `templates/` |
+| `terraform` | `terraform-ls serve` | `.tf`, `.tfvars` |
+| `helm` | `helm_ls serve` | `.yaml`, `.yml`, `.tpl` under a chart's `templates/` |
+
+A missing executable fails only that tool call (`lsp_server_missing`), with the
+tools still registered. `-lsp-config FILE` (`HARNESS_LSP_CONFIG`, settings
+`lsp_config`) replaces the whole server list; an empty `servers` array means no
+servers and an explicit `-lsp-config ""` selects the built-ins above:
+
+```json
+{"servers":[
+  {"name":"go","command":"./bin/gopls","env":{"GOFLAGS":"-mod=mod","GOPROXY":"off"},
+   "settings":{"gopls":{"staticcheck":true}}},
+  {"name":"yaml","command":"yaml-language-server","args":["--stdio"],"disabled":true}
+]}
+```
+
+Only the four route names are accepted; a relative command containing a slash is
+resolved against the file's directory, a bare one through `PATH`. Unknown fields,
+duplicate names, non-object `settings`/`initialization_options` (64 KiB each) and
+files over 1 MiB are errors. Servers inherit only the same minimal environment as
+MCP stdio servers plus their `env`; pass `GOPATH`, `GOMODCACHE`, `GOPROXY`,
+`TF_DATA_DIR` or credentials explicitly. `-enable-lsp=false` always wins, even
+with a configured file.
+
+Positions are one-based line and column, where a column counts Unicode characters
+exactly as numbered `read` output shows them. Paths and returned locations stay
+inside the working directory: locations in dependency sources (for example the Go
+module cache) are counted as `external_locations_omitted`, not shown. Every result
+is compact JSON of at most 64 KiB with `total`/`omitted`/`truncated` counts.
+
+`lsp_rename` returns `{"applied":false,"files":[{"path","anchor","edits":[…]}]}`.
+Apply each file with one ordinary `edit` call using those `old_text`/`new_text`/
+`anchor` values: each call passes the permission gate on its own, plan mode can
+compute a plan but not apply it, and a file that changed since the plan is rejected
+by its anchor. The files are separate edits, not one atomic rename; after a
+conflict, ask for a fresh plan. Plans over 64 files, 2,000 edits or 128 KiB fail
+whole, and renames in workspaces with more than 256 source files fail with
+`lsp_rename_scope_limit` rather than guess.
+
+`lsp_diagnostics` reports `fresh` and `freshness` (`current`, `unversioned`,
+`pending` or `outdated`). Only `current` means the report matches the file on disk;
+no report is `pending`, never "no errors". Edits never wait on a language server
+and diagnostics are never attached to edit results automatically.
+
+### Manifest diffs
+
+`manifest_diff` compares two local inputs, each a file (any extension) or a
+directory walked for `.yaml`, `.yml` and `.json`, and pairs resources by
+`(apiVersion, kind, namespace, name)`, not by filename. Key order, comments,
+anchors, merge keys and document layout don't count as changes; list order,
+`status`, nulls and default-looking fields do. An absent namespace differs from
+`default`, and an `apiVersion` change is a removal plus an addition. Core `v1`
+`List` objects are expanded; custom `*List` kinds are not. Duplicate resources,
+duplicate keys, custom tags and `generateName` without `name` are errors.
+
+It runs nothing. To review a chart or overlay change, render both versions into the
+working directory first (`helm template … > old.yaml`), which goes through the
+normal bash gate, then call `manifest_diff` on the two files. Output is JSON with a
+full `summary`, up to `max_resources` (50, at most 200) changed resources sorted by
+identity, and a canonical-YAML display patch per resource (8 KiB each, 64 KiB per
+result), which is a reading aid, not an applicable patch. Core `v1` `Secret`
+`data`/`stringData` values are replaced by `<redacted>` while still compared, so a
+secret-only change shows `secret_data_changed: true`; pass `redact_secrets: false`
+to see them. Limits per side: 2,048 files, 2 MiB per file, 16 MiB total, 2,000
+resources, 64 nesting levels and 200,000 YAML nodes including aliases. Symlinks in
+the inputs are rejected rather than skipped.
 
 ## Runs
 
@@ -513,9 +654,11 @@ implemented.
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
 (30m), `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model,
 permission, budget, and bash-timeout flags supply defaults for new sessions.
-`serve` and `mcp` also take `-enable-task`, `-enable-web`, and repeatable
-`-skill` with the same meaning as in one-shot mode; each flag overrides its
-`HARNESS_*` variable. Tools run on the server host, not the client.
+`serve` and `mcp` also take `-enable-task`, `-enable-web`, `-enable-lsp`,
+`-lsp-config`, `-cloud-policy` and repeatable `-skill` with the same meaning as in
+one-shot mode; each flag overrides its `HARNESS_*` variable. Protocol clients
+can't choose language-server commands or cloud grants. Tools and language servers
+run on the server host, not the client.
 
 SIGINT or SIGTERM stops admission, cancels runs, and flushes journals before
 exit, even if a stdio client keeps stdin open. A second signal exits with
@@ -631,6 +774,10 @@ fmt.Println("stop reason:", result.StopReason)
 
 `Prompt` blocks on its caller's goroutine. `Cancel` is safe from another
 goroutine; `Close` cancels, joins the run, and closes its journal.
+`Options.LSP` (`*tempest.LSPConfig`) and `Options.CloudRules`
+(`[]tempest.CloudRule`) replace the host's language-server and kube-context
+defaults for one session; nil keeps them. A session that enables language servers
+owns their processes, and `Close` stops and joins them.
 [The complete example](examples/embed/main.go) uses the faux provider by
 default, so it needs no API key. Pass `-model` to use a real provider:
 
@@ -649,9 +796,12 @@ The example is a separate module with a local `replace`; build it with
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](#runs). Zero means unlimited. |
 | `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
-| `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools (and enabled read-only web/attachment tools) are available; `-faux-script` still overrides the model provider. |
+| `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools, `manifest_diff`, enabled `lsp_*` tools (rename computes a plan only) and enabled read-only web/attachment tools are available; `-faux-script` still overrides the model provider. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
+| `-enable-lsp` | Register the `lsp_*` tools; language servers start on first use. See [Language servers](#language-servers). |
+| `-lsp-config <path>` | Operator language-server file; replaces the built-in server list. An empty path selects the built-ins. |
+| `-cloud-policy <path>` | Operator kube-context rules for `kubectl`/`helm` writes. See [Tiered permissions](#05--tiered-permissions-with-a-destructive-command-guard). |
 | `-skill <path>` | Additional skill directory or `.md` file; repeatable. See [Skills](#skills). |
 | `-permission-mode <mode>` | Tool gate mode: `default`, `plan`, `acceptEdits` or `bypass`. |
 | `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning on one-shot runs, `serve` and `mcp`. |
@@ -681,6 +831,8 @@ not read `.env` — export variables before running it.
 | `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
+| `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
+| `HARNESS_CLOUD_POLICY` | Kube-context rule file (settings `cloud_policy`). |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
 Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`

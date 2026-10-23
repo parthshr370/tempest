@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
 )
 
@@ -152,6 +153,9 @@ type Ceiling struct {
 	Tools       []string
 	Overrides   map[string]string // allow | deny | prompt; no credentials
 	Interactive map[string]string // launch-time session choices
+	// CloudRules is the launch-time cloud context policy. Absent in records
+	// written before M5, which means no grants (classification still applies).
+	CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 }
 type TaskEnvironment struct {
 	Ceiling  Ceiling

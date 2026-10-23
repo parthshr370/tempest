@@ -13,12 +13,14 @@ import (
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/subagent"
+	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
 )
@@ -84,17 +86,33 @@ type StackConfig struct {
 	AttachmentRegistry *document.AttachmentRegistry
 	AttachmentReader   *document.CacheRootBlobReader
 	Sanitize           func(string) string
+
+	// LSP is the resolved language-server configuration. tempest.Open
+	// creates, owns and closes one manager for an enabled configuration on
+	// the root session only; BuildAgentStack never starts one itself.
+	LSP *lsp.Config
+	// LSPManager serves the lsp_* tools and receives edit/write change
+	// notifications. An embedder calling BuildAgentStack directly may
+	// supply its own manager and owns its closure.
+	LSPManager *lsp.Manager
+	// MutationQueue serializes file mutations per real path. The LSP
+	// workspace must read through the same queue; nil selects the tools'
+	// process-wide default queue.
+	MutationQueue *toolio.FileMutationQueue
 }
 
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
 func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
+	lspConfig := cfg.LSP()
 	return StackConfig{
-		Plan:         cfg.Plan(),
-		EnableTask:   cfg.EnableTask(),
-		EnableWeb:    cfg.EnableWeb(),
-		WebSearchURL: cfg.WebSearchURL(),
-		SkillPaths:   cfg.SkillPaths(),
-		BashTimeout:  cfg.BashTimeout(),
+		Plan:             cfg.Plan(),
+		EnableTask:       cfg.EnableTask(),
+		EnableWeb:        cfg.EnableWeb(),
+		WebSearchURL:     cfg.WebSearchURL(),
+		SkillPaths:       cfg.SkillPaths(),
+		BashTimeout:      cfg.BashTimeout(),
+		LSP:              &lspConfig,
+		PermissionPolicy: permission.Policy{CloudRules: cfg.CloudRules()},
 	}
 }
 
@@ -165,6 +183,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		readResolver = resolver
 	}
 	options := tools.ToolsOptions{
+		MutationQueue:      cfg.MutationQueue,
 		EnableWeb:          cfg.EnableWeb,
 		BashTimeout:        cfg.BashTimeout,
 		SearchURL:          cfg.WebSearchURL,
@@ -179,6 +198,12 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		Child:              cfg.Child,
 		SessionDataDir:     sessionDataDir,
 	}
+	// Language servers are root-session-only: a child edits another
+	// worktree, whose changes must not reach the parent's documents.
+	if cfg.LSPManager != nil && !cfg.Child {
+		options.LSP = cfg.LSPManager
+		options.OnFileChanged = cfg.LSPManager.Changed
+	}
 	allTools := BuildToolRegistry(cwd, options)
 	var active []agent.AgentTool
 	model := cfg.Model
@@ -186,7 +211,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		if cfg.PlanModel.ID != "" {
 			model = cfg.PlanModel
 		}
-		active = SelectActive(allTools, []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment"}, cfg.ExcludeTools, "")
+		active = SelectActive(allTools, PlanToolNames(), cfg.ExcludeTools, "")
 	} else {
 		active = SelectActive(allTools, cfg.AllowedTools, cfg.ExcludeTools, "")
 	}
@@ -230,4 +255,14 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		BeforeToolCall:   beforeToolCall,
 	})
 	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd}, nil
+}
+
+// PlanToolNames is the read-only plan stack's selection. Tools that are not
+// registered (web access off, LSP disabled) are skipped by SelectActive.
+func PlanToolNames() []string {
+	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ManifestDiffTool)}
+	for _, name := range tools.LSPToolNames {
+		names = append(names, string(name))
+	}
+	return names
 }

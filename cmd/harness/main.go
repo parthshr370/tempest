@@ -376,6 +376,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
 	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
+	addIntelligenceFlags(fs, &values)
 	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
 	fs.StringVar(&values.OpenAIBaseURL.Value, "openai-base-url", "", "OpenAI-compatible base URL")
 	fs.StringVar(&values.AnthropicAPIKey.Value, "anthropic-api-key", "", "Anthropic API key")
@@ -443,6 +444,8 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
+		case "enable-lsp", "lsp-config", "cloud-policy":
+			markIntelligenceFlag(f.Name, &values)
 		case "anthropic-base-url":
 			values.AnthropicBaseURL.Set = true
 		case "openai-base-url":
@@ -692,7 +695,30 @@ func toolPolicy(stderr io.Writer, cfg *config.ResolvedConfig) permission.Policy 
 	allow, deny := cfg.PermissionAllowTools(), cfg.PermissionDenyTools()
 	warnUnknownToolNames(stderr, "-allow-tool", allow)
 	warnUnknownToolNames(stderr, "-deny-tool", deny)
-	return buildPermissionPolicy(allow, deny)
+	policy := buildPermissionPolicy(allow, deny)
+	policy.CloudRules = cfg.CloudRules()
+	return policy
+}
+
+// addIntelligenceFlags registers the language-server and cloud policy
+// flags every session-creating command accepts.
+func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
+	fs.BoolVar(&values.EnableLSP.Value, "enable-lsp", false, "enable the lsp_* tools; language servers are trusted executables started on first use")
+	fs.StringVar(&values.LSPConfig.Value, "lsp-config", "", `operator language-server JSON file {"servers":[...]} (empty selects the built-in gopls, yaml-language-server, terraform-ls and helm_ls definitions)`)
+	fs.StringVar(&values.CloudPolicy.Value, "cloud-policy", "", `operator kube-context policy JSON file {"rules":[{"tool":"kubectl","context":"dev","action":"allow_write"}]}`)
+}
+
+// markIntelligenceFlag records that an intelligence flag was set, so an
+// explicit -enable-lsp=false or empty file outranks the environment.
+func markIntelligenceFlag(name string, values *config.FlagValues) {
+	switch name {
+	case "enable-lsp":
+		values.EnableLSP.Set = true
+	case "lsp-config":
+		values.LSPConfig.Set = true
+	case "cloud-policy":
+		values.CloudPolicy.Set = true
+	}
 }
 
 // warnUnknownToolNames flags allow/deny entries that match no built-in tool.

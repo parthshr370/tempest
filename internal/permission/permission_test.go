@@ -39,23 +39,28 @@ func TestParseDecision(t *testing.T) {
 
 func TestClassifyToolTiers(t *testing.T) {
 	tests := map[tools.ToolName]Tier{
-		tools.ReadTool:       TierRead,
-		tools.BashTool:       TierExec,
-		tools.EditTool:       TierWrite,
-		tools.WriteTool:      TierWrite,
-		tools.GrepTool:       TierRead,
-		tools.FindTool:       TierRead,
-		tools.LsTool:         TierRead,
-		tools.TodoTool:       TierWrite,
-		tools.TaskTool:       TierExec,
-		tools.SkillTool:      TierRead,
-		tools.WebSearch:      TierRead,
-		tools.WebFetch:       TierRead,
-		tools.AttachmentTool: TierRead,
-		tools.JobsTool:       TierExec,
-		tools.WaitTool:       TierRead,
-		tools.CancelTool:     TierExec,
-		tools.LogsTool:       TierRead,
+		tools.ReadTool:           TierRead,
+		tools.BashTool:           TierExec,
+		tools.EditTool:           TierWrite,
+		tools.WriteTool:          TierWrite,
+		tools.GrepTool:           TierRead,
+		tools.FindTool:           TierRead,
+		tools.LsTool:             TierRead,
+		tools.TodoTool:           TierWrite,
+		tools.TaskTool:           TierExec,
+		tools.SkillTool:          TierRead,
+		tools.WebSearch:          TierRead,
+		tools.WebFetch:           TierRead,
+		tools.AttachmentTool:     TierRead,
+		tools.JobsTool:           TierExec,
+		tools.WaitTool:           TierRead,
+		tools.CancelTool:         TierExec,
+		tools.LogsTool:           TierRead,
+		tools.LSPDefinitionTool:  TierRead,
+		tools.LSPReferencesTool:  TierRead,
+		tools.LSPRenameTool:      TierRead,
+		tools.LSPDiagnosticsTool: TierRead,
+		tools.ManifestDiffTool:   TierRead,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))
@@ -117,12 +122,11 @@ func TestGateModeTierMatrix(t *testing.T) {
 }
 
 func TestGatePolicyOverrides(t *testing.T) {
-	t.Run("allow", func(t *testing.T) {
+	t.Run("allow cannot override plan", func(t *testing.T) {
 		policy := Policy{Overrides: map[string]Decision{"task": DecideAllow}}
 		out := Gate(context.Background(), ModePlan, "task", nil, &policy)
-		allow, reason := out.Allow, out.Reason
-		if !allow || reason != "" {
-			t.Fatalf("allow override = allow %v, reason %q", allow, reason)
+		if out.Allow || out.Source != SourceMode || out.Reason != "Plan mode: task is disabled because it can mutate the workspace" {
+			t.Fatalf("plan allow override = %+v", out)
 		}
 	})
 

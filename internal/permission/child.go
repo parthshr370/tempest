@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	"go.harness.dev/harness/internal/work"
 )
 
-// CaptureCeiling copies the policy and selected tools without retaining mutable maps.
+// CaptureCeiling copies the policy, selected tools and cloud rules without
+// retaining mutable maps or slices.
 func CaptureCeiling(mode Mode, tools []string, policy *Policy) work.Ceiling {
 	c := work.Ceiling{Mode: string(mode), Tools: append([]string(nil), tools...), Overrides: map[string]string{}, Interactive: map[string]string{}}
 	if policy == nil {
@@ -23,6 +25,7 @@ func CaptureCeiling(mode Mode, tools []string, policy *Policy) work.Ceiling {
 	for k, v := range policy.promptOverrides {
 		c.Interactive[k] = decisionName(v)
 	}
+	c.CloudRules = slices.Clone(policy.CloudRules)
 	return c
 }
 func decisionName(d Decision) string {
@@ -35,8 +38,11 @@ func decisionName(d Decision) string {
 		return "deny"
 	}
 }
+
+// ceilingPolicy restores a captured ceiling. Records without cloud rules
+// (written before M5) restore no grants; classification still applies.
 func ceilingPolicy(c work.Ceiling) *Policy {
-	p := &Policy{Overrides: map[string]Decision{}, promptOverrides: map[string]Decision{}}
+	p := &Policy{Overrides: map[string]Decision{}, promptOverrides: map[string]Decision{}, CloudRules: slices.Clone(c.CloudRules)}
 	for k, v := range c.Overrides {
 		d, err := ParseDecision(v)
 		if err != nil {
@@ -73,12 +79,14 @@ func evaluate(ctx context.Context, mode Mode, tool string, args json.RawMessage,
 type ChildScope struct{ JobID, SessionID, RunID, CallID, ToolCallID, Cwd string }
 
 // GateChild intersects launch and live policy, asking the root at most once.
+// Each layer is evaluated with its own cloud rules, so a deny in either layer
+// wins and a cloud grant passes only when both layers grant it.
 func GateChild(ctx context.Context, ceiling work.Ceiling, liveMode Mode, liveTools []string, policy *Policy, tool string, args json.RawMessage, scope ChildScope) Outcome {
 	denied := Outcome{Reason: "Tool " + tool + " denied by inherited policy", Source: SourceInherited}
 	if !slices.Contains(ceiling.Tools, tool) || !slices.Contains(liveTools, tool) {
 		return denied
 	}
-	if (liveMode == ModePlan || Mode(ceiling.Mode) == ModePlan) && ClassifyTool(tool) != TierRead && !(tool == "bash" && IsSafeCommand(commandFromArgs(args))) {
+	if (liveMode == ModePlan || Mode(ceiling.Mode) == ModePlan) && planDenial(tool, toolTier(tool, args), inspectShell(tool, args, scope.Cwd)) != "" {
 		return denied
 	}
 	launch, askLaunch := evaluate(ctx, Mode(ceiling.Mode), tool, args, ceilingPolicy(ceiling), scope.Cwd)
@@ -86,9 +94,14 @@ func GateChild(ctx context.Context, ceiling work.Ceiling, liveMode Mode, liveToo
 	if !launch.Allow || !live.Allow {
 		return denied
 	}
+	// One combined ask: the launch layer's per-call reason (for example an
+	// ungranted cloud write) must not be hidden behind a live-layer ask.
 	req := askLive
-	if req == nil {
+	switch {
+	case req == nil:
 		req = askLaunch
+	case askLaunch != nil && askLaunch.Reason != "" && askLaunch.Reason != req.Reason:
+		req.Reason = strings.TrimPrefix(req.Reason+"\n"+askLaunch.Reason, "\n")
 	}
 	if req == nil {
 		return Outcome{Allow: true, Source: SourceInherited}

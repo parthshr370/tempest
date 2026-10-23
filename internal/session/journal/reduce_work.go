@@ -262,7 +262,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 				}
 				r := &work.Recovery{Job: work.Job{ID: v.JobID, Kind: v.Kind, State: "starting", RunID: e.RunID, LogicalRunID: v.LogicalRunID, ToolCallID: v.ToolCallID, ChildSessionID: v.ChildSessionID, StartedAt: startedAt.UTC(), Cwd: v.Cwd, Isolation: v.Isolation, Cleanup: "none"}, Invocation: work.Invocation{RunID: e.RunID, CallID: v.CallID, ToolCallID: v.ToolCallID}, IdentityDigest: v.IdentityDigest, ChildJournal: v.ChildJournal}
 				if v.Environment != nil {
-					r.Environment = &work.TaskEnvironment{Model: v.Environment.Model, Provider: v.Environment.Provider, Ceiling: work.Ceiling{Mode: v.Environment.Ceiling.Mode, Tools: v.Environment.Ceiling.Tools, Overrides: v.Environment.Ceiling.Overrides, Interactive: v.Environment.Ceiling.Interactive}}
+					r.Environment = &work.TaskEnvironment{Model: v.Environment.Model, Provider: v.Environment.Provider, Ceiling: work.Ceiling{Mode: v.Environment.Ceiling.Mode, Tools: v.Environment.Ceiling.Tools, Overrides: v.Environment.Ceiling.Overrides, Interactive: v.Environment.Ceiling.Interactive, CloudRules: v.Environment.Ceiling.CloudRules}}
 				}
 				if v.Worktree != nil {
 					w := v.Worktree

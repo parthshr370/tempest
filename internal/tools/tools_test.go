@@ -29,8 +29,13 @@ import (
 func TestRegistry(t *testing.T) {
 	dir := t.TempDir()
 	all := AllTools(dir, ToolsOptions{})
-	if len(all) != 8 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] {
+	if len(all) != 9 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil {
 		t.Fatalf("registry = %v names=%v", all, AllToolNames)
+	}
+	for _, name := range LSPToolNames {
+		if _, registered := all[name]; registered || !AllToolNames[name] {
+			t.Fatalf("%s must be reserved but unregistered without a language-server manager", name)
+		}
 	}
 	if _, err := NewTool("unknown", dir, ToolsOptions{}); err == nil || err.Error() != "Unknown tool name: unknown" {
 		t.Fatalf("unknown err = %v", err)

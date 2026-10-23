@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.harness.dev/harness/internal/cloudcmd"
 )
 
 // Tier is a tool's approval tier. Unknown tools are [TierExec].
@@ -60,6 +62,10 @@ type Policy struct {
 	MCPDefaults map[string]Decision
 	// Prompter resolves prompt decisions; nil denies them in headless sessions.
 	Prompter Prompter
+	// CloudRules are normalized exact kube-context rules (see
+	// cloudcmd.NormalizeRules). Copies of Policy share the slice; it is
+	// replaced, never mutated in place.
+	CloudRules []cloudcmd.Rule
 	// promptOverrides stores session choices for ordinary asks. Guard asks
 	// never use or set these overrides.
 	promptOverrides map[string]Decision
@@ -116,6 +122,8 @@ const (
 	SourcePromptCancelled Source = "prompt_cancelled"
 	// SourceNoPrompter identifies an approval requirement with no prompt surface.
 	SourceNoPrompter Source = "no_prompter"
+	// SourceCloudPolicy identifies an exact kube-context deny or allow_write rule.
+	SourceCloudPolicy Source = "cloud_policy"
 	// SourceInherited identifies a child policy intersection.
 	SourceInherited Source = "inherited"
 )
@@ -132,7 +140,8 @@ type Outcome struct {
 // ClassifyTool returns the approval tier for toolName.
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
-	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs":
+	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
+		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff":
 		return TierRead
 	case "write", "edit", "todo_write":
 		return TierWrite

@@ -1,0 +1,62 @@
+{
+  "summary": {
+    "before": 0,
+    "after": 3,
+    "added": 3,
+    "removed": 0,
+    "changed": 0,
+    "unchanged": 0
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "a"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "a/x.json",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap a\n+++ after v1 ConfigMap a\n@@ -0,0 +1,4 @@\n+apiVersion: v1\n+kind: ConfigMap\n+metadata:\n+  name: a\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "z"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "b.yaml",
+        "document": 3
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap z\n+++ after v1 ConfigMap z\n@@ -0,0 +1,4 @@\n+apiVersion: v1\n+kind: ConfigMap\n+metadata:\n+  name: z\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "Service",
+        "namespace": "default",
+        "name": "api"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "b.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 Service default/api\n+++ after v1 Service default/api\n@@ -0,0 +1,8 @@\n+apiVersion: v1\n+kind: Service\n+metadata:\n+  name: api\n+  namespace: default\n+spec:\n+  ports:\n+    - port: 80\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

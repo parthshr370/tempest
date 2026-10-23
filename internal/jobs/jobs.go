@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -174,6 +175,7 @@ func cloneRecovery(recovery work.Recovery) work.Recovery {
 		value.Ceiling.Tools = append([]string(nil), value.Ceiling.Tools...)
 		value.Ceiling.Overrides = cloneStrings(value.Ceiling.Overrides)
 		value.Ceiling.Interactive = cloneStrings(value.Ceiling.Interactive)
+		value.Ceiling.CloudRules = slices.Clone(value.Ceiling.CloudRules)
 		recovery.Environment = &value
 	}
 	if recovery.Workspace != nil {

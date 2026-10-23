@@ -9,9 +9,11 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/jobs"
+	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
@@ -33,6 +35,14 @@ type Options struct {
 	// Stack optionally supplies resolved models, providers, discovery and tools.
 	// It applies to both new and resumed sessions; Open owns its live permission hook.
 	Stack *StackConfig
+	// LSP replaces the host's language-server configuration; nil keeps the
+	// resolved host default (Stack.LSP, or the environment and settings when
+	// Stack is nil). Open resolves it once; when Enabled is true the root
+	// session gets a manager that starts each server on its first query.
+	LSP *LSPConfig
+	// CloudRules replaces the host's exact kube-context rules; nil keeps the
+	// host default and a non-nil empty slice selects no scoped rules.
+	CloudRules []CloudRule
 }
 
 // NewSession configures a new conversation.
@@ -59,6 +69,15 @@ type ResumeSession struct {
 
 // ProviderConfig configures provider credentials and endpoint routing.
 type ProviderConfig = adapter.RoutingConfig
+
+// LSPConfig selects trusted language-server definitions for a session.
+type LSPConfig = lsp.Config
+
+// LSPServerConfig replaces one built-in language-server route.
+type LSPServerConfig = lsp.ServerConfig
+
+// CloudRule is one operator kube-context rule for kubectl and helm.
+type CloudRule = cloudcmd.Rule
 
 // StackConfig supplies an already resolved agent-stack recipe.
 type StackConfig = session.StackConfig

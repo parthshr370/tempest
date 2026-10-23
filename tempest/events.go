@@ -282,8 +282,11 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 		kind = "edit"
 	case "bash":
 		kind = "execute"
-	case "grep", "find", "ls":
+	case "grep", "find", "ls", "lsp_definition", "lsp_references":
 		kind = "search"
+	case "lsp_rename", "lsp_diagnostics", "manifest_diff":
+		// rename returns a plan (applied:false); applying it is a later edit.
+		kind = "read"
 	case "todo_write":
 		kind = "think"
 	default:
@@ -296,6 +299,20 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	if name == "bash" {
 		if cmd, ok := args["command"].(string); ok {
 			return "$ " + cmd, kind
+		}
+	}
+	if name == "manifest_diff" {
+		before, _ := args["before"].(string)
+		after, _ := args["after"].(string)
+		if before != "" && after != "" {
+			return name + ": " + before + " -> " + after, kind
+		}
+	}
+	if path, ok := args["path"].(string); ok && path != "" && strings.HasPrefix(name, "lsp_") {
+		line, hasLine := args["line"].(float64)
+		column, hasColumn := args["column"].(float64)
+		if hasLine && hasColumn {
+			return fmt.Sprintf("%s: %s:%d:%d", name, path, int(line), int(column)), kind
 		}
 	}
 	for _, key := range []string{"path", "pattern", "query"} {

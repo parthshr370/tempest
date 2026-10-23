@@ -16,7 +16,7 @@ func TestSelectActive(t *testing.T) {
 	dir := t.TempDir()
 	all := tools.AllTools(dir, tools.ToolsOptions{})
 	active := SelectActive(all, nil, nil, "")
-	if len(active) != 8 {
+	if len(active) != 9 {
 		t.Fatalf("all active = %d", len(active))
 	}
 	readonly := SelectActive(all, []string{"read", "grep", "find", "ls"}, nil, "")
@@ -24,7 +24,7 @@ func TestSelectActive(t *testing.T) {
 		t.Fatalf("readonly = %s", names(readonly))
 	}
 	excluded := SelectActive(all, nil, []string{"bash", "write"}, "")
-	if len(excluded) != 6 {
+	if len(excluded) != 7 {
 		t.Fatalf("excluded = %d", len(excluded))
 	}
 }

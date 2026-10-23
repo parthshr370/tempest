@@ -67,6 +67,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.DurationVar(&shutdownTimeout, "shutdown-timeout", 10*time.Second, "wait for runs during shutdown")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session journal directory")
 	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
+	addIntelligenceFlags(fs, &values)
 	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
 	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
 	fs.StringVar(&values.Model.Value, "model", "", "default model")
@@ -94,6 +95,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
+		case "enable-lsp", "lsp-config", "cloud-policy":
+			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true
 		case "permission-mode":

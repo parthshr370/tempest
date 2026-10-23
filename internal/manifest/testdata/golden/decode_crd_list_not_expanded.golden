@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "before": 0,
+    "after": 1,
+    "added": 1,
+    "removed": 0,
+    "changed": 0,
+    "unchanged": 0
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "example.com/v1",
+        "kind": "WidgetList",
+        "namespace": "",
+        "name": "widgets"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "crd.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before example.com/v1 WidgetList widgets\n+++ after example.com/v1 WidgetList widgets\n@@ -0,0 +1,9 @@\n+apiVersion: example.com/v1\n+items:\n+  - apiVersion: example.com/v1\n+    kind: Widget\n+    metadata:\n+      name: hidden\n+kind: WidgetList\n+metadata:\n+  name: widgets\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

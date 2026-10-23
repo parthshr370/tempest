@@ -1,5 +1,6 @@
-// Package permission provides tool approval modes and a destructive-command
-// guard. The guard recognizes common shell operations, not arbitrary scripts.
+// Package permission provides tool approval modes, a destructive-command
+// guard and cloud intent gating (via cloudcmd). Both recognize common shell
+// operations, not arbitrary scripts.
 package permission
 
 import (
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"go.harness.dev/harness/internal/cloudcmd"
 )
 
 // Mode is a tool-gating mode: plan (block mutations, collect plan),
@@ -201,6 +204,12 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 }
 
 // GateInDirectory evaluates shell destinations relative to the tool's workspace.
+//
+// Precedence: cancelled context and exact configured deny; plan mode's hard
+// read-only restriction (before every grant, allow and approval); cloud deny
+// rules (also in bypass); bypass; per-call approval for the destructive guard
+// or destructive/opaque command intent; cloud writes (exact allow_write grant
+// or per-call approval); then the ordinary session/configured/mode policy.
 func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, cwd string, toolCallID ...string) Outcome {
 	if ctx.Err() != nil {
 		return Outcome{Reason: "Operation aborted", Source: SourcePromptCancelled}
@@ -212,45 +221,53 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 	decision, overridden := policy.Overrides[toolName]
 	sessionDecision, sessionOverride := policy.promptOverrides[toolName]
 	mcpDefault, hasMCPDefault := policy.MCPDefaults[toolName]
+	cloudRules := policy.CloudRules
 	policyMu.Unlock()
 	deny := "Tool " + toolName + " denied by policy"
 	if overridden && decision == DecideDeny {
 		return Outcome{Reason: deny, Source: SourceOverride}
 	}
 	isMCP := strings.HasPrefix(toolName, "mcp__")
-	if isMCP && mode == ModePlan {
-		return Outcome{Reason: "Plan mode: MCP tools are disabled", Source: SourceMode}
+	tier := toolTier(toolName, args)
+	shell := inspectShell(toolName, args, cwd)
+	if mode == ModePlan {
+		if reason := planDenial(toolName, tier, shell); reason != "" {
+			return Outcome{Reason: reason, Source: SourceMode}
+		}
+	}
+	verdict := cloudcmd.Evaluate(shell.analysis, cloudRules)
+	if verdict.Denied {
+		return Outcome{Reason: verdict.Reason, Source: SourceCloudPolicy}
 	}
 	if mode == ModeBypass {
 		return Outcome{Allow: true, Source: SourceBypass}
 	}
-	tier := ClassifyTool(toolName)
-	if toolName == "jobs" {
-		var request struct {
-			Action string `json:"action"`
-		}
-		if json.Unmarshal(args, &request) == nil && (request.Action == "" || request.Action == "list") {
-			tier = TierRead
-		}
-	}
-	command := ""
-	if toolName == "bash" {
-		command = commandFromArgs(args)
-	}
-	guardReason := ""
-	if toolName == "bash" && isDestructiveCommand(command, cwd) {
-		guardReason = "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): " + command
-	}
-	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Reason: guardReason, Cwd: cwd}
+	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Cwd: cwd}
 	if len(toolCallID) != 0 {
 		req.ToolCallID = toolCallID[0]
 	}
-	// A guard approval is per-call, even when the answer says "always".
-	if guardReason != "" {
+	// Guard and cloud asks are per-call: a nonempty Reason is never
+	// remembered, and no configured or session allow can skip them.
+	if reason, guarded := shell.approvalReason(verdict); reason != "" {
+		req.Reason = reason
 		if policy.Prompter == nil {
-			return Outcome{Reason: guardReason, Source: SourceGuard}
+			source := SourceNoPrompter
+			if guarded {
+				source = SourceGuard
+			}
+			return Outcome{Reason: reason, Source: source}
 		}
 		return resolvePrompt(ctx, policy, req)
+	}
+	if verdict.Granted {
+		if overridden && decision == DecidePrompt {
+			req.Reason = verdict.Reason + "; bash also requires approval by policy"
+			return resolvePrompt(ctx, policy, req)
+		}
+		if sessionOverride && sessionDecision == DecideDeny {
+			return Outcome{Source: SourceOverride, Reason: "Tool " + toolName + " was not approved"}
+		}
+		return Outcome{Allow: true, Source: SourceCloudPolicy}
 	}
 	if sessionOverride {
 		return Outcome{Allow: sessionDecision == DecideAllow, Source: SourceOverride}
@@ -263,16 +280,6 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 			return resolvePrompt(ctx, policy, req)
 		}
 	}
-	if mode == ModePlan && tier != TierRead {
-		if toolName == "bash" && IsSafeCommand(command) {
-			return Outcome{Allow: true, Source: SourceMode}
-		}
-		reason := "Plan mode: " + toolName + " is disabled because it can mutate the workspace"
-		if toolName == "bash" {
-			reason = "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: " + command
-		}
-		return Outcome{Reason: reason, Source: SourceMode}
-	}
 	if isMCP {
 		if hasMCPDefault && mcpDefault == DecideAllow {
 			return Outcome{Allow: true, Source: SourceMode}
@@ -283,6 +290,100 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 		return resolvePrompt(ctx, policy, req)
 	}
 	return Outcome{Allow: true, Source: SourceMode}
+}
+
+// toolTier classifies a call; jobs listing is read-only.
+func toolTier(toolName string, args json.RawMessage) Tier {
+	tier := ClassifyTool(toolName)
+	if toolName == "jobs" {
+		var request struct {
+			Action string `json:"action"`
+		}
+		if json.Unmarshal(args, &request) == nil && (request.Action == "" || request.Action == "list") {
+			tier = TierRead
+		}
+	}
+	return tier
+}
+
+const guardReasonPrefix = "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): "
+
+// shellFacts is the one inspection of a bash command shared by every gate
+// step: the cwd-aware destructive guard and the cloud intent analysis.
+type shellFacts struct {
+	bash        bool
+	command     string
+	guardReason string
+	analysis    cloudcmd.Analysis
+}
+
+func inspectShell(toolName string, args json.RawMessage, cwd string) shellFacts {
+	if toolName != "bash" {
+		return shellFacts{analysis: cloudcmd.Analysis{Effect: cloudcmd.EffectNone}}
+	}
+	return inspectCommand(commandFromArgs(args), cwd)
+}
+
+func inspectCommand(command, cwd string) shellFacts {
+	facts := shellFacts{bash: true, command: command, analysis: cloudcmd.Analyze(command, cwd)}
+	if isDestructiveCommand(command, cwd) {
+		facts.guardReason = guardReasonPrefix + command
+	}
+	return facts
+}
+
+// planDenial returns why plan mode refuses the call, or "" when the call is
+// read-only. Bash must be fully read-only: plain syntax, every invocation a
+// proven cloud read or allowlisted read, safe redirects only, no guard
+// finding.
+func planDenial(toolName string, tier Tier, shell shellFacts) string {
+	if strings.HasPrefix(toolName, "mcp__") {
+		return "Plan mode: MCP tools are disabled"
+	}
+	if !shell.bash {
+		if tier == TierRead {
+			return ""
+		}
+		return "Plan mode: " + toolName + " is disabled because it can mutate the workspace"
+	}
+	if shell.planReadable() {
+		return ""
+	}
+	switch shell.analysis.Effect {
+	case cloudcmd.EffectWrite, cloudcmd.EffectDestructive, cloudcmd.EffectOpaque:
+		return "Plan mode: command blocked (" + shell.analysis.Reason + "). Plan mode cannot run mutating or unproven commands, even with approval or allow rules. Command: " + shell.command
+	}
+	if !shell.analysis.Proven && shell.analysis.Reason != "" {
+		return "Plan mode: command blocked (" + shell.analysis.Reason + "). Plan mode runs only plain read-only syntax. Command: " + shell.command
+	}
+	return "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: " + shell.command
+}
+
+// planReadable never accepts an empty command: missing or malformed bash
+// arguments are not proof of a read. Syntax the cloud analysis narrowed to
+// none (substitutions, here-documents, wrappers) is still not proven.
+func (s shellFacts) planReadable() bool {
+	effect := s.analysis.Effect
+	return strings.TrimSpace(s.command) != "" && s.guardReason == "" && s.analysis.Proven && (effect == cloudcmd.EffectNone || effect == cloudcmd.EffectRead) && hasReadOnlyShellSyntax(s.command)
+}
+
+// approvalReason returns the combined per-call ask reason, and whether it
+// includes a guard-class finding (filesystem guard or destructive/opaque
+// intent). An ungranted cloud write needs approval too.
+func (s shellFacts) approvalReason(verdict cloudcmd.Verdict) (string, bool) {
+	var reasons []string
+	guarded := s.guardReason != ""
+	if guarded {
+		reasons = append(reasons, s.guardReason)
+	}
+	switch effect := s.analysis.Effect; {
+	case effect == cloudcmd.EffectDestructive || effect == cloudcmd.EffectOpaque:
+		guarded = true
+		reasons = append(reasons, "Command intent is "+string(effect)+" and requires per-call approval: "+s.analysis.Reason)
+	case effect == cloudcmd.EffectWrite && !verdict.Granted:
+		reasons = append(reasons, "Cloud write requires per-call approval (no exact allow_write rule covers it): "+s.analysis.Reason)
+	}
+	return strings.Join(reasons, "\n"), guarded
 }
 
 func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outcome {
@@ -317,21 +418,13 @@ func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outco
 	return out
 }
 
-// IsSafeCommand reports whether command is non-destructive and matches
-// a safe (read-only / allowlisted) pattern.
+// IsSafeCommand reports whether plan mode may run command (relative paths use
+// the process directory): plain proven syntax, no destructive-guard finding,
+// every simple command is a proven cloud read or an allowlisted read-only
+// program, redirects only target safe sinks, and cloud analysis finds no
+// write, destructive or opaque intent.
 func IsSafeCommand(command string) bool {
-	if IsDestructiveCommand(command) {
-		return false
-	}
-	if !hasReadOnlyShellSyntax(command) {
-		return false
-	}
-	for _, pattern := range safePatterns {
-		if pattern.MatchString(command) {
-			return true
-		}
-	}
-	return false
+	return inspectCommand(command, "").planReadable()
 }
 
 // CleanStepText strips markdown formatting (bold/italic/code), leading

@@ -284,7 +284,7 @@ func TestOpenConfigPlanWithFauxScriptIsReadOnly(t *testing.T) {
 	defer s.Close(context.Background())
 	for _, tool := range s.core.agent.State().Tools {
 		switch tool.Name {
-		case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment":
+		case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "manifest_diff":
 		default:
 			t.Fatalf("config plan exposed %q", tool.Name)
 		}

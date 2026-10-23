@@ -1,0 +1,46 @@
+{
+  "summary": {
+    "before": 1,
+    "after": 1,
+    "added": 1,
+    "removed": 1,
+    "changed": 0,
+    "unchanged": 0
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "apps/v1",
+        "kind": "Deployment",
+        "namespace": "",
+        "name": "api"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "d.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before apps/v1 Deployment api\n+++ after apps/v1 Deployment api\n@@ -0,0 +1,4 @@\n+apiVersion: apps/v1\n+kind: Deployment\n+metadata:\n+  name: api\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "apps/v1beta1",
+        "kind": "Deployment",
+        "namespace": "",
+        "name": "api"
+      },
+      "change": "removed",
+      "before_source": {
+        "path": "d.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before apps/v1beta1 Deployment api\n+++ after apps/v1beta1 Deployment api\n@@ -1,4 +0,0 @@\n-apiVersion: apps/v1beta1\n-kind: Deployment\n-metadata:\n-  name: api\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

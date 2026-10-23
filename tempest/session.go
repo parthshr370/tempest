@@ -13,11 +13,13 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/cloudcmd"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/jobs"
+	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
@@ -82,27 +84,30 @@ type approvalResult struct {
 	err    error
 }
 type sessionCore struct {
-	mu               sync.Mutex
-	id               string
-	agent            *agent.Agent
-	store            *journal.Store
-	hub              *hub.Hub
-	model            types.Model
-	budget           Budget
-	mode             PermissionMode
-	prompter         Prompter
-	pending          map[string]*approval
-	active           *Run
-	closed           bool
-	closeOnce        sync.Once
-	closeErr         error
-	detachJournal    func()
-	detachHub        func()
-	lastText         string
-	runID            string
-	delivery         *session.MediaDelivery
-	mcp              *mcpclient.Manager
-	mcpEnabled       bool
+	mu            sync.Mutex
+	id            string
+	agent         *agent.Agent
+	store         *journal.Store
+	hub           *hub.Hub
+	model         types.Model
+	budget        Budget
+	mode          PermissionMode
+	prompter      Prompter
+	pending       map[string]*approval
+	active        *Run
+	closed        bool
+	closeOnce     sync.Once
+	closeErr      error
+	detachJournal func()
+	detachHub     func()
+	lastText      string
+	runID         string
+	delivery      *session.MediaDelivery
+	mcp           *mcpclient.Manager
+	mcpEnabled    bool
+	// lsp is the root session's language-server manager, owned and closed
+	// here; nil when language servers are disabled or supplied by the host.
+	lsp              *lsp.Manager
 	permissionPolicy *permission.Policy
 	baseTools        []Tool
 	excludeTools     []string
@@ -372,6 +377,14 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		overrides[k] = v
 	}
 	cfg.PermissionPolicy.Overrides = overrides
+	if o.CloudRules != nil {
+		cfg.PermissionPolicy.CloudRules = o.CloudRules
+	}
+	// Normalizing copies the rules, so later caller edits cannot reach the gate.
+	cfg.PermissionPolicy.CloudRules, err = cloudcmd.NormalizeRules(cfg.PermissionPolicy.CloudRules)
+	if err != nil {
+		return nil, err
+	}
 	if o.Prompter != nil {
 		cfg.PermissionPolicy.Prompter = gatePrompter{s}
 	}
@@ -395,6 +408,18 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 	}()
 	c.installMCPDefaults()
+	if err = c.openLSP(&cfg, o.LSP, cwd, logger); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil && c.lsp != nil {
+			// Open failed after the manager existed: stop it with its own
+			// bounded context, not the caller's, and report both failures.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			err = errors.Join(err, c.lsp.Close(closeCtx))
+		}
+	}()
 	cfg.ConfiguredTools = append(append([]Tool(nil), cfg.ConfiguredTools...), c.mcp.Tools()...)
 	cfg.PermissionPolicyRef = c.permissionPolicy
 	c.excludeTools = append([]string(nil), cfg.ExcludeTools...)
@@ -646,8 +671,43 @@ func (c *sessionCore) finishClose() {
 		c.hub.Close()
 		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		// Language servers stop and are joined before their workspace and
+		// the journal are released.
+		if c.lsp != nil {
+			c.closeErr = errors.Join(c.closeErr, c.lsp.Close(closeCtx))
+		}
 		c.closeErr = errors.Join(c.closeErr, c.mcp.Close(closeCtx), c.store.Close())
 	})
+}
+
+// openLSP creates the root session's language-server manager when the
+// resolved configuration enables it. New only validates: no server starts
+// until a tool queries it. A host-supplied manager is used as is and stays
+// the host's to close.
+func (c *sessionCore) openLSP(cfg *StackConfig, override *LSPConfig, cwd string, logger *slog.Logger) error {
+	selected := cfg.LSP
+	if override != nil {
+		selected = override
+	}
+	if cfg.LSPManager != nil || selected == nil || !selected.Enabled {
+		return nil
+	}
+	normalized, err := lsp.Normalize(*selected)
+	if err != nil {
+		return err
+	}
+	cfg.LSP = &normalized
+	workspace, err := tools.NewLSPWorkspace(cwd, cfg.MutationQueue)
+	if err != nil {
+		return err
+	}
+	manager, err := lsp.New(workspace, normalized, logger)
+	if err != nil {
+		return errors.Join(err, workspace.Close())
+	}
+	c.lsp = manager
+	cfg.LSPManager = manager
+	return nil
 }
 
 type gatePrompter struct{ session *Session }

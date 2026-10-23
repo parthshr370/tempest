@@ -60,3 +60,25 @@ func TestAttachmentSchemaParity(t *testing.T) {
 	want := `{"type":"object","properties":{"op":{"type":"string","enum":["list","read","grep","stats"]},"id":{"type":"string","description":"attachment id or filename (read/grep/stats)"},"pattern":{"type":"string","description":"regex to match (grep)"},"offset":{"type":"number","description":"1-indexed start line (read)"},"limit":{"type":"number","description":"max lines (read)"},"group_by":{"type":"string","description":"column name or 1-indexed number to group rows by (stats)"},"value":{"type":"string","description":"numeric column name or 1-indexed number to sum/min/max/mean (stats)"},"top":{"type":"number","description":"max groups to report, default 20 (stats)"}},"required":["op"]}`
 	assertSchemaParity(t, "attachment", tool.Parameters, want)
 }
+
+// intelligenceToolSchemas are the exact schemas frozen in
+// docs/design/07-intelligence.md sections 5.1 and 7.1.
+var intelligenceToolSchemas = map[ToolName]string{
+	LSPDefinitionTool:  `{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"column":{"type":"integer","minimum":1},"server":{"type":"string","enum":["go","yaml","terraform","helm"]},"max_results":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["path","line","column"]}`,
+	LSPReferencesTool:  `{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"column":{"type":"integer","minimum":1},"server":{"type":"string","enum":["go","yaml","terraform","helm"]},"include_declaration":{"type":"boolean","default":false},"max_results":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["path","line","column"]}`,
+	LSPRenameTool:      `{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1},"line":{"type":"integer","minimum":1},"column":{"type":"integer","minimum":1},"server":{"type":"string","enum":["go","yaml","terraform","helm"]},"new_name":{"type":"string","minLength":1,"maxLength":256}},"required":["path","line","column","new_name"]}`,
+	LSPDiagnosticsTool: `{"type":"object","additionalProperties":false,"properties":{"path":{"type":"string","minLength":1},"server":{"type":"string","enum":["go","yaml","terraform","helm"]},"severity":{"type":"string","enum":["all","error","warning","information","hint"],"default":"all"},"wait_ms":{"type":"integer","minimum":0,"maximum":10000,"default":2000},"max_results":{"type":"integer","minimum":1,"maximum":200,"default":100}},"required":["path"]}`,
+	ManifestDiffTool:   `{"type":"object","additionalProperties":false,"properties":{"before":{"type":"string","minLength":1},"after":{"type":"string","minLength":1},"context_lines":{"type":"integer","minimum":0,"maximum":10,"default":3},"max_resources":{"type":"integer","minimum":1,"maximum":200,"default":50},"redact_secrets":{"type":"boolean","default":true}},"required":["before","after"]}`,
+}
+
+func TestIntelligenceSchemasMatchDesign(t *testing.T) {
+	cwd := t.TempDir()
+	all := AllTools(cwd, ToolsOptions{LSP: newInertLSPManager(t, cwd)})
+	for name, want := range intelligenceToolSchemas {
+		tool, ok := all[name]
+		if !ok {
+			t.Fatalf("tool %s not built", name)
+		}
+		assertSchemaParity(t, string(name), tool.Parameters, want)
+	}
+}

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/cloudcmd"
+	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
 )
 
@@ -93,6 +95,9 @@ type FlagValues struct {
 	PermissionAllowTools StringsInput
 	PermissionDenyTools  StringsInput
 	MCPConfig            StringInput
+	EnableLSP            BoolInput
+	LSPConfig            StringInput
+	CloudPolicy          StringInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -154,6 +159,8 @@ type ResolvedConfig struct {
 	permissionDenyTools   []string
 	retry                 RetrySettings
 	mcpServers            []mcpconfig.Server
+	lsp                   lsp.Config
+	cloudRules            []cloudcmd.Rule
 }
 
 // Model returns the default model specification.
@@ -282,6 +289,9 @@ type fileSettings struct {
 	RetryJitterMax        *float64           `json:"retry_jitter_max"`
 	MCPConfig             *string            `json:"mcp_config"`
 	MCPServers            []mcpconfig.Server `json:"mcp_servers"`
+	EnableLSP             *bool              `json:"enable_lsp"`
+	LSPConfig             *string            `json:"lsp_config"`
+	CloudPolicy           *string            `json:"cloud_policy"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -328,6 +338,14 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	mcpServers, err := resolveMCP(c.Flags.MCPConfig, lookup("HARNESS_MCP_CONFIG"), settings)
 	if err != nil {
 		return nil, &Error{Field: "mcp_config", Err: err}
+	}
+	lspConfig, err := resolveLSP(c.Flags.EnableLSP, lookup("HARNESS_ENABLE_LSP"), c.Flags.LSPConfig, lookup("HARNESS_LSP_CONFIG"), settings)
+	if err != nil {
+		return nil, err
+	}
+	cloudRules, err := resolveCloudRules(c.Flags.CloudPolicy, lookup("HARNESS_CLOUD_POLICY"), settings)
+	if err != nil {
+		return nil, err
 	}
 	if c.Flags.AnthropicAPIKey.Set && c.Flags.AnthropicAuthToken.Set {
 		return nil, &Error{Field: "credentials", Err: errors.New("-anthropic-api-key and -anthropic-auth-token cannot be used together")}
@@ -456,6 +474,8 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		permissionAllowTools: permissionAllowTools,
 		permissionDenyTools:  permissionDenyTools,
 		mcpServers:           mcpServers,
+		lsp:                  lspConfig,
+		cloudRules:           cloudRules,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,
