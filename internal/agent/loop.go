@@ -11,8 +11,10 @@
 // calls and no steering or follow-up message is queued. It also ends on
 // Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
 // turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime]), or a
-// failure ([StopError]). A run that starts emits agent_start first and exactly
-// one agent_end last; agent_end carries the [RunResult].
+// failure ([StopError]). A run with an output schema whose final answer still
+// fails it after one correction turn ends with [StopOutputInvalid]. A run that
+// starts emits agent_start first and exactly one agent_end last; agent_end
+// carries the [RunResult].
 //
 // # Goroutine ownership
 //
@@ -50,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,6 +176,8 @@ type loopRun struct {
 	root         bool
 	initialTurns int
 	enforceFirst bool
+	// outputCorrections counts correction turns spent on the output schema.
+	outputCorrections int
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -528,7 +533,9 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				break
 			}
 			if config.Work == nil {
-				run.result.StopReason = StopCompleted
+				if pendingMessages = run.complete(); len(pendingMessages) > 0 {
+					break
+				}
 				return nil
 			}
 			stop, stopErr := run.boundaryStop(ctx)
@@ -553,7 +560,9 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				return err
 			}
 			if !again {
-				run.result.StopReason = StopCompleted
+				if pendingMessages = run.complete(); len(pendingMessages) > 0 {
+					break
+				}
 				return nil
 			}
 			pendingMessages, err = run.take(ctx, work.Steer)
@@ -582,6 +591,56 @@ func applyTurnUpdate(config *AgentLoopConfig, current *AgentContext, update *Age
 	} else if update.ThinkingLevel != "" {
 		config.Reasoning = string(update.ThinkingLevel)
 	}
+}
+
+// maxOutputCorrections is how many correction turns a run gets when its final
+// answer fails the output schema. One turn with the validator's error fixes
+// formatting slips; a model that fails twice will not converge.
+const maxOutputCorrections = 1
+
+// complete ends a run whose model has nothing left to do. Without an output
+// schema that is StopCompleted. With one, the final answer is validated: a
+// valid answer lands in RunResult.Output; an invalid one gets a correction
+// prompt, returned for the next turn, until the correction is spent, then the
+// run ends with StopOutputInvalid.
+func (run *loopRun) complete() []work.QueuedMessage {
+	run.result.StopReason = StopCompleted
+	schema := run.config.OutputSchema
+	if schema == nil {
+		return nil
+	}
+	value, err := schema.Validate(finalAnswerText(run.messages))
+	if err == nil {
+		run.result.Output = value
+		return nil
+	}
+	if run.outputCorrections < maxOutputCorrections {
+		run.outputCorrections++
+		run.result.StopReason = ""
+		text := fmt.Sprintf("Your final answer does not satisfy the required output schema: %v\n\nReply again with only the corrected answer. %s", err, schema.Instruction())
+		return []work.QueuedMessage{{Message: types.UserMessage{Content: types.BlockContent(types.NewText(text)), Timestamp: time.Now().UnixMilli()}}}
+	}
+	run.result.StopReason = StopOutputInvalid
+	run.result.Err = fmt.Errorf("final answer does not satisfy the output schema: %w", err)
+	return nil
+}
+
+// finalAnswerText is the text of the run's last assistant message.
+func finalAnswerText(messages []types.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		message, ok := messages[i].(types.AssistantMessage)
+		if !ok {
+			continue
+		}
+		var text strings.Builder
+		for _, block := range message.Content {
+			if block.Type == types.BlockText {
+				text.WriteString(block.Text)
+			}
+		}
+		return text.String()
+	}
+	return ""
 }
 
 // hasToolCalls reports whether the assistant message requests any tool call.

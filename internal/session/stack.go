@@ -35,12 +35,18 @@ type PermissionModeFunc func() permission.Mode
 // and prompt additions are supplied by the caller without coupling the core to
 // a host integration.
 type StackConfig struct {
-	Cwd              string
-	Model            ptypes.Model
-	PlanModel        ptypes.Model
-	SmolModel        ptypes.Model
-	StreamFn         agent.StreamFn
-	SmolStreamFn     agent.StreamFn
+	Cwd          string
+	Model        ptypes.Model
+	PlanModel    ptypes.Model
+	SmolModel    ptypes.Model
+	StreamFn     agent.StreamFn
+	SmolStreamFn agent.StreamFn
+	// Reasoning is the default role's reasoning effort ("", "off", minimal,
+	// low, medium, high). PlanReasoning and SmolReasoning override it for
+	// the plan stack and smol (explore) children; empty inherits Reasoning.
+	Reasoning        string
+	PlanReasoning    string
+	SmolReasoning    string
 	ProductName      string
 	CustomPrompt     string
 	PromptGuidelines []string
@@ -113,6 +119,9 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 	lspConfig := cfg.LSP()
 	return StackConfig{
 		Plan:             cfg.Plan(),
+		Reasoning:        cfg.Reasoning(),
+		PlanReasoning:    cfg.PlanReasoning(),
+		SmolReasoning:    cfg.SmolReasoning(),
 		EnableTask:       cfg.EnableTask(),
 		EnableWeb:        cfg.EnableWeb(),
 		WebSearchURL:     cfg.WebSearchURL(),
@@ -214,13 +223,20 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		options.LSP = cfg.LSPManager
 		options.OnFileChanged = cfg.LSPManager.Changed
 	}
-	allTools := BuildToolRegistry(cwd, options)
-	var active []agent.AgentTool
 	model := cfg.Model
+	reasoning := cfg.Reasoning
 	if cfg.Plan {
 		if cfg.PlanModel.ID != "" {
 			model = cfg.PlanModel
 		}
+		if cfg.PlanReasoning != "" {
+			reasoning = cfg.PlanReasoning
+		}
+	}
+	options.ImageInput = model.SupportsVision()
+	allTools := BuildToolRegistry(cwd, options)
+	var active []agent.AgentTool
+	if cfg.Plan {
 		active = SelectActive(allTools, PlanToolNames(), cfg.ExcludeTools, "")
 	} else {
 		active = SelectActive(allTools, cfg.AllowedTools, cfg.ExcludeTools, "")
@@ -256,7 +272,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		defer func() { runner.configureJournal(cfg.Journal, cfg.Loaded, agt) }()
 	}
 	agt = agent.NewAgent(agent.AgentOptions{
-		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, Tools: active, Messages: cfg.InitialMessages},
+		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, ThinkingLevel: thinkingLevel(reasoning), Tools: active, Messages: cfg.InitialMessages},
 		StreamFn:         cfg.StreamFn,
 		PrepareNextTurnE: compact,
 		QueueSource:      cfg.QueueSource,
@@ -267,10 +283,19 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd}, nil
 }
 
+// thinkingLevel maps a configured reasoning effort to the agent's level;
+// unset and "off" both mean no reasoning field.
+func thinkingLevel(reasoning string) agent.ThinkingLevel {
+	if reasoning == "" {
+		return agent.ThinkingOff
+	}
+	return agent.ThinkingLevel(reasoning)
+}
+
 // PlanToolNames is the read-only plan stack's selection. Tools that are not
 // registered (web access off, LSP disabled) are skipped by SelectActive.
 func PlanToolNames() []string {
-	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ManifestDiffTool)}
+	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ViewImageTool), string(tools.ManifestDiffTool)}
 	for _, name := range tools.LSPToolNames {
 		names = append(names, string(name))
 	}

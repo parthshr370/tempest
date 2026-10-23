@@ -71,6 +71,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
 	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
 	fs.StringVar(&values.Model.Value, "model", "", "default model")
+	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
 	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "default permission mode")
 	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default shell command timeout")
 	fs.StringVar(&values.FauxScript.Value, "faux-script", "", "scripted provider responses")
@@ -99,6 +100,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true
+		case "reasoning":
+			values.Reasoning.Set = true
 		case "permission-mode":
 			values.PermissionMode.Set = true
 		case "bash-timeout":

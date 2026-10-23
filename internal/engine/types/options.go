@@ -1,5 +1,7 @@
 package types
 
+import "encoding/json"
+
 // ProviderResponse is the response metadata passed to StreamOptions.OnResponse.
 type ProviderResponse struct {
 	Status  int               `json:"status"`
@@ -39,6 +41,10 @@ type StreamOptions struct {
 	MaxRetryDelayMs           int                                 `json:"maxRetryDelayMs,omitempty"`
 	Metadata                  map[string]any                      `json:"metadata,omitempty"`
 	Env                       map[string]string                   `json:"env,omitempty"`
+	// OutputSchema is a compact JSON Schema the final text answer must
+	// satisfy. Providers with native structured output constrain the text
+	// response to it; tool calls stay unconstrained. Nil asks for free text.
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 }
 
 // SimpleStreamOptions is the higher-level option bag whose reasoning level is

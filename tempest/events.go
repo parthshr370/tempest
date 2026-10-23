@@ -274,14 +274,18 @@ func rawInput(v any) json.RawMessage {
 	}
 	return raw
 }
+
+// maxStdinTitleBytes keeps a write_stdin title to one short line.
+const maxStdinTitleBytes = 60
+
 func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	kind := ToolKind("other")
 	switch name {
-	case "read":
+	case "read", "view_image":
 		kind = "read"
-	case "write", "edit", "hashline":
+	case "write", "edit", "hashline", "integrate":
 		kind = "edit"
-	case "bash":
+	case "bash", "write_stdin":
 		kind = "execute"
 	case "grep", "find", "ls", "lsp_definition", "lsp_references":
 		kind = "search"
@@ -302,6 +306,32 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 			return "$ " + cmd, kind
 		}
 	}
+	if name == "write_stdin" {
+		target, _ := args["name"].(string)
+		if target == "" {
+			target, _ = args["job_id"].(string)
+		}
+		text, _ := args["text"].(string)
+		if len(text) > maxStdinTitleBytes {
+			text = text[:maxStdinTitleBytes] + "…"
+		}
+		title := fmt.Sprintf("%s %s %q", name, target, text)
+		if closing, _ := args["close_stdin"].(bool); closing {
+			title += " + close_stdin"
+		}
+		return title, kind
+	}
+	if name == "read" {
+		if entries, ok := args["paths"].([]any); ok && len(entries) > 0 {
+			paths := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				if path, isText := entry.(string); isText {
+					paths = append(paths, path)
+				}
+			}
+			return name + ": " + strings.Join(paths, ", "), kind
+		}
+	}
 	if name == "message" {
 		if to, ok := args["to"].(string); ok && to != "" {
 			return "message → " + to, kind
@@ -312,6 +342,11 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 			if paths := hashline.SectionPaths(input); len(paths) > 0 {
 				return name + ": " + strings.Join(paths, ", "), kind
 			}
+		}
+	}
+	if name == "integrate" {
+		if jobID, ok := args["job_id"].(string); ok && jobID != "" {
+			return name + ": " + jobID, kind
 		}
 	}
 	if name == "manifest_diff" {

@@ -53,7 +53,7 @@ func RegistryListing(reg Registry) string {
 // NewTool delegates only through Controller, so no child can bypass journaling.
 func NewTool(controller work.Controller) agent.AgentTool {
 	return agent.AgentTool{
-		Tool:  ptypes.Tool{Name: "task", Description: "Start a delegated explore or general task. Returns a job handle immediately; completion arrives as a follow-up. General tasks use an isolated git worktree when eligible, otherwise shared cwd. Patches are not applied to the parent.", Parameters: schema.Object(schema.JSON{"description": schema.String(), "prompt": schema.String(), "subagent_type": schema.JSON{"type": "string", "enum": []string{"explore", "general"}}, "output_schema": schema.JSON{"type": "object"}}, "prompt", "subagent_type")},
+		Tool:  ptypes.Tool{Name: "task", Description: "Start a delegated explore or general task. Returns a job handle immediately; completion arrives as a follow-up. General tasks use an isolated git worktree when eligible, otherwise shared cwd. A worktree child's patch is never applied on its own: merge it into the parent workspace with integrate.", Parameters: schema.Object(schema.JSON{"description": schema.String(), "prompt": schema.String(), "subagent_type": schema.JSON{"type": "string", "enum": []string{"explore", "general"}}, "output_schema": schema.JSON{"type": "object"}}, "prompt", "subagent_type")},
 		Label: "task",
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			if controller == nil {

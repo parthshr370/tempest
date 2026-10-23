@@ -66,7 +66,10 @@ type ToolName string
 // LSPDefinitionTool, LSPReferencesTool, LSPRenameTool and LSPDiagnosticsTool
 // query an enabled language server; rename only returns an edit plan.
 // ManifestDiffTool compares two rendered local manifest trees by resource.
+// ViewImageTool shows a workspace image to a vision model as an image block.
+// WriteStdinTool writes to a background bash job's input and returns its new output.
 // MessageTool sends a message to the parent, a running child or all peers.
+// IntegrateTool three-way merges a finished general task's patch into the live workspace.
 //
 // These names keep tool lookup stable across prompts, clients, and persisted state.
 const (
@@ -88,6 +91,7 @@ const (
 	WaitTool       ToolName = "wait"
 	CancelTool     ToolName = "cancel"
 	LogsTool       ToolName = "logs"
+	WriteStdinTool ToolName = "write_stdin"
 	MessageTool    ToolName = "message"
 
 	LSPDefinitionTool  ToolName = "lsp_definition"
@@ -95,11 +99,13 @@ const (
 	LSPRenameTool      ToolName = "lsp_rename"
 	LSPDiagnosticsTool ToolName = "lsp_diagnostics"
 	ManifestDiffTool   ToolName = "manifest_diff"
+	ViewImageTool      ToolName = "view_image"
+	IntegrateTool      ToolName = "integrate"
 )
 
 // AllToolNames is the set of every known ToolName. Configured tools can
 // never shadow these names, including the lsp_* names when LSP is disabled.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true}
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true}
 
 // LSPToolNames are the language-server tools, all read-tier calculations.
 var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
@@ -139,7 +145,9 @@ type ToolsOptions struct {
 	// SessionDataDir is the journaled session's private directory
 	// (<journal>.d). todo_write checkpoints progress.md there, bash spills
 	// truncated output under tool-output/, and read may open exactly those
-	// files plus the session's job artifacts under jobs/.
+	// files plus the session's job artifacts under jobs/. Multi-file edit
+	// batches (hashline, integrate) journal there under edit-rollback/;
+	// without it they still roll back in process but not across a crash.
 	SessionDataDir string
 	// LSP registers the lsp_* tools when non-nil. Its owner closes it.
 	LSP *lsp.Manager
@@ -153,6 +161,9 @@ type ToolsOptions struct {
 	// the named clipboard registers. AllTools and the tool-list helpers
 	// create one per call when it is nil, so the tools they build share it.
 	Hashline *hashline.Store
+	// ImageInput reports whether the stack's model accepts image input;
+	// view_image refuses without it.
+	ImageInput bool
 }
 
 // These limits keep web responses bounded and prevent impractical command timeouts.
@@ -165,10 +176,11 @@ const (
 
 // readToolInput holds the raw request until selector parsing and defaults have run.
 type readToolInput struct {
-	Path   string `json:"path"`
-	Offset *int   `json:"offset"`
-	Limit  *int   `json:"limit"`
-	Mode   string `json:"mode"`
+	Path   string   `json:"path"`
+	Paths  []string `json:"paths"`
+	Offset *int     `json:"offset"`
+	Limit  *int     `json:"limit"`
+	Mode   string   `json:"mode"`
 }
 
 // editToolInput holds the normalized edit form after legacy arguments become edits.
@@ -237,6 +249,11 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 			return agent.AgentTool{}, fmt.Errorf("task tool not configured")
 		}
 		return options.TaskTool, nil
+	case WriteStdinTool:
+		if options.Work == nil || options.Child {
+			return agent.AgentTool{}, fmt.Errorf("write_stdin requires a durable root session")
+		}
+		return newWriteStdinTool(options.Work), nil
 	case JobsTool, WaitTool, CancelTool, LogsTool:
 		if options.Work == nil || options.Child {
 			return agent.AgentTool{}, fmt.Errorf("background management requires a durable root session")
@@ -271,6 +288,14 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 		return newManifestDiffTool(cwd), nil
 	case HashlineTool:
 		return newHashlineTool(cwd, options), nil
+	case IntegrateTool:
+		// Only a session that can start tasks has children to integrate.
+		if options.Work == nil || options.Child || options.TaskTool.Execute == nil {
+			return agent.AgentTool{}, fmt.Errorf("integrate requires a durable root session with the task tool")
+		}
+		return newIntegrateTool(cwd, options), nil
+	case ViewImageTool:
+		return newViewImageTool(cwd, options), nil
 	default:
 		return agent.AgentTool{}, fmt.Errorf("Unknown tool name: %s", toolName)
 	}
@@ -291,7 +316,7 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	options = withHashlineStore(options)
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool} {
+	for _, name := range []ToolName{ReadTool, BashTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -495,22 +520,24 @@ func withHashlineStore(options ToolsOptions) ToolsOptions {
 	return options
 }
 
-// newReadTool builds the file reader rooted at cwd. It accepts path plus optional
-// offset and limit inputs so callers can page through text without loading it all at once.
+// newReadTool builds the file reader rooted at cwd. It accepts one path with
+// optional offset and limit for paging, or several paths read in one call
+// under a shared output budget.
 func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 	// One os.Root per tool keeps every read inside the working directory.
-	getRoot := rootOnce(cwd)
-	store := options.Hashline
+	reader := fileReader{cwd: cwd, options: options, getRoot: rootOnce(cwd)}
 	return agent.AgentTool{
 		Tool: types.Tool{
-			Name:        string(ReadTool),
-			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Reading a whole file returns all of it as numbered rows when it fits in %d lines and %dKB. A larger Go file returns a structural outline instead (one row per declaration with its path:START-END range, no bodies) so you can read just the range you need; any other larger file returns its first page with the offset to continue. mode=outline asks for the outline of a Go file of any size; mode=raw always pages numbered rows. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
+			Name: string(ReadTool),
+			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Reading a whole file returns all of it as numbered rows when it fits in %d lines and %dKB. A larger Go file returns a structural outline instead (one row per declaration with its path:START-END range, no bodies) so you can read just the range you need; any other larger file returns its first page with the offset to continue. mode=outline asks for the outline of a Go file of any size; mode=raw always pages numbered rows. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. "+
+				"To read several files, pass paths (up to %d entries, each with its own optional :START-END or :START+COUNT) instead of path: each file returns as its own [path#TAG] section, in order, and all share one %d-line/%dKB budget; offset and limit apply only to path. Read every file you already know you need in one call rather than one call per turn.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024, maxReadPaths, truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
 			Parameters: schema.Object(schema.JSON{
-				"path":   schema.String(),
+				"path":   schema.JSON{"type": "string", "description": "one file, directory or internal URL, with an optional :START-END or :START+COUNT selector"},
+				"paths":  schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": maxReadPaths, "description": "several files read in one call, each with an optional selector; use instead of path"},
 				"offset": schema.Number(),
 				"limit":  schema.Number(),
 				"mode":   schema.JSON{"type": "string", "enum": []string{"auto", "raw", "outline"}, "default": "auto"},
-			}, "path"),
+			}),
 		},
 		Label: string(ReadTool),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
@@ -524,149 +551,34 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if input.Mode != "auto" && input.Mode != "raw" && input.Mode != "outline" {
 				return agent.AgentToolResult{}, fmt.Errorf("mode must be \"auto\", \"raw\" or \"outline\"")
 			}
-			if err := ctx.Err(); err != nil {
-				return agent.AgentToolResult{}, errors.New("Operation aborted")
-			}
-			rootForRead, err := getRoot()
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			selector, err := parseReadPathSelector(input.Path)
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			source, early, err := loadReadSource(ctx, cwd, rootForRead, options, selector.Path)
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			if early != nil {
-				return *early, nil
-			}
-			data, absolutePath, displayPath, isResource := source.data, source.absolutePath, source.displayPath, source.isResource
-			header := fmt.Sprintf("[%s#%s]", displayPath, hashline.Tag(data))
-			// observe records the rows shown in full for workspace files, the
-			// ones hashline can edit; resources and session artifacts are not.
-			observe := func(displayed []int) {}
-			if store != nil && !isResource && absolutePath != "" {
-				if _, canonical, err := rootRelPaths(cwd, absolutePath); err == nil {
-					observe = func(displayed []int) { store.Observe(canonical, hashline.Decode(data).Text, displayed) }
+			switch {
+			case input.Path != "" && len(input.Paths) > 0:
+				return agent.AgentToolResult{}, errors.New("pass path for one file or paths for several, not both")
+			case len(input.Paths) > 0:
+				if input.Offset != nil || input.Limit != nil {
+					return agent.AgentToolResult{}, errors.New("offset and limit page one path; with paths, give each entry a :START-END selector")
 				}
+				return reader.readBatch(ctx, input.Paths, input.Mode)
+			case input.Path == "":
+				return agent.AgentToolResult{}, errors.New("path is required: one file as path, or several as paths")
 			}
-			if containsNUL(data) {
-				return textResult(fmt.Sprintf("%s\n[binary file, %d bytes, not shown]", header, len(data)), &readToolDetails{Binary: true}), nil
-			}
-			wholeFile := !selector.Set && input.Offset == nil && input.Limit == nil
-			if input.Mode == "outline" {
-				if !wholeFile {
-					return agent.AgentToolResult{}, errors.New("mode=outline covers the whole file; drop the line range, offset and limit, or drop mode to read those lines")
-				}
-				outline, ok := "", false
-				if !isResource {
-					outline, ok = goSourceOutline(displayPath, absolutePath, data)
-				}
-				if !ok {
-					return agent.AgentToolResult{}, fmt.Errorf("mode=outline needs a workspace Go file that parses; read %s without mode for its numbered content", displayPath)
-				}
-				observe(nil)
-				return outlineResult(header, "", outline), nil
-			}
-
-			allLines := splitReadLines(string(data))
-			if len(allLines) == 0 {
-				observe(nil)
-				return textResult(header, nil), nil
-			}
-			startLine := 0
-			endLine := len(allLines)
-			userLimitedLines := -1
-			if selector.Set {
-				startLine = selector.Start - 1
-				endLine = min(selector.End, len(allLines))
-			} else {
-				if input.Offset != nil {
-					startLine = max(0, *input.Offset-1)
-				}
-				if input.Limit != nil {
-					if *input.Limit <= 0 {
-						return agent.AgentToolResult{}, fmt.Errorf("limit must be greater than zero")
-					}
-					endLine = min(startLine+*input.Limit, len(allLines))
-					userLimitedLines = endLine - startLine
-				}
-			}
-			if startLine >= len(allLines) {
-				return agent.AgentToolResult{}, fmt.Errorf("offset %d is beyond end of file (%d lines total)", startLine+1, len(allLines))
-			}
-
-			numberedLines := make([]string, endLine-startLine)
-			for index := startLine; index < endLine; index++ {
-				numberedLines[index-startLine] = fmt.Sprintf("%d:%s", index+1, allLines[index])
-			}
-			truncation := truncate.Head(strings.Join(numberedLines, "\n"), truncate.Options{})
-			if truncation.Truncated && wholeFile && input.Mode == "auto" && !isResource {
-				// The whole file does not fit one read. A Go file's declaration
-				// outline lets the model pick the range it needs instead of
-				// paging blind; the outline shows no rows, so it marks none seen.
-				if outline, ok := goSourceOutline(displayPath, absolutePath, data); ok {
-					note := fmt.Sprintf("[%s has %d lines (%s), more than one read shows (%d lines or %s), so this is a structural outline of its declarations, not the file's content. Each row is LINE: declaration [recover: PATH:START-END]. To see or edit a declaration, read its range, e.g. read %q; mode=raw with offset and limit pages the numbered lines instead.]", displayPath, len(allLines), truncate.FormatSize(len(data)), truncate.DefaultMaxLines, truncate.FormatSize(truncate.DefaultMaxBytes), displayPath+":START-END")
-					observe(nil)
-					return outlineResult(header, note, outline), nil
-				}
-			}
-			output := header + "\n" + truncation.Content
-			var details *readToolDetails
-			if truncation.FirstLineExceedsLimit {
-				firstLineSize := truncate.FormatSize(len([]byte(allLines[startLine])))
-				output = fmt.Sprintf("%s\n[%d: line is %s, exceeds %s limit. Use bash to read a bounded portion.]", header, startLine+1, firstLineSize, truncate.FormatSize(truncate.DefaultMaxBytes))
-				details = &readToolDetails{Truncation: truncation}
-			} else if truncation.Truncated {
-				endDisplay := startLine + truncation.OutputLines
-				nextOffset := endDisplay + 1
-				if selector.Set {
-					continuation := fmt.Sprintf("%s:%d-%d", displayPath, nextOffset, endLine)
-					if truncation.TruncatedBy == truncate.TruncatedByLines {
-						output += fmt.Sprintf("\n\n[Showing lines %d-%d of selected lines %d-%d. Use %s to continue.]", startLine+1, endDisplay, startLine+1, endLine, continuation)
-					} else {
-						output += fmt.Sprintf("\n\n[Showing lines %d-%d of selected lines %d-%d (%s limit). Use %s to continue.]", startLine+1, endDisplay, startLine+1, endLine, truncate.FormatSize(truncate.DefaultMaxBytes), continuation)
-					}
-				} else if truncation.TruncatedBy == truncate.TruncatedByLines {
-					output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", startLine+1, endDisplay, len(allLines), nextOffset)
-				} else {
-					output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", startLine+1, endDisplay, len(allLines), truncate.FormatSize(truncate.DefaultMaxBytes), nextOffset)
-				}
-				details = &readToolDetails{Truncation: truncation}
-			} else if !selector.Set && userLimitedLines >= 0 && startLine+userLimitedLines < len(allLines) {
-				remaining := len(allLines) - (startLine + userLimitedLines)
-				nextOffset := startLine + userLimitedLines + 1
-				output += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", remaining, nextOffset)
-			}
-			if !truncation.FirstLineExceedsLimit {
-				shown := truncation.OutputLines
-				if truncation.LastLinePartial {
-					shown--
-				}
-				displayed := make([]int, 0, max(shown, 0))
-				for line := startLine + 1; line <= startLine+shown; line++ {
-					displayed = append(displayed, line)
-				}
-				observe(displayed)
-			}
-			return textResult(output, details), nil
+			return reader.read(ctx, readRequest{path: input.Path, offset: input.Offset, limit: input.Limit, mode: input.Mode, budget: defaultReadBudget})
 		},
 	}
 }
 
-// outlineResult renders a Go declaration outline under the file header. A
-// non-empty note leads the outline and says why the read returned one.
-func outlineResult(header, note, outline string) agent.AgentToolResult {
+// outlineResult renders a Go declaration outline under the file header,
+// within budget. A non-empty note leads the outline and says why the read
+// returned one.
+func outlineResult(header, note, outline string, budget readBudget) agent.AgentToolResult {
 	prefix := header + "\n"
 	if note != "" {
 		prefix += note + "\n"
 	}
-	truncation := truncate.Head(outline, truncate.Options{})
+	truncation := truncate.Head(outline, budget.options())
 	output := prefix + truncation.Content
 	if truncation.FirstLineExceedsLimit {
-		output = prefix + fmt.Sprintf("[structural outline line exceeds %s limit; page the numbered lines with mode=raw and offset.]", truncate.FormatSize(truncate.DefaultMaxBytes))
+		output = prefix + fmt.Sprintf("[structural outline line exceeds %s limit; page the numbered lines with mode=raw and offset.]", truncate.FormatSize(budget.bytes))
 	} else if truncation.Truncated {
 		output += "\n\n[Structural outline truncated. Read a declaration with the path:START-END range on its row, or page the numbered lines with mode=raw and offset.]"
 	}
@@ -711,7 +623,7 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if err != nil && !errors.Is(err, fs.ErrNotExist) {
 					return fmt.Errorf("could not read %s before writing: %w", input.Path, err)
 				}
-				if err := writeFileInRoot(rootForWrite, relPath, []byte(input.Content)); err != nil {
+				if err := writeFileInRoot(rootForWrite, target.diskName(), []byte(input.Content)); err != nil {
 					return err
 				}
 				notifyFileChanged(options, canonicalPath)
@@ -816,7 +728,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 					return err
 				}
 				finalContent := bom + editdiff.RestoreLineEndings(applied.NewContent, ending)
-				if err := writeFileInRoot(rootForEdit, relPath, []byte(finalContent)); err != nil {
+				if err := writeFileInRoot(rootForEdit, target.diskName(), []byte(finalContent)); err != nil {
 					return err
 				}
 				// Disk changed even if the caller cancels from here on.
@@ -858,12 +770,14 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	parameters := schema.JSON{"command": schema.String(), "timeout": schema.Number()}
 	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
 	if options.Work != nil && !options.Child {
-		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, ready_log, ready_port and ready_timeout_ms already imply it"}
-		parameters["name"] = schema.JSON{"type": "string", "description": "runs the command as a background job with this name, unique among running jobs, and returns at once; wait, cancel and logs accept the name in place of the job id"}
+		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, pty, stdin, ready_log, ready_port and ready_timeout_ms already imply it"}
+		parameters["name"] = schema.JSON{"type": "string", "description": "runs the command as a background job with this name, unique among running jobs, and returns at once; wait, cancel, logs and write_stdin accept the name in place of the job id"}
+		parameters["pty"] = schema.JSON{"type": "boolean", "description": "runs the command as a background job on a pseudo-terminal (24x80, TERM=dumb): it sees a terminal, as REPLs and prompting tools need; stdout and stderr are one stream; drive it with write_stdin"}
+		parameters["stdin"] = schema.JSON{"type": "boolean", "description": "runs the command as a background job and keeps stdin open so write_stdin can feed this job; without it (or pty) a background job's stdin is /dev/null"}
 		parameters["ready_log"] = schema.JSON{"type": "string", "description": "runs the command as a background service: RE2 regex; the call returns once an output line matches"}
 		parameters["ready_port"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": 65535, "description": "runs the command as a background service: the call returns once 127.0.0.1:<port> accepts TCP connections"}
 		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline for ready_log/ready_port, default 30000; on timeout the process is killed"}
-		description += " A plain command runs in the foreground and returns its output; it needs none of async, name or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or its timeout passes, and wait, logs and cancel take its name or id. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
+		description += " A plain command runs in the foreground and returns its output; it needs none of async, name, pty, stdin or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or its timeout passes, and wait, logs and cancel take its name or id. A background job's stdin is /dev/null, so a command that reads input sees end of file; stdin:true keeps a pipe open for write_stdin, and pty:true runs the command on a terminal for interactive programs. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
@@ -884,6 +798,8 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 				ReadyLog       string `json:"ready_log"`
 				ReadyPort      int    `json:"ready_port"`
 				ReadyTimeoutMS int    `json:"ready_timeout_ms"`
+				PTY            bool   `json:"pty"`
+				Stdin          bool   `json:"stdin"`
 			}
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
@@ -891,12 +807,13 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := checkCommandURLs(options.Refs, input.Command); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			// A name or a readiness condition only means something for a job
-			// referred to later, so either one makes the command a background job.
+			// A name, a terminal, open stdin or a readiness condition only means
+			// something for a job referred to later, so each makes the command a
+			// background job.
 			service := input.ReadyLog != "" || input.ReadyPort != 0
-			if input.Async || service || input.Name != "" || input.ReadyTimeoutMS != 0 {
+			if input.Async || service || input.Name != "" || input.PTY || input.Stdin || input.ReadyTimeoutMS != 0 {
 				if options.Work == nil || options.Child {
-					return agent.AgentToolResult{}, errors.New("background bash (async, name, ready_log, ready_port, ready_timeout_ms) needs a durable root session; child bash runs in the foreground only, so drop those fields")
+					return agent.AgentToolResult{}, errors.New("background bash (async, name, pty, stdin, ready_log, ready_port, ready_timeout_ms) needs a durable root session; child bash runs in the foreground only, so drop those fields")
 				}
 				timeoutSeconds := int(timeoutDefault / time.Second)
 				if service {
@@ -906,7 +823,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if input.Timeout != nil && *input.Timeout > 0 {
 					timeoutSeconds = *input.Timeout
 				}
-				job, err := options.Work.StartBash(ctx, work.BashSpec{Command: input.Command, TimeoutSeconds: timeoutSeconds, Name: input.Name, ReadyLog: input.ReadyLog, ReadyPort: input.ReadyPort, ReadyTimeoutMS: input.ReadyTimeoutMS})
+				job, err := options.Work.StartBash(ctx, work.BashSpec{Command: input.Command, TimeoutSeconds: timeoutSeconds, Name: input.Name, ReadyLog: input.ReadyLog, ReadyPort: input.ReadyPort, ReadyTimeoutMS: input.ReadyTimeoutMS, PTY: input.PTY, Stdin: input.Stdin})
 				if err != nil {
 					return agent.AgentToolResult{}, err
 				}
@@ -977,15 +894,16 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 }
 
 // newGrepTool builds the ripgrep-backed content searcher rooted at cwd. It accepts
-// pattern plus optional path, glob, case, literal, context, and limit inputs.
+// pattern plus optional path or paths, glob, case, literal, context, and limit inputs.
 func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(GrepTool),
-			Description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. path may be an internal URL (skill://, job://, history://, local://).",
+			Description: fmt.Sprintf("Search file contents for a pattern. Returns matching lines grouped under each file's [path#TAG] header with line numbers. path may be an internal URL (skill://, job://, history://, local://). To search several workspace files or directories in one call, pass paths (up to %d) instead of path; matches from all of them share limit.", maxGrepPaths),
 			Parameters: schema.Object(schema.JSON{
 				"pattern":     schema.String(),
-				"path":        schema.String(),
+				"path":        schema.JSON{"type": "string", "description": "one file, directory or internal URL to search; default the working directory"},
+				"paths":       schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": maxGrepPaths, "description": "several workspace files or directories searched in one call; use instead of path"},
 				"glob":        schema.String(),
 				"ignore_case": schema.Bool(),
 				"literal":     schema.Bool(),
@@ -1000,19 +918,18 @@ func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 				return agent.AgentToolResult{}, err
 			}
 			if refs.IsURL(input.Path) {
+				if len(input.Paths) > 0 {
+					return agent.AgentToolResult{}, errors.New("pass path or paths, not both")
+				}
 				return grepRefs(ctx, options, input)
 			}
 			rootForGrep, err := rootOnce(cwd)()
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			relSearch, err := resolveRootPath(cwd, defaultString(input.Path, "."))
+			relSearches, err := grepSearchPaths(cwd, rootForGrep, input)
 			if err != nil {
 				return agent.AgentToolResult{}, err
-			}
-			searchPath := filepath.Join(cwd, relSearch)
-			if _, err := statInRoot(rootForGrep, relSearch); err != nil {
-				return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", searchPath)
 			}
 			limit := input.Limit
 			if limit <= 0 {
@@ -1037,7 +954,10 @@ func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if input.Glob != "" {
 					args = append(args, "--glob", input.Glob)
 				}
-				args = append(args, "--", input.Pattern, searchPath)
+				args = append(args, "--", input.Pattern)
+				for _, relSearch := range relSearches {
+					args = append(args, filepath.Join(cwd, relSearch))
+				}
 				cmd := exec.CommandContext(ctx, rgPath, args...)
 				stdout, err := cmd.StdoutPipe()
 				if err != nil {
@@ -1108,11 +1028,20 @@ func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 			} else {
 				// No rg on PATH: walk the root with the pure-Go fallback.
 				backend = "go"
-				var err error
-				matches, matchLimitReached, err = goGrep(ctx, rootForGrep, relSearch, input.Pattern, input.Glob, input.IgnoreCase, input.Literal, limit)
-				if err != nil {
-					return agent.AgentToolResult{}, err
+				for _, relSearch := range relSearches {
+					found, reached, err := goGrep(ctx, rootForGrep, relSearch, input.Pattern, input.Glob, input.IgnoreCase, input.Literal, limit-len(matches))
+					if err != nil {
+						return agent.AgentToolResult{}, err
+					}
+					matches = append(matches, found...)
+					if reached {
+						matchLimitReached = true
+						break
+					}
 				}
+			}
+			if len(relSearches) > 1 {
+				matches = uniqueGrepMatches(matches)
 			}
 			return formatGrepOutput(matches, workspaceGrepSource(cwd, rootForGrep), options.Hashline, contextLines, limit, matchLimitReached, backend), nil
 		},

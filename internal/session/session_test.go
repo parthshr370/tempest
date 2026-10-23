@@ -16,7 +16,7 @@ func TestSelectActive(t *testing.T) {
 	dir := t.TempDir()
 	all := tools.AllTools(dir, tools.ToolsOptions{})
 	active := SelectActive(all, nil, nil, "")
-	if len(active) != 10 {
+	if len(active) != 11 {
 		t.Fatalf("all active = %d", len(active))
 	}
 	readonly := SelectActive(all, []string{"read", "grep", "find", "ls"}, nil, "")
@@ -24,7 +24,7 @@ func TestSelectActive(t *testing.T) {
 		t.Fatalf("readonly = %s", names(readonly))
 	}
 	excluded := SelectActive(all, nil, []string{"bash", "write"}, "")
-	if len(excluded) != 8 {
+	if len(excluded) != 9 {
 		t.Fatalf("excluded = %d", len(excluded))
 	}
 }
@@ -127,7 +127,7 @@ func TestAppendCapabilitiesNamesChildTools(t *testing.T) {
 	for _, want := range []string{
 		"Child prompt.",
 		"<available_tools>",
-		"- read: Read files, directories, archive members, office documents, JSON queries and internal URLs",
+		"- read: Read files (several in one call with paths), directories, archive members, office documents, JSON queries and internal URLs",
 		"- custom_agent: custom_agent",
 	} {
 		if !strings.Contains(got, want) {

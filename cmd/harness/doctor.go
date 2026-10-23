@@ -57,6 +57,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  model: %s\n", opts.Config.Model())
 	fmt.Fprintf(stdout, "  plan_model: %s\n", roleSpec(opts.Config.PlanModel(), opts.Config.Model()))
 	fmt.Fprintf(stdout, "  smol_model: %s\n", roleSpec(opts.Config.SmolModel(), opts.Config.Model()))
+	fmt.Fprintf(stdout, "  reasoning: %s\n", reasoningSetting(opts.Config.Reasoning()))
+	fmt.Fprintf(stdout, "  plan_reasoning: %s\n", reasoningSetting(opts.Config.PlanReasoning()))
+	fmt.Fprintf(stdout, "  smol_reasoning: %s\n", reasoningSetting(opts.Config.SmolReasoning()))
 	fmt.Fprintf(stdout, "  max_tokens: %d\n", opts.Config.MaxTokens())
 	fmt.Fprintf(stdout, "  permission_mode_default: %s\n", opts.Config.PermissionModeDefault())
 	fmt.Fprintf(stdout, "  log_level: %s\n", opts.Config.LogLevel())
@@ -67,9 +70,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  openai_base_url: %s\n", opts.Config.OpenAIBaseURL())
 	fmt.Fprintln(stdout, "  provider_credentials: REDACTED")
 	fmt.Fprintln(stdout, "models:")
-	printRole(stdout, "default", roles.Default)
-	printRole(stdout, "plan", roles.Plan)
-	printRole(stdout, "smol", roles.Smol)
+	printRole(stdout, "default", roles.Default, opts.Config.Reasoning())
+	printRole(stdout, "plan", roles.Plan, opts.Config.PlanReasoning())
+	printRole(stdout, "smol", roles.Smol, opts.Config.SmolReasoning())
 	fmt.Fprintln(stdout, "providers:")
 	for _, p := range catalog.Providers() {
 		fmt.Fprintf(stdout, "  %s: api=%s key=%s present=%s base_url=%s\n", p.ID, p.API, p.KeyEnv, yesNo(providerCredentialPresent(p.ID, opts.Secrets)), p.BaseURL)
@@ -109,14 +112,35 @@ func roleSpec(role, fallback string) string {
 	return role
 }
 
-func printRole(w io.Writer, name string, router adapter.ProviderRouter) {
+// reasoningSetting renders a configured reasoning level; unset leaves the
+// provider's own default in place.
+func reasoningSetting(level string) string {
+	if level == "" {
+		return "provider default"
+	}
+	return level
+}
+
+// effectiveReasoning is what a role's requests actually carry: a level the
+// model can't use is dropped before the request is built.
+func effectiveReasoning(level string, model types.Model) string {
+	if level == "" || level == "off" {
+		return reasoningSetting(level)
+	}
+	if !model.Reasoning {
+		return level + " (ignored: no reasoning support)"
+	}
+	return level
+}
+
+func printRole(w io.Writer, name string, router adapter.ProviderRouter, reasoning string) {
 	price := "known"
 	if router.Model.ReportsBilledCost() {
 		price = "billed"
 	} else if router.Model.Cost.Unknown {
 		price = "unknown"
 	}
-	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL, price)
+	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL, price, effectiveReasoning(reasoning, router.Model), yesNo(router.Model.SupportsVision()))
 }
 
 func printPathCheck(w io.Writer, name, path string) {

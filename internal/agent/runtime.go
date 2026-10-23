@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -150,6 +151,7 @@ type Agent struct {
 	budget        Budget
 	bindings      *runtimeBindings
 	ended         bool
+	outputSchema  *outputschema.Schema
 
 	emitMu sync.Mutex
 	// seq is the last Seq handed out; guarded by emitMu.
@@ -462,6 +464,14 @@ func (a *Agent) SetThinkingLevel(level ThinkingLevel) {
 	a.state.ThinkingLevel = level
 }
 
+// SetOutputSchema sets the final-answer contract for future runs; nil
+// returns them to free text. See [AgentLoopConfig.OutputSchema].
+func (a *Agent) SetOutputSchema(schema *outputschema.Schema) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.outputSchema = schema
+}
+
 // Prompt runs one run with messages as the prompt and blocks until it ends.
 // The error is non-nil only when no run started: [ErrRunActive], a nil
 // StreamFn, or a budget that cannot be enforced ([Budget.Validate]). How a
@@ -612,6 +622,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		Work:             a.Work,
 		PrepareNextTurnE: a.PrepareNextTurnE,
 		bindings:         a.bindings,
+		OutputSchema:     a.outputSchema,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

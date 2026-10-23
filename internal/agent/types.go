@@ -10,6 +10,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -169,6 +170,11 @@ type AgentLoopConfig struct {
 	GetFollowUpMessages func() []types.Message
 	BeforeToolCall      func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall       func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
+	// OutputSchema, when set, is the contract for the run's final answer:
+	// the provider is asked for native structured output, and the loop
+	// validates the final text, granting one correction turn before the run
+	// ends with [StopOutputInvalid].
+	OutputSchema *outputschema.Schema
 }
 
 // Budget caps one run. Zero fields are unlimited. The loop checks the budget
@@ -221,6 +227,9 @@ const (
 	// StopError: the provider failed, a listener failed, or the loop
 	// panicked. [RunResult.Err] carries the cause.
 	StopError StopReason = "error"
+	// StopOutputInvalid: the final answer still failed the run's output
+	// schema after the correction turn. [RunResult.Err] carries why.
+	StopOutputInvalid StopReason = "output_invalid"
 )
 
 // RunResult is how one run ended. Prompt and Continue return it, and the run's
@@ -230,13 +239,17 @@ type RunResult struct {
 	RunID      string
 	ElapsedMS  int64
 	StopReason StopReason
-	// Err is set only when StopReason is StopError.
+	// Err is set when StopReason is StopError or StopOutputInvalid.
 	Err error
 	// Turns counts model calls made in this run.
 	Turns int
 	// Usage sums this run's model calls and delegated child calls. Cost.Unknown
 	// is true when any call's price was unknown, so the total is a lower bound.
 	Usage types.Usage
+	// Output is the final answer validated against the run's output schema,
+	// in compact JSON. It is nil when the run had no schema or the answer
+	// never validated.
+	Output json.RawMessage
 }
 
 // AgentEventType is the discriminant for AgentEvent.

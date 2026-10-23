@@ -159,7 +159,7 @@ func TestModelToolSurfaceIsSnakeCase(t *testing.T) {
 		AttachmentRegistry: document.NewAttachmentRegistry(), AttachmentReader: document.NewCacheRootBlobReader(t.TempDir()), Sanitize: func(s string) string { return s },
 		LSP: newInertLSPManager(t, cwd),
 	})
-	for _, name := range []ToolName{TaskTool, AttachmentTool, WebFetch, WebSearch, SkillTool, JobsTool, LSPRenameTool, ManifestDiffTool} {
+	for _, name := range []ToolName{TaskTool, AttachmentTool, WebFetch, WebSearch, SkillTool, JobsTool, LSPRenameTool, ManifestDiffTool, IntegrateTool} {
 		if _, ok := registry[name]; !ok {
 			t.Fatalf("%s not built", name)
 		}

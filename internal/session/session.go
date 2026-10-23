@@ -66,17 +66,19 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 		}
 		switch tool.Name {
 		case "read":
-			snippets[tool.Name] = "Read files, directories, archive members, office documents, JSON queries and internal URLs"
+			snippets[tool.Name] = "Read files (several in one call with paths), directories, archive members, office documents, JSON queries and internal URLs"
 		case "bash":
 			snippets[tool.Name] = "Execute bash commands (ls, grep, find, etc.)"
 		case "edit":
 			snippets[tool.Name] = "Make precise file edits with exact text replacement"
 		case "hashline":
 			snippets[tool.Name] = "Edit, move, rename or delete existing files with line-anchored [path#TAG] patches"
+		case "integrate":
+			snippets[tool.Name] = "Three-way merge a finished general task's changes into the live workspace"
 		case "write":
 			snippets[tool.Name] = "Create or overwrite files"
 		case "grep":
-			snippets[tool.Name] = "Search file contents for patterns"
+			snippets[tool.Name] = "Search file contents for patterns, in one path or several"
 		case "find":
 			snippets[tool.Name] = "Find files by glob pattern"
 		case "ls":
@@ -87,6 +89,8 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Delegate a focused task to a child agent"
 		case "message":
 			snippets[tool.Name] = "Message your parent, a running child or all peers"
+		case "write_stdin":
+			snippets[tool.Name] = "Type into a background bash job (pty for REPLs and prompts) and read what it printed back"
 		case "web_search":
 			snippets[tool.Name] = "Search the web through the configured endpoint"
 		case "web_fetch":
@@ -105,6 +109,8 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Report a file's language-server diagnostics and their freshness"
 		case "manifest_diff":
 			snippets[tool.Name] = "Compare two rendered Kubernetes manifest snapshots by resource"
+		case "view_image":
+			snippets[tool.Name] = "Look at a PNG, JPEG, GIF or WebP image in the workspace"
 		default:
 			snippets[tool.Name] = label
 		}

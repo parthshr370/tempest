@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 	"strings"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/editbatch"
 	"go.harness.dev/harness/internal/editdiff"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
@@ -105,7 +105,7 @@ func newHashlineTool(cwd string, options ToolsOptions) agent.AgentTool {
 			}, "input"),
 		},
 		Label: string(HashlineTool),
-		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+		Execute: func(ctx context.Context, toolCallID string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
 				Input string `json:"input"`
 			}
@@ -142,7 +142,7 @@ func newHashlineTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if err := abortErr(ctx); err != nil {
 					return err
 				}
-				text, details, err = commitHashlinePlan(plan, root, targets, store, options)
+				text, details, err = commitHashlinePlan(plan, root, targets, store, options, "hashline call "+toolCallID)
 				return err
 			})
 			if err != nil {
@@ -176,31 +176,22 @@ func lockFiles(queue *toolio.FileMutationQueue, targets map[string]hashlineTarge
 	return lockNext(0)
 }
 
-// commitHashlinePlan writes a validated plan in patch order and renders the
-// result. A write failure stops the commit and names what landed.
-func commitHashlinePlan(plan *hashline.Plan, root *os.Root, targets map[string]hashlineTarget, store *hashline.Store, options ToolsOptions) (string, hashlineDetails, error) {
-	var sections []string
+// commitHashlinePlan writes a validated plan as one edit batch and renders
+// the result. A plan touching more than one path is journaled, so a write
+// failure rolls every path back and a crash is undone at the next session
+// open (see editbatch).
+func commitHashlinePlan(plan *hashline.Plan, root *os.Root, targets map[string]hashlineTarget, store *hashline.Store, options ToolsOptions, origin string) (string, hashlineDetails, error) {
 	details := hashlineDetails{Files: []hashlineFileResult{}, Warnings: plan.Warnings}
-	for index, change := range plan.Changes {
-		source := targets[change.Path]
-		if err := commitHashlineChange(change, root, source, targets[change.Dest]); err != nil {
-			var written, pending []string
-			for _, done := range plan.Changes[:index] {
-				written = append(written, done.Path)
-			}
-			for _, rest := range plan.Changes[index+1:] {
-				pending = append(pending, rest.Path)
-			}
-			message := fmt.Sprintf("writing %s failed: %v.", change.Path, err)
-			if len(written) > 0 {
-				message += " Already written: " + strings.Join(written, ", ") + "."
-			}
-			if len(pending) > 0 {
-				message += " Not written: " + strings.Join(pending, ", ") + "."
-			}
-			return "", details, errors.New(message)
-		}
-		notifyFileChanged(options, source.canonical)
+	changes, err := hashlineBatch(plan, root, targets)
+	if err != nil {
+		return "", details, err
+	}
+	if err := editbatch.New(options.SessionDataDir).Apply(root, origin, changes); err != nil {
+		return "", details, err
+	}
+	var sections []string
+	for _, change := range plan.Changes {
+		notifyFileChanged(options, targets[change.Path].canonical)
 		tag, preview := store.Committed(change)
 		switch change.Op {
 		case hashline.OpRemove:
@@ -235,27 +226,36 @@ func commitHashlinePlan(plan *hashline.Plan, root *os.Root, targets map[string]h
 	return text, details, nil
 }
 
-// commitHashlineChange applies one change to the disk through the root.
-func commitHashlineChange(change *hashline.Change, root *os.Root, source, dest hashlineTarget) error {
-	switch change.Op {
-	case hashline.OpRemove:
-		return wrapOutsideRoot(source.rel, root.Remove(source.rel))
-	case hashline.OpMove:
-		if err := root.MkdirAll(filepath.Dir(dest.rel), 0o755); err != nil {
-			return wrapOutsideRoot(dest.rel, err)
+// hashlineBatch turns a plan into per-path final states on the
+// symlink-resolved names. A move is a write of the destination, keeping the
+// source's permission bits, plus a delete of the source.
+func hashlineBatch(plan *hashline.Plan, root *os.Root, targets map[string]hashlineTarget) ([]editbatch.Change, error) {
+	var changes []editbatch.Change
+	for _, change := range plan.Changes {
+		source := filepath.FromSlash(targets[change.Path].canonical)
+		switch change.Op {
+		case hashline.OpRemove:
+			changes = append(changes, editbatch.Change{Path: source, Delete: true})
+		case hashline.OpMove:
+			info, err := statInRoot(root, source)
+			if err != nil {
+				return nil, err
+			}
+			data := change.Encoded
+			if change.After == change.Before.Text {
+				// An unedited move keeps the exact bytes, mixed line endings
+				// included, rather than a re-encoding of the decoded text.
+				if data, err = readFileInRoot(root, source); err != nil {
+					return nil, err
+				}
+			}
+			dest := filepath.FromSlash(targets[change.Dest].canonical)
+			changes = append(changes, editbatch.Change{Path: dest, Data: data, Perm: info.Mode().Perm()}, editbatch.Change{Path: source, Delete: true})
+		default:
+			changes = append(changes, editbatch.Change{Path: source, Data: change.Encoded})
 		}
-		// Rename first so the file keeps its mode, then write the edited
-		// content in place.
-		if err := root.Rename(source.rel, dest.rel); err != nil {
-			return wrapOutsideRoot(dest.rel, err)
-		}
-		if change.After == change.Before.Text {
-			return nil
-		}
-		return writeFileInRoot(root, dest.rel, change.Encoded)
-	default:
-		return writeFileInRoot(root, source.rel, change.Encoded)
 	}
+	return changes, nil
 }
 
 // verifyEditTag checks an edit's 4-hex anchor against the file's live

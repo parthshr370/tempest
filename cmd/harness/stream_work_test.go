@@ -16,7 +16,7 @@ func TestStreamJSONIncludesSupervisedWorkBeforeUnchangedReport(t *testing.T) {
 	provider.SetResponses(faux.Respond(faux.ToolCall("bash", json.RawMessage(`{"command":"printf background","async":true}`), "async_bash")), faux.Respond(faux.Text("waiting")), faux.Respond(faux.Text("finished")))
 	owner := streamSession(t, provider, provider.StreamSimple, tempest.Budget{})
 	var stdout bytes.Buffer
-	outcome, err := executeOneShot(t.Context(), owner, "background command", "stream-json", &stdout, io.Discard, 512)
+	outcome, err := executeOneShot(t.Context(), owner, tempest.Prompt{Text: "background command"}, "stream-json", &stdout, io.Discard, 512)
 	if err != nil {
 		t.Fatal(err)
 	}

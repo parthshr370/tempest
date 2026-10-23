@@ -3,6 +3,7 @@ package tempest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"time"
@@ -109,10 +110,15 @@ type ToolUpdateCallback = agent.AgentToolUpdateCallback
 // ToolDefinition is the model-visible name, description and JSON schema.
 type ToolDefinition = types.Tool
 
-// Prompt is a user message and optional images.
+// Prompt is a user message and optional images. OutputSchema, when set, is a
+// JSON Schema the run's final answer must satisfy: the provider is asked for
+// native structured output, the answer is validated locally with one
+// correction turn, and a valid answer is returned in [RunResult].Output. A
+// run whose answer never validates stops with "output_invalid".
 type Prompt struct {
-	Text  string
-	Media []Media
+	Text         string
+	Media        []Media
+	OutputSchema json.RawMessage
 }
 
 // WatchOptions bounds the live queue; Approver is interpreted by the server.
@@ -220,6 +226,9 @@ var (
 	ErrNoPendingAsk = errors.New("no pending permission ask")
 	// ErrClosed means the session has been closed.
 	ErrClosed = errors.New("session closed")
+	// ErrInvalidOutputSchema means a prompt's OutputSchema is not a usable
+	// JSON Schema; no run starts.
+	ErrInvalidOutputSchema = errors.New("invalid output schema")
 	// ErrQueueFull means the durable input queue is at capacity.
 	ErrQueueFull = session.ErrQueueFull
 	// ErrQueueConflict means an idempotency key was reused with different input.

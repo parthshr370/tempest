@@ -155,6 +155,13 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		model.OpenAICompat = cm.OpenAICompat
 		model.Compat = cm.AnthropicCompat
 		model.Reasoning = slices.Contains(cm.Capabilities, "thinking")
+		// Image blocks reach only models the catalog lists with image
+		// input; for any other model the transform replaces them with a
+		// placeholder before the request is built.
+		model.Input = []string{"text"}
+		if slices.Contains(cm.Capabilities, "images") {
+			model.Input = append(model.Input, "image")
+		}
 		if maxTokens <= 0 && cm.MaxTokens > 0 {
 			model.MaxTokens = cm.MaxTokens
 		}

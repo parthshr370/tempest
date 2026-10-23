@@ -130,6 +130,11 @@ func TestToolKindAndTitle(t *testing.T) {
 		kind               ToolKind
 	}{
 		{"read", `{"path":"a.go"}`, "read: a.go", "read"}, {"write", `{"path":"a"}`, "write: a", "edit"}, {"edit", `{}`, "edit", "edit"}, {"hashline", `{"input":"[a.go#1A2B]\nPUT 1.=1:\n+x\n[b c.md#3C4D]\nREM\n"}`, "hashline: a.go, b c.md", "edit"}, {"bash", `{"command":"pwd"}`, "$ pwd", "execute"}, {"grep", `{"pattern":"x"}`, "grep: x", "search"}, {"find", `{"pattern":"*.go"}`, "find: *.go", "search"}, {"ls", `{"path":"."}`, "ls: .", "search"}, {"web_fetch", `{"query":"q"}`, "web_fetch: q", "fetch"}, {"web_search", `{}`, "web_search", "fetch"}, {"todo_write", `{}`, "todo_write", "think"}, {"task", `{}`, "task", "other"},
+		{"read", `{"paths":["a.go:1-9","b.go"]}`, "read: a.go:1-9, b.go", "read"},
+		{"integrate", `{"job_id":"job_1","accept_merged":true}`, "integrate: job_1", "edit"},
+		{"write_stdin", `{"name":"repl","text":"print(6*7)\n"}`, `write_stdin repl "print(6*7)\n"`, "execute"},
+		{"write_stdin", `{"job_id":"job_1","text":"\u0003"}`, `write_stdin job_1 "\x03"`, "execute"},
+		{"write_stdin", `{"name":"repl","close_stdin":true}`, `write_stdin repl "" + close_stdin`, "execute"},
 	}
 	for _, tc := range cases {
 		title, kind := toolDescription(tc.name, json.RawMessage(tc.input))
