@@ -20,7 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/santhosh-tekuri/jsonschema/v6"
+	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/internal/worktree"
 )
@@ -61,7 +61,7 @@ type Options struct {
 type entry struct {
 	transition  sync.Mutex
 	recovery    work.Recovery
-	schema      *jsonschema.Schema
+	schema      *outputschema.Schema
 	cancel      context.CancelFunc
 	done        chan struct{}
 	live        bool
@@ -70,7 +70,8 @@ type entry struct {
 	joined      bool
 	truncated   bool
 	outputBytes int64
-	service     *service // set for an async bash job with a readiness condition
+	service     *service  // set for an async bash job with a readiness condition
+	input       *jobInput // set for a bash job this manager launched; write_stdin's channel
 }
 
 // Manager owns every worker until its terminal fact and completion delivery settle.
@@ -635,6 +636,9 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 	if err != nil {
 		return nil, work.Job{}, err
 	}
+	if spec.PTY && !ptySupported {
+		return nil, work.Job{}, fmt.Errorf("%w: pty needs darwin or linux; run the command without pty", ErrInvalidInput)
+	}
 	manager.admission.Lock()
 	defer manager.admission.Unlock()
 	invocation, jobID, _, digest, err := manager.invocation(ctx)
@@ -662,7 +666,7 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 	if readiness != nil {
 		job.Readiness = "waiting"
 	}
-	record := &entry{recovery: work.Recovery{Job: job, Invocation: invocation, IdentityDigest: digest, Bash: &spec}, done: make(chan struct{}), credited: true, service: readiness}
+	record := &entry{recovery: work.Recovery{Job: job, Invocation: invocation, IdentityDigest: digest, Bash: &spec}, done: make(chan struct{}), credited: true, service: readiness, input: newJobInput(spec.PTY, spec.Stdin)}
 	if err = manager.commitStart(ctx, record); err != nil {
 		return nil, work.Job{}, err
 	}
@@ -726,15 +730,8 @@ func (manager *Manager) runTask(ctx context.Context, record *entry, resume bool)
 	taskCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	launchSpec := *recovery.Task
-	if len(launchSpec.OutputSchema) > 0 {
-		var compact bytes.Buffer
-		if compactErr := json.Compact(&compact, launchSpec.OutputSchema); compactErr != nil {
-			job.State = "failed"
-			job.Reason = "yield_invalid"
-			manager.settle(record, job)
-			return
-		}
-		launchSpec.Prompt += "\n\nYour final answer must be exactly one JSON value, at most 64 KiB, without Markdown fences or trailing prose, satisfying this JSON Schema:\n" + compact.String()
+	if record.schema != nil {
+		launchSpec.Prompt += "\n\n" + record.schema.Instruction()
 	}
 	result, err := manager.host.RunTask(taskCtx, work.TaskLaunch{Job: cloneJob(job), Spec: launchSpec, Environment: *recovery.Environment, JournalPath: recovery.ChildJournal, Resume: resume})
 	job.Usage = result.Usage
@@ -773,7 +770,7 @@ func (manager *Manager) runTask(ctx context.Context, record *entry, resume bool)
 		job.Result = &artifact
 	}
 	if record.schema != nil && job.State == "completed" {
-		value, validationErr := validateYield(record.schema, text)
+		value, validationErr := record.schema.Validate(text)
 		if validationErr != nil {
 			job.State = "failed"
 			job.Reason = "yield_invalid"

@@ -366,6 +366,17 @@ func buildParams(ctx context.Context, model types.Model, c types.Context, isOAut
 		}
 	}
 
+	if opts != nil && len(opts.OutputSchema) > 0 {
+		// output_config.format constrains the final text answer; tool_use
+		// turns stay free, so the agent can act before it answers.
+		outputConfig, _ := params["output_config"].(map[string]any)
+		if outputConfig == nil {
+			outputConfig = map[string]any{}
+		}
+		outputConfig["format"] = map[string]any{"type": "json_schema", "schema": json.RawMessage(opts.OutputSchema)}
+		params["output_config"] = outputConfig
+	}
+
 	if opts != nil {
 		if userID, ok := opts.Metadata["user_id"].(string); ok {
 			params["metadata"] = map[string]any{"user_id": userID}

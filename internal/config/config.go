@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -73,6 +74,9 @@ type FlagValues struct {
 	Model                StringInput
 	PlanModel            StringInput
 	SmolModel            StringInput
+	Reasoning            StringInput
+	PlanReasoning        StringInput
+	SmolReasoning        StringInput
 	MaxTokens            IntInput
 	PermissionMode       StringInput
 	BashTimeout          StringInput
@@ -137,6 +141,9 @@ type ResolvedConfig struct {
 	model                 string
 	planModel             string
 	smolModel             string
+	reasoning             string
+	planReasoning         string
+	smolReasoning         string
 	maxTokens             int
 	permissionModeDefault string
 	bashTimeout           time.Duration
@@ -171,6 +178,31 @@ func (c *ResolvedConfig) PlanModel() string { return c.planModel }
 
 // SmolModel returns the small-helper model specification.
 func (c *ResolvedConfig) SmolModel() string { return c.smolModel }
+
+// Reasoning returns the default role's reasoning effort: "" when unset (the
+// provider default), "off", or one of minimal, low, medium, high.
+func (c *ResolvedConfig) Reasoning() string { return c.reasoning }
+
+// PlanReasoning returns the plan role's reasoning effort, inheriting the
+// default role's when its own is unset.
+func (c *ResolvedConfig) PlanReasoning() string { return firstSet(c.planReasoning, c.reasoning) }
+
+// SmolReasoning returns the smol role's reasoning effort, inheriting the
+// default role's when its own is unset.
+func (c *ResolvedConfig) SmolReasoning() string { return firstSet(c.smolReasoning, c.reasoning) }
+
+// ReasoningLevels are the accepted reasoning settings; "off" asks for no
+// reasoning, the rest map to each provider's effort or thinking budget.
+var ReasoningLevels = []string{"off", "minimal", "low", "medium", "high"}
+
+func firstSet(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
 
 // MaxTokens returns the maximum model output tokens.
 func (c *ResolvedConfig) MaxTokens() int { return c.maxTokens }
@@ -261,6 +293,9 @@ type fileSettings struct {
 	Model                 *string            `json:"model"`
 	PlanModel             *string            `json:"plan_model"`
 	SmolModel             *string            `json:"smol_model"`
+	Reasoning             *string            `json:"reasoning"`
+	PlanReasoning         *string            `json:"plan_reasoning"`
+	SmolReasoning         *string            `json:"smol_reasoning"`
 	MaxTokens             *int               `json:"max_tokens"`
 	PermissionModeDefault *string            `json:"permission_mode_default"`
 	BashTimeout           *string            `json:"bash_timeout"`
@@ -450,6 +485,9 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		model:                 resolveString(c.Flags.Model, lookup("HARNESS_MODEL"), settings.Model, defaultModel),
 		planModel:             resolveString(c.Flags.PlanModel, lookup("HARNESS_PLAN_MODEL"), settings.PlanModel, ""),
 		smolModel:             resolveString(c.Flags.SmolModel, lookup("HARNESS_SMOL_MODEL"), settings.SmolModel, ""),
+		reasoning:             strings.ToLower(resolveString(c.Flags.Reasoning, lookup("HARNESS_REASONING"), settings.Reasoning, "")),
+		planReasoning:         strings.ToLower(resolveString(c.Flags.PlanReasoning, lookup("HARNESS_PLAN_REASONING"), settings.PlanReasoning, "")),
+		smolReasoning:         strings.ToLower(resolveString(c.Flags.SmolReasoning, lookup("HARNESS_SMOL_REASONING"), settings.SmolReasoning, "")),
 		maxTokens:             maxTokens,
 		permissionModeDefault: resolveString(c.Flags.PermissionMode, lookup("HARNESS_PERMISSION_MODE"), settings.PermissionModeDefault, defaultPermissionMode),
 		bashTimeout:           bashTimeout,
@@ -509,6 +547,11 @@ func validateResolved(c *ResolvedConfig) error {
 		}
 		if err := adapter.ValidateBaseURL(baseURL); err != nil {
 			return &Error{Field: field, Err: err}
+		}
+	}
+	for field, level := range map[string]string{"reasoning": c.reasoning, "plan_reasoning": c.planReasoning, "smol_reasoning": c.smolReasoning} {
+		if level != "" && !slices.Contains(ReasoningLevels, level) {
+			return &Error{Field: field, Err: fmt.Errorf("unknown level %q (valid: %s)", level, strings.Join(ReasoningLevels, ", "))}
 		}
 	}
 	switch c.permissionModeDefault {

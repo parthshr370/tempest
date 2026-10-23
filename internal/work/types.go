@@ -27,6 +27,10 @@ const (
 	MailboxCap            = 100
 	DefaultReadyTimeoutMS = 30000
 	MaxReadyTimeoutMS     = 300000
+	// DefaultStdinWaitMS and MaxStdinWaitMS bound how long write_stdin
+	// collects output when it does not go quiet first.
+	DefaultStdinWaitMS = 2000
+	MaxStdinWaitMS     = 30000
 )
 
 type QueueInput struct {
@@ -94,6 +98,12 @@ type BashSpec struct {
 	ReadyLog       string `json:"ready_log,omitempty"`
 	ReadyPort      int    `json:"ready_port,omitempty"`
 	ReadyTimeoutMS int    `json:"ready_timeout_ms,omitempty"`
+	// PTY runs the command on a pseudo-terminal: the process sees a
+	// terminal on stdin, stdout and stderr, and its output is one stream.
+	PTY bool `json:"pty,omitempty"`
+	// Stdin gives the process a pipe write_stdin writes to. Without it, or
+	// PTY, a background job reads /dev/null and sees end of file at once.
+	Stdin bool `json:"stdin,omitempty"`
 }
 
 // JobArtifactsDir is the directory inside a session's data directory
@@ -144,6 +154,37 @@ type LogPage struct {
 	EOF        bool   `json:"eof"`
 	Truncated  bool   `json:"truncated"`
 }
+
+// StdinRequest is one write_stdin call on a running bash job: Text is written
+// first, then CloseStdin ends its input, then output is collected for up to
+// Wait or until it goes quiet.
+type StdinRequest struct {
+	Text       string
+	CloseStdin bool
+	Wait       time.Duration
+}
+
+// StdinResult is the job output produced since the previous write_stdin read.
+// Output starts at raw log Offset; OmittedBytes newer than that read but
+// before Offset were left out to bound the result, and logs pages them.
+type StdinResult struct {
+	Job          Job
+	Output       string
+	Offset       int64
+	NextOffset   int64
+	OmittedBytes int64
+	StdinClosed  bool
+}
+
+// ChildPatch is a finished general task's exported change: its verified
+// patch artifact and the commit the patch is relative to.
+type ChildPatch struct {
+	Job Job
+	// Repo is the parent repository root the child's worktree came from.
+	Repo       string
+	BaseCommit string
+	Patch      Artifact
+}
 type Controller interface {
 	StartTask(context.Context, TaskSpec) (Job, error)
 	StartBash(context.Context, BashSpec) (Job, error)
@@ -155,6 +196,12 @@ type Controller interface {
 	// JobByName resolves a service name: the running job with that name,
 	// else the most recently started one.
 	JobByName(context.Context, string) (Job, error)
+	// WriteStdin writes to a running bash job's input and returns the output
+	// it produced since the previous WriteStdin on that job.
+	WriteStdin(context.Context, string, StdinRequest) (StdinResult, error)
+	// ChildPatch returns a settled task's patch for integration into the
+	// parent workspace.
+	ChildPatch(context.Context, string) (ChildPatch, error)
 }
 type Fact struct {
 	Kind    string

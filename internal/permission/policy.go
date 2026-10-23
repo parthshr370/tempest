@@ -141,13 +141,18 @@ type Outcome struct {
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
 	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
-		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff":
+		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image":
 		return TierRead
-	case "write", "edit", "hashline", "todo_write":
+	case "write", "edit", "hashline", "integrate", "todo_write":
 		return TierWrite
 	default:
 		// Includes message: it directs other agents' work, so plan mode
-		// denies it like task.
+		// denies it like task. Includes write_stdin: input to a running job
+		// is code its program runs, which the guard and cloud analysis
+		// cannot inspect. It needs no per-call ask because the job's command
+		// already passed this gate, and a shell reading commands from stdin
+		// is opaque, so starting one needed per-call approval. Plan mode
+		// denies it, and a write_stdin override (prompt, deny) applies.
 		return TierExec
 	}
 }

@@ -148,6 +148,26 @@ you named. LF/CRLF endings and a UTF-8 BOM are preserved. `edit` (exact-text
 replacement) accepts the same 4-hex tag as its anchor, as well as the full anchor
 `lsp_rename` plans carry.
 
+Every write is atomic: `write`, `edit` and `hashline` stage the new bytes in a
+hidden file beside the target, sync it, rename it over the target and sync the
+directory, so a crash leaves the old file or the new one, never a truncated mix
+(the file keeps its permission bits; a hard link to it is not followed). A patch
+that writes more than one path (several sections, `MV`, `REM`, or an `integrate`)
+is a batch under a rollback journal, the discipline of
+[SQLite's atomic commit](https://sqlite.org/atomiccommit.html): before the first
+write, every path's prior existence, bytes and mode are synced to
+`<journal>.d/edit-rollback/<batch>/` under an `flock`, and deleting the record is
+the commit. A write that fails mid-batch rolls the written paths back before the
+tool returns. A process killed mid-batch leaves the record; the next session open
+in that workspace (a resume, or any new session, CLI, `serve` or `mcp`) restores
+each path whose content is still the batch's pre or post state, reports a path
+someone changed since as a conflict and leaves it alone, keeps the conflicted
+paths' pre-batch copies under `edit-rollback/conflicts/<batch>/prior/`, and
+surfaces one diagnostic per batch in the session snapshot and log. A batch whose
+owner is still running holds its lock and is never touched. This is crash
+recovery, not isolation: other processes can see intermediate files while a batch
+runs.
+
 ### 03 · Robust error handling that nudges the model back on track
 
 The run bends, it doesn't break. Transient provider failures — rate limits, resets,
@@ -334,13 +354,38 @@ active shared general child per session. Explore remains read-only in the live c
 Worktrees fence cooperative writes, not arbitrary shell commands or hostile code.
 
 Children export binary-capable patches against their pinned base; they never
-merge into the parent. Inspect the full job through `WaitJobs` or `tempest/wait`;
-the model reads the patch at the artifact path in the job's completion notice with
-`read`, then explicitly applies it through ordinary gated bash/edit. Dirty worktrees
-are retained; `CleanupJob`, `tempest/cleanup_job`, or `jobs` with `action:"cleanup"`
-remove only owned, safely exported trees. Missing/corrupt patches, unique ignored
-files, or an uncertain surviving crash process block cleanup. Shared jobs have no
-patch and no worktree cleanup.
+merge into the parent on their own. Inspect the full job through `WaitJobs` or
+`tempest/wait`, or read the patch at the artifact path in the job's completion
+notice. `integrate {"job_id": ...}` brings a finished child's work in with a
+three-way merge relative to the base the child started from, so parent and child
+edits to different parts of one file both survive:
+
+1. The parent's current files (uncommitted and untracked ones included, ignored
+   ones excluded) are snapshotted into a tree through a private index; the child's
+   tree is rebuilt by applying its patch to its base in another private index; and
+   `git merge-tree --write-tree` merges the two in the object database. The user's
+   index, HEAD, refs and working files are never touched, and no worktree is
+   checked out; the only residue is unreferenced objects `git gc` prunes.
+2. Each file the child changed is reported as `clean` (only the child changed it),
+   `merged` (both changed it, without overlap) or `conflict` (overlapping edits,
+   shown as numbered diff3 marker hunks labelled parent, base and child; also
+   symlink or submodule changes). Nothing is written while any file conflicts; the
+   live file keeps the parent's side and the model carries the child's side over
+   with `edit` or `hashline`. The full conflicted file stays readable with
+   `git show <merged_tree>:<path>`.
+3. A textually clean merge is not proof the code still works together, so merged
+   files are written only when the call passes `accept_merged:true`. Before
+   writing, every target is re-hashed under the file mutation locks; a file that
+   changed since the snapshot refuses the whole integration with what changed.
+   The write goes through workspace containment, the mutation queue, language
+   server change notices and, for more than one file, the edit rollback journal.
+
+`integrate` needs git and a root session with the job controller; in a workspace
+without git it says so and points at the patch to apply with the edit tools.
+Dirty worktrees are retained; `CleanupJob`, `tempest/cleanup_job`, or `jobs` with
+`action:"cleanup"` remove only owned, safely exported trees. Missing/corrupt
+patches, unique ignored files, or an uncertain surviving crash process block
+cleanup. Shared jobs have no patch and no worktree cleanup.
 
 Admission limits: 4 running jobs per kind (task, bash), 8 jobs running or holding
 an undelivered completion notice, 64 jobs per run, 16 retained general-task
@@ -396,6 +441,44 @@ resolves to its running job, else the one started last. Starting a name that is
 already running fails with the job holding it; restart a service with `cancel
 {"name":…}` and start it again.
 
+#### Interactive jobs: stdin and pseudo-terminals
+
+A background job's stdin is `/dev/null`, as for any background process: a command
+that reads input (a credential or host-key prompt, a y/n installer, bare `cat`)
+sees end of file and fails fast instead of waiting out its timeout. Only a job
+started with `stdin:true` (a pipe, which also makes it a background job) or
+`pty:true` takes input; `write_stdin` with text to any other job fails and says to
+start it with one of those. `write_stdin {"name":…, "text":…}` writes the text as
+given (`\n` ends a line, `\u0003` is Ctrl-C) and returns the output the job
+printed since the previous `write_stdin` on it: it waits until new output has been
+quiet for 0.3 s, until `wait_ms` (default 2000, at most 30000) passes, or until the
+job's output ends, and returns at most the newest 16 KiB with raw
+`offset`/`next_offset` (bytes it skipped stay readable with `logs`). Empty text
+polls any background job; `close_stdin:true` ends the input after the text.
+
+`pty:true` starts the job on a pseudo-terminal (stdlib ioctls on darwin and Linux,
+no dependency): the process is a session leader whose controlling terminal is
+24x80, with `TERM=dumb`, `NO_COLOR=1` and `cat` as pager so REPLs and prompting
+tools run as they do for a person without painting the log. Its stdout and stderr
+are one stream, the terminal echoes input and ends lines with `\r\n`, and nothing
+is stripped. Ctrl-C reaches the foreground program through the line discipline;
+on a pipe job, with or without `stdin:true`, text that is exactly `\u0003` sends
+SIGINT to the job's process group instead. `close_stdin` closes a pipe job's stdin
+and sends Ctrl-D on a pty.
+Cancellation, timeouts and output bounds are those of every background job, and the
+pty is closed once the job's output is drained. A process is never reattached after
+a restart: a pty job interrupted by one settles as `unknown` like any other bash
+job, and `write_stdin` to it says so. Children have no background jobs, so they
+get neither `pty`, `stdin` nor `write_stdin`.
+
+`write_stdin` is in the `exec` tier: plan mode denies it, and a `write_stdin`
+override (`prompt`, `deny`) applies to every call. The destructive guard and cloud
+analysis can't see what a program does with its input, so `default` mode allows a
+write the way it allows the program's own command: the job's command already
+passed the gate, and a shell reading commands from stdin (`bash`, `sh -s`) is
+opaque there, so starting one needed per-call approval (and is denied without an
+approver). Approving such a shell approves what is typed into it.
+
 ### 09 · Reads that show the file, and outline it only when it won't fit
 
 Point `read` at a file and it returns the numbered content whenever the whole file
@@ -406,6 +489,17 @@ note saying it is an outline and how to read a range, so the agent picks the lin
 it needs rather than paging blind. Any other large file returns its first page and
 the offset to continue. `mode:"outline"` asks for the outline of a Go file of any
 size; `mode:"raw"` always pages numbered rows.
+
+**Several files, one call.** `paths` takes the place of `path` when the agent knows
+several files it needs: `{"paths":["go.mod","internal/a.go:40-90","README.md:1-30"]}`
+returns one `[path#TAG]` section per entry, in order, each recording the rows it
+showed for `hashline`. The sections share one 2000-line/50KB budget; a file the
+budget cuts short ends with the `path:START-END` that continues it, and a file it
+leaves no room for is named, not read. A failing entry reports its error in place
+of its section. `offset`/`limit` page a single `path` only. `grep` takes `paths`
+the same way, with one shared match `limit`. The system prompt tells the model to
+batch known reads this way and to issue independent tool calls in one response,
+which the agent loop already runs concurrently.
 
 `read` takes more than files. Every text output below starts with the
 `[path#TAG]` header and accepts the same `path:START-END` / `path:START+COUNT`
@@ -483,25 +577,27 @@ wire methods use camelCase (`jobId`, `jobIds`).
 
 **Files & search**
 
-- `read` — files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`); numbered content when the file fits one read, a structural outline for a Go file that doesn't.
+- `read` — files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`); numbered content when the file fits one read, a structural outline for a Go file that doesn't; `paths` reads up to 20 files in one call, each with its own selector.
 - `write` — create or overwrite a file, or a `local://` scratch file.
 - `edit` — exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor); also edits `local://` files.
 - `hashline` — line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers; see [02](#02--line-anchored-edits-that-never-corrupt-a-file).
-- `grep` — regex search across the tree, or under an internal URL.
+- `grep` — regex search across the tree, under up to 20 `paths` at once, or under an internal URL.
 - `find` — glob-based path lookup.
 - `ls` — directory listing.
 
 **Runtime**
 
-- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `name` (or `async:true` for an unnamed job) starts a supervised background job, optionally a service that returns once `ready_log`/`ready_port` holds.
+- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds; `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal.
 - `jobs` — page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
 - `wait` — wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
 - `cancel` — cancel one task or background bash job, by id or name.
 - `logs` — page a background command's bounded stdout/stderr by byte offset, by id or name.
+- `write_stdin` — type into a running background job (text, Ctrl-C, end of input) and get back the output it printed since the last call, by id or name.
 
 **Coordination**
 
 - `task` — admit asynchronous children and return job handles *(behind `-enable-task`)*.
+- `integrate` — three-way merge a finished general task's patch into the live workspace: per file clean, merged or conflict (with markers); writes only when nothing conflicts and the live files still match the snapshot, merged files only with `accept_merged:true` *(behind `-enable-task`; plan mode blocks it)*.
 - `message` — message the parent, a running child, or all peers, optionally awaiting the first reply *(behind `-enable-task`; children get it too)*.
 - `todo_write` — the task list, replaced in full (`todos`) or edited by one op naming todos by content (`init`, `append`, `start`, `done`, `block` with a reason, `drop`), with optional phases; checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace, and the result shows the updated list.
 
@@ -518,6 +614,7 @@ wire methods use camelCase (`jobId`, `jobIds`).
 **Code & manifest intelligence** *(see [Code and manifest intelligence](#code-and-manifest-intelligence))*
 
 - `manifest_diff` — compare two rendered Kubernetes manifest snapshots resource by resource; never runs a renderer.
+- `view_image` — show a PNG, JPEG, GIF or WebP file inside the working directory to the model as an image (at most 3,932,160 bytes, 5 MB once base64-encoded, and 8000 px per side). It refuses when the model has no image input in the catalog. Anthropic gets the image inside the `tool_result`, Gemini 3 inside the `functionResponse`, and OpenAI-compatible routes as a user message right after the tool messages, since chat-completions tool messages carry text only.
 - `lsp_definition`, `lsp_references` — semantic navigation through a language server *(behind `-enable-lsp`)*.
 - `lsp_rename` — a rename **plan** of anchored edits for the ordinary `edit` tool; it writes nothing *(behind `-enable-lsp`)*.
 - `lsp_diagnostics` — a file's diagnostics with an explicit freshness verdict *(behind `-enable-lsp`)*.
@@ -651,7 +748,21 @@ as unknown, never reruns the command and never signals a stale PID.
 ```
 
 `cost_usd` is `null` when any call's price was unknown, and `error` appears on
-`error` stops. `message` is the transcript's last message. In text mode the last
+`error` and `output_invalid` stops.
+
+`-output-schema FILE` makes the run's final answer one JSON value that satisfies
+the JSON Schema in FILE. The provider is asked for native structured output
+(OpenAI-compatible `response_format: {type: json_schema, strict: true}`,
+Anthropic `output_config.format`, Gemini `responseJsonSchema`); tool calls stay
+free, so the agent still works before it answers. The prompt also carries the
+schema, and the final text is validated locally with the same validator as a
+task's `output_schema`. An invalid answer gets one correction turn naming the
+validation error; if it still fails, the run stops with `output_invalid` and
+exits 1. The report's `output` field holds the parsed value. Write strict
+schemas (`additionalProperties: false`, every property required): OpenAI's and
+Anthropic's native modes require them. In Go, set `Prompt.OutputSchema` and read
+`RunResult.Output`; over ACP, send `_meta.tempest.outputSchema` on
+`session/prompt` and read `_meta.tempest.output` from the response. `message` is the transcript's last message. In text mode the last
 assistant text goes to stdout, and a stop reason other than `completed` goes to
 stderr. Text mode ends with `session: <id> (resume with -resume <id>)` on stderr.
 
@@ -956,6 +1067,9 @@ The example is a separate module with a local `replace`; build it with
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
 | `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools, `manifest_diff`, enabled `lsp_*` tools (rename computes a plan only) and enabled read-only web/attachment tools are available; `-faux-script` still overrides the model provider. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
+| `-image <path>` | Attach a PNG, JPEG, GIF or WebP image to the prompt as an image block; repeatable. Refused at startup when the model has no image input in the catalog or the image exceeds the `view_image` limits. |
+| `-output-schema <path>` | JSON Schema for the final answer; see [Runs](#runs). |
+| `-reasoning <level>`, `-plan-reasoning`, `-smol-reasoning` | Reasoning effort: `off`, `minimal`, `low`, `medium` or `high`; unset leaves the provider default. Plan and smol inherit `-reasoning`. Sent as OpenAI `reasoning_effort`, OpenRouter `reasoning.effort`, Gemini `thinkingLevel`, and an Anthropic thinking budget or adaptive effort. A model the catalog lists without reasoning gets no field and one warning. `serve` and `mcp` take `-reasoning`; `doctor` shows each role's effective value. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
 | `-enable-lsp` | Register the `lsp_*` tools; language servers start on first use. See [Language servers](#language-servers). |
 | `-lsp-config <path>` | Operator language-server file; replaces the built-in server list. An empty path selects the built-ins. |
@@ -983,6 +1097,7 @@ not read `.env` — export variables before running it.
 | `OPENAI_BASE_URL` | OpenAI-compatible endpoint for `openai:<id>` models without `@<base-url>`. `-openai-base-url`, `HARNESS_OPENAI_BASE_URL` and settings `openai_base_url` override it, in that order. |
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY` | Google and OpenRouter credentials. Point those routes elsewhere with `google:<id>@<base-url>` or `openrouter:<id>@<base-url>`. |
 | `HARNESS_MODEL`, `HARNESS_PLAN_MODEL`, `HARNESS_SMOL_MODEL` | Model for each role. |
+| `HARNESS_REASONING`, `HARNESS_PLAN_REASONING`, `HARNESS_SMOL_REASONING` | Reasoning effort per role (settings `reasoning`, `plan_reasoning`, `smol_reasoning`). |
 | `HARNESS_PERMISSION_MODE` | Default tool gate mode. |
 | `HARNESS_PERMISSION_ALLOW_TOOLS`, `HARNESS_PERMISSION_DENY_TOOLS` | Per-tool allow/deny lists. |
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |

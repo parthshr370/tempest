@@ -12,9 +12,11 @@ import (
 	"go.harness.dev/harness/internal/provider/google"
 	"go.harness.dev/harness/internal/provider/openai"
 	"go.harness.dev/harness/internal/retry"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -118,11 +120,20 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 // error since NewProviderRouter validates it, so it surfaces as a terminal error
 // event rather than a panic.
 func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, apiKey, authToken string, blobReader types.BlobReader) ProviderRouter {
+	var reasoningWarning sync.Once
 	r.StreamFn = func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 		if streamSimple == nil {
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
+		if resolved.Reasoning != "" && !model.Reasoning {
+			// A reasoning field the model doesn't support is rejected by
+			// strict endpoints, so it never reaches the wire.
+			reasoningWarning.Do(func() {
+				slog.Warn("reasoning effort ignored: the model has no reasoning support in the catalog", "provider", model.Provider, "model", model.ID, "reasoning", resolved.Reasoning)
+			})
+			resolved.Reasoning = ""
+		}
 		if blobReader != nil {
 			resolved.BlobReader = blobReader
 		}

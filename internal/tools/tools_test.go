@@ -30,7 +30,7 @@ import (
 func TestRegistry(t *testing.T) {
 	dir := t.TempDir()
 	all := AllTools(dir, ToolsOptions{})
-	if len(all) != 10 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil {
+	if len(all) != 11 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil || all[ViewImageTool].Execute == nil {
 		t.Fatalf("registry = %v names=%v", all, AllToolNames)
 	}
 	for _, name := range LSPToolNames {

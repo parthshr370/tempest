@@ -50,7 +50,26 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 	}
 
 	if opts != nil && opts.ReasoningEffort != "" {
-		params["reasoning_effort"] = opts.ReasoningEffort
+		if model.Provider == "openrouter" {
+			// OpenRouter's canonical form; reasoning_effort is its alias.
+			params["reasoning"] = map[string]any{"effort": opts.ReasoningEffort}
+		} else {
+			params["reasoning_effort"] = opts.ReasoningEffort
+		}
+	}
+
+	if opts != nil && len(opts.OutputSchema) > 0 {
+		// Strict mode makes the endpoint constrain every text answer to the
+		// schema; tool calls are unaffected, so the agent can still act
+		// before answering.
+		params["response_format"] = map[string]any{
+			"type": "json_schema",
+			"json_schema": map[string]any{
+				"name":   outputSchemaName,
+				"schema": json.RawMessage(opts.OutputSchema),
+				"strict": true,
+			},
+		}
 	}
 
 	applyPromptCache(params, model, opts)
@@ -172,10 +191,7 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 							parts = append(parts, map[string]any{"type": "text", "text": text})
 						}
 					} else if item.Type == types.BlockImage {
-						parts = append(parts, map[string]any{
-							"type":      "image_url",
-							"image_url": map[string]any{"url": fmt.Sprintf("data:%s;base64,%s", item.MimeType, item.Data)},
-						})
+						parts = append(parts, imageURLPart(item))
 					}
 				}
 				if len(parts) > 0 {
@@ -223,20 +239,28 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 			continue
 		}
 
-		if toolResult, ok := asToolResult(msg); ok {
-			toolResults := []map[string]any{toolResultBlock(toolResult)}
-			j := i + 1
+		if _, ok := asToolResult(msg); ok {
+			// Chat-completions tool messages carry text only, so the
+			// batch's images follow it as one user message.
+			var images []map[string]any
+			j := i
 			for j < len(transformedMessages) {
-				nextMsg, ok := asToolResult(transformedMessages[j])
+				next, ok := asToolResult(transformedMessages[j])
 				if !ok {
 					break
 				}
-				toolResults = append(toolResults, toolResultBlock(nextMsg))
+				params = append(params, toolResultBlock(next))
+				for _, block := range next.Content {
+					if block.Type == types.BlockImage {
+						images = append(images, imageURLPart(block))
+					}
+				}
 				j++
 			}
 			i = j - 1
-			for _, tr := range toolResults {
-				params = append(params, tr)
+			if len(images) > 0 {
+				parts := append([]map[string]any{{"type": "text", "text": "Attached image(s) from tool result:"}}, images...)
+				params = append(params, map[string]any{"role": "user", "content": parts})
 			}
 		}
 	}
@@ -256,6 +280,17 @@ func toolResultBlock(msg types.ToolResultMessage) map[string]any {
 		"role":         "tool",
 		"content":      util.SanitizeSurrogates(text),
 		"tool_call_id": msg.ToolCallID,
+	}
+}
+
+// outputSchemaName names the response_format schema; the wire requires one.
+const outputSchemaName = "final_answer"
+
+// imageURLPart renders an image block as an inline data-URL content part.
+func imageURLPart(block types.ContentBlock) map[string]any {
+	return map[string]any{
+		"type":      "image_url",
+		"image_url": map[string]any{"url": fmt.Sprintf("data:%s;base64,%s", block.MimeType, block.Data)},
 	}
 }
 

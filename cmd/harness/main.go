@@ -48,6 +48,10 @@ type commandOptions struct {
 	Continue     bool
 	Version      bool
 	Budget       agent.Budget
+	// OutputSchemaPath names a JSON Schema file for the run's final answer.
+	OutputSchemaPath string
+	// ImagePaths are image files attached to the prompt.
+	ImagePaths []string
 }
 
 // skillPathsFlag adapts repeated -skill values to config's tracked input, so resolution can still tell flags from defaults.
@@ -176,6 +180,11 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		stackModel = roles.Plan.Model
 		stackStreamFn = roles.Plan.StreamFn
 	}
+	prompt, err := buildOneShotPrompt(opts, stackModel)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 	// Refuse an unenforceable budget before anything is written to disk.
 	if err := opts.Budget.Validate(stackModel); err != nil {
 		fmt.Fprintf(stderr, "budget error: %v\n", err)
@@ -255,7 +264,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			slog.Warn("session close failed", "error", err)
 		}
 	}()
-	outcome, outputErr := executeOneShot(runCtx, sess, opts.Prompt, mode, stdout, stderr, 256)
+	outcome, outputErr := executeOneShot(runCtx, sess, prompt, mode, stdout, stderr, 256)
 	if outputErr != nil {
 		fmt.Fprintf(stderr, "output error: %v\n", outputErr)
 		return 1
@@ -272,7 +281,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "session: %s (resume with -resume %s)\n", sess.ID(), sess.ID())
 	}
 	switch outcome.StopReason {
-	case agent.StopError:
+	case agent.StopError, agent.StopOutputInvalid:
 		return 1
 	case agent.StopAborted:
 		return exitAborted
@@ -302,6 +311,8 @@ type runReport struct {
 	// last message (a tool result when a budget stopped the run mid-task).
 	Text    string         `json:"text"`
 	Message ptypes.Message `json:"message,omitempty"`
+	// Output is the final answer parsed against -output-schema.
+	Output json.RawMessage `json:"output,omitempty"`
 }
 
 // writeRunOutput prints the run result: a runReport in json mode; otherwise
@@ -327,7 +338,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 	}
 	switch outcome.StopReason {
 	case agent.StopCompleted:
-	case agent.StopError:
+	case agent.StopError, agent.StopOutputInvalid:
 		fmt.Fprintf(stderr, "run failed after %d turns: %v\n", outcome.Turns, outcome.Err)
 	default:
 		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)
@@ -335,7 +346,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 }
 
 func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
-	report := runReport{SessionID: outcome.SessionID, StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last}
+	report := runReport{SessionID: outcome.SessionID, StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last, Output: outcome.Output}
 	if outcome.Err != nil {
 		report.Error = outcome.Err.Error()
 	}
@@ -363,6 +374,9 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.StringVar(&values.Model.Value, "model", "", "model ID")
 	fs.StringVar(&values.PlanModel.Value, "plan-model", "", "model ID for the read-only plan agent")
 	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
+	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
+	fs.StringVar(&values.PlanReasoning.Value, "plan-reasoning", "", "reasoning effort for the plan role (default: -reasoning)")
+	fs.StringVar(&values.SmolReasoning.Value, "smol-reasoning", "", "reasoning effort for the smol role (default: -reasoning)")
 	fs.IntVar(&values.MaxTokens.Value, "max-tokens", 0, "maximum model output tokens")
 	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "tool permission mode: default, plan, acceptEdits, bypass")
 	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default bash command timeout, e.g. 10m (default 10m)")
@@ -396,6 +410,10 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.BoolVar(&version, "version", false, "print build version")
 	fs.StringVar(&resume, "resume", "", "resume a session by id")
 	fs.BoolVar(&continueRecent, "continue", false, "continue the most recent session for this directory")
+	var outputSchemaPath string
+	var imagePaths config.StringsInput
+	fs.StringVar(&outputSchemaPath, "output-schema", "", "JSON Schema file the final answer must satisfy; json reports carry the parsed value as output")
+	fs.Var(skillPathsFlag{input: &imagePaths}, "image", "PNG, JPEG, GIF or WebP image to attach to the prompt (repeatable)")
 	var budget agent.Budget
 	fs.IntVar(&budget.MaxTurns, "max-turns", 0, "stop the run after this many model calls (0 = unlimited)")
 	fs.Float64Var(&budget.MaxCostUSD, "max-cost", 0, "stop the run once its model calls cost this many USD (0 = unlimited; refused when the model's price is unknown and its route doesn't report billed cost)")
@@ -416,6 +434,12 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 			values.PlanModel.Set = true
 		case "smol-model":
 			values.SmolModel.Set = true
+		case "reasoning":
+			values.Reasoning.Set = true
+		case "plan-reasoning":
+			values.PlanReasoning.Set = true
+		case "smol-reasoning":
+			values.SmolReasoning.Set = true
 		case "max-tokens":
 			values.MaxTokens.Set = true
 		case "permission-mode":
@@ -459,7 +483,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 		}
 	})
 	secrets := secretResolver(values)
-	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, Continue: continueRecent, Budget: budget}, nil
+	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, Continue: continueRecent, Budget: budget, OutputSchemaPath: outputSchemaPath, ImagePaths: imagePaths.Values}, nil
 }
 
 // resolveCommandConfig rejects incompatible session flags before resolving the config's precedence layers.

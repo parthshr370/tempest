@@ -13,14 +13,14 @@ import (
 
 var errStreamGap = errors.New("stream incomplete: updates skipped (tempest/gap)")
 
-func executeOneShot(ctx context.Context, sess *tempest.Session, prompt, mode string, stdout, stderr io.Writer, buffer int) (runOutcome, error) {
+func executeOneShot(ctx context.Context, sess *tempest.Session, prompt tempest.Prompt, mode string, stdout, stderr io.Writer, buffer int) (runOutcome, error) {
 	var updates <-chan tempest.Update
 	stop := func() {}
 	if mode == "stream-json" {
 		_, updates, stop = sess.Watch(context.Background(), tempest.WatchOptions{Buffer: buffer})
 	}
 	defer stop()
-	run, err := sess.Begin(ctx, tempest.Prompt{Text: prompt})
+	run, err := sess.Begin(ctx, prompt)
 	if err != nil {
 		return runOutcome{}, err
 	}

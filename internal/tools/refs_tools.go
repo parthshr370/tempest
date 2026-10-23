@@ -16,13 +16,14 @@ import (
 
 // grepToolInput is the grep tool's arguments.
 type grepToolInput struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path"`
-	Glob       string `json:"glob"`
-	IgnoreCase bool   `json:"ignore_case"`
-	Literal    bool   `json:"literal"`
-	Context    int    `json:"context"`
-	Limit      int    `json:"limit"`
+	Pattern    string   `json:"pattern"`
+	Path       string   `json:"path"`
+	Paths      []string `json:"paths"`
+	Glob       string   `json:"glob"`
+	IgnoreCase bool     `json:"ignore_case"`
+	Literal    bool     `json:"literal"`
+	Context    int      `json:"context"`
+	Limit      int      `json:"limit"`
 }
 
 // defaultGrepMatchLimit matches the grep tool's default for workspace
@@ -130,6 +131,16 @@ type mutationTarget struct {
 	canonicalPath string
 	queueKey      string
 	release       func() error
+}
+
+// diskName is the name a write replaces inside root: the symlink-resolved
+// canonical path when there is one, so an atomic rename lands on the real
+// file instead of replacing a link to it.
+func (t mutationTarget) diskName() string {
+	if t.canonicalPath != "" {
+		return filepath.FromSlash(t.canonicalPath)
+	}
+	return t.relPath
 }
 
 // resolveMutationTarget maps a write or edit path to its root: the

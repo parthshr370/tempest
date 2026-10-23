@@ -2,6 +2,7 @@ package google
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"go.harness.dev/harness/internal/engine/transform"
@@ -57,6 +58,15 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 		generationConfig["thinkingConfig"] = map[string]any{"thinkingBudget": 0}
 	}
 
+	if opts != nil && len(opts.OutputSchema) > 0 {
+		// responseJsonSchema takes the caller's JSON Schema as is;
+		// responseSchema would need a lossy translation into Gemini's
+		// OpenAPI subset. Gemini 3 keeps function calling available
+		// alongside it, so only the final text answer is constrained.
+		generationConfig["responseMimeType"] = "application/json"
+		generationConfig["responseJsonSchema"] = json.RawMessage(opts.OutputSchema)
+	}
+
 	return params
 }
 
@@ -70,6 +80,7 @@ func convertMessages(messages []types.Message, model types.Model) []map[string]a
 	transformedMessages := transform.TransformMessages(messages, model, normalizeID)
 
 	contents := []map[string]any{}
+	var pendingImages []map[string]any
 	for i := 0; i < len(transformedMessages); i++ {
 		msg := transformedMessages[i]
 
@@ -160,15 +171,16 @@ func convertMessages(messages []types.Message, model types.Model) []map[string]a
 
 		if toolResult, ok := asToolResult(msg); ok {
 			textParts := []string{}
-			hasImages := false
+			var imageParts []map[string]any
 			for _, block := range toolResult.Content {
 				if block.Type == types.BlockText {
 					textParts = append(textParts, block.Text)
 				}
 				if block.Type == types.BlockImage {
-					hasImages = true
+					imageParts = append(imageParts, map[string]any{"inlineData": map[string]any{"mimeType": block.MimeType, "data": block.Data}})
 				}
 			}
+			hasImages := len(imageParts) > 0
 			text := strings.Join(textParts, "\n")
 			if !hasImages {
 				text = util.SanitizeSurrogates(text)
@@ -191,6 +203,25 @@ func convertMessages(messages []types.Message, model types.Model) []map[string]a
 			if requiresToolCallID(model.ID) {
 				frp["functionResponse"].(map[string]any)["id"] = toolResult.ToolCallID
 			}
+			// Gemini 3 takes images inside the function response; older
+			// models need them in a user turn after the responses.
+			if hasImages && multimodalFunctionResponse(model.ID) {
+				frp["functionResponse"].(map[string]any)["parts"] = imageParts
+			} else if hasImages {
+				pendingImages = append(append(pendingImages, map[string]any{"text": "Tool result image:"}), imageParts...)
+			}
+			flushPending := func() {
+				if len(pendingImages) == 0 {
+					return
+				}
+				if i+1 < len(transformedMessages) {
+					if _, next := asToolResult(transformedMessages[i+1]); next {
+						return
+					}
+				}
+				contents = append(contents, map[string]any{"role": "user", "parts": pendingImages})
+				pendingImages = nil
+			}
 
 			lastContent := contents[len(contents)-1]
 			if lastContent["role"] == "user" {
@@ -205,13 +236,31 @@ func convertMessages(messages []types.Message, model types.Model) []map[string]a
 				if hasFR {
 					parts = append(parts, frp)
 					lastContent["parts"] = parts
+					flushPending()
 					continue
 				}
 			}
 			contents = append(contents, map[string]any{"role": "user", "parts": []map[string]any{frp}})
+			flushPending()
 		}
 	}
 	return contents
+}
+
+// multimodalFunctionResponse reports whether a Gemini model accepts image
+// parts inside functionResponse: Gemini 3 and later do. Ids without a
+// gemini-N version are assumed current.
+func multimodalFunctionResponse(modelID string) bool {
+	rest, ok := strings.CutPrefix(strings.ToLower(modelID), "gemini-")
+	if !ok {
+		return true
+	}
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end == -1 {
+		end = len(rest)
+	}
+	major, err := strconv.Atoi(rest[:end])
+	return err != nil || major >= 3
 }
 
 // requiresToolCallID reports whether a model needs explicit tool-call IDs on the

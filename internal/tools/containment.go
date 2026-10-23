@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"go.harness.dev/harness/internal/editbatch"
 	"go.harness.dev/harness/internal/pathutil"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/work"
@@ -187,16 +188,12 @@ func readSessionArtifact(sessionDataDir, name string) ([]byte, error) {
 	return data, errors.Join(err, root.Close())
 }
 
-// writeFileInRoot writes a file through the root, creating parent directories
-// inside the root as needed.
+// writeFileInRoot replaces a file through the root atomically (staged file,
+// sync, rename; see editbatch.WriteFile), creating parent directories inside
+// the root as needed and keeping an existing file's permission bits. name is
+// the symlink-resolved path, so the rename replaces the real file.
 func writeFileInRoot(root *os.Root, name string, content []byte) error {
-	if err := root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
-		return wrapOutsideRoot(name, err)
-	}
-	if err := root.WriteFile(name, content, 0o644); err != nil {
-		return wrapOutsideRoot(name, err)
-	}
-	return nil
+	return wrapOutsideRoot(name, editbatch.WriteFile(root, name, content, 0))
 }
 
 // statInRoot stats a path through the root.

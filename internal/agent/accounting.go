@@ -36,6 +36,9 @@ func newLoopRun(ctx context.Context, config AgentLoopConfig, emit AgentEventSink
 		}
 		ctx = context.WithValue(ctx, accountingKey{}, accounting)
 	}
+	if config.OutputSchema != nil {
+		config.SimpleStreamOptions.OutputSchema = config.OutputSchema.Raw()
+	}
 	run := &loopRun{config: config, emit: emit, streamFn: streamFn, accounting: accounting, root: root, started: time.Now()}
 	return context.WithValue(ctx, localRunKey{}, run), run
 }

@@ -101,6 +101,11 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 		if loaded.Header.Cwd != launch.Job.Cwd {
 			return result, errors.New("child journal cwd mismatch")
 		}
+		// Undo a batch the crash cut short before the child resumes or its
+		// worktree is exported as a patch.
+		for _, message := range recoverEditBatches(filepath.Dir(childPath), cfg.MutationQueue) {
+			c.logger.Warn("interrupted child edit batch", "job_id", launch.Job.ID, "diagnostic", message)
+		}
 		for source, usage := range loaded.UsageSources {
 			if err = c.agent.ImportUsage(ctx, source, loaded.Model, usage); err != nil {
 				return result, err
@@ -123,6 +128,9 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	childCfg := cfg
 	childCfg.Cwd = launch.Job.Cwd
 	childCfg.Model, childCfg.StreamFn = model, stream
+	if launch.Spec.SubagentType == "explore" && cfg.SmolReasoning != "" {
+		childCfg.Reasoning = cfg.SmolReasoning
+	}
 	childCfg.Plan = false
 	childCfg.Child = true
 	childCfg.EnableTask = false
@@ -226,7 +234,7 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	return result, runErr
 }
 func childToolNames(kind string, parent []string) []string {
-	builtin := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "message"}
+	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message"}
 	if kind == "general" {
 		builtin = append(builtin, "write", "edit", "hashline", "bash", "todo_write")
 	}

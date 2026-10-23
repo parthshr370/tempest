@@ -23,6 +23,7 @@ import (
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
+	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
@@ -85,16 +86,19 @@ type approvalResult struct {
 	err    error
 }
 type sessionCore struct {
-	mu            sync.Mutex
-	id            string
-	agent         *agent.Agent
-	store         *journal.Store
-	hub           *hub.Hub
-	model         types.Model
-	budget        Budget
-	mode          PermissionMode
-	prompter      Prompter
-	pending       map[string]*approval
+	mu       sync.Mutex
+	id       string
+	agent    *agent.Agent
+	store    *journal.Store
+	hub      *hub.Hub
+	model    types.Model
+	budget   Budget
+	mode     PermissionMode
+	prompter Prompter
+	pending  map[string]*approval
+	// logger reports diagnostics that have no run to attach to, such as a
+	// resumed child's edit-batch recovery.
+	logger        *slog.Logger
 	active        *Run
 	closed        bool
 	closeOnce     sync.Once
@@ -315,7 +319,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			return nil, err
 		}
 	}
-	c := &sessionCore{id: store.ID(), store: store, model: runtimeModel, budget: budget, mode: mode, prompter: o.Prompter, pending: make(map[string]*approval)}
+	c := &sessionCore{id: store.ID(), store: store, model: runtimeModel, budget: budget, mode: mode, prompter: o.Prompter, pending: make(map[string]*approval), logger: logger}
 	s := &Session{core: c}
 	mapper := newMapper(c.id, runtimeModel)
 	seed := Snapshot{SessionID: c.id, Cwd: cwd, Model: runtimeModel.ID, PermissionMode: string(mode), Budget: budget, Usage: mapper.usage}
@@ -334,6 +338,13 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		for _, i := range loaded.Interrupted {
 			logger.Warn("previous run left a tool call unfinished; its outcome is unknown", "tool", i.Tool, "tool_call_id", i.ToolCallID)
 		}
+	}
+	// A process that died mid-batch may have left a multi-file edit half
+	// applied, in this session or another of the same workspace (a new
+	// session after a crash): restore it before any tool runs.
+	for _, message := range recoverEditBatches(filepath.Dir(store.Path()), cfg.MutationQueue) {
+		seed.Diagnostics = append(seed.Diagnostics, message)
+		logger.Warn("interrupted edit batch", "diagnostic", message)
 	}
 	c.hub = hub.New(seed, mapper.mapEvent)
 	if loaded != nil {
@@ -537,17 +548,25 @@ func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
 		c.mu.Unlock()
 		return nil, ErrRecoveryRequired
 	}
+	var schema *outputschema.Schema
+	if p != nil {
+		var err error
+		if schema, err = outputschema.Compile(p.OutputSchema); err != nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("%w: %v", ErrInvalidOutputSchema, err)
+		}
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	r := &Run{cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), started: time.Now()}
 	c.active = r
 	c.lastText = ""
 	c.runID = ""
 	c.mu.Unlock()
-	go s.execute(runCtx, p, r)
+	go s.execute(runCtx, p, schema, r)
 	return r, nil
 }
 
-func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
+func (s *Session) execute(runCtx context.Context, p *Prompt, schema *outputschema.Schema, r *Run) {
 	c := s.core
 	defer func() {
 		r.cancel()
@@ -579,11 +598,14 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
 		c.installMCPDefaults()
 		c.agent.SetTools(c.selectedMCPTools())
 	}
+	// The schema belongs to this prompt's run only; a continuation answers
+	// in free text.
+	c.agent.SetOutputSchema(schema)
 	if p == nil {
 		r.result, r.err = c.agent.Continue(runCtx)
 		return
 	}
-	if len(p.Media) == 0 {
+	if len(p.Media) == 0 && schema == nil {
 		r.result, r.err = c.agent.PromptText(runCtx, p.Text)
 		return
 	}
@@ -592,7 +614,13 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, r *Run) {
 		v := *c.delivery
 		delivery = &v
 	}
-	r.result, r.err = c.agent.Prompt(runCtx, session.BuildUserMessage(p.Text, p.Media, delivery))
+	message := session.BuildUserMessage(p.Text, p.Media, delivery)
+	if schema != nil {
+		// The instruction rides in this prompt, not the system prompt, so
+		// the cached prefix is the same with or without a schema.
+		message.Content = types.BlockContent(append(message.Content.Blocks, types.NewText(schema.Instruction()))...)
+	}
+	r.result, r.err = c.agent.Prompt(runCtx, message)
 }
 func (s *Session) cancel() {
 	c := s.core

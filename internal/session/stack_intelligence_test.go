@@ -52,7 +52,7 @@ func stackToolNames(t *testing.T, cfg StackConfig) []string {
 func TestPlanStackSelectsIntelligenceReadTools(t *testing.T) {
 	cwd := t.TempDir()
 	names := stackToolNames(t, StackConfig{Cwd: cwd, Plan: true, LSPManager: inertManager(t, cwd)})
-	want := []string{"find", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read"}
+	want := []string{"find", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read", "view_image"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("plan tools = %v, want %v", names, want)
 	}

@@ -59,7 +59,7 @@ func TestStreamJSONOrderAndImmediateDelta(t *testing.T) {
 	reader, writer := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
-		_, err := executeOneShot(context.Background(), s, "go", "stream-json", writer, io.Discard, 256)
+		_, err := executeOneShot(context.Background(), s, tempest.Prompt{Text: "go"}, "stream-json", writer, io.Discard, 256)
 		_ = writer.Close()
 		done <- err
 	}()
@@ -121,7 +121,7 @@ func TestStreamJSONWriterFailureCancelsAndJoins(t *testing.T) {
 	f := faux.New(faux.Options{TokensPerSecond: 1})
 	f.AppendResponses(faux.Respond(faux.Text(strings.Repeat("long response ", 100))))
 	s := streamSession(t, f, f.StreamSimple, tempest.Budget{})
-	outcome, err := executeOneShot(context.Background(), s, "go", "stream-json", failingWriter{}, io.Discard, 256)
+	outcome, err := executeOneShot(context.Background(), s, tempest.Prompt{Text: "go"}, "stream-json", failingWriter{}, io.Discard, 256)
 	if err == nil || !strings.Contains(err.Error(), "broken writer") {
 		t.Fatalf("error=%v", err)
 	}
@@ -151,7 +151,7 @@ func TestStreamJSONGapKeepsHonestTerminalReport(t *testing.T) {
 	writer := &pausedWriter{entered: make(chan struct{}), release: make(chan struct{})}
 	done := make(chan error, 1)
 	go func() {
-		_, err := executeOneShot(context.Background(), s, "go", "stream-json", writer, io.Discard, 1)
+		_, err := executeOneShot(context.Background(), s, tempest.Prompt{Text: "go"}, "stream-json", writer, io.Discard, 1)
 		done <- err
 	}()
 	<-writer.entered
@@ -230,7 +230,7 @@ func TestStreamJSONStopsShareJSONReport(t *testing.T) {
 			}
 			defer s.Close(context.Background())
 			var output bytes.Buffer
-			outcome, err := executeOneShot(ctx, s, "go", "stream-json", &output, io.Discard, 256)
+			outcome, err := executeOneShot(ctx, s, tempest.Prompt{Text: "go"}, "stream-json", &output, io.Discard, 256)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -287,7 +287,7 @@ func TestStreamJSONResumeDoesNotReplayHistory(t *testing.T) {
 	defer sess.Close(context.Background())
 	before := sess.Snapshot().Seq
 	var stdout bytes.Buffer
-	if _, err := executeOneShot(context.Background(), sess, "new user text", "stream-json", &stdout, io.Discard, 256); err != nil {
+	if _, err := executeOneShot(context.Background(), sess, tempest.Prompt{Text: "new user text"}, "stream-json", &stdout, io.Discard, 256); err != nil {
 		t.Fatal(err)
 	}
 	lines := bytes.Split(bytes.TrimSpace(stdout.Bytes()), []byte("\n"))

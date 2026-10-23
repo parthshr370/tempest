@@ -32,6 +32,10 @@ type processOutput struct {
 	bytesSinceSync int
 	lastNotice     time.Time
 	lastSync       time.Time
+	// grew is closed and replaced on every append; write_stdin waits on it.
+	grew chan struct{}
+	// drained is closed once every output reader has finished.
+	drained chan struct{}
 }
 
 func (manager *Manager) runBash(ctx context.Context, record *entry) {
@@ -39,6 +43,8 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	job := cloneJob(record.recovery.Job)
 	spec := *record.recovery.Bash
 	manager.mu.Unlock()
+	input := record.input
+	defer input.settleStart()
 	job.State = "failed"
 	outputPath := manager.jobPath(job.ID, "output.log")
 	if err := worktree.PrivateDir(manager.jobPath(job.ID, ".")); err != nil {
@@ -47,7 +53,7 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		manager.settle(record, job)
 		return
 	}
-	output := &processOutput{accumulator: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxLines: 1000000, MaxBytes: outputTailBytes, SpillPath: outputPath, MaxTotalBytes: maxLogBytes})}
+	output := &processOutput{accumulator: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxLines: 1000000, MaxBytes: outputTailBytes, SpillPath: outputPath, MaxTotalBytes: maxLogBytes}), grew: make(chan struct{}), drained: make(chan struct{})}
 	if err := output.accumulator.OpenSpill(); err != nil {
 		job.Reason = "output_io"
 		job.ResultText = preview(err.Error(), maxPreviewBytes)
@@ -63,7 +69,6 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	cmd := exec.CommandContext(processCtx, manager.options.ShellPath, "-c", command)
 	cmd.Dir = job.Cwd
 	cmd.WaitDelay = pipeJoinDelay
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		if errors.Is(err, syscall.ESRCH) {
@@ -71,33 +76,25 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		}
 		return err
 	}
-	stdout, stdoutWrite, err := os.Pipe()
+	streams, err := openStreams(cmd, spec.PTY, spec.Stdin)
 	if err != nil {
 		output.err = err
 		manager.finishProcess(record, job, output, nil, processCtx)
 		return
 	}
-	stderr, stderrWrite, err := os.Pipe()
-	if err != nil {
-		output.err = errors.Join(err, stdout.Close(), stdoutWrite.Close())
-		manager.finishProcess(record, job, output, nil, processCtx)
-		return
-	}
-	cmd.Stdout = stdoutWrite
-	cmd.Stderr = stderrWrite
 	if err = cmd.Start(); err != nil {
-		output.err = errors.Join(err, stdout.Close(), stdoutWrite.Close(), stderr.Close(), stderrWrite.Close())
+		output.err = errors.Join(err, streams.closeAll())
 		job.Reason = "process_start"
 		manager.finishProcess(record, job, output, nil, processCtx)
 		return
 	}
-	closeErr := errors.Join(stdoutWrite.Close(), stderrWrite.Close())
-	if closeErr != nil {
+	if closeErr := streams.closeChild(); closeErr != nil {
 		output.err = closeErr
 		cancel()
 	}
+	input.attach(streams.input, cmd.Process.Pid, output)
 	var readers sync.WaitGroup
-	readers.Add(2)
+	readers.Add(len(streams.output))
 	appendPipe := func(pipe *os.File, matcher *lineMatcher) {
 		defer readers.Done()
 		defer pipe.Close()
@@ -108,6 +105,8 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 				output.mu.Lock()
 				if output.err == nil {
 					output.err = output.accumulator.Append(buffer[:count])
+					close(output.grew)
+					output.grew = make(chan struct{})
 					output.bytesSinceSync += count
 					if output.err == nil && (output.lastSync.IsZero() || output.bytesSinceSync >= outputSyncBytes) {
 						output.err = output.accumulator.Sync()
@@ -144,7 +143,9 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 				}
 			}
 			if readErr != nil {
-				if readErr != io.EOF && !errors.Is(readErr, os.ErrClosed) {
+				// Linux reports a pty whose terminal side is closed by every
+				// process as EIO: that is the end of its output.
+				if readErr != io.EOF && !errors.Is(readErr, os.ErrClosed) && !(spec.PTY && errors.Is(readErr, syscall.EIO)) {
 					output.mu.Lock()
 					if output.err == nil {
 						output.err = readErr
@@ -156,12 +157,13 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 			}
 		}
 	}
-	var pipeMatchers [2]*lineMatcher
-	if record.service != nil && record.service.pattern != nil {
-		pipeMatchers = [2]*lineMatcher{{manager: manager, record: record}, {manager: manager, record: record}}
+	for _, stream := range streams.output {
+		var matcher *lineMatcher
+		if record.service != nil && record.service.pattern != nil {
+			matcher = &lineMatcher{manager: manager, record: record}
+		}
+		go appendPipe(stream, matcher)
 	}
-	go appendPipe(stdout, pipeMatchers[0])
-	go appendPipe(stderr, pipeMatchers[1])
 	if err = manager.running(context.WithoutCancel(ctx), record, cmd.Process.Pid, ""); err != nil {
 		cancel()
 	}
@@ -190,31 +192,33 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		case waitErr = <-waited:
 			waiting = false
 		case <-ticker.C:
-			output.mu.Lock()
-			if output.err == nil {
-				output.err = output.accumulator.Sync()
-				output.bytesSinceSync = 0
-				if output.err == nil {
-					manager.mu.Lock()
-					record.outputBytes = output.accumulator.Bytes()
-					manager.mu.Unlock()
-				}
-			}
-			failed := output.err != nil
-			output.mu.Unlock()
-			if failed {
+			if !manager.syncOutput(record, output) {
 				cancel()
 			}
 		}
 	}
-	// A setsid descendant can inherit the pipes after the group leader exits.
-	// It isn't ours to reattach, so close our read ends on the same WaitDelay bound.
+	if stdinErr := input.processExited(); stdinErr != nil {
+		output.mu.Lock()
+		if output.err == nil {
+			output.err = stdinErr
+		}
+		output.mu.Unlock()
+	}
+	// A setsid descendant can inherit the pipes or terminal after the group
+	// leader exits. It isn't ours to reattach, so close our read ends on the
+	// same WaitDelay bound.
 	closed := make(chan struct{})
-	readerDeadline := time.AfterFunc(pipeJoinDelay, func() { stdout.Close(); stderr.Close(); close(closed) })
+	readerDeadline := time.AfterFunc(pipeJoinDelay, func() {
+		for _, stream := range streams.output {
+			stream.Close()
+		}
+		close(closed)
+	})
 	readers.Wait()
 	if !readerDeadline.Stop() {
 		<-closed
 	}
+	close(output.drained)
 	stopPolling()
 	pollers.Wait()
 	code := cmd.ProcessState.ExitCode()
@@ -227,6 +231,23 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		output.mu.Unlock()
 	}
 	manager.finishProcess(record, job, output, waitErr, processCtx)
+}
+
+// syncOutput commits the job's appended output so logs can page it, and
+// reports false once the output has failed and the job must stop.
+func (manager *Manager) syncOutput(record *entry, output *processOutput) bool {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	if output.err == nil {
+		output.err = output.accumulator.Sync()
+		output.bytesSinceSync = 0
+		if output.err == nil {
+			manager.mu.Lock()
+			record.outputBytes = output.accumulator.Bytes()
+			manager.mu.Unlock()
+		}
+	}
+	return output.err == nil
 }
 
 func (manager *Manager) finishProcess(record *entry, job work.Job, output *processOutput, waitErr error, ctx context.Context) {

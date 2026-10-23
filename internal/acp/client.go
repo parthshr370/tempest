@@ -120,7 +120,7 @@ func failure(err error) *rpc.Error {
 		return rpc.NewError(-32020, "job_not_cleanupable", err.Error())
 	case errors.Is(err, tempest.ErrRecoveryRequired):
 		return rpc.NewError(-32021, "recovery_required", err.Error())
-	case errors.Is(err, tempest.ErrInvalidQueueInput), errors.Is(err, tempest.ErrInvalidJobInput):
+	case errors.Is(err, tempest.ErrInvalidQueueInput), errors.Is(err, tempest.ErrInvalidJobInput), errors.Is(err, tempest.ErrInvalidOutputSchema):
 		return rpc.NewError(-32602, "invalid_params", err.Error())
 	case errors.Is(err, tempest.ErrMCPConfigConflict):
 		return rpc.NewError(-32012, "mcp_config_conflict", err.Error())
@@ -221,6 +221,14 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		MaxCostUSD           *float64 `json:"maxCostUsd"`
 		MaxWallSeconds       *float64 `json:"maxWallSeconds"`
 		Mode                 string   `json:"mode"`
+		Meta                 struct {
+			Tempest struct {
+				// OutputSchema is the session/prompt run's final-answer
+				// JSON Schema; the response's _meta.tempest.output carries
+				// the validated answer.
+				OutputSchema json.RawMessage `json:"outputSchema"`
+			} `json:"tempest"`
+		} `json:"_meta"`
 	}
 	if e := decode(raw, &p); e != nil {
 		return nil, e
@@ -254,6 +262,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			if e != nil {
 				return nil, e
 			}
+			prompt.OutputSchema = p.Meta.Tempest.OutputSchema
 		}
 		remove := c.broker.add(s.ID(), c.conn)
 		var run *tempest.Run
@@ -283,12 +292,15 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			if result.RunID != "" {
 				c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
 			}
-			if result.StopReason == "error" {
-				message := "run failed"
+			if result.StopReason == "error" || result.StopReason == "output_invalid" {
+				code, name, message := -32009, "run_error", "run failed"
+				if result.StopReason == "output_invalid" {
+					code, name = -32022, "output_invalid"
+				}
 				if result.Err != nil {
 					message = result.Err.Error()
 				}
-				return nil, rpc.NewError(-32009, "run_error", message)
+				return nil, rpc.NewError(code, name, message)
 			}
 			if err != nil {
 				return nil, failure(err)
@@ -304,7 +316,11 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			if !result.Usage.Cost.Unknown {
 				cost = result.Usage.Cost.Total
 			}
-			return map[string]any{"stopReason": reason, "_meta": map[string]any{"tempest": map[string]any{"stopReason": result.StopReason, "runId": result.RunID, "turns": result.Turns, "usage": result.Usage, "costUsd": cost, "elapsedMs": result.ElapsedMS}}}, nil
+			meta := map[string]any{"stopReason": result.StopReason, "runId": result.RunID, "turns": result.Turns, "usage": result.Usage, "costUsd": cost, "elapsedMs": result.ElapsedMS}
+			if result.Output != nil {
+				meta["output"] = result.Output
+			}
+			return map[string]any{"stopReason": reason, "_meta": map[string]any{"tempest": meta}}, nil
 		}), nil
 	case "session/cancel":
 		s.Cancel()

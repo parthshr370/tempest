@@ -57,12 +57,15 @@ func TestClassifyToolTiers(t *testing.T) {
 		tools.WaitTool:           TierRead,
 		tools.CancelTool:         TierExec,
 		tools.LogsTool:           TierRead,
+		tools.WriteStdinTool:     TierExec,
 		tools.MessageTool:        TierExec,
 		tools.LSPDefinitionTool:  TierRead,
 		tools.LSPReferencesTool:  TierRead,
 		tools.LSPRenameTool:      TierRead,
 		tools.LSPDiagnosticsTool: TierRead,
 		tools.ManifestDiffTool:   TierRead,
+		tools.ViewImageTool:      TierRead,
+		tools.IntegrateTool:      TierWrite,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))
@@ -100,11 +103,14 @@ func TestGateModeTierMatrix(t *testing.T) {
 		{name: "plan write", mode: ModePlan, tool: "write", wantReason: "Plan mode: write is disabled because it can mutate the workspace"},
 		{name: "plan edit", mode: ModePlan, tool: "edit", wantReason: "Plan mode: edit is disabled because it can mutate the workspace"},
 		{name: "plan hashline", mode: ModePlan, tool: "hashline", wantReason: "Plan mode: hashline is disabled because it can mutate the workspace"},
+		{name: "plan integrate", mode: ModePlan, tool: "integrate", wantReason: "Plan mode: integrate is disabled because it can mutate the workspace"},
 		{name: "plan safe bash", mode: ModePlan, tool: "bash", args: commandArgs("git status"), wantAllow: true},
 		{name: "plan unsafe bash", mode: ModePlan, tool: "bash", args: commandArgs("python x.py"), wantReason: "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: python x.py"},
 		{name: "plan task", mode: ModePlan, tool: "task", wantReason: "Plan mode: task is disabled because it can mutate the workspace"},
 		{name: "plan read", mode: ModePlan, tool: "read", wantAllow: true},
 		{name: "plan unknown tool", mode: ModePlan, tool: "unknown_tool", wantReason: "Plan mode: unknown_tool is disabled because it can mutate the workspace"},
+		{name: "plan write_stdin", mode: ModePlan, tool: "write_stdin", args: json.RawMessage(`{"name":"repl","text":"print(1)\n"}`), wantReason: "Plan mode: write_stdin is disabled because it can mutate the workspace"},
+		{name: "default write_stdin", mode: ModeDefault, tool: "write_stdin", args: json.RawMessage(`{"name":"repl","text":"print(1)\n"}`), wantAllow: true},
 	}
 
 	for _, test := range tests {
@@ -121,6 +127,26 @@ func TestGateModeTierMatrix(t *testing.T) {
 				t.Fatalf("Gate() reason = %q; want empty", reason)
 			}
 		})
+	}
+}
+
+// TestWriteStdinIsGatedByItsJobsLaunch pins the write_stdin decision: input
+// is not inspected, because the launch of the program reading it was. A
+// shell reading commands from stdin is opaque, so starting one asks per call
+// (and is refused headless); a configured override still governs each write.
+func TestWriteStdinIsGatedByItsJobsLaunch(t *testing.T) {
+	shell := Gate(context.Background(), ModeDefault, "bash", json.RawMessage(`{"command":"bash","name":"sh","pty":true}`), &Policy{})
+	if shell.Allow || shell.Source != SourceGuard || !strings.Contains(shell.Reason, "shell reads commands from stdin") {
+		t.Fatalf("interactive shell launch = %+v", shell)
+	}
+	input := json.RawMessage(`{"name":"sh","text":"rm -rf build\n"}`)
+	if out := Gate(context.Background(), ModeDefault, "write_stdin", input, &Policy{}); !out.Allow || out.Source != SourceMode {
+		t.Fatalf("write_stdin after an approved launch = %+v", out)
+	}
+	prompter := &recordingPrompter{choice: RejectOnce}
+	out := Gate(context.Background(), ModeDefault, "write_stdin", input, &Policy{Overrides: map[string]Decision{"write_stdin": DecidePrompt}, Prompter: prompter})
+	if out.Allow || !out.Prompted || len(prompter.requests) != 1 || prompter.requests[0].Tool != "write_stdin" {
+		t.Fatalf("write_stdin with a prompt override = %+v, requests %+v", out, prompter.requests)
 	}
 }
 
