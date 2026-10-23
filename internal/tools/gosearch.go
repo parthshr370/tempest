@@ -58,7 +58,7 @@ func goGrep(ctx context.Context, root *os.Root, base string, pattern string, glo
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" {
+			if entry.Name() == ".git" && p != base {
 				return fs.SkipDir
 			}
 			return nil

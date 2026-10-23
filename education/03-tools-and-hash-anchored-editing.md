@@ -36,13 +36,13 @@ The sentinel `ErrStaleAnchor` supports `errors.Is` for callers that only care ab
 
 ### Multi-hunk atomicity without a filesystem transaction
 
-The edit tool accepts an array of `edits`, each a `{oldText, newText, anchor?}`. The question: if hunk 3 is stale but hunks 1 and 2 are fine, should we apply 1 and 2? The answer: no. Partial application leaves the file in a state the agent does not expect — hunk 3's `newText` was written assuming hunks 1 and 2 landed, and now the file is half-transformed.
+The edit tool accepts an array of `edits`, each a `{old_text, new_text, anchor?}`. The question: if hunk 3 is stale but hunks 1 and 2 are fine, should we apply 1 and 2? The answer: no. Partial application leaves the file in a state the agent does not expect — hunk 3's `newText` was written assuming hunks 1 and 2 landed, and now the file is half-transformed.
 
 The implementation enforces all-or-none in three layers:
 
 1. **Per-file `FileMutationQueue`.** `queue.Do(absolutePath, fn)` acquires a mutex keyed on the resolved real path (symlinks evaluated). No two edits to the same real file interleave.
 2. **Anchor check before any mutation.** Inside the lock, the code re-reads the file, computes the current anchor, and checks every supplied hunk anchor against it. Any mismatch returns `StaleAnchorError` immediately — `os.ReadFile` has been called but no write has occurred.
-3. **`ApplyEditsToNormalizedContent` validates all hunks first.** It finds every `oldText` match, rejects not-found/duplicate/overlapping/no-op edits, and only then constructs the new content. If any hunk is invalid, no replacement string is built and no write occurs.
+3. **`ApplyEditsToNormalizedContent` validates all hunks first.** It finds every `old_text` match, rejects not-found/duplicate/overlapping/no-op edits, and only then constructs the new content. If any hunk is invalid, no replacement string is built and no write occurs.
 
 This is logical all-or-none, **not crash-safe atomicity**. `os.WriteFile` truncates and writes in place; a crash mid-write can leave a partial file. For the harness's threat model — an agent modifying source files on a developer's machine — this is acceptable. A production file-sync tool would use a temp-file + rename pattern. The code documents this distinction clearly.
 
@@ -137,7 +137,7 @@ type AgentTool struct {
 }
 ```
 
-`PrepareArguments` is an escape hatch that normalizes legacy input shapes before the tool sees them. The edit tool uses it to convert `{oldText, newText}` into the `{edits: [...]}` array form.
+`PrepareArguments` is an escape hatch that normalizes legacy input shapes before the tool sees them. The edit tool uses it to convert `{old_text, new_text}` into the `{edits: [...]}` array form.
 
 ### Content anchoring (`internal/editdiff/editdiff.go:33-64`)
 
@@ -284,7 +284,7 @@ At startup, `Config.Resolve()` builds a `ToolsOptions` and calls `AllTools(cwd, 
 6. If `mode=auto` with no selector/offset/limit and the file is parseable Go: call `goSourceOutline` to produce a body-free declaration outline with recovery selectors, truncate to output caps, and return.
 7. Otherwise: split into lines, apply selector or offset/limit, number them, truncate, emit continuation notice.
 
-**Edit.** The model received `[foo.go#abc123...def456]` and now calls `edit` with `{path: "foo.go", edits: [{oldText: "...", newText: "...", anchor: "abc123...def456"}]}`. Inside `newEditTool`'s `Execute` closure:
+**Edit.** The model received `[foo.go#abc123...def456]` and now calls `edit` with `{path: "foo.go", edits: [{old_text: "...", new_text: "...", anchor: "abc123...def456"}]}`. Inside `newEditTool`'s `Execute` closure:
 
 1. Resolve `absolutePath` from `input.Path` relative to `cwd`.
 2. Call `queue.Do(absolutePath, fn)`. The queue resolves symlinks on `absolutePath` to get the real-path key, acquires the per-key mutex, and runs `fn`.

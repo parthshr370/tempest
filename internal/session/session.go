@@ -109,12 +109,14 @@ type RebuildSystemPromptOptions struct {
 	PromptGuidelines   []string
 	AppendSystemPrompt string
 	Cwd                string
-	ContextFiles       []prompt.ContextFile
-	Skills             []skills.Skill
-	Rules              []prompt.PromptRule
-	GenericRules       []string
-	Personality        string
-	ActiveTools        []agent.AgentTool
+	// ProgressPath is the todo_write checkpoint, empty when the session has none.
+	ProgressPath string
+	ContextFiles []prompt.ContextFile
+	Skills       []skills.Skill
+	Rules        []prompt.PromptRule
+	GenericRules []string
+	Personality  string
+	ActiveTools  []agent.AgentTool
 }
 
 // RebuildSystemPrompt assembles the full system prompt from the given options,
@@ -134,6 +136,7 @@ func RebuildSystemPrompt(opts RebuildSystemPromptOptions) string {
 		PromptGuidelines:   opts.PromptGuidelines,
 		AppendSystemPrompt: opts.AppendSystemPrompt,
 		Cwd:                opts.Cwd,
+		ProgressPath:       opts.ProgressPath,
 		ContextFiles:       opts.ContextFiles,
 		Skills:             opts.Skills,
 		Rules:              opts.Rules,
@@ -147,5 +150,5 @@ func RebuildSystemPrompt(opts RebuildSystemPromptOptions) string {
 // same formatter and snippets as the orchestrator prompt, keeping every agent's
 // capability list derived from the real tool registry rather than prose.
 func AppendCapabilities(base string, active []agent.AgentTool) string {
-	return base + prompt.CapabilitiesSection(ToolNames(active), BuildToolSnippets(active))
+	return base + prompt.CapabilitiesSection(ToolNames(active), BuildToolSnippets(active), "")
 }

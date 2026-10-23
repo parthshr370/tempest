@@ -1,11 +1,13 @@
 // Package progress manages the anti-stateless checkpoint: on each todo_write,
-// it atomically rewrites .harness/progress.md (tmp+rename, mutex-guarded) so a
-// crash mid-build doesn't lose the working state. Validate rejects control
-// characters that would break the single-line checklist format.
+// it atomically rewrites the session's progress.md (tmp+rename, mutex-guarded)
+// so a crash mid-build doesn't lose the working state. The file lives in the
+// session's private data directory, never in the user's workspace. Validate
+// rejects control characters that would break the single-line checklist format.
 package progress
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +15,18 @@ import (
 	"sync"
 	"unicode"
 )
+
+// FileName is the checkpoint's name inside a session data directory.
+const FileName = "progress.md"
+
+// Path returns the checkpoint path inside sessionDataDir, or "" when the
+// session has no data directory and todos stay in memory.
+func Path(sessionDataDir string) string {
+	if sessionDataDir == "" {
+		return ""
+	}
+	return filepath.Join(sessionDataDir, FileName)
+}
 
 // TodoItem is a single todo with id, content, status, and optional priority.
 type TodoItem struct {
@@ -22,22 +36,27 @@ type TodoItem struct {
 	Priority string `json:"priority,omitempty"`
 }
 
-// Store is a thread-safe progress store backed by .harness/progress.md.
-// Update atomically rewrites the file (tmp+rename, mutex-guarded) so a
-// crash mid-build doesn't lose working state.
+// Store is a thread-safe progress store. When it has a path, Update
+// atomically rewrites that file (tmp+rename, mutex-guarded) so a crash
+// mid-build doesn't lose working state.
 type Store struct {
 	mu    sync.Mutex
-	cwd   string
+	path  string
 	todos []TodoItem
 }
 
-// NewStore starts a progress store rooted at cwd.
-func NewStore(cwd string) *Store {
-	return &Store{cwd: cwd}
+// NewStore keeps todos in memory and checkpoints them to path when it is set.
+func NewStore(path string) *Store {
+	return &Store{path: path}
+}
+
+// Path returns the checkpoint file, or "" for an in-memory store.
+func (s *Store) Path() string {
+	return s.path
 }
 
 // Update validates todos, renders them to markdown, and atomically writes
-// .harness/progress.md. Returns validation errors without touching the file.
+// the checkpoint. Returns validation errors without touching the file.
 func (s *Store) Update(ctx context.Context, todos []TodoItem) error {
 	if err := Validate(todos); err != nil {
 		return err
@@ -49,23 +68,31 @@ func (s *Store) Update(ctx context.Context, todos []TodoItem) error {
 		return nil
 	}
 	copyTodos := cloneTodos(todos)
-	content := RenderMarkdown(copyTodos)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Join(s.cwd, ".harness"), 0o755); err != nil {
-		return err
-	}
-	progressPath := filepath.Join(s.cwd, ".harness", "progress.md")
-	tmpPath := progressPath + ".tmp"
-	if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, progressPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
+	if s.path != "" {
+		if err := writeAtomic(s.path, RenderMarkdown(copyTodos)); err != nil {
+			return err
+		}
 	}
 	s.todos = copyTodos
+	return nil
+}
+
+// writeAtomic replaces path through a sibling temp file; the session data
+// directory is private, so it is created 0700 and the file 0600.
+func writeAtomic(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(content), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return errors.Join(err, os.Remove(tmpPath))
+	}
 	return nil
 }
 
@@ -142,14 +169,6 @@ func RenderMarkdown(todos []TodoItem) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
-}
-
-// ProgressPath returns the path to .harness/progress.md under cwd.
-func ProgressPath(cwd string) string {
-	if cwd == "" {
-		return filepath.Join(".harness", "progress.md")
-	}
-	return filepath.Join(cwd, ".harness", "progress.md")
 }
 
 func cloneTodos(todos []TodoItem) []TodoItem {

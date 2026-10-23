@@ -67,13 +67,7 @@ func NewTool(controller work.Controller) agent.AgentTool {
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			handle := struct {
-				JobID          string `json:"jobId"`
-				Kind           string `json:"kind"`
-				State          string `json:"state"`
-				ChildSessionID string `json:"childSessionId,omitempty"`
-			}{job.ID, job.Kind, job.State, job.ChildSessionID}
-			encoded, err := json.Marshal(handle)
+			encoded, err := json.Marshal(job.Handle())
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}

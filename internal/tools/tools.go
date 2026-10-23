@@ -112,6 +112,11 @@ type ToolsOptions struct {
 	// Work is installed only on a journaled root session.
 	Work  work.Controller
 	Child bool
+	// SessionDataDir is the journaled session's private directory
+	// (<journal>.d). todo_write checkpoints progress.md there, bash spills
+	// truncated output under tool-output/, and read may open exactly those
+	// files plus the session's job artifacts under jobs/.
+	SessionDataDir string
 }
 
 // ReadResourceResolver resolves non-filesystem read resources. It is defined
@@ -214,7 +219,7 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 	case LsTool:
 		return newLsTool(cwd), nil
 	case TodoTool:
-		return newTodoTool(cwd, options), nil
+		return newTodoTool(options), nil
 	case TaskTool:
 		if options.TaskTool.Execute == nil {
 			return agent.AgentTool{}, fmt.Errorf("task tool not configured")
@@ -327,17 +332,18 @@ func newSkillTool(items []skills.Skill) agent.AgentTool {
 	}
 }
 
-// newTodoTool builds the todo writer for cwd, using options.TodoStore when supplied.
-// It accepts todos so progress survives across turns.
-func newTodoTool(cwd string, options ToolsOptions) agent.AgentTool {
+// newTodoTool builds the todo writer, using options.TodoStore when supplied.
+// Otherwise it checkpoints into the session data directory, never the
+// workspace, and keeps todos in memory when the session has no directory.
+func newTodoTool(options ToolsOptions) agent.AgentTool {
 	store := options.TodoStore
 	if store == nil {
-		store = progress.NewStore(cwd)
+		store = progress.NewStore(progress.Path(options.SessionDataDir))
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(TodoTool),
-			Description: "Update the session todo list and write .harness/progress.md for continuity.",
+			Description: "Replace the session todo list with the full, current list. It is saved as the session's progress checkpoint, outside the workspace.",
 			Parameters: schema.Object(schema.JSON{
 				"todos": schema.JSON{
 					"type": "array",
@@ -365,13 +371,17 @@ func newTodoTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := store.Update(ctx, input.Todos); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			return textResult(fmt.Sprintf("Todo list updated with %d item(s). Progress written to %s", len(input.Todos), progress.ProgressPath(cwd)), nil), nil
+			text := fmt.Sprintf("Todo list updated with %d item(s).", len(input.Todos))
+			if path := store.Path(); path != "" {
+				text += " Progress checkpoint: " + path
+			}
+			return textResult(text, nil), nil
 		},
 	}
 }
 
 // newWebFetchTool builds the HTTP(S) fetcher from options. It accepts url and
-// optional maxBytes, and NewTool returns it only when web access is enabled.
+// optional max_bytes, and NewTool returns it only when web access is enabled.
 func newWebFetchTool(options ToolsOptions) agent.AgentTool {
 	client := webClient(options)
 	resolveIP := webResolver(options)
@@ -380,15 +390,15 @@ func newWebFetchTool(options ToolsOptions) agent.AgentTool {
 			Name:        string(WebFetch),
 			Description: "Fetch a URL over HTTP(S). This tool is gated and only registered when web access is explicitly enabled.",
 			Parameters: schema.Object(schema.JSON{
-				"url":      schema.String(),
-				"maxBytes": schema.Number(),
+				"url":       schema.String(),
+				"max_bytes": schema.Number(),
 			}, "url"),
 		},
 		Label: string(WebFetch),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
 				URL      string `json:"url"`
-				MaxBytes int    `json:"maxBytes"`
+				MaxBytes int    `json:"max_bytes"`
 			}
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
@@ -431,15 +441,15 @@ func newWebSearchTool(options ToolsOptions) agent.AgentTool {
 			Name:        string(WebSearch),
 			Description: "Search the web through a configured HTTP search endpoint. This tool is gated and only registered when web access is explicitly enabled.",
 			Parameters: schema.Object(schema.JSON{
-				"query":      schema.String(),
-				"numResults": schema.Number(),
+				"query":       schema.String(),
+				"num_results": schema.Number(),
 			}, "query"),
 		},
 		Label: string(WebSearch),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
 				Query      string `json:"query"`
-				NumResults int    `json:"numResults"`
+				NumResults int    `json:"num_results"`
 			}
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
@@ -551,10 +561,11 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			} else {
 				absolutePath = pathutil.ResolveReadPath(selector.Path, cwd)
 				relPath, err := rootRelPath(cwd, absolutePath)
-				if err != nil {
-					return agent.AgentToolResult{}, err
+				if err == nil {
+					data, err = readFileInRoot(rootForRead, relPath)
+				} else if name, ok := sessionArtifactName(options.SessionDataDir, absolutePath); ok && errors.Is(err, ErrOutsideRoot) {
+					data, err = readSessionArtifact(options.SessionDataDir, name)
 				}
-				data, err = readFileInRoot(rootForRead, relPath)
 				if err != nil {
 					return agent.AgentToolResult{}, err
 				}
@@ -699,7 +710,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(EditTool),
-			Description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. Supply the anchor from read output on each edit to reject stale file contents before any change.",
+			Description: "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file. Supply the anchor from read output on each edit to reject stale file contents before any change.",
 			Parameters: schema.Object(schema.JSON{
 				"path": schema.String(),
 				"edits": schema.JSON{
@@ -707,11 +718,11 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 					"items": schema.JSON{
 						"type": "object",
 						"properties": schema.JSON{
-							"oldText": schema.String(),
-							"newText": schema.String(),
-							"anchor":  schema.String(),
+							"old_text": schema.String(),
+							"new_text": schema.String(),
+							"anchor":   schema.String(),
 						},
-						"required": []string{"oldText", "newText"},
+						"required": []string{"old_text", "new_text"},
 					},
 				},
 			}, "path", "edits"),
@@ -870,7 +881,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 					return err
 				}
 			}
-			acc := toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{TempFilePrefix: "harness-bash"})
+			acc := toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{TempFilePrefix: "harness-bash", TempDir: ToolOutputDir(options.SessionDataDir)})
 			writer := &bashOutputWriter{accumulator: acc, cancel: cancel}
 			cmd.Stdout = writer
 			cmd.Stderr = writer
@@ -913,13 +924,13 @@ func newGrepTool(cwd string) agent.AgentTool {
 			Name:        string(GrepTool),
 			Description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers.",
 			Parameters: schema.Object(schema.JSON{
-				"pattern":    schema.String(),
-				"path":       schema.String(),
-				"glob":       schema.String(),
-				"ignoreCase": schema.Bool(),
-				"literal":    schema.Bool(),
-				"context":    schema.Number(),
-				"limit":      schema.Number(),
+				"pattern":     schema.String(),
+				"path":        schema.String(),
+				"glob":        schema.String(),
+				"ignore_case": schema.Bool(),
+				"literal":     schema.Bool(),
+				"context":     schema.Number(),
+				"limit":       schema.Number(),
 			}, "pattern"),
 		},
 		Label: string(GrepTool),
@@ -928,7 +939,7 @@ func newGrepTool(cwd string) agent.AgentTool {
 				Pattern    string `json:"pattern"`
 				Path       string `json:"path"`
 				Glob       string `json:"glob"`
-				IgnoreCase bool   `json:"ignoreCase"`
+				IgnoreCase bool   `json:"ignore_case"`
 				Literal    bool   `json:"literal"`
 				Context    int    `json:"context"`
 				Limit      int    `json:"limit"`
@@ -961,7 +972,8 @@ func newGrepTool(cwd string) agent.AgentTool {
 			matchLimitReached := false
 			backend := "rg"
 			if rgPath, ok := toolio.EnsureTool("rg"); ok {
-				args := []string{"--json", "--line-number", "--color=never", "--hidden"}
+				// --hidden searches dotfiles; .git is repository internals, never project content.
+				args := []string{"--json", "--line-number", "--color=never", "--hidden", "--glob", "!.git"}
 				if input.IgnoreCase {
 					args = append(args, "--ignore-case")
 				}
@@ -1162,7 +1174,7 @@ func newFindTool(cwd string) agent.AgentTool {
 			var rawLines []string
 			backend := "fd"
 			if fdPath, ok := toolio.EnsureTool("fd"); ok {
-				args := []string{"--glob", "--color=never", "--hidden"}
+				args := []string{"--glob", "--color=never", "--hidden", "--exclude", ".git"}
 				if !insideGitRepo(searchPath) {
 					args = append(args, "--no-require-git")
 				}
@@ -1342,10 +1354,10 @@ func prepareEditArguments(args json.RawMessage) json.RawMessage {
 		}
 	}
 	if _, ok := raw["edits"]; !ok {
-		oldText, hasOld := raw["oldText"]
-		newText, hasNew := raw["newText"]
+		oldText, hasOld := raw["old_text"]
+		newText, hasNew := raw["new_text"]
 		if hasOld && hasNew {
-			edit := map[string]json.RawMessage{"oldText": oldText, "newText": newText}
+			edit := map[string]json.RawMessage{"old_text": oldText, "new_text": newText}
 			if anchor, hasAnchor := raw["anchor"]; hasAnchor {
 				edit["anchor"] = anchor
 			}

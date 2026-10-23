@@ -108,7 +108,7 @@ func TestWriteAndEditRefusePathsOutsideRoot(t *testing.T) {
 		t.Run("edit "+name, func(t *testing.T) {
 			_, err := executeTool(t, edit, map[string]any{
 				"path":  target,
-				"edits": []map[string]string{{"oldText": "one", "newText": "1"}},
+				"edits": []map[string]string{{"old_text": "one", "new_text": "1"}},
 			})
 			if !errors.Is(err, ErrOutsideRoot) {
 				t.Fatalf("edit %q error = %v, want ErrOutsideRoot", target, err)
@@ -325,6 +325,42 @@ func TestGoGrepGlobFilter(t *testing.T) {
 	matches, _, err := goGrep(context.Background(), root, ".", "needle", "*.go", false, false, 100)
 	if err != nil || len(matches) != 2 {
 		t.Fatalf("go grep glob = %v, %v", matches, err)
+	}
+}
+
+// TestGrepAndFindSkipGitDirectory keeps repository internals out of search
+// results on both backends: rg/fd run with --hidden, which on its own walks
+// into .git/hooks and .git/HEAD.
+func TestGrepAndFindSkipGitDirectory(t *testing.T) {
+	for _, backend := range []string{"fast", "go"} {
+		t.Run(backend, func(t *testing.T) {
+			if backend == "fast" {
+				requireExternalTool(t, "rg")
+				requireExternalTool(t, "fd")
+			} else {
+				t.Setenv("PATH", "")
+			}
+			dir := t.TempDir()
+			writeTempFile(t, dir, "notes.sample", "needle in the project\n")
+			writeTempFile(t, dir, ".hidden.sample", "needle in a dotfile\n")
+			writeTempFile(t, dir, ".git/hooks/pre-commit.sample", "needle in a hook\n")
+			writeTempFile(t, dir, ".git/HEAD", "ref: refs/heads/main\n")
+			grep, _ := NewTool(GrepTool, dir, ToolsOptions{})
+			grepResult, err := executeTool(t, grep, map[string]any{"pattern": "needle"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			find, _ := NewTool(FindTool, dir, ToolsOptions{})
+			findResult, err := executeTool(t, find, map[string]any{"pattern": "*.sample"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for tool, text := range map[string]string{"grep": resultText(grepResult), "find": resultText(findResult)} {
+				if strings.Contains(text, ".git/") || !strings.Contains(text, "notes.sample") || !strings.Contains(text, ".hidden.sample") {
+					t.Fatalf("%s %s backend output = %q", backend, tool, text)
+				}
+			}
+		})
 	}
 }
 

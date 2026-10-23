@@ -104,6 +104,20 @@ func (host *memoryHost) consume() {
 func invocation(index int) context.Context {
 	return work.WithInvocation(context.Background(), work.Invocation{RunID: "run", CallID: fmt.Sprintf("message:%d", index), ToolCallID: "reused"})
 }
+
+// assertNamesHolders checks that a refused admission tells the model which
+// jobs hold the limit and which call frees one, not just "job_limit".
+func assertNamesHolders(t *testing.T, err error, freeingCall string, jobIDs ...string) {
+	t.Helper()
+	if !errors.Is(err, ErrJobLimit) {
+		t.Fatal(err)
+	}
+	for _, jobID := range append(jobIDs, freeingCall) {
+		if !strings.Contains(err.Error(), jobID) {
+			t.Fatalf("admission error does not mention %q: %v", jobID, err)
+		}
+	}
+}
 func awaitJob(t *testing.T, manager *Manager, jobID string) work.Job {
 	t.Helper()
 	record, err := manager.find(jobID)
@@ -156,9 +170,8 @@ func TestAdmissionIsNonblockingBoundedAndJoined(t *testing.T) {
 			t.Fatal("runner did not start")
 		}
 	}
-	if _, err := host.manager.StartTask(invocation(4), work.TaskSpec{Prompt: "work", SubagentType: "explore"}); !errors.Is(err, ErrJobLimit) {
-		t.Fatal(err)
-	}
+	_, err := host.manager.StartTask(invocation(4), work.TaskSpec{Prompt: "work", SubagentType: "explore"})
+	assertNamesHolders(t, err, "cancel", jobs[0].ID, jobs[1].ID, jobs[2].ID, jobs[3].ID)
 	if err := host.manager.Finish(context.Background(), "max_cost"); err != nil {
 		t.Fatal(err)
 	}
@@ -193,16 +206,17 @@ func TestCompletionCreditsPersistUntilConsumption(t *testing.T) {
 	host := newHost(t, func(context.Context, work.TaskLaunch) (work.TaskResult, error) {
 		return work.TaskResult{Text: "done", StopReason: "completed"}, nil
 	})
+	var finished []string
 	for index := range 8 {
 		job, err := host.manager.StartTask(invocation(index), work.TaskSpec{Prompt: "work", SubagentType: "explore"})
 		if err != nil {
 			t.Fatal(index, err)
 		}
 		awaitJob(t, host.manager, job.ID)
+		finished = append(finished, job.ID)
 	}
-	if _, err := host.manager.StartTask(invocation(8), work.TaskSpec{Prompt: "work", SubagentType: "explore"}); !errors.Is(err, ErrJobLimit) {
-		t.Fatal(err)
-	}
+	_, err := host.manager.StartTask(invocation(8), work.TaskSpec{Prompt: "work", SubagentType: "explore"})
+	assertNamesHolders(t, err, "end this turn", finished...)
 	host.consume()
 	job, err := host.manager.StartTask(invocation(8), work.TaskSpec{Prompt: "work", SubagentType: "explore"})
 	if err != nil {
@@ -262,9 +276,8 @@ func TestSharedGeneralQuotaAndNoPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = host.manager.StartTask(invocation(2), work.TaskSpec{Prompt: "work", SubagentType: "general"}); !errors.Is(err, ErrJobLimit) {
-		t.Fatal(err)
-	}
+	_, err = host.manager.StartTask(invocation(2), work.TaskSpec{Prompt: "work", SubagentType: "general"})
+	assertNamesHolders(t, err, "cancel", job.ID)
 	close(release)
 	job = awaitJob(t, host.manager, job.ID)
 	if job.Patch != nil || job.Cleanup != "none" || job.Cwd != host.manager.host.Cwd {

@@ -43,7 +43,9 @@ ANTHROPIC_API_KEY=... ./bin/tempest -p "Create hello.txt with hi"
 `google:<id>` (via `GEMINI_API_KEY` or `GOOGLE_API_KEY`), or
 `openrouter:~google/gemini-flash-latest` (via `OPENROUTER_API_KEY`).
 `openai:<id>@<base-url>` targets an OpenAI Chat Completions-compatible endpoint;
-use `OPENAI_API_KEY` for that route. The ID is opaque and endpoint-specific:
+without `@<base-url>`, the endpoint comes from `-openai-base-url`,
+`HARNESS_OPENAI_BASE_URL`, settings `openai_base_url` or `OPENAI_BASE_URL`, in
+that order. Use `OPENAI_API_KEY` for that route. The ID is opaque and endpoint-specific:
 `claude-fable-5-1` on Anthropic differs from `anthropic/claude-fable-5.1`
 on OpenRouter, whose aliases include a literal `~` prefix.
 Output is text by default; `-output-format json` prints a run report and
@@ -170,8 +172,49 @@ routable to a different provider and model. Set them with
 
 At startup the agent walks `AGENTS.md` up from your working directory, loads a sticky
 `RULES.md` that survives compaction, expands safe `@file` imports, and registers
-bundled or `-skill`-supplied skills. Skill bodies load on demand through the `skill`
-tool or a `skill://` read — nothing bloats the prompt until it's needed.
+skills from your agent directory, the project and `-skill` paths. Skill bodies load
+on demand through the `skill` tool or a `skill://` read — nothing bloats the prompt
+until it's needed.
+
+#### Skills
+
+A skill is a markdown file with YAML frontmatter between `---` lines at the very
+top; the body below it is what the `skill` tool returns:
+
+```markdown
+---
+name: deploy-app
+description: Deploy the app to staging. Use when asked to ship or deploy.
+---
+# Deploy
+Run `make deploy` and report the URL it prints.
+```
+
+- `description` is required (at most 1024 bytes); the system prompt lists each
+  skill's name and description so the model knows when to load it.
+- `name` defaults to the name of the directory holding the file. It must be
+  lowercase `a-z`, `0-9` and single hyphens, at most 64 characters, and must not
+  start or end with a hyphen.
+- `disable-model-invocation: true` (or `hide: true`) leaves the skill out of
+  that list; `skill` and `skill://<name>` still load it by name.
+- `when_to_use`, `allowed-tools`, `model`, `context` and `paths` are accepted for
+  compatibility and currently have no effect; other keys are ignored.
+
+Skills load from `<agent-dir>/skills` (by default `~/.config/harness/agent/skills`),
+then `.harness/skills` in the working directory, then each `-skill` path (or the
+settings `skill_paths` list when no `-skill` flag is given). A `-skill` path may
+be a directory or a single `.md` file. In each directory:
+
+- every `.md` file directly inside it is a skill;
+- below that, only files named `SKILL.md` count, and a directory holding a
+  `SKILL.md` is one skill: its subdirectories aren't searched;
+- hidden entries, `node_modules` and paths matched by `.gitignore`, `.ignore` or
+  `.fdignore` are skipped.
+
+A file with a missing description or an invalid name is skipped with a
+`discovery diagnostic` warning on stderr. When two skills share a name, the first
+one loaded wins and the collision is logged. `skill://<name>/<path>` reads other
+files from the skill's directory and cannot leave it.
 
 ### 08 · Subagents, behind `-enable-task`
 
@@ -193,12 +236,21 @@ active shared general child per session. Explore remains read-only in the live c
 Worktrees fence cooperative writes, not arbitrary shell commands or hostile code.
 
 Children export binary-capable patches against their pinned base; they never
-merge into the parent. Inspect the full job through `WaitJobs` or `tempest/wait`
-and explicitly apply its patch through ordinary gated bash/edit. Dirty worktrees
+merge into the parent. Inspect the full job through `WaitJobs` or `tempest/wait`;
+the model reads the patch at the artifact path in the job's completion notice with
+`read`, then explicitly applies it through ordinary gated bash/edit. Dirty worktrees
 are retained; `CleanupJob`, `tempest/cleanup_job`, or `jobs` with `action:"cleanup"`
 remove only owned, safely exported trees. Missing/corrupt patches, unique ignored
 files, or an uncertain surviving crash process block cleanup. Shared jobs have no
 patch and no worktree cleanup.
+
+Admission limits: 4 running jobs per kind (task, bash), 8 jobs running or holding
+an undelivered completion notice, 64 jobs per run, 16 retained general-task
+worktrees, and one unisolated general task at a time. A refused `task` or
+`bash async:true` fails with `job_limit:` followed by which limit is full, the
+job ids holding it, and the call that frees one (`wait`, `cancel`, ending the turn
+to receive pending notices, or `jobs` cleanup). Invalid task or command input
+names the field to fix.
 
 ### 09 · Reads that summarize, not dump
 
@@ -211,7 +263,19 @@ window on lines it doesn't need yet.
 Seventeen built-in tools share one namespace, **12 of them on by default**; pin the
 active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
 All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
-fall back to pure Go when `rg`/`fd` are absent.
+fall back to pure Go when `rg`/`fd` are absent. Both search hidden files, honor
+`.gitignore` inside a Git repository, and skip the `.git` directory unless you
+point them at it. The one exception to containment is read-only: `read` may also
+open this session's own job artifacts (`<journal>.d/jobs/<job>/` `changes.patch`,
+`result.txt`, `output.log`), its `progress.md` checkpoint, and spilled tool output
+under `<journal>.d/tool-output/` (the "Full output: <path>" of truncated bash
+output, tool results cleared from context, and oversized MCP results). Child
+journals, worktrees and every other path outside the workspace stay refused.
+Spilled output lives as long as the session's files do.
+
+Model tools use snake_case keys in both arguments and results (`job_id`,
+`job_ids`, `subagent_type`, `old_text`, `ignore_case`); the ACP and `tempest/*`
+wire methods use camelCase (`jobId`, `jobIds`).
 
 **Files & search**
 
@@ -233,7 +297,7 @@ fall back to pure Go when `rg`/`fd` are absent.
 **Coordination**
 
 - `task` — admit asynchronous children and return job handles *(behind `-enable-task`)*.
-- `todo_write` — ordered task list with phase tracking.
+- `todo_write` — ordered task list with phase tracking, checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace.
 
 **Context**
 
@@ -492,6 +556,17 @@ Unanswered asks deny after the permission timeout. Reconnecting approvers
 can watch with `approver:true` and answer pending asks with
 `tempest/permission`. `session/cancel` aborts the run.
 
+`tempest/continue` takes `{sessionId}` and starts a run without adding a user
+message; its response and errors match `session/prompt`. After a host crash,
+`session/load` or `session/resume` the session and call it to finish the
+interrupted run: tool calls that never recorded a result come back to the model
+as "outcome unknown" and are not re-run. When the transcript already ends with
+an assistant reply, continue instead delivers pending `tempest/steer` and
+`tempest/follow_up` input or recovered background-job results; with none, it
+fails with `-32603` (`Cannot continue without pending input`). Unlike
+`session/prompt`, it is admitted while interrupted background jobs still need
+recovery (`-32021` `recovery_required`).
+
 `tempest/steer` and `tempest/follow_up` accept `{sessionId,text,key?}` and return a
 durable `{item}` receipt. Steer waits for a safe checkpoint; follow-up waits for
 quiescence. Idle input stays pending until explicit Prompt/Continue. Accepted
@@ -577,9 +652,14 @@ The example is a separate module with a local `replace`; build it with
 | `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools (and enabled read-only web/attachment tools) are available; `-faux-script` still overrides the model provider. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
-| `-skill <path>` | Additional skill location; repeatable. |
+| `-skill <path>` | Additional skill directory or `.md` file; repeatable. See [Skills](#skills). |
 | `-permission-mode <mode>` | Tool gate mode: `default`, `plan`, `acceptEdits` or `bypass`. |
-| `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning. |
+| `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning on one-shot runs, `serve` and `mcp`. |
+| `-faux-script <path>` | Replace the model with a scripted one; see [Testing without a provider](#testing-without-a-provider). |
+
+Every command takes flags only: the prompt goes in `-p`. A stray argument, such
+as `run` in `tempest run -p hi`, or an unknown flag exits with status 2 and names
+the problem.
 
 ## Configuration
 
@@ -590,8 +670,10 @@ not read `.env` — export variables before running it.
 | Setting | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN` | Anthropic credential (key, OAuth token, or proxy bearer). |
-| `ANTHROPIC_BASE_URL` / `HARNESS_ANTHROPIC_BASE_URL` | Anthropic-compatible provider URL. |
-| `OPENAI_API_KEY`, `OPENAI_BASE_URL` | OpenAI-compatible credential and endpoint. |
+| `ANTHROPIC_BASE_URL` | Anthropic-compatible provider URL. `-anthropic-base-url`, `HARNESS_ANTHROPIC_BASE_URL` and settings `anthropic_base_url` override it, in that order. |
+| `OPENAI_API_KEY` | OpenAI-compatible credential. |
+| `OPENAI_BASE_URL` | OpenAI-compatible endpoint for `openai:<id>` models without `@<base-url>`. `-openai-base-url`, `HARNESS_OPENAI_BASE_URL` and settings `openai_base_url` override it, in that order. |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY` | Google and OpenRouter credentials. Point those routes elsewhere with `google:<id>@<base-url>` or `openrouter:<id>@<base-url>`. |
 | `HARNESS_MODEL`, `HARNESS_PLAN_MODEL`, `HARNESS_SMOL_MODEL` | Model for each role. |
 | `HARNESS_PERMISSION_MODE` | Default tool gate mode. |
 | `HARNESS_PERMISSION_ALLOW_TOOLS`, `HARNESS_PERMISSION_DENY_TOOLS` | Per-tool allow/deny lists. |
@@ -603,6 +685,30 @@ not read `.env` — export variables before running it.
 
 Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`
 and `version` subcommands.
+
+## Testing without a provider
+
+`-faux-script <path>` (also `HARNESS_FAUX_SCRIPT` or settings `faux_script`)
+replaces the model with a scripted one, so a run needs no API key or network.
+It works for one-shot runs, `serve` and `mcp`, and overrides `-model`; reports
+name the model `faux-1`. The script is a JSON array with one entry per model
+call, used in order:
+
+```json
+[
+  {"text": "Listing files.", "toolCalls": [{"id": "b1", "name": "bash", "arguments": {"command": "ls"}}]},
+  {"text": "done"}
+]
+```
+
+- `text` is the assistant text for that call; it may be omitted.
+- `toolCalls` lists the tool calls the model makes: `name` is required,
+  `arguments` is the tool's JSON input (default `{}`) and `id` is the tool-call
+  id. The tools really run, through the normal permission gate.
+- After an entry with tool calls, the tool results go back to the model and the
+  next entry answers them. An entry without tool calls ends the run.
+- An empty array is a startup error. A model call after the last entry fails
+  the run with `No more faux responses queued`.
 
 ## Development
 

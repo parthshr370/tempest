@@ -96,7 +96,7 @@ func TestApplyEditsToNormalizedContentErrors(t *testing.T) {
 		edits   []Edit
 		want    string
 	}{
-		{"empty", "abc", []Edit{{OldText: "", NewText: "x"}}, "oldText must not be empty in file.txt."},
+		{"empty", "abc", []Edit{{OldText: "", NewText: "x"}}, "old_text must not be empty in file.txt."},
 		{"missing", "abc", []Edit{{OldText: "z", NewText: "x"}}, "Could not find the exact text in file.txt. The old text must match exactly including all whitespace and newlines."},
 		{"duplicate", "abc abc", []Edit{{OldText: "abc", NewText: "x"}}, "Found 2 occurrences of the text in file.txt. The text must be unique. Please provide more context to make it unique."},
 		{"overlap", "abcdef", []Edit{{OldText: "abc", NewText: "x"}, {OldText: "bcd", NewText: "y"}}, "edits[0] and edits[1] overlap in file.txt. Merge them into one edit or target disjoint regions."},

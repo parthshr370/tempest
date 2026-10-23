@@ -82,11 +82,11 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.Float64Var(&maxCost, "max-cost", 0, "default maximum model cost in USD")
 	fs.DurationVar(&maxWall, "max-wall-time", 0, "default maximum run duration")
 	if err := fs.Parse(args); err != nil {
-		return 1
+		return parseExitCode(usageFailure(err))
 	}
 	if fs.NArg() != 0 {
-		fmt.Fprintln(stderr, command+" accepts flags only")
-		return 1
+		fmt.Fprintln(stderr, unexpectedArgument(command, fs.Arg(0)))
+		return exitUsage
 	}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
@@ -124,7 +124,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 	stack := session.StackConfigFromConfig(cfg)
-	stack.PermissionPolicy = buildPermissionPolicy(cfg.PermissionAllowTools(), cfg.PermissionDenyTools())
+	stack.PermissionPolicy = toolPolicy(stderr, cfg)
 	if cfg.FauxScript() != "" {
 		provider, model, err := loadFauxScript(cfg.FauxScript())
 		if err != nil {

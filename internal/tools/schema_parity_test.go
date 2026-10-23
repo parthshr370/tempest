@@ -32,15 +32,15 @@ func assertSchemaParity(t *testing.T, name string, got json.RawMessage, wantRaw 
 var originalToolSchemas = map[ToolName]string{
 	ReadTool:  `{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"},"mode":{"type":"string","enum":["auto","raw"],"default":"auto"}},"required":["path"]}`,
 	WriteTool: `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`,
-	EditTool:  `{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"},"anchor":{"type":"string"}},"required":["oldText","newText"]}}},"required":["path","edits"]}`,
+	EditTool:  `{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"old_text":{"type":"string"},"new_text":{"type":"string"},"anchor":{"type":"string"}},"required":["old_text","new_text"]}}},"required":["path","edits"]}`,
 	BashTool:  `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"}},"required":["command"]}`,
-	GrepTool:  `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignoreCase":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"number"},"limit":{"type":"number"}},"required":["pattern"]}`,
+	GrepTool:  `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"number"},"limit":{"type":"number"}},"required":["pattern"]}`,
 	FindTool:  `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"number"}},"required":["pattern"]}`,
 	LsTool:    `{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}}`,
 	TodoTool:  `{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status"]}}},"required":["todos"]}`,
 	SkillTool: `{"type":"object","properties":{"name":{"type":"string","description":"the skill name to load"},"command":{"type":"string"}},"required":[]}`,
-	WebFetch:  `{"type":"object","properties":{"url":{"type":"string"},"maxBytes":{"type":"number"}},"required":["url"]}`,
-	WebSearch: `{"type":"object","properties":{"query":{"type":"string"},"numResults":{"type":"number"}},"required":["query"]}`,
+	WebFetch:  `{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"number"}},"required":["url"]}`,
+	WebSearch: `{"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"number"}},"required":["query"]}`,
 }
 
 func TestToolSchemaParity(t *testing.T) {

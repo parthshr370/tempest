@@ -3,7 +3,6 @@ package progress
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -45,11 +44,11 @@ func TestRenderMarkdown(t *testing.T) {
 
 func TestStoreUpdateWritesProgress(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(dir)
+	store := NewStore(Path(dir))
 	if err := store.Update(context.Background(), []TodoItem{{Content: "ship", Status: "pending"}}); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, ".harness", "progress.md"))
+	data, err := os.ReadFile(Path(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,25 +58,25 @@ func TestStoreUpdateWritesProgress(t *testing.T) {
 	if got := store.Todos(); len(got) != 1 || got[0].Content != "ship" {
 		t.Fatalf("store todos = %+v", got)
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".harness", "progress.md.tmp")); !os.IsNotExist(err) {
+	if _, err := os.Stat(Path(dir) + ".tmp"); !os.IsNotExist(err) {
 		t.Fatalf("temp file should not remain after atomic rename; err=%v", err)
 	}
 }
 
 func TestStoreUpdateEmptyListIsNoop(t *testing.T) {
 	dir := t.TempDir()
-	store := NewStore(dir)
+	store := NewStore(Path(dir))
 	if err := store.Update(context.Background(), []TodoItem{{Content: "ship", Status: "pending"}}); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.ReadFile(filepath.Join(dir, ".harness", "progress.md"))
+	before, err := os.ReadFile(Path(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Update(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	after, err := os.ReadFile(filepath.Join(dir, ".harness", "progress.md"))
+	after, err := os.ReadFile(Path(dir))
 	if err != nil {
 		t.Fatal(err)
 	}

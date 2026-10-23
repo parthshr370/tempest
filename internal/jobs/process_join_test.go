@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -77,7 +78,7 @@ func TestBashAndTaskTotalQuota(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := host.manager.StartBash(invocation(20), work.BashSpec{Command: "echo not-run", TimeoutSeconds: 10}); err != ErrJobLimit {
+	if _, err := host.manager.StartBash(invocation(20), work.BashSpec{Command: "echo not-run", TimeoutSeconds: 10}); !errors.Is(err, ErrJobLimit) {
 		t.Fatal(err)
 	}
 	if err := host.manager.Finish(context.Background(), "aborted"); err != nil {

@@ -122,10 +122,6 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	defer cancel()
 	childCfg := cfg
 	childCfg.Cwd = launch.Job.Cwd
-	childCfg.SpillDir = filepath.Join(filepath.Dir(childPath), "tool-output")
-	if err = os.MkdirAll(childCfg.SpillDir, 0700); err != nil {
-		return result, err
-	}
 	childCfg.Model, childCfg.StreamFn = model, stream
 	childCfg.Plan = false
 	childCfg.Child = true

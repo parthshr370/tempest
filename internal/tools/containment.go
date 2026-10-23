@@ -1,6 +1,8 @@
 // Containment keeps every file tool inside the working directory. The OS
 // refuses traversal through os.Root, so escaping paths fail structurally
-// instead of by string comparison.
+// instead of by string comparison. The one exception is read-only: read may
+// open the session's own progress checkpoint, job artifacts and spilled tool
+// output, which live in the session data directory outside the workspace.
 package tools
 
 import (
@@ -13,6 +15,8 @@ import (
 	"sync"
 
 	"go.harness.dev/harness/internal/pathutil"
+	"go.harness.dev/harness/internal/progress"
+	"go.harness.dev/harness/internal/work"
 )
 
 // ErrOutsideRoot reports a path that resolves outside the tool's working
@@ -113,6 +117,64 @@ func readFileInRoot(root *os.Root, name string) ([]byte, error) {
 		return nil, wrapOutsideRoot(name, err)
 	}
 	return data, nil
+}
+
+// ToolOutputDirName is the directory inside a session data directory that
+// holds spilled tool output: truncated bash output, tool results cleared from
+// context, and oversized MCP results.
+const ToolOutputDirName = "tool-output"
+
+// ToolOutputDir returns the spill directory of sessionDataDir, or "" when the
+// session has no data directory.
+func ToolOutputDir(sessionDataDir string) string {
+	if sessionDataDir == "" {
+		return ""
+	}
+	return filepath.Join(sessionDataDir, ToolOutputDirName)
+}
+
+// sessionArtifactName returns the name of absolute inside sessionDataDir when
+// it is the session's progress checkpoint, a file of one of its jobs
+// (jobs/<job id>/<file>) or spilled tool output (tool-output/...). Child
+// journals, worktrees and compaction snapshots in the same directory stay
+// refused. The check runs on the symlink-resolved path, so a link cannot
+// dress another file up as an artifact, and the read itself goes through an
+// os.Root on the data directory.
+func sessionArtifactName(sessionDataDir, absolute string) (string, bool) {
+	if sessionDataDir == "" {
+		return "", false
+	}
+	evaluatedDir, err := filepath.EvalSymlinks(sessionDataDir)
+	if err != nil {
+		return "", false
+	}
+	evaluated, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", false
+	}
+	name, err := relInside(evaluatedDir, evaluated)
+	if err != nil {
+		return "", false
+	}
+	name = filepath.ToSlash(name)
+	parts := strings.Split(name, "/")
+	isJobArtifact := len(parts) == 3 && parts[0] == work.JobArtifactsDir
+	isToolOutput := len(parts) >= 2 && parts[0] == ToolOutputDirName
+	if name != progress.FileName && !isJobArtifact && !isToolOutput {
+		return "", false
+	}
+	return name, true
+}
+
+// readSessionArtifact reads a name approved by sessionArtifactName through a
+// root on the session data directory.
+func readSessionArtifact(sessionDataDir, name string) ([]byte, error) {
+	root, err := os.OpenRoot(sessionDataDir)
+	if err != nil {
+		return nil, err
+	}
+	data, err := readFileInRoot(root, name)
+	return data, errors.Join(err, root.Close())
 }
 
 // writeFileInRoot writes a file through the root, creating parent directories

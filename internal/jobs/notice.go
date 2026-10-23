@@ -76,7 +76,7 @@ func renderNotice(job work.Job, withValue, withPreview bool) string {
 		writeArtifact(&b, "output log", job.Output)
 	}
 	if job.Patch != nil {
-		b.WriteString("The patch is NOT applied to your workspace and excludes ignored files and empty directories; read it with bash (cat) and apply it with git apply if you want the changes.\n")
+		b.WriteString("The patch is NOT applied to your workspace and excludes ignored files and empty directories; read it with the read tool and apply it with git apply if you want the changes.\n")
 	}
 	if omitted {
 		b.WriteString("Some output was too large for this notice; call wait for the full details.\n")

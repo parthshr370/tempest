@@ -23,6 +23,7 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -380,7 +381,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	cfg.PermissionPolicy.MCPDefaults = make(map[string]permission.Decision)
 	c.permissionPolicy = &cfg.PermissionPolicy
-	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(dir, "mcp-output", c.id), selectedMCP, logger)
+	// MCP spills sit with the session's other tool output, where read can open them.
+	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(tools.ToolOutputDir(store.Path()+".d"), "mcp"), selectedMCP, logger)
 	if err != nil {
 		return nil, err
 	}

@@ -190,6 +190,55 @@ func TestReconcileWordsEachMissingResultFromTheRecords(t *testing.T) {
 	}
 }
 
+// An interruption is reported until a later run starts. After that the session
+// has been resumed past it, so every later load must stay quiet about it.
+func TestInterruptedRunDiagnosticStopsOnceALaterRunStarts(t *testing.T) {
+	store := newTestStore(t, t.TempDir())
+	crashed := Meta{RunID: store.NewRunID()}
+	appendAll(t, store,
+		RunStartedRecord{Meta: crashed, Model: "m"},
+		MessageEntry{Meta: crashed, Message: userMessage("first")},
+		ToolStartedRecord{Meta: crashed, ToolCallID: "c1", Tool: "bash"},
+	)
+	interruptions := func() []string {
+		t.Helper()
+		loaded, err := Load(testContext, store.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found []string
+		for _, diagnostic := range loaded.Diagnostics {
+			if strings.Contains(diagnostic.Message, "interrupted") {
+				found = append(found, diagnostic.Message)
+			}
+		}
+		return found
+	}
+	if found := interruptions(); len(found) != 1 || !strings.Contains(found[0], crashed.RunID) {
+		t.Fatalf("crashed last run: interruptions = %q, want one naming %s", found, crashed.RunID)
+	}
+
+	resumed := Meta{RunID: store.NewRunID()}
+	appendAll(t, store, RunStartedRecord{Meta: resumed, Model: "m", ContinuationOf: crashed.RunID})
+	if found := interruptions(); len(found) != 1 || !strings.Contains(found[0], resumed.RunID) {
+		t.Fatalf("resume in progress: interruptions = %q, want only the open run %s", found, resumed.RunID)
+	}
+	appendAll(t, store, RunFinishedRecord{Meta: resumed, StopReason: "completed"})
+	if found := interruptions(); len(found) != 0 {
+		t.Fatalf("after a completed resume: interruptions = %q, want none", found)
+	}
+
+	later := Meta{RunID: store.NewRunID()}
+	appendAll(t, store,
+		RunStartedRecord{Meta: later, Model: "m"},
+		RunFinishedRecord{Meta: later, StopReason: "completed"},
+	)
+	if found := interruptions(); len(found) != 0 {
+		t.Fatalf("after another completed run: interruptions = %q, want none", found)
+	}
+	closeStore(t, store)
+}
+
 func TestTornTailIsTrimmedAndUnterminatedTailIsKept(t *testing.T) {
 	for _, test := range []struct {
 		name     string
