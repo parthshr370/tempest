@@ -1,0 +1,49 @@
+# Rendered by: helm template api ./chart (chart version 1.1.0)
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: shop
+  name: api-credentials
+type: Opaque
+data:
+  DATABASE_PASSWORD: bmV3LXBhc3N3b3Jk
+---
+# key order differs from the old render; the Service is unchanged
+apiVersion: v1
+kind: Service
+metadata: {namespace: shop, name: api}
+spec:
+  ports:
+    - {targetPort: 8080, port: 80}
+  selector: {app: api}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: shop
+  labels: {app: api}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: api}
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/api:1.1.0
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef: {name: api-credentials}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-flags
+  namespace: shop
+data:
+  checkout_v2: "true"

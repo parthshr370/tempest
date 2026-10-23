@@ -44,8 +44,9 @@ const (
 
 // safeToRerun names the shipped tools whose re-execution has no side effects
 // (docs/design/03-durable-core.md section 6). Everything else defaults to
-// never re-run.
-var safeToRerun = map[string]bool{"read": true, "grep": true, "find": true, "ls": true}
+// never re-run. The lsp_* tools stay off: a query may start a language
+// server, which is trusted executable code.
+var safeToRerun = map[string]bool{"read": true, "grep": true, "find": true, "ls": true, "manifest_diff": true}
 
 // toolKey identifies the queue of occurrences sharing an endpoint's call id.
 type toolKey struct {

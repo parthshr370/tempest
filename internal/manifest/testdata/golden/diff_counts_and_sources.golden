@@ -1,0 +1,66 @@
+{
+  "summary": {
+    "before": 3,
+    "after": 3,
+    "added": 1,
+    "removed": 1,
+    "changed": 1,
+    "unchanged": 1
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "apps/v1",
+        "kind": "Deployment",
+        "namespace": "",
+        "name": "api"
+      },
+      "change": "changed",
+      "before_source": {
+        "path": "old/deploy.yaml",
+        "document": 1
+      },
+      "after_source": {
+        "path": "new/all.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before apps/v1 Deployment api\n+++ after apps/v1 Deployment api\n@@ -3,7 +3,9 @@\n metadata:\n   name: api\n spec:\n-  replicas: 2\n+  paused: false\n+  replicas: 3\n+  status: null\n   template:\n     spec:\n       containers:\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "fresh"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "new/all.yaml",
+        "document": 3
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap fresh\n+++ after v1 ConfigMap fresh\n@@ -0,0 +1,5 @@\n+apiVersion: v1\n+data: {}\n+kind: ConfigMap\n+metadata:\n+  name: fresh\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "gone"
+      },
+      "change": "removed",
+      "before_source": {
+        "path": "old/cm.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap gone\n+++ after v1 ConfigMap gone\n@@ -1,4 +0,0 @@\n-apiVersion: v1\n-kind: ConfigMap\n-metadata:\n-  name: gone\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

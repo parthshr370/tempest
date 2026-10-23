@@ -1,0 +1,34 @@
+{
+  "summary": {
+    "before": 1,
+    "after": 1,
+    "added": 0,
+    "removed": 0,
+    "changed": 1,
+    "unchanged": 0
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "types"
+      },
+      "change": "changed",
+      "before_source": {
+        "path": "s.yaml",
+        "document": 1
+      },
+      "after_source": {
+        "path": "s.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap types\n+++ after v1 ConfigMap types\n@@ -1,13 +1,13 @@\n apiVersion: v1\n data:\n-  big: !!int 123456789012345678901234567890\n-  bool: true\n+  big: !!int 123456789012345678901234567891\n+  bool: \"true\"\n   float: 1.5\n   hex: 15\n   int: 1\n   null_value: null\n   octal: 15\n-  quoted_int: \"1\"\n+  quoted_int: 1\n   when: 2001-12-14\n kind: ConfigMap\n metadata:\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

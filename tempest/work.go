@@ -131,6 +131,9 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	childCfg.OnMessagesChanged = nil
 	childCfg.PermissionModeFunc = nil
 	childCfg.AttachmentRegistry, childCfg.AttachmentReader = nil, nil
+	// Language servers are root-session-only in M5: a child edits its own
+	// worktree and must neither query nor dirty the parent's documents.
+	childCfg.LSP, childCfg.LSPManager = nil, nil
 	childCfg.Journal, childCfg.Loaded = store, loaded
 	childCfg.InitialMessages = nil
 	if loaded != nil {

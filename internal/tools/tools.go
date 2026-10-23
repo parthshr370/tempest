@@ -35,6 +35,7 @@ import (
 	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/editdiff"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/pathutil"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/resource"
@@ -61,6 +62,9 @@ type ToolName string
 // WebSearch searches through the configured endpoint when web access is enabled.
 // WebFetch fetches an HTTP(S) URL when web access is enabled.
 // AttachmentTool reads resolved session attachments when an attachment reader is configured.
+// LSPDefinitionTool, LSPReferencesTool, LSPRenameTool and LSPDiagnosticsTool
+// query an enabled language server; rename only returns an edit plan.
+// ManifestDiffTool compares two rendered local manifest trees by resource.
 //
 // These names keep tool lookup stable across prompts, clients, and persisted state.
 const (
@@ -81,10 +85,20 @@ const (
 	WaitTool       ToolName = "wait"
 	CancelTool     ToolName = "cancel"
 	LogsTool       ToolName = "logs"
+
+	LSPDefinitionTool  ToolName = "lsp_definition"
+	LSPReferencesTool  ToolName = "lsp_references"
+	LSPRenameTool      ToolName = "lsp_rename"
+	LSPDiagnosticsTool ToolName = "lsp_diagnostics"
+	ManifestDiffTool   ToolName = "manifest_diff"
 )
 
-// AllToolNames is the set of every known ToolName.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true}
+// AllToolNames is the set of every known ToolName. Configured tools can
+// never shadow these names, including the lsp_* names when LSP is disabled.
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true}
+
+// LSPToolNames are the language-server tools, all read-tier calculations.
+var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
 
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
@@ -117,6 +131,13 @@ type ToolsOptions struct {
 	// truncated output under tool-output/, and read may open exactly those
 	// files plus the session's job artifacts under jobs/.
 	SessionDataDir string
+	// LSP registers the lsp_* tools when non-nil. Its owner closes it.
+	LSP *lsp.Manager
+	// OnFileChanged is called by write and edit after a successful disk
+	// write, while the file's mutation lock is still held, with the
+	// canonical slash-separated path relative to the resolved cwd. It must
+	// only record the change: no I/O, waiting or error.
+	OnFileChanged func(canonicalPath string)
 }
 
 // ReadResourceResolver resolves non-filesystem read resources. It is defined
@@ -245,6 +266,13 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 			return agent.AgentTool{}, fmt.Errorf("web_fetch tool not enabled")
 		}
 		return newWebFetchTool(options), nil
+	case LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool:
+		if options.LSP == nil {
+			return agent.AgentTool{}, fmt.Errorf("%s requires language servers to be enabled", toolName)
+		}
+		return newLSPTool(toolName, options.LSP), nil
+	case ManifestDiffTool:
+		return newManifestDiffTool(cwd), nil
 	default:
 		return agent.AgentTool{}, fmt.Errorf("Unknown tool name: %s", toolName)
 	}
@@ -264,7 +292,7 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 // options, returning only the ones that were successfully created.
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool} {
+	for _, name := range []ToolName{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -682,7 +710,7 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 				return agent.AgentToolResult{}, err
 			}
 			absolutePath := pathutil.ResolveToCwd(input.Path, cwd)
-			relPath, err := rootRelPath(cwd, absolutePath)
+			relPath, canonicalPath, err := rootRelPaths(cwd, absolutePath)
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
@@ -693,6 +721,7 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if err := writeFileInRoot(rootForWrite, relPath, []byte(input.Content)); err != nil {
 					return err
 				}
+				notifyFileChanged(options, canonicalPath)
 				return abortErr(ctx)
 			})
 			if err != nil {
@@ -742,7 +771,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			relPath, err := rootRelPath(cwd, absolutePath)
+			relPath, canonicalPath, err := rootRelPaths(cwd, absolutePath)
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
@@ -788,6 +817,8 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if err := writeFileInRoot(rootForEdit, relPath, []byte(finalContent)); err != nil {
 					return err
 				}
+				// Disk changed even if the caller cancels from here on.
+				notifyFileChanged(options, canonicalPath)
 				if err := abortErr(ctx); err != nil {
 					return err
 				}
@@ -1538,6 +1569,31 @@ func decodeParams(params json.RawMessage, target any) error {
 		params = json.RawMessage(`{}`)
 	}
 	return json.Unmarshal(params, target)
+}
+
+// decodeStrict decodes one JSON object, rejecting unknown arguments,
+// trailing data and non-integer values for integer fields. The tools whose
+// schemas declare additionalProperties:false use it.
+func decodeStrict(params json.RawMessage, target any) error {
+	if len(params) == 0 {
+		params = json.RawMessage(`{}`)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(params))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return fmt.Errorf("invalid arguments: %w", err)
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("invalid arguments: trailing data after the arguments object")
+	}
+	return nil
+}
+
+// notifyFileChanged reports a completed disk write to options.OnFileChanged.
+func notifyFileChanged(options ToolsOptions, canonicalPath string) {
+	if options.OnFileChanged != nil {
+		options.OnFileChanged(canonicalPath)
+	}
 }
 
 // abortErr turns a canceled context into the tool-layer error callers expect.

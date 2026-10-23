@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"go.harness.dev/harness/internal/cloudcmd"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
 )
@@ -14,6 +15,8 @@ type ceilingPayload struct {
 	Tools       []string          `json:"tools"`
 	Overrides   map[string]string `json:"overrides,omitempty"`
 	Interactive map[string]string `json:"interactive,omitempty"`
+	// CloudRules is additive: older records omit it and restore no grants.
+	CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 }
 type environmentPayload struct {
 	Ceiling  ceilingPayload `json:"ceiling"`
@@ -89,7 +92,7 @@ func (manager *Manager) commitStart(ctx context.Context, record *entry) error {
 		payload.Spec, err = json.Marshal(recovery.Task)
 		environment := recovery.Environment
 		ceiling := environment.Ceiling
-		payload.Environment = &environmentPayload{Ceiling: ceilingPayload{ceiling.Mode, ceiling.Tools, ceiling.Overrides, ceiling.Interactive}, Model: environment.Model, Provider: environment.Provider}
+		payload.Environment = &environmentPayload{Ceiling: ceilingPayload{ceiling.Mode, ceiling.Tools, ceiling.Overrides, ceiling.Interactive, ceiling.CloudRules}, Model: environment.Model, Provider: environment.Provider}
 	} else {
 		payload.Spec, err = json.Marshal(recovery.Bash)
 		payload.OutputPath = manager.jobPath(recovery.Job.ID, "output.log")

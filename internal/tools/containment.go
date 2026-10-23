@@ -59,11 +59,20 @@ func resolveRootPath(cwd string, requested string) (string, error) {
 // inside cwd pointing outside is refused too; a missing final component
 // (write creating a new file) falls back to evaluating its parent.
 func rootRelPath(cwd string, absolute string) (string, error) {
+	relative, _, err := rootRelPaths(cwd, absolute)
+	return relative, err
+}
+
+// rootRelPaths is rootRelPath that also returns the canonical name: the
+// symlink-resolved path relative to the symlink-resolved cwd. The canonical
+// name identifies the file a write actually changes, which is how a
+// language server workspace keys its documents.
+func rootRelPaths(cwd string, absolute string) (relative string, canonical string, err error) {
 	// macOS temp dirs live behind a symlinked prefix (/var -> /private/var),
 	// so symlink evaluation must be anchored at an equally resolved cwd.
-	relative, err := relInside(cwd, absolute)
+	relative, err = relInside(cwd, absolute)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	evaluatedCwd, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
@@ -89,10 +98,11 @@ func rootRelPath(cwd string, absolute string) (string, error) {
 			candidate = parent
 		}
 	}
-	if _, err := relInside(evaluatedCwd, evaluated); err != nil {
-		return "", fmt.Errorf("%w: %s escapes the working directory through a symlink", ErrOutsideRoot, absolute)
+	canonical, err = relInside(evaluatedCwd, evaluated)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %s escapes the working directory through a symlink", ErrOutsideRoot, absolute)
 	}
-	return filepath.ToSlash(relative), nil
+	return filepath.ToSlash(relative), filepath.ToSlash(canonical), nil
 }
 
 // relInside reports the path of absolute relative to cwd, or ErrOutsideRoot

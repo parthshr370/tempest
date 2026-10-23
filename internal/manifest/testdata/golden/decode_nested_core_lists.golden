@@ -1,0 +1,46 @@
+{
+  "summary": {
+    "before": 0,
+    "after": 2,
+    "added": 2,
+    "removed": 0,
+    "changed": 0,
+    "unchanged": 0
+  },
+  "resources": [
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "one"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "list.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap one\n+++ after v1 ConfigMap one\n@@ -0,0 +1,4 @@\n+apiVersion: v1\n+kind: ConfigMap\n+metadata:\n+  name: one\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    },
+    {
+      "identity": {
+        "api_version": "v1",
+        "kind": "ConfigMap",
+        "namespace": "",
+        "name": "two"
+      },
+      "change": "added",
+      "after_source": {
+        "path": "list.yaml",
+        "document": 1
+      },
+      "patch": "# display diff of canonical YAML, not an applicable patch\n--- before v1 ConfigMap two\n+++ after v1 ConfigMap two\n@@ -0,0 +1,4 @@\n+apiVersion: v1\n+kind: ConfigMap\n+metadata:\n+  name: two\n",
+      "patch_truncated": false,
+      "secret_data_changed": false
+    }
+  ],
+  "omitted_resources": 0,
+  "truncated": false
+}

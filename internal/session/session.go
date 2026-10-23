@@ -85,6 +85,16 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Load a bundled skill's full instructions by name"
 		case "attachment":
 			snippets[tool.Name] = "Inspect files attached to the session (list, read, grep, stats)"
+		case "lsp_definition":
+			snippets[tool.Name] = "Find a symbol's definition with the language server"
+		case "lsp_references":
+			snippets[tool.Name] = "Find a symbol's references with the language server"
+		case "lsp_rename":
+			snippets[tool.Name] = "Plan a symbol rename as anchored edits to apply with edit"
+		case "lsp_diagnostics":
+			snippets[tool.Name] = "Report a file's language-server diagnostics and their freshness"
+		case "manifest_diff":
+			snippets[tool.Name] = "Compare two rendered Kubernetes manifest snapshots by resource"
 		default:
 			snippets[tool.Name] = label
 		}

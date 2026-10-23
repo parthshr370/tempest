@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,11 +93,13 @@ type Conn struct {
 	protocolError func(error)
 	lateIDs       map[string]bool
 	drainOnEOF    bool
+	// protocol prefixes strict-mode fault codes, such as mcp_protocol or lsp_protocol.
+	protocol string
 }
 
 func newConn(t frameTransport) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message), accepting: true, writerDone: make(chan struct{}), maxFrame: MaxFrame}
+	c := &Conn{transport: t, ctx: ctx, cancel: cancel, out: make(chan []byte, 32), pending: make(map[string]chan message), accepting: true, writerDone: make(chan struct{}), maxFrame: MaxFrame, protocol: "mcp"}
 	go c.writeLoop()
 	return c
 }
@@ -117,6 +120,11 @@ func (c *Conn) SetProtocolErrorHandler(handler func(error)) {
 // Set it before Serve; the owner must then call Drain and Close.
 func (c *Conn) SetDrainOnEOF(enabled bool) {
 	c.drainOnEOF = enabled
+}
+
+// fault names a strict-mode violation with the connection's protocol prefix.
+func (c *Conn) fault(kind, detail string) error {
+	return fmt.Errorf("%s_%s: %s", c.protocol, kind, detail)
 }
 
 func (c *Conn) rejectProtocol(err error) bool {
@@ -183,8 +191,16 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 	}()
 	for {
 		data, err := c.transport.read(c.ctx)
+		var framing *framingError
+		if errors.As(err, &framing) {
+			// Content-Length framing can't resynchronize after a corrupt header or body.
+			if c.ctx.Err() == nil {
+				c.rejectProtocol(c.fault("protocol", framing.detail))
+			}
+			return err
+		}
 		if errors.Is(err, errOversize) {
-			if c.rejectProtocol(errors.New("mcp_output_limit: MCP frame exceeds response cap; remote outcome may be unknown")) {
+			if c.rejectProtocol(c.fault("output_limit", strings.ToUpper(c.protocol)+" frame exceeds response cap; remote outcome may be unknown")) {
 				return err
 			}
 			if err = c.reply(nil, nil, NewError(-32600, "frame_too_large", fmt.Sprintf("frame exceeds %d bytes", c.maxFrame))); err != nil {
@@ -202,14 +218,14 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 		data = bytes.TrimSpace(data)
 		var m message
 		if !utf8.Valid(data) || !json.Valid(data) {
-			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON or UTF-8")) {
+			if c.rejectProtocol(c.fault("protocol", "invalid JSON or UTF-8")) {
 				return errors.New("invalid peer frame")
 			}
 			_ = c.reply(nil, nil, NewError(-32700, "parse_error", "invalid JSON"))
 			continue
 		}
 		if err = json.Unmarshal(data, &m); err != nil || m.JSONRPC != "2.0" || len(data) == 0 || data[0] != '{' || !validID(m.ID) {
-			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC envelope")) {
+			if c.rejectProtocol(c.fault("protocol", "invalid JSON-RPC envelope")) {
 				return errors.New("invalid peer frame")
 			}
 			_ = c.reply(nil, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC request"))
@@ -217,7 +233,7 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 		}
 		if m.Method == "" {
 			if len(m.ID) == 0 || (len(m.Result) == 0) == (m.Error == nil) {
-				if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC response")) {
+				if c.rejectProtocol(c.fault("protocol", "invalid JSON-RPC response")) {
 					return errors.New("invalid peer response")
 				}
 				_ = c.reply(nil, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC response"))
@@ -227,7 +243,7 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 			ch := c.pending[string(m.ID)]
 			isLate := c.lateIDs[string(m.ID)]
 			c.mu.Unlock()
-			if ch == nil && !isLate && c.rejectProtocol(errors.New("mcp_protocol: unexpected response ID")) {
+			if ch == nil && !isLate && c.rejectProtocol(c.fault("protocol", "unexpected response ID")) {
 				return errors.New("unexpected response ID")
 			}
 			if ch != nil {
@@ -239,7 +255,7 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 			continue
 		}
 		if len(m.Result) != 0 || m.Error != nil || (len(m.Params) > 0 && m.Params[0] != '{' && m.Params[0] != '[') {
-			if c.rejectProtocol(errors.New("mcp_protocol: invalid JSON-RPC request")) {
+			if c.rejectProtocol(c.fault("protocol", "invalid JSON-RPC request")) {
 				return errors.New("invalid peer request")
 			}
 			_ = c.reply(m.ID, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC request"))
