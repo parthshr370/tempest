@@ -46,9 +46,9 @@ The implementation enforces all-or-none in three layers:
 
 This is logical all-or-none, **not crash-safe atomicity**. `os.WriteFile` truncates and writes in place; a crash mid-write can leave a partial file. For the harness's threat model — an agent modifying source files on a developer's machine — this is acceptable. A production file-sync tool would use a temp-file + rename pattern. The code documents this distinction clearly.
 
-### The structural read outline: `mode: auto`, body-free, recovery selectors
+### The structural read outline: overflow form, body-free, recovery selectors
 
-When the read tool receives no selector, no offset, no limit, and `mode=auto` (the default), it checks whether the file is a parseable Go source file. If so, it returns a structural outline instead of numbered lines:
+When the read tool receives no selector, no offset, no limit, and `mode=auto` (the default), it returns the whole file as numbered lines whenever they fit the normal output budget (2000 lines, 50KB). Only when they don't, and the file is a parseable Go source file, does it return a structural outline instead, headed by a note that says it is an outline and how to read a range (`mode=outline` asks for it at any size):
 
 ```
 [path/to/file.go#full64hex]
@@ -63,9 +63,9 @@ type readToolInput struct { ... }                                [path/to/file.g
 
 Every declaration carries an exact `path:START-END` recovery selector so the agent can request the raw region. The outline is **body-free at every nesting depth**: `renderType` recursively elides struct and interface member bodies, even those nested inside maps, slices, channels, function types, and generic parameters. Type aliases, named underlying types, and generic constraints survive. Composite and function literals in initializers are elided.
 
-Why not a size threshold? The TypeScript reference used "summarize above N lines." But the outline is already compact — it is one line per declaration regardless of body size. Adding a threshold means a 200-line file of tiny functions gets a raw dump while a 2000-line file with 5 declarations gets a summary; the decision should be about parseability, not file length. Any explicit selector, offset, limit, or `mode=raw` bypasses summarization entirely and returns numbered lines.
+Why the output budget as the threshold, and not parseability alone? An earlier version outlined every parseable Go file. In the cross-harness benchmark (`context/bench/results/20261023T131649Z/analysis.md`) 63 of 77 Tempest reads came back as outlines; the model needs exact text to edit, re-read the same 9-line file 17 times, and hashline rejected its edits because outline rows are not displayed lines. A file that fits one read loses nothing by being shown whole, and every shown row becomes editable. The outline earns its place only when the whole file can't be shown, where it beats paging blind. Any explicit selector, offset, limit, or `mode=raw` returns numbered lines.
 
-Truncation continuations preserve the selector bounds: a truncated `file:1-2500` advertises `file:2001-2500`, not a bare `offset=2001` that could read past line 2500. Summary-mode truncation produces a note that no raw offset continuation exists and tells the agent to use the recovery selectors.
+Truncation continuations preserve the selector bounds: a truncated `file:1-2500` advertises `file:2001-2500`, not a bare `offset=2001` that could read past line 2500. A truncated outline tells the agent to read a declaration's range or page with `mode=raw` and `offset`.
 
 For binary files (detected by a NUL byte in the first 8KB), the read tool returns `[binary file, N bytes, not shown]` with `Details.Binary = true`.
 
@@ -226,7 +226,7 @@ type readToolInput struct {
     Path   string   // May include a :START-END or :START+COUNT selector suffix.
     Offset *int     // 1-based start line; nil means from line 1.
     Limit  *int     // Max lines to return; nil means unlimited (subject to truncation caps).
-    Mode   string   // "auto" (structural outline when possible) or "raw" (numbered lines).
+    Mode   string   // "auto" (content, outline only for a Go file over the budget), "raw" (numbered lines) or "outline".
 }
 
 type readToolDetails struct {
@@ -281,8 +281,8 @@ At startup, `Config.Resolve()` builds a `ToolsOptions` and calls `AllTools(cwd, 
 3. If the file is an image (by extension), return the image block immediately.
 4. Compute `header := fmt.Sprintf("[%s#%s]", displayPath, editdiff.ContentAnchor(data))`. The anchor is computed from the raw bytes, including any CRLF, BOM, and trailing newline bytes.
 5. Detect binary: if `data` contains a NUL byte in the first 8KB, return `[binary file, N bytes, not shown]`.
-6. If `mode=auto` with no selector/offset/limit and the file is parseable Go: call `goSourceOutline` to produce a body-free declaration outline with recovery selectors, truncate to output caps, and return.
-7. Otherwise: split into lines, apply selector or offset/limit, number them, truncate, emit continuation notice.
+6. If `mode=outline`: require a whole-file read of a parseable workspace Go file and return `goSourceOutline`'s body-free declaration outline.
+7. Otherwise: split into lines, apply selector or offset/limit, number them, truncate. If `mode=auto` read the whole file, the numbered lines overflowed the caps, and the file is parseable Go, return the outline headed by a note on how to read a range; else emit the numbered rows with a continuation notice.
 
 **Edit.** The model received `[foo.go#abc123...def456]` and now calls `edit` with `{path: "foo.go", edits: [{old_text: "...", new_text: "...", anchor: "abc123...def456"}]}`. Inside `newEditTool`'s `Execute` closure:
 
@@ -322,7 +322,7 @@ The lock is reference-counted: `acquire` increments `refs`, `release` decrements
 3. For each top-level declaration, call `outlineDeclaration`.
 4. `outlineDeclaration` renders functions with their receiver, name, type parameters, parameters, and results — all via `renderType` which recursively elides `*ast.StructType` and `*ast.InterfaceType` member bodies.
 5. Each declaration gets a `[path:START-END]` recovery selector from the `token.FileSet` position.
-6. The result is truncated to the standard line/byte caps. If truncated, no raw offset continuation is offered — the agent must use the recovery selectors.
+6. The result is truncated to the standard line/byte caps. If truncated, the note points at the recovery selectors and at `mode=raw` paging.
 
 ## Failure modes and invariants
 
@@ -359,7 +359,7 @@ Files without a recognized image extension but containing NUL bytes are detected
 
 ### Invariant: truncation continuation preserves selector bounds
 
-When a selector read like `foo.go:1-2500` is truncated at the line cap, the continuation notice uses `foo.go:2001-2500` (the clamped end), not `offset=2001`. A bare offset read would continue past line 2500. Summary-mode truncation explicitly says no raw offset continuation is available. When no selector is present, the continuation uses `offset=N` as before — there is no end bound to preserve.
+When a selector read like `foo.go:1-2500` is truncated at the line cap, the continuation notice uses `foo.go:2001-2500` (the clamped end), not `offset=2001`. A bare offset read would continue past line 2500. When no selector is present, the continuation uses `offset=N` as before — there is no end bound to preserve.
 
 ## TypeScript to Go
 

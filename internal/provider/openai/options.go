@@ -23,6 +23,9 @@ const (
 	contextSafetyTokens  = 4096
 	minMaxTokens         = 1
 	defaultOpenAIBaseURL = "https://api.openai.com/v1"
+	// cacheRetentionNone is the StreamOptions.CacheRetention value that turns
+	// prompt-cache request fields off.
+	cacheRetentionNone = "none"
 )
 
 // StreamIdleTimeoutFromEnv returns the stream idle timeout from

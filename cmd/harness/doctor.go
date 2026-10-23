@@ -111,7 +111,9 @@ func roleSpec(role, fallback string) string {
 
 func printRole(w io.Writer, name string, router adapter.ProviderRouter) {
 	price := "known"
-	if router.Model.Cost.Unknown {
+	if router.Model.ReportsBilledCost() {
+		price = "billed"
+	} else if router.Model.Cost.Unknown {
 		price = "unknown"
 	}
 	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL, price)

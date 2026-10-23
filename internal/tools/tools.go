@@ -504,12 +504,12 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(ReadTool),
-			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Parseable Go files are returned as structural outlines by default; use mode=raw, a line selector, offset, or limit for numbered content. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. Output is truncated to %d lines or %dKB (whichever is hit first).", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
+			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Reading a whole file returns all of it as numbered rows when it fits in %d lines and %dKB. A larger Go file returns a structural outline instead (one row per declaration with its path:START-END range, no bodies) so you can read just the range you need; any other larger file returns its first page with the offset to continue. mode=outline asks for the outline of a Go file of any size; mode=raw always pages numbered rows. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
 			Parameters: schema.Object(schema.JSON{
 				"path":   schema.String(),
 				"offset": schema.Number(),
 				"limit":  schema.Number(),
-				"mode":   schema.JSON{"type": "string", "enum": []string{"auto", "raw"}, "default": "auto"},
+				"mode":   schema.JSON{"type": "string", "enum": []string{"auto", "raw", "outline"}, "default": "auto"},
 			}, "path"),
 		},
 		Label: string(ReadTool),
@@ -521,8 +521,8 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if input.Mode == "" {
 				input.Mode = "auto"
 			}
-			if input.Mode != "auto" && input.Mode != "raw" {
-				return agent.AgentToolResult{}, fmt.Errorf("mode must be \"auto\" or \"raw\"")
+			if input.Mode != "auto" && input.Mode != "raw" && input.Mode != "outline" {
+				return agent.AgentToolResult{}, fmt.Errorf("mode must be \"auto\", \"raw\" or \"outline\"")
 			}
 			if err := ctx.Err(); err != nil {
 				return agent.AgentToolResult{}, errors.New("Operation aborted")
@@ -555,19 +555,20 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if containsNUL(data) {
 				return textResult(fmt.Sprintf("%s\n[binary file, %d bytes, not shown]", header, len(data)), &readToolDetails{Binary: true}), nil
 			}
-			if !isResource && !selector.Set && input.Offset == nil && input.Limit == nil && input.Mode == "auto" {
-				if outline, ok := goSourceOutline(displayPath, absolutePath, data); ok {
-					truncation := truncate.Head(outline, truncate.Options{})
-					output := header + "\n" + truncation.Content
-					details := &readToolDetails{Truncation: truncation, Summary: true}
-					if truncation.FirstLineExceedsLimit {
-						output = fmt.Sprintf("%s\n[structural outline line exceeds %s limit; no raw continuation is available.]", header, truncate.FormatSize(truncate.DefaultMaxBytes))
-					} else if truncation.Truncated {
-						output += "\n\n[Structural outline truncated in summary mode; no raw offset continuation is available. Use the recovery selectors above to read raw regions.]"
-					}
-					observe(nil)
-					return textResult(output, details), nil
+			wholeFile := !selector.Set && input.Offset == nil && input.Limit == nil
+			if input.Mode == "outline" {
+				if !wholeFile {
+					return agent.AgentToolResult{}, errors.New("mode=outline covers the whole file; drop the line range, offset and limit, or drop mode to read those lines")
 				}
+				outline, ok := "", false
+				if !isResource {
+					outline, ok = goSourceOutline(displayPath, absolutePath, data)
+				}
+				if !ok {
+					return agent.AgentToolResult{}, fmt.Errorf("mode=outline needs a workspace Go file that parses; read %s without mode for its numbered content", displayPath)
+				}
+				observe(nil)
+				return outlineResult(header, "", outline), nil
 			}
 
 			allLines := splitReadLines(string(data))
@@ -602,6 +603,16 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 				numberedLines[index-startLine] = fmt.Sprintf("%d:%s", index+1, allLines[index])
 			}
 			truncation := truncate.Head(strings.Join(numberedLines, "\n"), truncate.Options{})
+			if truncation.Truncated && wholeFile && input.Mode == "auto" && !isResource {
+				// The whole file does not fit one read. A Go file's declaration
+				// outline lets the model pick the range it needs instead of
+				// paging blind; the outline shows no rows, so it marks none seen.
+				if outline, ok := goSourceOutline(displayPath, absolutePath, data); ok {
+					note := fmt.Sprintf("[%s has %d lines (%s), more than one read shows (%d lines or %s), so this is a structural outline of its declarations, not the file's content. Each row is LINE: declaration [recover: PATH:START-END]. To see or edit a declaration, read its range, e.g. read %q; mode=raw with offset and limit pages the numbered lines instead.]", displayPath, len(allLines), truncate.FormatSize(len(data)), truncate.DefaultMaxLines, truncate.FormatSize(truncate.DefaultMaxBytes), displayPath+":START-END")
+					observe(nil)
+					return outlineResult(header, note, outline), nil
+				}
+			}
 			output := header + "\n" + truncation.Content
 			var details *readToolDetails
 			if truncation.FirstLineExceedsLimit {
@@ -643,6 +654,23 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			return textResult(output, details), nil
 		},
 	}
+}
+
+// outlineResult renders a Go declaration outline under the file header. A
+// non-empty note leads the outline and says why the read returned one.
+func outlineResult(header, note, outline string) agent.AgentToolResult {
+	prefix := header + "\n"
+	if note != "" {
+		prefix += note + "\n"
+	}
+	truncation := truncate.Head(outline, truncate.Options{})
+	output := prefix + truncation.Content
+	if truncation.FirstLineExceedsLimit {
+		output = prefix + fmt.Sprintf("[structural outline line exceeds %s limit; page the numbered lines with mode=raw and offset.]", truncate.FormatSize(truncate.DefaultMaxBytes))
+	} else if truncation.Truncated {
+		output += "\n\n[Structural outline truncated. Read a declaration with the path:START-END range on its row, or page the numbered lines with mode=raw and offset.]"
+	}
+	return textResult(output, &readToolDetails{Truncation: truncation, Summary: true})
 }
 
 // newWriteTool builds the file writer rooted at cwd. It accepts path and content,
@@ -830,12 +858,12 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	parameters := schema.JSON{"command": schema.String(), "timeout": schema.Number()}
 	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
 	if options.Work != nil && !options.Child {
-		parameters["async"] = schema.Bool()
-		parameters["name"] = schema.JSON{"type": "string", "description": "async only: a name unique among running jobs; jobs, wait, cancel and logs accept it in place of the job id"}
-		parameters["ready_log"] = schema.JSON{"type": "string", "description": "async only: RE2 regex; the call returns once an output line matches"}
-		parameters["ready_port"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": 65535, "description": "async only: the call returns once 127.0.0.1:<port> accepts TCP connections"}
-		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline, default 30000; on timeout the process is killed"}
-		description += " async:true starts a background job and returns its handle. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
+		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, ready_log, ready_port and ready_timeout_ms already imply it"}
+		parameters["name"] = schema.JSON{"type": "string", "description": "runs the command as a background job with this name, unique among running jobs, and returns at once; wait, cancel and logs accept the name in place of the job id"}
+		parameters["ready_log"] = schema.JSON{"type": "string", "description": "runs the command as a background service: RE2 regex; the call returns once an output line matches"}
+		parameters["ready_port"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": 65535, "description": "runs the command as a background service: the call returns once 127.0.0.1:<port> accepts TCP connections"}
+		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline for ready_log/ready_port, default 30000; on timeout the process is killed"}
+		description += " A plain command runs in the foreground and returns its output; it needs none of async, name or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or its timeout passes, and wait, logs and cancel take its name or id. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
@@ -863,13 +891,12 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := checkCommandURLs(options.Refs, input.Command); err != nil {
 				return agent.AgentToolResult{}, err
 			}
+			// A name or a readiness condition only means something for a job
+			// referred to later, so either one makes the command a background job.
 			service := input.ReadyLog != "" || input.ReadyPort != 0
-			if !input.Async && (service || input.Name != "" || input.ReadyTimeoutMS != 0) {
-				return agent.AgentToolResult{}, errors.New("name, ready_log, ready_port and ready_timeout_ms need async:true")
-			}
-			if input.Async {
+			if input.Async || service || input.Name != "" || input.ReadyTimeoutMS != 0 {
 				if options.Work == nil || options.Child {
-					return agent.AgentToolResult{}, errors.New("async bash requires a durable root session; child bash is synchronous only")
+					return agent.AgentToolResult{}, errors.New("background bash (async, name, ready_log, ready_port, ready_timeout_ms) needs a durable root session; child bash runs in the foreground only, so drop those fields")
 				}
 				timeoutSeconds := int(timeoutDefault / time.Second)
 				if service {

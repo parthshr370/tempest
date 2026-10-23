@@ -70,8 +70,25 @@ Keep four concepts separate:
 
 Unknown model IDs still run with provider-default limits and **unknown price**,
 not a fabricated free price. Computed JSON costs encode `{"unknown":true}` rather
-than zero-dollar components. A cost budget requires known pricing. Unknown provider
-prefixes are configuration errors; bare IDs use the Anthropic route.
+than zero-dollar components. Unknown provider prefixes are configuration errors;
+bare IDs use the Anthropic route.
+
+**Cost** comes from the provider's bill when the route reports one. OpenRouter
+returns each request's billed cost in its usage (`usage.cost`); with a
+bring-your-own-key upstream, the request costs OpenRouter's fee plus
+`cost_details.upstream_inference_cost`. That amount, which already prices cached
+and cache-write tokens, is the call's cost and counts against `-max-cost`, so an
+OpenRouter model needs no catalog entry for a cost budget. Billed costs carry only
+a total, no per-component split. The catalog price is the fallback when a response
+reports no billed cost; with neither, the call's cost stays unknown.
+
+**Prompt caching.** Within a session, every request extends the previous one byte
+for byte: history is only rewritten by compaction, and the tool list is in name
+order. On OpenAI's endpoint and on OpenRouter each request carries the session id
+as `prompt_cache_key`; OpenRouter also gets it as `session_id`, its sticky-routing
+key, so later turns reach the endpoint that holds the cache. Claude models on
+OpenRouter get a top-level `cache_control`, without which they cache nothing.
+Other OpenAI-compatible endpoints get none of these fields.
 
 `internal/catalog/models.json` records import provenance (`generated_from`, `as_of`)
 and each entry's `source` URL and `verified_at` date. Most direct-provider entries
@@ -328,7 +345,7 @@ patch and no worktree cleanup.
 Admission limits: 4 running jobs per kind (task, bash), 8 jobs running or holding
 an undelivered completion notice, 64 jobs per run, 16 retained general-task
 worktrees, and one unisolated general task at a time. A refused `task` or
-`bash async:true` fails with `job_limit:` followed by which limit is full, the
+background `bash` fails with `job_limit:` followed by which limit is full, the
 job ids holding it, and the call that frees one (`wait`, `cancel`, ending the turn
 to receive pending notices, or `jobs` cleanup). Invalid task or command input
 names the field to fix.
@@ -356,28 +373,39 @@ most 100 unread messages; bodies are at most 8 KiB. Messages are journaled with
 idempotency keys derived from the sending tool call, so recovery delivers each
 exactly once. Plan mode denies `message` like `task`.
 
-#### Named background services
+#### Named background jobs and services
 
-Async `bash` takes an optional `name`, unique among the session's running jobs,
-and readiness conditions: `ready_log` (an RE2 regex matched against each output
-line) and/or `ready_port` (a TCP port on 127.0.0.1), with `ready_timeout_ms`
-(default 30000, at most 300000). With a condition the call returns once every
+`bash` runs a plain command in the foreground and returns its output. Giving it a
+`name`, unique among the session's running jobs, starts the command as a
+background job instead and returns the job handle at once; `async:true` does the
+same for an unnamed job, and a name or readiness field implies it, so there is no
+foreground/background mismatch to reject. Readiness conditions make the job a
+service: `ready_log` (an RE2 regex matched against each output line) and/or
+`ready_port` (a TCP port on 127.0.0.1), with `ready_timeout_ms` (default 30000, at
+most 300000). With a condition the call returns once every
 condition holds, with `readiness:"ready"` and the matched line or port in
 `ready_match`; if the process exits first, or the deadline passes (the process is
 then killed, reason `ready_timeout`), the call fails with the output tail. A ready
 service doesn't keep the run open: it runs until it exits, until it is cancelled,
 or until the run ends, which stops it. Unless `timeout` is given it is not bounded
-by the bash timeout. `jobs` lists `name` and `readiness`; `cancel` and `logs` take
+by the bash timeout. A named job without a readiness condition is ordinary
+background work: the bash timeout bounds it and a one-shot run waits for it to
+finish. `jobs` lists `name` and `readiness`; `cancel` and `logs` take
 `name` in place of `job_id`, and `wait` takes `names` besides `job_ids`. A name
 resolves to its running job, else the one started last. Starting a name that is
 already running fails with the job holding it; restart a service with `cancel
 {"name":…}` and start it again.
 
-### 09 · Reads that summarize, not dump
+### 09 · Reads that show the file, and outline it only when it won't fit
 
-Point `read` at a source file and it returns a structural outline — declarations
-without bodies — so the agent orients in a large file without spending the context
-window on lines it doesn't need yet.
+Point `read` at a file and it returns the numbered content whenever the whole file
+fits one read (2000 lines and 50KB), and every row it shows is editable with
+`hashline`. A Go file too large for that returns a structural outline instead —
+declarations without bodies, each with its `path:START-END` range — headed by a
+note saying it is an outline and how to read a range, so the agent picks the lines
+it needs rather than paging blind. Any other large file returns its first page and
+the offset to continue. `mode:"outline"` asks for the outline of a Go file of any
+size; `mode:"raw"` always pages numbered rows.
 
 `read` takes more than files. Every text output below starts with the
 `[path#TAG]` header and accepts the same `path:START-END` / `path:START+COUNT`
@@ -455,7 +483,7 @@ wire methods use camelCase (`jobId`, `jobIds`).
 
 **Files & search**
 
-- `read` — files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`), with structural outlines for code.
+- `read` — files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`); numbered content when the file fits one read, a structural outline for a Go file that doesn't.
 - `write` — create or overwrite a file, or a `local://` scratch file.
 - `edit` — exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor); also edits `local://` files.
 - `hashline` — line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers; see [02](#02--line-anchored-edits-that-never-corrupt-a-file).
@@ -465,11 +493,11 @@ wire methods use camelCase (`jobId`, `jobIds`).
 
 **Runtime**
 
-- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `async:true` starts a supervised background job, optionally a named service that returns once `ready_log`/`ready_port` holds.
-- `jobs` — page durable job summaries (with service name and readiness), or explicitly clean one exported worktree.
-- `wait` — wait for any requested job, by id or service name, without cancelling it on wait timeout.
-- `cancel` — cancel one task or background bash job, by id or service name.
-- `logs` — page a background command's bounded stdout/stderr by byte offset, by id or service name.
+- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `name` (or `async:true` for an unnamed job) starts a supervised background job, optionally a service that returns once `ready_log`/`ready_port` holds.
+- `jobs` — page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
+- `wait` — wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
+- `cancel` — cancel one task or background bash job, by id or name.
+- `logs` — page a background command's bounded stdout/stderr by byte offset, by id or name.
 
 **Coordination**
 
@@ -603,8 +631,9 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
   Finishing naturally on call N still reports `completed`; the cap stops a run
   only when another turn or outstanding work remains.
 - `-max-cost USD` caps the summed cost of the run's model calls. When the
-  model's price is unknown the run is refused at startup: an unknown price is
-  not a zero price.
+  model's price is unknown and its route doesn't report billed cost, the run is
+  refused at startup: an unknown price is not a zero price. On a billed-cost
+  route, a call that comes back without a cost stops the run with that error.
 - `-max-wall-time D` caps elapsed time, as a Go duration such as `10m`.
 
 Background bash and the four management tools ship with ordinary bash; task

@@ -217,3 +217,37 @@ func TestDefaultStackHonorsConfiguredTaskOptIn(t *testing.T) {
 		})
 	}
 }
+
+// TestNamedBashRunsInBackgroundWithoutAsync replays the benchmark's call
+// shape: bash with a name and no async starts a background job the model
+// then waits for by name.
+func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	// The job's completion follow-up opens one more turn after the first DONE.
+	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"},{"text":"DONE"}]`)
+	owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, FauxScript: script})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := owner.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	result, err := owner.Prompt(t.Context(), Prompt{Text: "run make_marker in the background"})
+	if err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run=%+v %v", result, err)
+	}
+	results := toolResults(owner.Messages())
+	handle, waited := results["bg"], results["w"]
+	if handle.IsError || !strings.Contains(handle.Content[0].Text, `"name":"make_marker"`) || !strings.Contains(handle.Content[0].Text, `"kind":"bash"`) || strings.Contains(handle.Content[0].Text, `"state":"completed"`) {
+		t.Fatalf("bash result is not a background job handle: %#v", handle)
+	}
+	if waited.IsError || !strings.Contains(waited.Content[0].Text, `"name":"make_marker"`) || !strings.Contains(waited.Content[0].Text, `"state":"completed"`) {
+		t.Fatalf("wait by name = %#v", waited)
+	}
+	if marker, err := os.ReadFile(filepath.Join(cwd, "marker.txt")); err != nil || string(marker) != "ready" {
+		t.Fatalf("marker=%q %v", marker, err)
+	}
+}

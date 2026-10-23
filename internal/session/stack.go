@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
-	"go.harness.dev/harness/internal/compaction"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
@@ -170,14 +169,14 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		beforeToolCall = cfg.BeforeToolCall
 	}
 
-	// The session data directory holds spills so read can open them; a
-	// session without a journal clears old results inline instead.
-	sessionDataDir := ""
+	// The session data directory holds tool-output spills so read can open
+	// them. The journal id is the session id providers key their prompt
+	// cache on.
+	sessionDataDir, sessionID := "", ""
 	if cfg.Journal != nil {
 		sessionDataDir = cfg.Journal.Path() + ".d"
+		sessionID = cfg.Journal.ID()
 	}
-	toolOutputDir := tools.ToolOutputDir(sessionDataDir)
-	transformContext := compaction.Transform(compaction.TransformOptions{Cwd: cwd, SpillToolResults: toolOutputDir != "", SpillDir: toolOutputDir})
 	var taskTool agent.AgentTool
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
 		taskTool = subagent.NewTool(cfg.Controller)
@@ -259,11 +258,11 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	agt = agent.NewAgent(agent.AgentOptions{
 		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, Tools: active, Messages: cfg.InitialMessages},
 		StreamFn:         cfg.StreamFn,
-		TransformContext: transformContext,
 		PrepareNextTurnE: compact,
 		QueueSource:      cfg.QueueSource,
 		Work:             cfg.Work,
 		BeforeToolCall:   beforeToolCall,
+		SessionID:        sessionID,
 	})
 	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd}, nil
 }

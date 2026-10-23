@@ -13,7 +13,10 @@ type ModelCost struct {
 	CacheWrite float64 `json:"cacheWrite"` // $/million tokens
 }
 
-// Cost is the computed per-component + total cost of a Usage (USD).
+// Cost is the USD cost of a Usage. Total is authoritative. The components are
+// filled when the cost is computed from a price list (CalculateCost); a cost
+// billed by the provider (see Model.ReportsBilledCost) carries only Total,
+// because the provider reports no per-component split.
 type Cost struct {
 	Unknown    bool    `json:"unknown,omitempty"`
 	Input      float64 `json:"input"`
