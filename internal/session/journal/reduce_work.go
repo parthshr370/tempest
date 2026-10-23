@@ -256,7 +256,11 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 					}
 					return fmt.Errorf("duplicate job intent %q", v.JobID)
 				}
-				r := &work.Recovery{Job: work.Job{ID: v.JobID, Kind: v.Kind, State: "starting", RunID: e.RunID, LogicalRunID: v.LogicalRunID, ToolCallID: v.ToolCallID, ChildSessionID: v.ChildSessionID, StartedAt: e.Timestamp, Cwd: v.Cwd, Isolation: v.Isolation, Cleanup: "none"}, Invocation: work.Invocation{RunID: e.RunID, CallID: v.CallID, ToolCallID: v.ToolCallID}, IdentityDigest: v.IdentityDigest, ChildJournal: v.ChildJournal}
+				startedAt := v.StartedAt
+				if startedAt.IsZero() {
+					startedAt = e.Timestamp
+				}
+				r := &work.Recovery{Job: work.Job{ID: v.JobID, Kind: v.Kind, State: "starting", RunID: e.RunID, LogicalRunID: v.LogicalRunID, ToolCallID: v.ToolCallID, ChildSessionID: v.ChildSessionID, StartedAt: startedAt.UTC(), Cwd: v.Cwd, Isolation: v.Isolation, Cleanup: "none"}, Invocation: work.Invocation{RunID: e.RunID, CallID: v.CallID, ToolCallID: v.ToolCallID}, IdentityDigest: v.IdentityDigest, ChildJournal: v.ChildJournal}
 				if v.Environment != nil {
 					r.Environment = &work.TaskEnvironment{Model: v.Environment.Model, Provider: v.Environment.Provider, Ceiling: work.Ceiling{Mode: v.Environment.Ceiling.Mode, Tools: v.Environment.Ceiling.Tools, Overrides: v.Environment.Ceiling.Overrides, Interactive: v.Environment.Ceiling.Interactive}}
 				}
@@ -322,7 +326,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 					return fmt.Errorf("invalid job_finished %q", v.JobID)
 				}
 				r.Job.State = v.State
-				r.Job.FinishedAt = v.FinishedAt
+				r.Job.FinishedAt = v.FinishedAt.UTC()
 				r.Job.Reason = v.Reason
 				r.Job.ExitCode = v.ExitCode
 				r.Job.Usage = v.Usage

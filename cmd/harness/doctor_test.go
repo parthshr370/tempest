@@ -10,28 +10,30 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"go.harness.dev/harness/internal/catalog"
+	"go.harness.dev/harness/internal/adapter"
 )
 
-func TestCheapestCatalogModels(t *testing.T) {
-	for _, provider := range catalog.Providers() {
-		cheapest, found := cheapestModel(provider.ID)
-		if !found {
-			t.Fatalf("no priced model for %s", provider.ID)
+func TestPingTargetsAreConfiguredRoleModels(t *testing.T) {
+	resolve := func(defaultModel, planModel, smolModel string) []pingTarget {
+		t.Helper()
+		roles, err := adapter.ResolveRoles(adapter.RoleRoutingConfig{DefaultModel: defaultModel, PlanModel: planModel, SmolModel: smolModel})
+		if err != nil {
+			t.Fatal(err)
 		}
-		for _, candidate := range catalog.Models() {
-			if candidate.Provider == provider.ID && !candidate.Cost.Unknown && candidate.Cost.Input+candidate.Cost.Output < cheapest.Cost.Input+cheapest.Cost.Output {
-				t.Fatalf("%s isn't cheapest for %s", cheapest.ID, provider.ID)
-			}
-		}
+		return pingTargets(roles)
 	}
-	if _, found := cheapestModel("unconfigured-provider"); found {
-		t.Fatal("unknown provider has a cheapest model")
+	only := resolve("openrouter:~google/gemini-flash-latest", "", "")
+	if len(only) != 1 || strings.Join(only[0].roles, "+") != "default+plan+smol" || only[0].router.Model.Provider != "openrouter" || only[0].router.Model.ID != "~google/gemini-flash-latest" {
+		t.Fatalf("default-only targets: %+v", only)
+	}
+	split := resolve("openrouter:~google/gemini-flash-latest", "openrouter:~google/gemini-flash-latest", "openai:gpt-small@https://example.test/v1")
+	if len(split) != 2 || strings.Join(split[0].roles, "+") != "default+plan" || strings.Join(split[1].roles, "+") != "smol" || split[1].router.Model.ID != "gpt-small" {
+		t.Fatalf("split targets: %+v", split)
 	}
 }
 
-func TestDoctorProbeUsesSmallBudgetAcceptsLengthAndRedactsFailures(t *testing.T) {
-	for _, status := range []int{http.StatusOK, http.StatusTooManyRequests} {
+func TestDoctorPingProbesConfiguredModelAndReportsProviderStatus(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusTooManyRequests, http.StatusNotFound} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())
 			for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"} {
@@ -45,7 +47,6 @@ func TestDoctorProbeUsesSmallBudgetAcceptsLengthAndRedactsFailures(t *testing.T)
 				var body struct {
 					Model     string `json:"model"`
 					MaxTokens int    `json:"max_completion_tokens"`
-					Effort    string `json:"reasoning_effort"`
 					Messages  []struct {
 						Role    string `json:"role"`
 						Content string `json:"content"`
@@ -55,36 +56,45 @@ func TestDoctorProbeUsesSmallBudgetAcceptsLengthAndRedactsFailures(t *testing.T)
 					t.Error(err)
 					return
 				}
-				cheapest, _ := cheapestModel("openai")
-				if body.Model != cheapest.ID || body.MaxTokens != 16 || body.Effort != "none" || len(body.Messages) != 1 || body.Messages[0].Role != "user" || body.Messages[0].Content != "hi" {
+				if body.Model != "gpt-configured" || body.MaxTokens != 16 || len(body.Messages) != 1 || body.Messages[0].Content != "hi" {
 					t.Errorf("unexpected probe: %+v", body)
 				}
 				writer.Header().Set("Content-Type", "text/event-stream")
 				writer.WriteHeader(status)
 				payload := "data: {\"choices\":[{\"delta\":{\"content\":\"h\"},\"finish_reason\":\"length\"}]}\n\n"
-				if status != http.StatusOK {
+				switch status {
+				case http.StatusTooManyRequests:
 					payload = key + " rate limit"
+				case http.StatusNotFound:
+					payload = `{"error":{"message":"allowed-providers setting permits only: google-vertex"}}`
 				}
 				if _, err := io.WriteString(writer, payload); err != nil {
 					t.Error(err)
 				}
 			}))
 			defer endpoint.Close()
-			t.Setenv("OPENAI_BASE_URL", endpoint.URL)
 			var output, diagnostics bytes.Buffer
-			code := runDoctor([]string{"--ping"}, &output, &diagnostics)
+			code := runDoctor([]string{"--ping", "-model", "openai:gpt-configured@" + endpoint.URL}, &output, &diagnostics)
 			if calls.Load() != 1 {
-				t.Fatalf("probe calls: %d", calls.Load())
+				t.Fatalf("probe calls: %d output=%s", calls.Load(), &output)
 			}
 			if strings.Contains(output.String()+diagnostics.String(), key) {
 				t.Fatal("doctor leaked key")
 			}
-			if status == http.StatusOK {
-				if code != 0 || !strings.Contains(output.String(), "openai: ok ") {
+			label := "default+plan+smol (openai:gpt-configured): "
+			switch status {
+			case http.StatusOK:
+				if code != 0 || !strings.Contains(output.String(), label+"ok ") {
 					t.Fatalf("doctor: code=%d output=%s diagnostics=%s", code, &output, &diagnostics)
 				}
-			} else if code != 1 || !strings.Contains(output.String(), "rate_limited") {
-				t.Fatalf("doctor: code=%d output=%s", code, &output)
+			case http.StatusTooManyRequests:
+				if code != 1 || !strings.Contains(output.String(), label+"error rate_limited: provider HTTP 429") {
+					t.Fatalf("doctor: code=%d output=%s", code, &output)
+				}
+			default:
+				if code != 1 || !strings.Contains(output.String(), "provider HTTP 404") || !strings.Contains(output.String(), "allowed-providers setting") {
+					t.Fatalf("doctor: code=%d output=%s", code, &output)
+				}
 			}
 		})
 	}

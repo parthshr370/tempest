@@ -491,7 +491,7 @@ func validateResolved(c *ResolvedConfig) error {
 	switch c.permissionModeDefault {
 	case "default", "plan", "acceptEdits", "bypass":
 	default:
-		return &Error{Field: "permission_mode_default", Err: fmt.Errorf("unknown mode %q", c.permissionModeDefault)}
+		return &Error{Field: "permission_mode_default", Err: fmt.Errorf("unknown mode %q (valid modes: default, plan, acceptEdits, bypass)", c.permissionModeDefault)}
 	}
 	switch strings.ToLower(c.logLevel) {
 	case "debug", "info", "warn", "warning", "error":

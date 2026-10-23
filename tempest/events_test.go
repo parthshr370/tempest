@@ -27,7 +27,8 @@ func TestMapEveryAgentEvent(t *testing.T) {
 		{"assistant_end", agent.MessageEnd(assistant), []string{"agent_message_chunk", "agent_thought_chunk", "tempest/message_end", "usage_update"}},
 		{"tool_result_end", agent.MessageEnd(types.ToolResultMessage{}), nil},
 		{"child_usage", agent.AgentEvent{Type: agent.EventUsage, Model: "child", RunResult: RunResult{Usage: Usage{Input: 5}}}, []string{"tempest/usage"}},
-		{"permission", agent.AgentEvent{Type: agent.EventToolPermission, ToolCallID: "c", Permission: &agent.PermissionOutcome{Allow: true, Source: "prompt", Wait: 3 * time.Millisecond}}, []string{"tool_call_update"}},
+		{"permission", agent.AgentEvent{Type: agent.EventToolPermission, ToolCallID: "c", ToolName: "read", Permission: &agent.PermissionOutcome{Allow: true, Source: "mode", Wait: 3 * time.Millisecond}}, []string{"tool_call", "tool_call_update"}},
+		{"prompted_permission", agent.AgentEvent{Type: agent.EventToolPermission, ToolCallID: "c", Permission: &agent.PermissionOutcome{Allow: true, Source: "prompt", Prompted: true}}, []string{"tool_call_update"}},
 		{"tool_start", agent.ToolExecutionStart("c", "read", json.RawMessage(`{"path":"x"}`)), []string{"tool_call"}},
 		{"tool_update", agent.ToolExecutionUpdate("c", "read", nil, agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("partial")}}), []string{"tool_call_update"}},
 		{"tool_end", agent.ToolExecutionEnd("c", "read", agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("done")}}, false), []string{"tool_call_update"}},
@@ -49,6 +50,61 @@ func TestMapEveryAgentEvent(t *testing.T) {
 				t.Fatalf("updates = %v, want %v", kinds, tc.want)
 			}
 		})
+	}
+}
+
+// Every update for a call must follow its tool_call, including the permission decision.
+func TestToolCallPrecedesItsUpdates(t *testing.T) {
+	args := json.RawMessage(`{"command":"rm -rf build"}`)
+	done := agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("done")}}
+	for _, test := range []struct {
+		name     string
+		outcome  *agent.PermissionOutcome
+		statuses []string
+	}{
+		{"allowed", &agent.PermissionOutcome{Allow: true, Source: "mode"}, []string{"tool_call:pending", "tool_call_update:pending", "tool_call_update:in_progress", "tool_call_update:completed"}},
+		{"denied", &agent.PermissionOutcome{Source: "guard"}, []string{"tool_call:pending", "tool_call_update:failed", "tool_call_update:failed"}},
+		{"ungated", nil, []string{"tool_call:in_progress", "tool_call_update:completed"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := newMapper("s", types.Model{ID: "m"})
+			events := []agent.AgentEvent{agent.ToolExecutionStart("c", "bash", args), agent.ToolExecutionEnd("c", "bash", done, test.outcome != nil && !test.outcome.Allow)}
+			if test.outcome != nil {
+				events = append([]agent.AgentEvent{{Type: agent.EventToolPermission, ToolCallID: "c", ToolName: "bash", Args: args, Permission: test.outcome}}, events...)
+			}
+			var got []string
+			for _, ev := range events {
+				for _, u := range m.mapEvent(ev) {
+					var p struct {
+						ToolCallID string          `json:"toolCallId"`
+						Status     string          `json:"status"`
+						Title      string          `json:"title"`
+						RawInput   json.RawMessage `json:"rawInput"`
+					}
+					if err := json.Unmarshal(u.Update, &p); err != nil || p.ToolCallID != "c" {
+						t.Fatalf("update %s: %v", u.Update, err)
+					}
+					if u.Kind == "tool_call" && (p.Title != "$ rm -rf build" || string(p.RawInput) != string(args)) {
+						t.Fatalf("announcement lacks call details: %s", u.Update)
+					}
+					got = append(got, u.Kind+":"+p.Status)
+				}
+			}
+			if !reflect.DeepEqual(got, test.statuses) {
+				t.Fatalf("updates = %v, want %v", got, test.statuses)
+			}
+		})
+	}
+}
+
+func TestConsumedQueueUpdateCarriesOnlyTheID(t *testing.T) {
+	m := newMapper("s", types.Model{ID: "m"})
+	ev := agent.MessageEnd(types.UserMessage{Content: types.StringContent("follow up")})
+	ev.QueueID = "queue_1"
+	updates := m.mapEvent(ev)
+	last := updates[len(updates)-1]
+	if last.Kind != "tempest/queue" || string(last.Update) != `{"action":"consumed","item":{"id":"queue_1"}}` {
+		t.Fatalf("consumed update = %s %s", last.Kind, last.Update)
 	}
 }
 func TestUsageContextAndUnknownCost(t *testing.T) {

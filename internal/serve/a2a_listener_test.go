@@ -3,6 +3,7 @@ package serve
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,25 +13,22 @@ import (
 )
 
 func TestA2ALoopbackAddressAndCardPolicy(t *testing.T) {
-	s, err := New(Options{SessionDir: t.TempDir(), Cwd: t.TempDir()})
+	bound := make(chan string, 1)
+	s, err := New(Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), OnListen: func(addr net.Addr) { bound <- addr.String() }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.ListenAndServe("127.0.0.1:0") }()
-	deadline := time.Now().Add(5 * time.Second)
-	address := ""
-	for address == "" {
-		s.mu.Lock()
-		if s.listener != nil {
-			address = s.listener.Addr().String()
-		}
-		s.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatal("listener didn't bind")
-		}
-		time.Sleep(time.Millisecond)
+	var address string
+	select {
+	case address = <-bound:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listener didn't bind")
+	}
+	if _, port, _ := net.SplitHostPort(address); port == "0" || port == "" {
+		t.Fatalf("OnListen got unresolved address %q", address)
 	}
 	base := "http://" + address
 	client := &http.Client{Timeout: 5 * time.Second}

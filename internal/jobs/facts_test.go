@@ -15,7 +15,7 @@ func strictFact(fact work.Fact) error {
 	switch fact.Kind {
 	case "job_started":
 		required = []string{"job_id", "identity_digest", "call_id", "tool_call_id", "logical_run_id", "kind", "spec", "cwd"}
-		optional = []string{"environment", "child_session_id", "child_journal", "output_path", "worktree"}
+		optional = []string{"started_at", "environment", "child_session_id", "child_journal", "output_path", "worktree"}
 	case "job_running":
 		required = []string{"job_id"}
 		optional = []string{"child_run_id", "pid", "pgid"}

@@ -120,3 +120,43 @@ type Snapshot struct {
 	JobsTruncated  bool                      `json:"jobsTruncated"`
 	JobsCursor     string                    `json:"jobsCursor,omitempty"`
 }
+
+// WireBudget is the ACP form of [agent.Budget], matching the session/new and
+// tempest/set_budget parameters. Zero fields are unlimited.
+type WireBudget struct {
+	MaxTurns       int     `json:"maxTurns"`
+	MaxCostUSD     float64 `json:"maxCostUsd"`
+	MaxWallSeconds float64 `json:"maxWallSeconds"`
+}
+
+// NewWireBudget converts a budget to its wire form.
+func NewWireBudget(b agent.Budget) WireBudget {
+	return WireBudget{MaxTurns: b.MaxTurns, MaxCostUSD: b.MaxCostUSD, MaxWallSeconds: b.MaxWallTime.Seconds()}
+}
+
+// Budget converts the wire form back to a budget.
+func (w WireBudget) Budget() agent.Budget {
+	return agent.Budget{MaxTurns: w.MaxTurns, MaxCostUSD: w.MaxCostUSD, MaxWallTime: time.Duration(w.MaxWallSeconds * float64(time.Second))}
+}
+
+// snapshotJSON shadows Budget so the snapshot carries the camelCase wire form.
+type snapshotJSON struct {
+	*snapshotFields
+	Budget WireBudget `json:"budget"`
+}
+type snapshotFields Snapshot
+
+// MarshalJSON writes the budget in its wire form.
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	return json.Marshal(snapshotJSON{(*snapshotFields)(&s), NewWireBudget(s.Budget)})
+}
+
+// UnmarshalJSON reads the budget's wire form.
+func (s *Snapshot) UnmarshalJSON(raw []byte) error {
+	v := snapshotJSON{snapshotFields: (*snapshotFields)(s)}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	s.Budget = v.Budget.Budget()
+	return nil
+}

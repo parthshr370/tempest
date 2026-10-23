@@ -78,11 +78,14 @@ type JobWorkspace struct {
 
 // JobStarted precedes every child, process and workspace effect.
 type JobStarted struct {
-	JobID          string          `json:"job_id"`
-	IdentityDigest string          `json:"identity_digest"`
-	CallID         string          `json:"call_id"`
-	ToolCallID     string          `json:"tool_call_id"`
-	LogicalRunID   string          `json:"logical_run_id"`
+	JobID          string `json:"job_id"`
+	IdentityDigest string `json:"identity_digest"`
+	CallID         string `json:"call_id"`
+	ToolCallID     string `json:"tool_call_id"`
+	LogicalRunID   string `json:"logical_run_id"`
+	// StartedAt is the job's own admission time; older v3 lines omit it and
+	// reduce to the record timestamp.
+	StartedAt      time.Time       `json:"started_at,omitzero"`
 	Kind           string          `json:"kind"`
 	Spec           json.RawMessage `json:"spec"`
 	Environment    *JobEnvironment `json:"environment,omitempty"`

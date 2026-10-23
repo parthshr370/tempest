@@ -38,10 +38,17 @@ func TestDoctorFailsOnHardConfigurationError(t *testing.T) {
 	}
 }
 
-func TestDoctorListsEveryCatalogProviderAndModel(t *testing.T) {
+func TestDoctorListsCatalogModelsOnlyWithModelsFlag(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	var brief bytes.Buffer
+	if code := runDoctor(nil, &brief, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("doctor exit = %d", code)
+	}
+	if first := catalog.Models()[0]; strings.Contains(brief.String(), first.Provider+"/"+first.ID+": window=") {
+		t.Fatalf("default doctor output dumps the catalog: %s", &brief)
+	}
 	var out bytes.Buffer
-	if code := runDoctor(nil, &out, &bytes.Buffer{}); code != 0 {
+	if code := runDoctor([]string{"-models"}, &out, &bytes.Buffer{}); code != 0 {
 		t.Fatalf("doctor exit = %d", code)
 	}
 	output := out.String()

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net"
@@ -194,6 +195,21 @@ func writeResponse(w http.ResponseWriter, id json.RawMessage, result any, e *rpc
 
 var versionPattern = regexp.MustCompile(`^1\.0(?:\.[0-9]+)?$`)
 
+// legacyMethods maps A2A 0.3 method names to their 1.0 replacements so a 0.3
+// client learns what to send instead of a bare "Method not found".
+var legacyMethods = map[string]string{
+	"message/send":                        "SendMessage",
+	"message/stream":                      "SendStreamingMessage",
+	"tasks/get":                           "GetTask",
+	"tasks/cancel":                        "CancelTask",
+	"tasks/resubscribe":                   "SubscribeToTask",
+	"tasks/pushNotificationConfig/set":    "CreateTaskPushNotificationConfig",
+	"tasks/pushNotificationConfig/get":    "GetTaskPushNotificationConfig",
+	"tasks/pushNotificationConfig/list":   "ListTaskPushNotificationConfigs",
+	"tasks/pushNotificationConfig/delete": "DeleteTaskPushNotificationConfig",
+	"agent/getAuthenticatedExtendedCard":  "GetExtendedAgentCard",
+}
+
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -231,8 +247,18 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		writeResponse(w, nil, nil, &rpcError{Code: -32600, Message: "Invalid Request"})
 		return
 	}
-	if !versionPattern.MatchString(r.Header.Get("A2A-Version")) {
-		writeResponse(w, req.ID, nil, protocolError(-32009, "unsupported_version", nil))
+	// A 0.3 method name is the clearer signal than its usually missing version header.
+	if replacement, ok := legacyMethods[req.Method]; ok {
+		writeResponse(w, req.ID, nil, &rpcError{Code: -32601, Message: fmt.Sprintf("Method not found: %s is the A2A 0.3 name; this server speaks A2A 1.0, use %s with header A2A-Version: 1.0", req.Method, replacement)})
+		return
+	}
+	if version := r.Header.Get("A2A-Version"); !versionPattern.MatchString(version) {
+		e := protocolError(-32009, "unsupported_version", nil)
+		if version == "" {
+			version = "missing (A2A 0.3)"
+		}
+		e.Message += fmt.Sprintf(": A2A-Version %s is not supported; send header A2A-Version: 1.0", version)
+		writeResponse(w, req.ID, nil, e)
 		return
 	}
 	if len(req.Params) == 0 || bytes.Equal(req.Params, []byte("null")) || bytes.TrimSpace(req.Params)[0] != '{' {

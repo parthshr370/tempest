@@ -62,9 +62,11 @@ type StackConfig struct {
 	EnableTask          bool
 	EnableWeb           bool
 	WebSearchURL        string
-	ConfiguredTools     []agent.AgentTool
-	PromptAdditions     []string
-	BashTimeout         time.Duration
+	// SkillPaths feeds per-session discovery in tempest.Open; nil uses the resolved config's paths.
+	SkillPaths      []string
+	ConfiguredTools []agent.AgentTool
+	PromptAdditions []string
+	BashTimeout     time.Duration
 	// Work and QueueSource bind the session-owned durable runtime.
 	Work           work.RunHooks
 	Controller     work.Controller
@@ -91,6 +93,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		EnableTask:   cfg.EnableTask(),
 		EnableWeb:    cfg.EnableWeb(),
 		WebSearchURL: cfg.WebSearchURL(),
+		SkillPaths:   cfg.SkillPaths(),
 		BashTimeout:  cfg.BashTimeout(),
 	}
 }

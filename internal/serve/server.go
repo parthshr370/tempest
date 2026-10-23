@@ -39,6 +39,8 @@ type Options struct {
 	Clock             acp.Clock
 	A2ABaseURL        string
 	Cwd               string
+	// OnListen, when set, receives the bound address before ListenAndServe accepts connections.
+	OnListen func(net.Addr)
 }
 
 type entry struct {
@@ -413,6 +415,9 @@ func (s *Server) ListenAndServe(address string) error {
 	s.http = server
 	s.listener = listener
 	s.mu.Unlock()
+	if s.opts.OnListen != nil {
+		s.opts.OnListen(listener.Addr())
+	}
 	err = server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
 		return nil

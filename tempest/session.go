@@ -270,7 +270,11 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cfg.SmolModel = cfg.Model
 	}
 	if needsDiscovery {
-		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: defaults.SkillPaths(), IncludeDefaultSkills: true})
+		skillPaths := cfg.SkillPaths
+		if skillPaths == nil {
+			skillPaths = defaults.SkillPaths()
+		}
+		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: skillPaths, IncludeDefaultSkills: true})
 		if e != nil {
 			return nil, e
 		}

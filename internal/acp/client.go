@@ -16,6 +16,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/build"
+	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
@@ -360,7 +361,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		if err := s.SetBudget(budget); err != nil {
 			return nil, rpc.NewError(-32005, "budget_invalid", err.Error())
 		}
-		return map[string]any{"budget": budget}, nil
+		return map[string]any{"budget": hub.NewWireBudget(budget)}, nil
 	case "tempest/set_permission_mode":
 		mode, err := permission.ParseMode(p.Mode)
 		if err != nil {
@@ -413,6 +414,9 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	if p.Cwd == "" || !filepath.IsAbs(p.Cwd) {
 		return nil, rpc.NewError(-32602, "invalid_params", "cwd must be absolute")
 	}
+	if e := checkWorkspace(p.Cwd); e != nil {
+		return nil, e
+	}
 	var s *tempest.Session
 	var err error
 	if method == "session/new" {
@@ -459,6 +463,20 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	}
 	// Replay precedes the response; live updates stay queued until after it.
 	return rpc.Response{Value: struct{}{}, After: after}, nil
+}
+
+// checkWorkspace rejects a cwd that a session could not run tools in.
+func checkWorkspace(cwd string) *rpc.Error {
+	info, err := os.Stat(cwd)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return rpc.NewError(-32602, "invalid_params", fmt.Sprintf("cwd %s does not exist", cwd))
+	case err != nil:
+		return rpc.NewError(-32602, "invalid_params", fmt.Sprintf("cwd is not accessible: %v", err))
+	case !info.IsDir():
+		return rpc.NewError(-32602, "invalid_params", fmt.Sprintf("cwd %s is not a directory", cwd))
+	}
+	return nil
 }
 
 func convertMCPServers(raw []json.RawMessage) ([]tempest.MCPServerConfig, *rpc.Error) {

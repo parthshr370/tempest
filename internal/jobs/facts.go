@@ -34,6 +34,7 @@ type startedPayload struct {
 	CallID         string              `json:"call_id"`
 	ToolCallID     string              `json:"tool_call_id"`
 	LogicalRunID   string              `json:"logical_run_id"`
+	StartedAt      time.Time           `json:"started_at,omitzero"`
 	Kind           string              `json:"kind"`
 	Spec           json.RawMessage     `json:"spec"`
 	Environment    *environmentPayload `json:"environment,omitempty"`
@@ -82,7 +83,7 @@ type stopPayload struct {
 
 func (manager *Manager) commitStart(ctx context.Context, record *entry) error {
 	recovery := record.recovery
-	payload := startedPayload{JobID: recovery.Job.ID, IdentityDigest: recovery.IdentityDigest, CallID: recovery.Invocation.CallID, ToolCallID: recovery.Invocation.ToolCallID, LogicalRunID: recovery.Job.LogicalRunID, Kind: recovery.Job.Kind, ChildSessionID: recovery.Job.ChildSessionID, ChildJournal: recovery.ChildJournal, Cwd: recovery.Job.Cwd}
+	payload := startedPayload{JobID: recovery.Job.ID, IdentityDigest: recovery.IdentityDigest, CallID: recovery.Invocation.CallID, ToolCallID: recovery.Invocation.ToolCallID, LogicalRunID: recovery.Job.LogicalRunID, StartedAt: recovery.Job.StartedAt, Kind: recovery.Job.Kind, ChildSessionID: recovery.Job.ChildSessionID, ChildJournal: recovery.ChildJournal, Cwd: recovery.Job.Cwd}
 	var err error
 	if recovery.Task != nil {
 		payload.Spec, err = json.Marshal(recovery.Task)

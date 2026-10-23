@@ -88,7 +88,7 @@ type Job struct {
 	ChildSessionID string          `json:"childSessionId,omitempty"`
 	Description    string          `json:"description,omitempty"`
 	StartedAt      time.Time       `json:"startedAt"`
-	FinishedAt     time.Time       `json:"finishedAt,omitempty"`
+	FinishedAt     time.Time       `json:"finishedAt,omitzero"`
 	Cwd            string          `json:"cwd,omitempty"`
 	Isolation      string          `json:"isolation,omitempty"` // worktree | shared (general); empty for explore/bash
 	BaseCommit     string          `json:"baseCommit,omitempty"`
