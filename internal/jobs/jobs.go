@@ -42,6 +42,11 @@ const (
 	maxCompletionBytes = 8 << 10
 	maxLogBytes        = 16 << 20
 	maxTimeoutSeconds  = 2147483
+	maxPromptBytes     = 32 << 10
+	maxDescription     = 512
+	maxJobPage         = 50
+	maxLogPage         = 64 << 10
+	maxWait            = 300 * time.Second
 )
 
 // Options preserves the synchronous shell's configuration for async commands.
@@ -415,6 +420,9 @@ func (manager *Manager) refreshCredits() {
 	}
 	manager.mu.Unlock()
 }
+
+// capacity admits one more job of kind, or says which limit is full, which
+// jobs hold it and what frees it, so the model can act on the refusal.
 func (manager *Manager) capacity(kind string, shared, writer bool) error {
 	manager.refreshCredits()
 	manager.mu.Lock()
@@ -428,31 +436,60 @@ func (manager *Manager) capacity(kind string, shared, writer bool) error {
 	if err := manager.scope.Err(); err != nil {
 		return err
 	}
-	active, total, credits, retained := 0, 0, 0, 0
-	for _, record := range manager.entries {
+	var running, sameKind, unread, retained []string
+	sharedJob := ""
+	for jobID, record := range manager.entries {
+		job := record.recovery.Job
 		if record.live {
-			total++
-			if record.recovery.Job.Kind == kind {
-				active++
+			running = append(running, jobID)
+			if job.Kind == kind {
+				sameKind = append(sameKind, jobID)
 			}
-			if shared && record.recovery.Job.Isolation == "shared" {
-				return ErrJobLimit
+			if job.Isolation == "shared" {
+				sharedJob = jobID
 			}
+		} else if record.credited {
+			unread = append(unread, jobID)
 		}
-		if record.credited {
-			credits++
-		}
-		if record.recovery.Job.Isolation == "worktree" && (record.recovery.Job.Cleanup == "retained" || record.recovery.Job.Cleanup == "blocked") {
-			retained++
+		if job.Isolation == "worktree" && (job.Cleanup == "retained" || job.Cleanup == "blocked") {
+			retained = append(retained, jobID)
 		}
 	}
-	if active >= maxActiveKind || total >= maxCredits || credits >= maxCredits || manager.accepted[manager.run.LogicalRunID] >= maxAccepted {
-		return ErrJobLimit
+	for _, ids := range [][]string{running, sameKind, unread, retained} {
+		sort.Strings(ids)
 	}
-	if writer && retained >= maxRetained {
-		return ErrJobLimit
+	switch {
+	case shared && sharedJob != "":
+		return fmt.Errorf("%w: general task %s is already running directly in the working directory (no isolated git worktree is available here), and only one such task can run at a time. %s, or start an explore task instead", ErrJobLimit, sharedJob, freeRunning([]string{sharedJob}))
+	case len(sameKind) >= maxActiveKind:
+		return fmt.Errorf("%w: %d background %s jobs are already running, the most allowed at once: %s. %s, then retry", ErrJobLimit, len(sameKind), kind, strings.Join(sameKind, ", "), freeRunning(sameKind))
+	case len(running)+len(unread) >= maxCredits:
+		message := fmt.Sprintf("%d background jobs are running or have completion notices you have not received yet (limit %d).", len(running)+len(unread), maxCredits)
+		if len(running) > 0 {
+			message += fmt.Sprintf(" Running: %s.", strings.Join(running, ", "))
+		}
+		if len(unread) > 0 {
+			message += fmt.Sprintf(" Finished, notice pending: %s; their notices arrive after you end this turn (reply without tool calls), which frees their slots.", strings.Join(unread, ", "))
+		}
+		if len(running) > 0 {
+			message += " " + freeRunning(running) + "."
+		}
+		return fmt.Errorf("%w: %s", ErrJobLimit, message)
+	case manager.accepted[manager.run.LogicalRunID] >= maxAccepted:
+		return fmt.Errorf("%w: this run has already started %d background jobs, the most one run may start; continue with the jobs you have", ErrJobLimit, maxAccepted)
+	case writer && len(retained) >= maxRetained:
+		return fmt.Errorf("%w: %d finished general tasks still keep their git worktrees (limit %d): %s. Take what you need from a task's patch, then free its worktree with jobs {\"action\":\"cleanup\",\"job_id\":%q} and retry", ErrJobLimit, len(retained), maxRetained, strings.Join(retained, ", "), retained[0])
 	}
 	return nil
+}
+
+// freeRunning tells the model how to free a slot held by running jobs.
+func freeRunning(ids []string) string {
+	quoted := make([]string, len(ids))
+	for i, jobID := range ids {
+		quoted[i] = fmt.Sprintf("%q", jobID)
+	}
+	return fmt.Sprintf("Wait for one to finish with wait {\"job_ids\":[%s]} or stop one with cancel {\"job_id\":%s}", strings.Join(quoted, ","), quoted[0])
 }
 
 func (manager *Manager) invocation(ctx context.Context) (work.Invocation, string, string, string, error) {
@@ -470,10 +507,25 @@ func (manager *Manager) invocation(ctx context.Context) (work.Invocation, string
 	return invocation, jobID, childID, digest, nil
 }
 
+// validateTask rejects a task spec with the reason the model needs to fix it.
+func validateTask(spec work.TaskSpec) error {
+	switch {
+	case strings.TrimSpace(spec.Prompt) == "":
+		return fmt.Errorf("%w: prompt is required", ErrInvalidInput)
+	case len(spec.Prompt) > maxPromptBytes:
+		return fmt.Errorf("%w: prompt is %d bytes; the limit is %d", ErrInvalidInput, len(spec.Prompt), maxPromptBytes)
+	case len(spec.Description) > maxDescription:
+		return fmt.Errorf("%w: description is %d bytes; the limit is %d", ErrInvalidInput, len(spec.Description), maxDescription)
+	case spec.SubagentType != "explore" && spec.SubagentType != "general":
+		return fmt.Errorf("%w: subagent_type must be \"explore\" or \"general\"", ErrInvalidInput)
+	}
+	return nil
+}
+
 // StartTask returns after durable intent; workspace setup and provider work stay in its worker.
 func (manager *Manager) StartTask(ctx context.Context, spec work.TaskSpec) (work.Job, error) {
-	if strings.TrimSpace(spec.Prompt) == "" || len(spec.Prompt) > 32<<10 || len(spec.Description) > 512 || (spec.SubagentType != "explore" && spec.SubagentType != "general") {
-		return work.Job{}, ErrInvalidInput
+	if err := validateTask(spec); err != nil {
+		return work.Job{}, err
 	}
 	compiled, err := compileSchema(spec.OutputSchema)
 	if err != nil {
@@ -552,8 +604,11 @@ func (manager *Manager) existing(jobID, digest string) (work.Job, bool, error) {
 
 // StartBash never starts a process before its job intent is synced.
 func (manager *Manager) StartBash(ctx context.Context, spec work.BashSpec) (work.Job, error) {
-	if strings.TrimSpace(spec.Command) == "" || spec.TimeoutSeconds < 0 || spec.TimeoutSeconds > maxTimeoutSeconds {
-		return work.Job{}, ErrInvalidInput
+	if strings.TrimSpace(spec.Command) == "" {
+		return work.Job{}, fmt.Errorf("%w: command is required", ErrInvalidInput)
+	}
+	if spec.TimeoutSeconds < 0 || spec.TimeoutSeconds > maxTimeoutSeconds {
+		return work.Job{}, fmt.Errorf("%w: timeout must be between 1 and %d seconds", ErrInvalidInput, maxTimeoutSeconds)
 	}
 	if spec.TimeoutSeconds == 0 {
 		spec.TimeoutSeconds = int(manager.options.BashTimeout / time.Second)
@@ -712,7 +767,7 @@ func (manager *Manager) runTask(ctx context.Context, record *entry, resume bool)
 	manager.settle(record, job)
 }
 func (manager *Manager) jobPath(jobID, name string) string {
-	return filepath.Join(manager.host.JournalPath+".d", "jobs", jobID, name)
+	return filepath.Join(manager.host.JournalPath+".d", work.JobArtifactsDir, jobID, name)
 }
 func preview(text string, limit int) string {
 	text = strings.ToValidUTF8(text, "\ufffd")
@@ -1063,14 +1118,14 @@ func (manager *Manager) Jobs(ctx context.Context, cursor string, limit int) (wor
 	if limit == 0 {
 		limit = 20
 	}
-	if limit < 1 || limit > 50 {
-		return work.JobPage{}, ErrInvalidInput
+	if limit < 1 || limit > maxJobPage {
+		return work.JobPage{}, fmt.Errorf("%w: limit must be between 1 and %d", ErrInvalidInput, maxJobPage)
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if cursor != "" {
 		if _, ok := manager.entries[cursor]; !ok {
-			return work.JobPage{}, ErrInvalidInput
+			return work.JobPage{}, fmt.Errorf("%w: cursor %q is not a job id from this session", ErrInvalidInput, cursor)
 		}
 	}
 	ids := make([]string, 0, len(manager.entries))
@@ -1100,8 +1155,11 @@ func (manager *Manager) Jobs(ctx context.Context, cursor string, limit int) (wor
 
 // Wait observes any terminal job; cancelling a waiter never cancels its jobs.
 func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.Duration) ([]work.Job, error) {
-	if len(jobIDs) < 1 || len(jobIDs) > maxCredits || timeout < 0 || timeout > 300*time.Second {
-		return nil, ErrInvalidInput
+	if len(jobIDs) < 1 || len(jobIDs) > maxCredits {
+		return nil, fmt.Errorf("%w: wait takes 1 to %d job ids", ErrInvalidInput, maxCredits)
+	}
+	if timeout < 0 || timeout > maxWait {
+		return nil, fmt.Errorf("%w: timeout must be between 0 and %d seconds", ErrInvalidInput, int(maxWait/time.Second))
 	}
 	if timeout == 0 {
 		timeout = 30 * time.Second
@@ -1109,7 +1167,7 @@ func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.
 	seen := make(map[string]bool, len(jobIDs))
 	for _, jobID := range jobIDs {
 		if seen[jobID] {
-			return nil, ErrInvalidInput
+			return nil, fmt.Errorf("%w: job id %s is listed twice", ErrInvalidInput, jobID)
 		}
 		seen[jobID] = true
 		if _, err := manager.find(jobID); err != nil {
@@ -1160,8 +1218,8 @@ func (manager *Manager) Logs(ctx context.Context, jobID string, offset int64, li
 	if err := ctx.Err(); err != nil {
 		return work.LogPage{}, err
 	}
-	if offset < 0 || limit < 0 || limit > 64<<10 {
-		return work.LogPage{}, ErrInvalidInput
+	if offset < 0 || limit < 0 || limit > maxLogPage {
+		return work.LogPage{}, fmt.Errorf("%w: offset must be at least 0 and limit between 0 and %d bytes", ErrInvalidInput, maxLogPage)
 	}
 	if limit == 0 {
 		limit = 16 << 10
@@ -1177,7 +1235,7 @@ func (manager *Manager) Logs(ctx context.Context, jobID string, offset int64, li
 	live := record.live
 	manager.mu.Unlock()
 	if job.Kind != "bash" {
-		return work.LogPage{}, ErrInvalidInput
+		return work.LogPage{}, fmt.Errorf("%w: logs reads background bash output, and %s is a %s job; its result is in the artifacts wait returns", ErrInvalidInput, jobID, job.Kind)
 	}
 	file, err := os.OpenFile(manager.jobPath(jobID, "output.log"), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if errors.Is(err, os.ErrNotExist) && offset == 0 {
@@ -1196,7 +1254,7 @@ func (manager *Manager) Logs(ctx context.Context, jobID string, offset int64, li
 		available = committedBytes
 	}
 	if offset > available {
-		return work.LogPage{}, ErrInvalidInput
+		return work.LogPage{}, fmt.Errorf("%w: offset %d is past the %d bytes of output so far", ErrInvalidInput, offset, available)
 	}
 	if int64(limit) > available-offset {
 		limit = int(available - offset)

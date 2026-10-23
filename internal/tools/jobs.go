@@ -35,13 +35,7 @@ func (writer *bashOutputWriter) Write(buffer []byte) (int, error) {
 	return len(buffer), nil
 }
 func jobHandleResult(job work.Job) (agent.AgentToolResult, error) {
-	handle := struct {
-		JobID          string `json:"jobId"`
-		Kind           string `json:"kind"`
-		State          string `json:"state"`
-		ChildSessionID string `json:"childSessionId,omitempty"`
-	}{job.ID, job.Kind, job.State, job.ChildSessionID}
-	encoded, err := json.Marshal(handle)
+	encoded, err := json.Marshal(job.Handle())
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}
@@ -117,14 +111,14 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 					return agent.AgentToolResult{}, callErr
 				}
 				encoded, err = json.Marshal(struct {
-					Job work.Job `json:"job"`
-				}{job})
+					Job work.ToolJob `json:"job"`
+				}{job.ToolView()})
 			} else {
 				page, callErr := controller.Jobs(ctx, input.Cursor, input.Limit)
 				if callErr != nil {
 					return agent.AgentToolResult{}, callErr
 				}
-				encoded, err = json.Marshal(page)
+				encoded, err = json.Marshal(page.ToolView())
 			}
 		case WaitTool:
 			timeout := 30 * time.Second
@@ -146,9 +140,9 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 				}
 			}
 			encoded, err = json.Marshal(struct {
-				Jobs     []work.Job `json:"jobs"`
-				TimedOut bool       `json:"timed_out"`
-			}{jobs, timedOut})
+				Jobs     []work.ToolJob `json:"jobs"`
+				TimedOut bool           `json:"timed_out"`
+			}{work.ToolViews(jobs), timedOut})
 		case CancelTool:
 			if input.JobID == "" {
 				return agent.AgentToolResult{}, errors.New("job_id is required")
@@ -158,14 +152,14 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 				return agent.AgentToolResult{}, callErr
 			}
 			encoded, err = json.Marshal(struct {
-				Job work.Job `json:"job"`
-			}{job})
+				Job work.ToolJob `json:"job"`
+			}{job.ToolView()})
 		case LogsTool:
 			page, callErr := controller.Logs(ctx, input.JobID, input.Offset, input.Limit)
 			if callErr != nil {
 				return agent.AgentToolResult{}, callErr
 			}
-			encoded, err = json.Marshal(page)
+			encoded, err = json.Marshal(page.ToolView())
 		}
 		if err != nil {
 			return agent.AgentToolResult{}, err

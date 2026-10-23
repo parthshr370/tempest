@@ -27,7 +27,7 @@ func TestTaskReturnsDurableHandleWithoutTerminating(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Terminate || !strings.Contains(string(result.Details), `"jobId":"job_test"`) || result.Content[0].Text != string(result.Details) {
+	if result.Terminate || !strings.Contains(string(result.Details), `"job_id":"job_test"`) || result.Content[0].Text != string(result.Details) {
 		t.Fatal(result)
 	}
 	if controller.spec.Prompt != "work" || controller.spec.SubagentType != "general" || string(controller.spec.OutputSchema) != `{"type":"integer"}` {

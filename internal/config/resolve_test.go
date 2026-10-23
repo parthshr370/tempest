@@ -76,6 +76,51 @@ func TestResolvePrecedence(t *testing.T) {
 	}
 }
 
+// The README documents ANTHROPIC_BASE_URL and OPENAI_BASE_URL; they must reach
+// the resolved config, below every tempest-specific source.
+func TestProviderBaseURLPrecedence(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"anthropic_base_url":"https://settings.anthropic","openai_base_url":"https://settings.openai"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	vendor := map[string]string{"ANTHROPIC_BASE_URL": "https://vendor.anthropic", "OPENAI_BASE_URL": "https://vendor.openai"}
+	withHarness := map[string]string{"HARNESS_ANTHROPIC_BASE_URL": "https://harness.anthropic", "HARNESS_OPENAI_BASE_URL": "https://harness.openai"}
+	for key, value := range vendor {
+		withHarness[key] = value
+	}
+	flags := FlagValues{
+		AnthropicBaseURL: StringInput{Value: "https://flag.anthropic", Set: true},
+		OpenAIBaseURL:    StringInput{Value: "https://flag.openai", Set: true},
+	}
+	for _, test := range []struct {
+		name              string
+		flags             FlagValues
+		env               map[string]string
+		path              string
+		anthropic, openai string
+	}{
+		{name: "unset", path: missing},
+		{name: "vendor variables", env: vendor, path: missing, anthropic: "https://vendor.anthropic", openai: "https://vendor.openai"},
+		{name: "settings beat vendor variables", env: vendor, path: settingsPath, anthropic: "https://settings.anthropic", openai: "https://settings.openai"},
+		{name: "HARNESS variables beat vendor variables", env: withHarness, path: missing, anthropic: "https://harness.anthropic", openai: "https://harness.openai"},
+		{name: "flags beat everything", flags: flags, env: withHarness, path: settingsPath, anthropic: "https://flag.anthropic", openai: "https://flag.openai"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resolved, err := Config{Flags: test.flags, SettingsPath: test.path, LookupEnv: func(name string) string { return test.env[name] }}.Resolve()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := resolved.AnthropicBaseURL(); got != test.anthropic {
+				t.Errorf("anthropic base URL = %q, want %q", got, test.anthropic)
+			}
+			if got := resolved.OpenAIBaseURL(); got != test.openai {
+				t.Errorf("openai base URL = %q, want %q", got, test.openai)
+			}
+		})
+	}
+}
+
 func TestPermissionToolListsResolveWithPrecedenceAndDefensiveCopies(t *testing.T) {
 	settingsPath := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(settingsPath, []byte(`{

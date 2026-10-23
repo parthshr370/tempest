@@ -14,6 +14,7 @@ import (
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
@@ -32,7 +33,6 @@ type PermissionModeFunc func() permission.Mode
 // a host integration.
 type StackConfig struct {
 	Cwd              string
-	SpillDir         string
 	Model            ptypes.Model
 	PlanModel        ptypes.Model
 	SmolModel        ptypes.Model
@@ -144,14 +144,14 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		beforeToolCall = cfg.BeforeToolCall
 	}
 
-	if cfg.SpillDir == "" {
-		dir, err := os.MkdirTemp("", "harness-tool-outputs-")
-		if err != nil {
-			return nil, err
-		}
-		cfg.SpillDir = dir
+	// The session data directory holds spills so read can open them; a
+	// session without a journal clears old results inline instead.
+	sessionDataDir := ""
+	if cfg.Journal != nil {
+		sessionDataDir = cfg.Journal.Path() + ".d"
 	}
-	transformContext := compaction.Transform(compaction.TransformOptions{Cwd: cwd, SpillToolResults: true, SpillDir: cfg.SpillDir})
+	toolOutputDir := tools.ToolOutputDir(sessionDataDir)
+	transformContext := compaction.Transform(compaction.TransformOptions{Cwd: cwd, SpillToolResults: toolOutputDir != "", SpillDir: toolOutputDir})
 	var taskTool agent.AgentTool
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
 		taskTool = subagent.NewTool(cfg.Controller)
@@ -177,6 +177,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		ReadResolver:       readResolver,
 		Work:               cfg.Controller,
 		Child:              cfg.Child,
+		SessionDataDir:     sessionDataDir,
 	}
 	allTools := BuildToolRegistry(cwd, options)
 	var active []agent.AgentTool
@@ -205,6 +206,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		GenericRules:       cfg.GenericRules,
 		Personality:        cfg.Personality,
 		Cwd:                cwd,
+		ProgressPath:       progress.Path(sessionDataDir),
 		ActiveTools:        active,
 	})
 	var agt *agent.Agent

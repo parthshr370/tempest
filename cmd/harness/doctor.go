@@ -34,8 +34,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	args = filtered
 	opts, err := parseCommandOptions("doctor", args, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "doctor configuration error: %v\n", err)
-		return 1
+		return parseExitCode(err)
 	}
 	if err := resolveCommandConfig(&opts); err != nil {
 		fmt.Fprintf(stderr, "doctor configuration error: %v\n", err)

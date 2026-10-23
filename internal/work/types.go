@@ -73,6 +73,11 @@ type BashSpec struct {
 	Command        string `json:"command"`
 	TimeoutSeconds int    `json:"timeout_seconds"` // normalized internal spec
 }
+
+// JobArtifactsDir is the directory inside a session's data directory
+// (<journal>.d) that holds <job id>/{output.log,result.txt,changes.patch}.
+const JobArtifactsDir = "jobs"
+
 type Artifact struct {
 	Path   string `json:"path"` // private host-local path
 	SHA256 string `json:"sha256"`

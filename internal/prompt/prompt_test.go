@@ -163,8 +163,9 @@ func TestBuildSystemPromptCustomIncludesCapabilities(t *testing.T) {
 			"todo_write": "Update the session todo list and progress checkpoint",
 			"task":       "Delegate a focused task to a child agent",
 		},
-		Cwd: "/workspace/project",
-		Now: time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC),
+		Cwd:          "/workspace/project",
+		ProgressPath: "/sessions/s.jsonl.d/progress.md",
+		Now:          time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC),
 	})
 	for _, want := range []string{
 		"Orchestrator instructions.",
@@ -173,7 +174,7 @@ func TestBuildSystemPromptCustomIncludesCapabilities(t *testing.T) {
 		"- task: Delegate a focused task to a child agent",
 		"<runtime>",
 		"Full output:",
-		".harness/progress.md",
+		"/sessions/s.jsonl.d/progress.md",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, got)
@@ -182,7 +183,7 @@ func TestBuildSystemPromptCustomIncludesCapabilities(t *testing.T) {
 }
 
 func TestCapabilitiesSectionOmitsUnavailableRuntimeNotes(t *testing.T) {
-	got := CapabilitiesSection([]string{"write"}, map[string]string{"write": "Create or overwrite files"})
+	got := CapabilitiesSection([]string{"write"}, map[string]string{"write": "Create or overwrite files"}, "/sessions/s.jsonl.d/progress.md")
 	if !strings.Contains(got, "<available_tools>") || !strings.Contains(got, "- write: Create or overwrite files") {
 		t.Fatalf("missing tool list: %s", got)
 	}
@@ -201,10 +202,13 @@ func TestCapabilitiesSectionOmitsUnavailableRuntimeNotes(t *testing.T) {
 	if strings.Contains(got, "Full output:") {
 		t.Fatalf("spill note should be absent without read: %s", got)
 	}
-	if strings.Contains(got, ".harness/progress.md") {
+	if strings.Contains(got, "progress.md") {
 		t.Fatalf("progress note should be absent without todo_write: %s", got)
 	}
-	if CapabilitiesSection(nil, nil) != "" {
+	if got := CapabilitiesSection([]string{"todo_write"}, map[string]string{"todo_write": "Update todos"}, ""); strings.Contains(got, "progress checkpoint") {
+		t.Fatalf("progress note needs a checkpoint path: %s", got)
+	}
+	if CapabilitiesSection(nil, nil, "") != "" {
 		t.Fatal("empty tool set should yield empty section")
 	}
 }

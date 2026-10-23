@@ -344,7 +344,7 @@ func TestEditToolRejectsFormerShortAnchorCollisionWithoutMutation(t *testing.T) 
 		t.Fatal(err)
 	}
 	edit, _ := NewTool(EditTool, dir, ToolsOptions{MutationQueue: toolio.NewFileMutationQueue()})
-	_, err = executeTool(t, edit, map[string]any{"path": "file.txt", "edits": []map[string]string{{"oldText": "content", "newText": "changed", "anchor": anchor}}})
+	_, err = executeTool(t, edit, map[string]any{"path": "file.txt", "edits": []map[string]string{{"old_text": "content", "new_text": "changed", "anchor": anchor}}})
 	if !errors.Is(err, editdiff.ErrStaleAnchor) {
 		t.Fatalf("collision edit error = %v", err)
 	}
@@ -364,7 +364,7 @@ func TestEditTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	edit, _ := NewTool(EditTool, dir, ToolsOptions{MutationQueue: toolio.NewFileMutationQueue()})
-	raw := edit.PrepareArguments(mustJSON(t, map[string]any{"path": "file.txt", "oldText": "two", "newText": "2"}))
+	raw := edit.PrepareArguments(mustJSON(t, map[string]any{"path": "file.txt", "old_text": "two", "new_text": "2"}))
 	result, err := edit.Execute(context.Background(), "id", raw, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -417,10 +417,10 @@ func TestEditToolAppliesCorrectAnchor(t *testing.T) {
 	}
 	edit, _ := NewTool(EditTool, dir, ToolsOptions{MutationQueue: toolio.NewFileMutationQueue()})
 	_, err := executeTool(t, edit, map[string]any{
-		"path":    "file.txt",
-		"oldText": "two",
-		"newText": "2",
-		"anchor":  editdiff.ContentAnchor(content),
+		"path":     "file.txt",
+		"old_text": "two",
+		"new_text": "2",
+		"anchor":   editdiff.ContentAnchor(content),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -449,9 +449,9 @@ func TestEditToolRejectsStaleAnchorWithoutMutation(t *testing.T) {
 	_, err := executeTool(t, edit, map[string]any{
 		"path": "file.txt",
 		"edits": []map[string]string{{
-			"oldText": "two",
-			"newText": "2",
-			"anchor":  editdiff.ContentAnchor(readContent),
+			"old_text": "two",
+			"new_text": "2",
+			"anchor":   editdiff.ContentAnchor(readContent),
 		}},
 	})
 	var stale *editdiff.StaleAnchorError
@@ -476,8 +476,8 @@ func TestEditToolLeavesFileUnchangedWhenAnyHunkIsInvalid(t *testing.T) {
 	_, err := executeTool(t, edit, map[string]any{
 		"path": "file.txt",
 		"edits": []map[string]string{
-			{"oldText": "one", "newText": "1"},
-			{"oldText": "missing", "newText": "x"},
+			{"old_text": "one", "new_text": "1"},
+			{"old_text": "missing", "new_text": "x"},
 		},
 	})
 	if err == nil || !strings.Contains(err.Error(), "Could not find edits[1]") {
@@ -552,7 +552,7 @@ func TestGrepAndFindTools(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "ignored", "hidden.go"), "package hidden\n")
 
 	grep, _ := NewTool(GrepTool, dir, ToolsOptions{})
-	grepResult, err := executeTool(t, grep, map[string]any{"pattern": "HELLO", "ignoreCase": true, "glob": "*.txt"})
+	grepResult, err := executeTool(t, grep, map[string]any{"pattern": "HELLO", "ignore_case": true, "glob": "*.txt"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,29 +613,111 @@ func TestFindPathGlobAndGitignore(t *testing.T) {
 	}
 }
 
-func TestTodoTool(t *testing.T) {
-	dir := t.TempDir()
-	store := progress.NewStore(dir)
-	todo, _ := NewTool(TodoTool, dir, ToolsOptions{TodoStore: store})
-	result, err := executeTool(t, todo, map[string]any{"todos": []map[string]any{{"id": "a", "content": "implement", "status": "in_progress", "priority": "high"}}})
+// TestTodoToolCheckpointsOutsideWorkspace guards against todo_write
+// dirtying the user's working tree: the checkpoint goes to the session data
+// directory, and without one the list stays in memory.
+func TestTodoToolCheckpointsOutsideWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDataDir := filepath.Join(t.TempDir(), "session.jsonl.d")
+	todos := map[string]any{"todos": []map[string]any{{"id": "a", "content": "implement", "status": "in_progress", "priority": "high"}}}
+	todo, _ := NewTool(TodoTool, workspace, ToolsOptions{SessionDataDir: sessionDataDir})
+	result, err := executeTool(t, todo, todos)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := resultText(result); !strings.Contains(got, "Todo list updated with 1 item") {
+	checkpoint := filepath.Join(sessionDataDir, progress.FileName)
+	if got := resultText(result); !strings.Contains(got, "Todo list updated with 1 item") || !strings.Contains(got, checkpoint) {
 		t.Fatalf("todo result = %q", got)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, ".harness", "progress.md"))
+	data, err := os.ReadFile(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(data), "implement _(in progress, high priority)_") {
 		t.Fatalf("progress.md = %q", string(data))
 	}
+	memoryOnly, _ := NewTool(TodoTool, workspace, ToolsOptions{})
+	if _, err = executeTool(t, memoryOnly, todos); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 0 {
+		t.Fatalf("todo_write wrote into the workspace: %v %v", entries, err)
+	}
+}
+
+// TestReadSessionArtifacts lets the model read its own job patches and
+// progress checkpoint, which live outside the workspace, without opening
+// anything else in the session data directory.
+func TestReadSessionArtifacts(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDataDir := filepath.Join(t.TempDir(), "session.jsonl.d")
+	patch := filepath.Join(sessionDataDir, "jobs", "job_a", "changes.patch")
+	childJournal := filepath.Join(sessionDataDir, "children", "c", "session.jsonl")
+	writeFile(t, patch, "diff --git a/x b/x\n")
+	writeFile(t, filepath.Join(sessionDataDir, progress.FileName), "# Progress\n")
+	writeFile(t, childJournal, "secret child transcript\n")
+	if err := os.MkdirAll(filepath.Join(sessionDataDir, "jobs", "job_b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(childJournal, filepath.Join(sessionDataDir, "jobs", "job_b", "changes.patch")); err != nil {
+		t.Fatal(err)
+	}
+	spill := filepath.Join(sessionDataDir, ToolOutputDirName, "mcp", "x1", "result.json")
+	writeFile(t, spill, `{"spilled":true}`)
+	outside := filepath.Join(t.TempDir(), "other.txt")
+	writeFile(t, outside, "elsewhere\n")
+
+	read, _ := NewTool(ReadTool, workspace, ToolsOptions{SessionDataDir: sessionDataDir})
+	for path, want := range map[string]string{patch: "diff --git", filepath.Join(sessionDataDir, progress.FileName): "# Progress", spill: `"spilled"`} {
+		result, err := executeTool(t, read, map[string]any{"path": path})
+		if err != nil || !strings.Contains(resultText(result), want) {
+			t.Fatalf("read %s = %q, %v", path, resultText(result), err)
+		}
+	}
+	for _, path := range []string{childJournal, filepath.Join(sessionDataDir, "jobs", "job_b", "changes.patch"), filepath.Join(sessionDataDir, "jobs", "job_a"), outside} {
+		if result, err := executeTool(t, read, map[string]any{"path": path}); err == nil {
+			t.Fatalf("read %s outside the artifact scope: %q", path, resultText(result))
+		}
+	}
+	withoutSession, _ := NewTool(ReadTool, workspace, ToolsOptions{})
+	if _, err := executeTool(t, withoutSession, map[string]any{"path": patch}); !errors.Is(err, ErrOutsideRoot) {
+		t.Fatalf("read without a session data directory: %v", err)
+	}
+}
+
+// TestBashFullOutputIsReadable keeps the "Full output: <path>" promise: a
+// truncated command's complete output lands in the session's tool-output
+// directory, where read can open it.
+func TestBashFullOutputIsReadable(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDataDir := filepath.Join(t.TempDir(), "session.jsonl.d")
+	options := ToolsOptions{SessionDataDir: sessionDataDir}
+	bash, _ := NewTool(BashTool, workspace, options)
+	result, err := executeTool(t, bash, map[string]any{"command": "seq 1 5000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, path, ok := strings.Cut(resultText(result), "Full output: ")
+	if !ok {
+		t.Fatalf("no full-output path: %q", resultText(result))
+	}
+	path = strings.TrimSuffix(path, "]")
+	if !strings.HasPrefix(path, ToolOutputDir(sessionDataDir)+string(filepath.Separator)) {
+		t.Fatalf("full output %s is outside %s", path, ToolOutputDir(sessionDataDir))
+	}
+	read, _ := NewTool(ReadTool, workspace, options)
+	readResult, err := executeTool(t, read, map[string]any{"path": path + ":5000-5000"})
+	if err != nil || !strings.Contains(resultText(readResult), "5000:5000") {
+		t.Fatalf("read full output = %q, %v", resultText(readResult), err)
+	}
+	if entries, err := os.ReadDir(workspace); err != nil || len(entries) != 0 {
+		t.Fatalf("bash spilled into the workspace: %v %v", entries, err)
+	}
 }
 
 func TestTodoToolValidationErrorsPropagate(t *testing.T) {
 	dir := t.TempDir()
-	todo, _ := NewTool(TodoTool, dir, ToolsOptions{TodoStore: progress.NewStore(dir)})
+	todo, _ := NewTool(TodoTool, dir, ToolsOptions{TodoStore: progress.NewStore(progress.Path(dir))})
 	for _, tc := range []struct {
 		name string
 		args map[string]any
@@ -755,7 +837,7 @@ func TestWebFetchClampsOversizedMaxBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := executeTool(t, tool, map[string]any{"url": "http://example.com/large", "maxBytes": maxWebFetchBytes * 2})
+	result, err := executeTool(t, tool, map[string]any{"url": "http://example.com/large", "max_bytes": maxWebFetchBytes * 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,7 +876,7 @@ func TestWebSearchTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := executeTool(t, tool, map[string]any{"query": "widgets", "numResults": 3})
+	result, err := executeTool(t, tool, map[string]any{"query": "widgets", "num_results": 3})
 	if err != nil {
 		t.Fatal(err)
 	}

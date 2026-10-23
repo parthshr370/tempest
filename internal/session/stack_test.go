@@ -59,7 +59,7 @@ func TestStackConfigFromConfigPreservesReadOnlyPlan(t *testing.T) {
 	}
 	cfg := StackConfigFromConfig(resolved)
 	provider := faux.New(faux.Options{})
-	cfg.Cwd, cfg.SpillDir = t.TempDir(), t.TempDir()
+	cfg.Cwd = t.TempDir()
 	cfg.Model, cfg.StreamFn = provider.Model(), provider.StreamSimple
 	stack, err := BuildAgentStack(cfg)
 	if err != nil {

@@ -105,6 +105,9 @@ type OutputAccumulatorOptions struct {
 	MaxLines       int
 	MaxBytes       int
 	TempFilePrefix string
+	// TempDir holds the full-output file of truncated output; it is created
+	// private (0700) on first use. Empty means the OS temp directory.
+	TempDir string
 	// SpillPath opens a private, exclusive log before the first byte is accepted.
 	SpillPath     string
 	MaxTotalBytes int64
@@ -129,6 +132,7 @@ type OutputAccumulator struct {
 	maxBytes                 int
 	maxRollingBytes          int
 	tempFilePrefix           string
+	tempDir                  string
 	pendingUTF8              []byte
 	rawChunks                [][]byte
 	tailText                 string
@@ -169,7 +173,7 @@ func NewOutputAccumulator(options OutputAccumulatorOptions) *OutputAccumulator {
 	if maxRollingBytes < 1 {
 		maxRollingBytes = 1
 	}
-	return &OutputAccumulator{maxLines: maxLines, maxBytes: maxBytes, maxRollingBytes: maxRollingBytes, tempFilePrefix: prefix, tailStartsAtLineBoundary: true, spillPath: options.SpillPath, maxTotalBytes: options.MaxTotalBytes}
+	return &OutputAccumulator{maxLines: maxLines, maxBytes: maxBytes, maxRollingBytes: maxRollingBytes, tempFilePrefix: prefix, tempDir: options.TempDir, tailStartsAtLineBoundary: true, spillPath: options.SpillPath, maxTotalBytes: options.MaxTotalBytes}
 }
 
 // ErrOutputLimit means the retained prefix reached the configured disk bound.
@@ -404,7 +408,12 @@ func (a *OutputAccumulator) ensureTempFile() error {
 	if a.spillPath != "" {
 		file, err = os.OpenFile(a.spillPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
 	} else {
-		file, err = os.CreateTemp("", a.tempFilePrefix+"-*.log")
+		if a.tempDir != "" {
+			if err = os.MkdirAll(a.tempDir, 0o700); err != nil {
+				return err
+			}
+		}
+		file, err = os.CreateTemp(a.tempDir, a.tempFilePrefix+"-*.log")
 	}
 	if err != nil {
 		return err

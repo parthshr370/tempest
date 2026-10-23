@@ -192,10 +192,11 @@ func reduce(loaded *Loaded, entries []Entry) {
 			StartedAt:  state.started.Timestamp,
 		})
 	}
-	for _, run := range runs {
-		if !run.Finished {
-			loaded.diagnose("run %s was interrupted: no run_finished record", run.RunID)
-		}
+	// Like Interrupted, the warning is scoped to LastRun: a later run_started
+	// means the session was already resumed past the interruption, so an older
+	// unfinished run is history, not news. Its synthesized tool results stay.
+	if loaded.LastRun != nil && !loaded.LastRun.Finished {
+		loaded.diagnose("run %s was interrupted: no run_finished record", loaded.LastRun.RunID)
 	}
 	loaded.Messages = reconcile(messages)
 }

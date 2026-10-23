@@ -445,14 +445,17 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		webSearchURL:          resolveString(c.Flags.WebSearchURL, lookup("HARNESS_WEB_SEARCH_URL"), settings.WebSearchURL, ""),
 		agentDir:              ExpandTildePath(agentDir),
 		sessionDir:            ExpandTildePath(sessionDir),
-		anthropicBaseURL:      resolveString(c.Flags.AnthropicBaseURL, lookup("HARNESS_ANTHROPIC_BASE_URL"), settings.AnthropicBaseURL, ""),
-		openAIBaseURL:         resolveString(c.Flags.OpenAIBaseURL, lookup("HARNESS_OPENAI_BASE_URL"), settings.OpenAIBaseURL, ""),
-		fauxScript:            resolveString(c.Flags.FauxScript, lookup("HARNESS_FAUX_SCRIPT"), settings.FauxScript, ""),
-		settingsPath:          settingsPath,
-		skillPaths:            skillPaths,
-		permissionAllowTools:  permissionAllowTools,
-		permissionDenyTools:   permissionDenyTools,
-		mcpServers:            mcpServers,
+		// The vendor variables (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) are the
+		// lowest-priority source: tempest's own flag, HARNESS_* variable and
+		// settings key all override them.
+		anthropicBaseURL:     resolveString(c.Flags.AnthropicBaseURL, lookup("HARNESS_ANTHROPIC_BASE_URL"), settings.AnthropicBaseURL, strings.TrimSpace(lookup("ANTHROPIC_BASE_URL"))),
+		openAIBaseURL:        resolveString(c.Flags.OpenAIBaseURL, lookup("HARNESS_OPENAI_BASE_URL"), settings.OpenAIBaseURL, strings.TrimSpace(lookup("OPENAI_BASE_URL"))),
+		fauxScript:           resolveString(c.Flags.FauxScript, lookup("HARNESS_FAUX_SCRIPT"), settings.FauxScript, ""),
+		settingsPath:         settingsPath,
+		skillPaths:           skillPaths,
+		permissionAllowTools: permissionAllowTools,
+		permissionDenyTools:  permissionDenyTools,
+		mcpServers:           mcpServers,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,

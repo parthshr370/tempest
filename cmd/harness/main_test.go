@@ -418,7 +418,8 @@ func TestCLIRunLifecycle(t *testing.T) {
 	})
 
 	t.Run("plan uses faux and exposes no mutating tools", func(t *testing.T) {
-		script := `[{"toolCalls":[{"id":"write-plan","name":"write","arguments":{"path":"plan-output.txt","content":"must not write"}},{"id":"todo-plan","name":"todo_write","arguments":{"todos":[]}}]},{"text":"read-only plan"}]`
+		// A non-empty todo list: if plan mode ever exposed todo_write, it would write progress.md.
+		script := `[{"toolCalls":[{"id":"write-plan","name":"write","arguments":{"path":"plan-output.txt","content":"must not write"}},{"id":"todo-plan","name":"todo_write","arguments":{"todos":[{"content":"must not checkpoint","status":"pending"}]}}]},{"text":"read-only plan"}]`
 		report, sessionDir, code := run(t, script, "-plan", "-enable-task", "-max-cost", "1", "-plan-model", "openai:not-a-cataloged-model@http://127.0.0.1:1/v1")
 		if code != 0 || report.StopReason != "completed" || report.Text != "read-only plan" {
 			t.Fatalf("plan exit %d, report %+v", code, report)
@@ -431,8 +432,13 @@ func TestCLIRunLifecycle(t *testing.T) {
 				}
 			}
 		}
-		for _, path := range []string{"plan-output.txt", filepath.Join(".harness", "progress.md")} {
-			if _, err := os.Stat(filepath.Join(tmp, path)); !os.IsNotExist(err) {
+		journalPaths, err := filepath.Glob(filepath.Join(sessionDir, "*", "*.jsonl"))
+		if err != nil || len(journalPaths) != 1 {
+			t.Fatalf("journals = %v, %v; want one", journalPaths, err)
+		}
+		// todo_write keeps its progress file beside the journal.
+		for _, path := range []string{filepath.Join(tmp, "plan-output.txt"), filepath.Join(journalPaths[0]+".d", "progress.md")} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
 				t.Fatalf("plan created %s: %v", path, err)
 			}
 		}

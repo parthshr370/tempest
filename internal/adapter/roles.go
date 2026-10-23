@@ -68,8 +68,12 @@ func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) 
 		APIKey:           apiKey,
 		AuthToken:        authToken,
 		MaxTokens:        cfg.MaxTokens,
-		Env:              func(string) string { return "" },
-		Retry:            cfg.Retry,
+		// Environment sources are resolved upstream: config folds
+		// HARNESS_* and the vendor base-URL variables into cfg in
+		// precedence order, and SecretLookup supplies credentials. The
+		// router must not read the process environment behind them.
+		Env:   func(string) string { return "" },
+		Retry: cfg.Retry,
 	})
 }
 

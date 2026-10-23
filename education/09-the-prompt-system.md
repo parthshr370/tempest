@@ -268,7 +268,7 @@ map by accident.
    unavailable ones.
 2. `<runtime>` — sandbox ephemerality, network caveats, and (when `read` is
    active) a note about truncated tool output with the path to the full result.
-   When `todo_write` is active, mentions `.harness/progress.md`.
+   When `todo_write` is active and the session has a journal, names the session's progress checkpoint (`<journal>.d/progress.md`), which `read` may open.
 
 Returns `""` when no tools have snippets, which means the rendered prompt will
 have no `<available_tools>` block at all.

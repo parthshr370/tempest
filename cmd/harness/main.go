@@ -83,6 +83,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		case "doctor":
 			return runDoctor(args[1:], stdout, stderr)
 		case "version":
+			if len(args) > 1 {
+				fmt.Fprintln(stderr, unexpectedArgument("version", args[1]))
+				return exitUsage
+			}
 			return runVersion(stdout)
 		}
 	}
@@ -93,7 +97,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func runOneShot(args []string, stdout, stderr io.Writer) int {
 	opts, err := parseCommandOptions("", args, stderr)
 	if err != nil {
-		return 1
+		return parseExitCode(err)
 	}
 	if opts.Version {
 		return runVersion(stdout)
@@ -122,9 +126,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	warnUnknownToolNames(stderr, "-allow-tool", opts.Config.PermissionAllowTools())
-	warnUnknownToolNames(stderr, "-deny-tool", opts.Config.PermissionDenyTools())
-	permissionPolicy := buildPermissionPolicy(opts.Config.PermissionAllowTools(), opts.Config.PermissionDenyTools())
+	permissionPolicy := toolPolicy(stderr, opts.Config)
 	var retryConfig *retry.Config
 	if settings := opts.Config.Retry(); settings.Enabled {
 		resolvedRetry := retry.DefaultConfig()
@@ -398,6 +400,11 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.Float64Var(&budget.MaxCostUSD, "max-cost", 0, "stop the run once its model calls cost this many USD (0 = unlimited; refused when the model's price is unknown)")
 	fs.DurationVar(&budget.MaxWallTime, "max-wall-time", 0, "stop the run at the first turn boundary after this much time, e.g. 10m (0 = unlimited)")
 	if err := fs.Parse(args); err != nil {
+		return commandOptions{}, usageFailure(err)
+	}
+	if fs.NArg() > 0 {
+		err := unexpectedArgument(command, fs.Arg(0))
+		fmt.Fprintln(stderr, err)
 		return commandOptions{}, err
 	}
 	fs.Visit(func(f *flag.Flag) {
@@ -635,6 +642,58 @@ Prints the resolved configuration and credential checks without network access.
 
 Flags:
 `
+
+// exitUsage is the exit status for a malformed command line (an unknown flag,
+// a bad flag value or a stray argument), as with Go's flag package.
+const exitUsage = 2
+
+// usageError is a command-line mistake. Its message is already on stderr
+// when it reaches a caller, which only turns it into exitUsage.
+type usageError struct{ message string }
+
+func (e usageError) Error() string { return e.message }
+
+// usageFailure classifies a flag-set parse error. -help is not a mistake and
+// keeps its own error; the flag package has already printed either one.
+func usageFailure(err error) error {
+	if errors.Is(err, flag.ErrHelp) {
+		return err
+	}
+	return usageError{message: err.Error()}
+}
+
+// parseExitCode keeps -help at status 1, as before, and gives every real
+// command-line mistake exitUsage so scripts can tell it from a failed run.
+func parseExitCode(err error) int {
+	if errors.As(err, new(usageError)) {
+		return exitUsage
+	}
+	return 1
+}
+
+// unexpectedArgument names a positional argument the command doesn't take.
+// Go's flag parsing stops at the first non-flag, so in `tempest run -p hi`
+// the stray word is "run" and -p was never read.
+func unexpectedArgument(command, arg string) error {
+	switch command {
+	case "":
+		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, version); see 'tempest -help'", arg)}
+	case "version":
+		return usageError{message: fmt.Sprintf("tempest version: unexpected argument %q; version takes no arguments", arg)}
+	default:
+		return usageError{message: fmt.Sprintf("tempest %s: unexpected argument %q; %s takes flags only; see 'tempest %s -help'", command, arg, command, command)}
+	}
+}
+
+// toolPolicy builds the configured allow/deny policy and warns on stderr about
+// names that match no tool. Every command that accepts -allow-tool or
+// -deny-tool builds its policy here, so none of them drops a typo silently.
+func toolPolicy(stderr io.Writer, cfg *config.ResolvedConfig) permission.Policy {
+	allow, deny := cfg.PermissionAllowTools(), cfg.PermissionDenyTools()
+	warnUnknownToolNames(stderr, "-allow-tool", allow)
+	warnUnknownToolNames(stderr, "-deny-tool", deny)
+	return buildPermissionPolicy(allow, deny)
+}
 
 // warnUnknownToolNames flags allow/deny entries that match no built-in tool.
 // MCP tools are discovered after startup, so mcp__ names are never warned about.

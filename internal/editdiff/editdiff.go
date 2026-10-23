@@ -67,9 +67,9 @@ func (e *StaleAnchorError) Is(target error) bool {
 // the file before it was changed.
 type Edit struct {
 	// OldText is the text to locate in the content.
-	OldText string `json:"oldText"`
+	OldText string `json:"old_text"`
 	// NewText is the replacement text.
-	NewText string `json:"newText"`
+	NewText string `json:"new_text"`
 	// Anchor is the optional full 64-character SHA-256 hexadecimal digest emitted by the read tool.
 	Anchor string `json:"anchor,omitempty"`
 }
@@ -523,21 +523,21 @@ func getNotFoundError(path string, editIndex int, totalEdits int) error {
 	if totalEdits == 1 {
 		return fmt.Errorf("Could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.", path)
 	}
-	return fmt.Errorf("Could not find edits[%d] in %s. The oldText must match exactly including all whitespace and newlines.", editIndex, path)
+	return fmt.Errorf("Could not find edits[%d] in %s. The old_text must match exactly including all whitespace and newlines.", editIndex, path)
 }
 
 func getDuplicateError(path string, editIndex int, totalEdits int, occurrences int) error {
 	if totalEdits == 1 {
 		return fmt.Errorf("Found %d occurrences of the text in %s. The text must be unique. Please provide more context to make it unique.", occurrences, path)
 	}
-	return fmt.Errorf("Found %d occurrences of edits[%d] in %s. Each oldText must be unique. Please provide more context to make it unique.", occurrences, editIndex, path)
+	return fmt.Errorf("Found %d occurrences of edits[%d] in %s. Each old_text must be unique. Please provide more context to make it unique.", occurrences, editIndex, path)
 }
 
 func getEmptyOldTextError(path string, editIndex int, totalEdits int) error {
 	if totalEdits == 1 {
-		return fmt.Errorf("oldText must not be empty in %s.", path)
+		return fmt.Errorf("old_text must not be empty in %s.", path)
 	}
-	return fmt.Errorf("edits[%d].oldText must not be empty in %s.", editIndex, path)
+	return fmt.Errorf("edits[%d].old_text must not be empty in %s.", editIndex, path)
 }
 
 func getNoChangeError(path string, totalEdits int) error {

@@ -16,7 +16,7 @@ cat >"$SCRATCH/faux.json" <<'JSON'
   {
     "text": "I will edit the smoke file.",
     "toolCalls": [
-      {"id":"smoke_edit","name":"edit","arguments":{"path":"app/page.tsx","edits":[{"oldText":"draft","newText":"final"}]}}
+      {"id":"smoke_edit","name":"edit","arguments":{"path":"app/page.tsx","edits":[{"old_text":"draft","new_text":"final"}]}}
     ]
   },
   {"text":"Smoke completed."}

@@ -25,12 +25,14 @@ type BuildSystemPromptOptions struct {
 	PromptGuidelines   []string
 	AppendSystemPrompt string
 	Cwd                string
-	ContextFiles       []ContextFile
-	Skills             []skills.Skill
-	Rules              []PromptRule
-	GenericRules       []string
-	Personality        string
-	Now                time.Time
+	// ProgressPath is the todo_write checkpoint, empty when the session has none.
+	ProgressPath string
+	ContextFiles []ContextFile
+	Skills       []skills.Skill
+	Rules        []PromptRule
+	GenericRules []string
+	Personality  string
+	Now          time.Time
 }
 
 // BuildSystemPrompt renders the embedded system prompt template. Custom prompts
@@ -53,7 +55,7 @@ func BuildSystemPrompt(options BuildSystemPromptOptions) string {
 		ProductName:         defaultProductName(options.ProductName),
 		CustomPrompt:        options.CustomPrompt,
 		HasCustomPrompt:     options.CustomPrompt != "",
-		CapabilitiesSection: CapabilitiesSection(tools, options.ToolSnippets),
+		CapabilitiesSection: CapabilitiesSection(tools, options.ToolSnippets, options.ProgressPath),
 		AppendSystemPrompt:  options.AppendSystemPrompt,
 		Cwd:                 filepath.ToSlash(options.Cwd),
 		Date:                now.Format("2006-01-02"),
@@ -111,8 +113,9 @@ func visiblePromptSkills(all []skills.Skill) []PromptSkill {
 // CapabilitiesSection renders the canonical, authoritative block naming the
 // tools the agent actually holds this session plus how its runtime works.
 // names preserves order; snippets supplies each tool's one-line purpose. A tool
-// without a snippet is skipped.
-func CapabilitiesSection(names []string, snippets map[string]string) string {
+// without a snippet is skipped. progressPath is the todo_write checkpoint in
+// the session data directory, empty when the session has none.
+func CapabilitiesSection(names []string, snippets map[string]string, progressPath string) string {
 	lines := make([]string, 0, len(names))
 	for _, name := range names {
 		if snippets == nil || snippets[name] == "" {
@@ -135,8 +138,8 @@ func CapabilitiesSection(names []string, snippets map[string]string) string {
 	if has(names, "read") {
 		runtime = append(runtime, `- Tool output is capped. When a result ends with "Full output: <path>" or a "[Tool result cleared to save context. ... Full output: <path>]" placeholder, the complete output is saved at that path. Read it back with the read tool instead of re-running the command.`)
 	}
-	if has(names, "todo_write") {
-		runtime = append(runtime, "- Your live progress checkpoint is .harness/progress.md under the working directory; todo_write rewrites it on every update. Read it to recover the plan and current step after an interruption.")
+	if has(names, "todo_write") && progressPath != "" {
+		runtime = append(runtime, "- Your live progress checkpoint is "+progressPath+" (session data, outside the workspace); todo_write rewrites it on every update. Read it with the read tool to recover the plan and current step after an interruption.")
 	}
 	return block + "\n\n<runtime>\n" + strings.Join(runtime, "\n") + "\n</runtime>"
 }
