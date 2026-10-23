@@ -224,7 +224,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 			case KindQueueEnqueued:
 				var v QueueEnqueued
 				_ = json.Unmarshal(e.Payload, &v)
-				item := work.QueueItem{ID: v.QueueID, Kind: v.Kind, Text: v.Text, Key: v.Key, SourceJobID: v.SourceJobID, EnqueuedAt: e.Timestamp.UTC()}
+				item := work.QueueItem{ID: v.QueueID, Kind: v.Kind, Text: v.Text, Key: v.Key, SourceJobID: v.SourceJobID, SourceAgent: v.SourceAgent, EnqueuedAt: e.Timestamp.UTC()}
 				if prior, ok := queue[v.QueueID]; ok {
 					prior.EnqueuedAt = item.EnqueuedAt
 					if !equalJSON(prior, item) {
@@ -285,6 +285,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 					var spec work.BashSpec
 					_ = json.Unmarshal(v.Spec, &spec)
 					r.Bash = &spec
+					r.Job.Name = spec.Name
 					if v.OutputPath != "" {
 						r.Job.Output = &work.Artifact{Path: v.OutputPath}
 					}

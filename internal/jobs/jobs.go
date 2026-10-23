@@ -70,6 +70,7 @@ type entry struct {
 	joined      bool
 	truncated   bool
 	outputBytes int64
+	service     *service // set for an async bash job with a readiness condition
 }
 
 // Manager owns every worker until its terminal fact and completion delivery settle.
@@ -604,13 +605,25 @@ func (manager *Manager) existing(jobID, digest string) (work.Job, bool, error) {
 	return work.Job{}, false, nil
 }
 
-// StartBash never starts a process before its job intent is synced.
+// StartBash never starts a process before its job intent is synced. A spec
+// with a readiness condition returns once the service is ready, or fails with
+// its output tail once it can no longer become ready.
 func (manager *Manager) StartBash(ctx context.Context, spec work.BashSpec) (work.Job, error) {
+	record, job, err := manager.admitBash(ctx, spec)
+	if err != nil || record == nil || record.service == nil {
+		return job, err
+	}
+	return manager.awaitReady(ctx, record)
+}
+
+// admitBash commits and launches the job; a replayed occurrence returns its
+// prior job without a record.
+func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*entry, work.Job, error) {
 	if strings.TrimSpace(spec.Command) == "" {
-		return work.Job{}, fmt.Errorf("%w: command is required", ErrInvalidInput)
+		return nil, work.Job{}, fmt.Errorf("%w: command is required", ErrInvalidInput)
 	}
 	if spec.TimeoutSeconds < 0 || spec.TimeoutSeconds > maxTimeoutSeconds {
-		return work.Job{}, fmt.Errorf("%w: timeout must be between 1 and %d seconds", ErrInvalidInput, maxTimeoutSeconds)
+		return nil, work.Job{}, fmt.Errorf("%w: timeout must be between 1 and %d seconds", ErrInvalidInput, maxTimeoutSeconds)
 	}
 	if spec.TimeoutSeconds == 0 {
 		spec.TimeoutSeconds = int(manager.options.BashTimeout / time.Second)
@@ -618,28 +631,43 @@ func (manager *Manager) StartBash(ctx context.Context, spec work.BashSpec) (work
 			spec.TimeoutSeconds = 1
 		}
 	}
+	readiness, err := validateService(&spec)
+	if err != nil {
+		return nil, work.Job{}, err
+	}
 	manager.admission.Lock()
 	defer manager.admission.Unlock()
 	invocation, jobID, _, digest, err := manager.invocation(ctx)
 	if err != nil {
-		return work.Job{}, err
+		return nil, work.Job{}, err
 	}
 	if prior, exists, err := manager.existing(jobID, digest); exists || err != nil {
-		return prior, err
+		return nil, prior, err
+	}
+	if spec.Name != "" {
+		manager.mu.Lock()
+		holder := manager.nameHolderLocked(spec.Name)
+		manager.mu.Unlock()
+		if holder != "" {
+			return nil, work.Job{}, fmt.Errorf("%w: job %s is already running as %q. To restart it, stop it with cancel {\"name\":%q} and start it again; to run another copy, pick another name", ErrNameInUse, holder, spec.Name, spec.Name)
+		}
 	}
 	if err = manager.capacity("bash", false, false); err != nil {
-		return work.Job{}, err
+		return nil, work.Job{}, err
 	}
 	manager.mu.Lock()
 	run := manager.run
 	manager.mu.Unlock()
-	job := work.Job{ID: jobID, Kind: "bash", State: "starting", RunID: invocation.RunID, LogicalRunID: run.LogicalRunID, ToolCallID: invocation.ToolCallID, StartedAt: time.Now().UTC(), Cwd: manager.host.Cwd, Cleanup: "none"}
-	record := &entry{recovery: work.Recovery{Job: job, Invocation: invocation, IdentityDigest: digest, Bash: &spec}, done: make(chan struct{}), credited: true}
+	job := work.Job{ID: jobID, Kind: "bash", State: "starting", RunID: invocation.RunID, LogicalRunID: run.LogicalRunID, ToolCallID: invocation.ToolCallID, StartedAt: time.Now().UTC(), Cwd: manager.host.Cwd, Cleanup: "none", Name: spec.Name}
+	if readiness != nil {
+		job.Readiness = "waiting"
+	}
+	record := &entry{recovery: work.Recovery{Job: job, Invocation: invocation, IdentityDigest: digest, Bash: &spec}, done: make(chan struct{}), credited: true, service: readiness}
 	if err = manager.commitStart(ctx, record); err != nil {
-		return work.Job{}, err
+		return nil, work.Job{}, err
 	}
 	manager.launch(record, false)
-	return cloneJob(job), nil
+	return record, cloneJob(job), nil
 }
 
 func (manager *Manager) launch(record *entry, resume bool) {
@@ -912,7 +940,8 @@ func (manager *Manager) deliver(ctx context.Context, record *entry) error {
 	return nil
 }
 
-// Idle parks without spending provider calls while owned work or queue delivery is pending.
+// Idle parks without spending provider calls while owned work or queue
+// delivery is pending. A ready service doesn't hold the run; Finish stops it.
 func (manager *Manager) Idle(ctx context.Context) (bool, error) {
 	for {
 		manager.mu.Lock()
@@ -923,7 +952,7 @@ func (manager *Manager) Idle(ctx context.Context) (bool, error) {
 		}
 		live := false
 		for _, record := range manager.entries {
-			live = live || record.live
+			live = live || holdsRun(record)
 		}
 		changed := manager.changed
 		manager.mu.Unlock()
@@ -939,7 +968,7 @@ func (manager *Manager) Idle(ctx context.Context) (bool, error) {
 			manager.admission.Lock()
 			manager.mu.Lock()
 			for _, record := range manager.entries {
-				live = live || record.live
+				live = live || holdsRun(record)
 			}
 			manager.mu.Unlock()
 			pending := false

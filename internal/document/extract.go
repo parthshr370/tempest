@@ -2,6 +2,7 @@ package document
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/xml"
 	"errors"
 	"io"
@@ -31,25 +32,72 @@ func ExtractOOXMLText(path string, mediaType string) (string, error) {
 	return extractOOXMLTextWithLimit(path, mediaType, maxOOXMLDecodedBytes, maxOOXMLExtractedBytes)
 }
 
+// ExtractOOXMLBytes extracts readable text from an in-memory OOXML
+// document under the same limits as [ExtractOOXMLText].
+func ExtractOOXMLBytes(data []byte, mediaType string) (string, error) {
+	if err := checkOOXMLMediaType(mediaType); err != nil {
+		return "", err
+	}
+	packageReader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", NewDocumentError(CodeCorruptOrEncrypted, "The document could not be read.", nil, err)
+	}
+	return extractOOXMLFiles(packageReader.File, mediaType, maxOOXMLDecodedBytes, maxOOXMLExtractedBytes)
+}
+
+// OOXMLMediaType returns the OOXML media type for a .docx, .xlsx or .pptx
+// file name, or "" for anything else.
+func OOXMLMediaType(name string) string {
+	lower := strings.ToLower(name)
+	switch {
+	case strings.HasSuffix(lower, ".docx"):
+		return docxMediaType
+	case strings.HasSuffix(lower, ".xlsx"):
+		return xlsxMediaType
+	case strings.HasSuffix(lower, ".pptx"):
+		return pptxMediaType
+	}
+	return ""
+}
+
+func checkOOXMLMediaType(mediaType string) error {
+	switch mediaType {
+	case docxMediaType, pptxMediaType, xlsxMediaType:
+		return nil
+	}
+	return NewDocumentError(
+		CodeUnsupportedForRoute,
+		"The document type cannot be extracted.",
+		map[string]any{"media_type": mediaType},
+		nil,
+	)
+}
+
 // extractOOXMLTextWithLimit keeps extraction bounded while mapping bad packages and size overruns to stable document errors.
 func extractOOXMLTextWithLimit(path string, mediaType string, maxDecoded, maxOut int64) (string, error) {
+	if err := checkOOXMLMediaType(mediaType); err != nil {
+		return "", err
+	}
+	packageReader, err := zip.OpenReader(path)
+	if err != nil {
+		return "", NewDocumentError(CodeCorruptOrEncrypted, "The document could not be read.", nil, err)
+	}
+	defer packageReader.Close()
+	return extractOOXMLFiles(packageReader.File, mediaType, maxDecoded, maxOut)
+}
+
+func extractOOXMLFiles(files []*zip.File, mediaType string, maxDecoded, maxOut int64) (string, error) {
 	text := ooxmlTextAccumulator{max: maxOut}
 	var err error
-
 	switch mediaType {
 	case docxMediaType:
-		err = extractDOCXText(path, maxDecoded, &text)
+		err = extractDOCXText(files, maxDecoded, &text)
 	case pptxMediaType:
-		err = extractPPTXText(path, maxDecoded, &text)
+		err = extractPPTXText(files, maxDecoded, &text)
 	case xlsxMediaType:
-		err = extractXLSXText(path, maxDecoded, &text)
+		err = extractXLSXText(files, maxDecoded, &text)
 	default:
-		return "", NewDocumentError(
-			CodeUnsupportedForRoute,
-			"The document type cannot be extracted.",
-			map[string]any{"media_type": mediaType},
-			nil,
-		)
+		return "", checkOOXMLMediaType(mediaType)
 	}
 	if errors.Is(err, errOOXMLExtractLimit) {
 		return "", NewDocumentError(CodeRequestSizeExceeded, "The extracted document text is too large.", nil, nil)
@@ -60,14 +108,8 @@ func extractOOXMLTextWithLimit(path string, mediaType string, maxDecoded, maxOut
 	return text.String(), nil
 }
 
-func extractDOCXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) error {
-	packageReader, err := zip.OpenReader(path)
-	if err != nil {
-		return err
-	}
-	defer packageReader.Close()
-
-	mainPart, err := uniqueOOXMLPart(packageReader.File, "word/document.xml")
+func extractDOCXText(files []*zip.File, maxDecoded int64, text *ooxmlTextAccumulator) error {
+	mainPart, err := uniqueOOXMLPart(files, "word/document.xml")
 	if err != nil {
 		return err
 	}
@@ -81,17 +123,11 @@ func extractDOCXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) 
 	}); err != nil {
 		return err
 	}
-	return readRemainingOOXMLParts(packageReader.File, map[*zip.File]bool{mainPart: true}, &consumed, maxDecoded)
+	return readRemainingOOXMLParts(files, map[*zip.File]bool{mainPart: true}, &consumed, maxDecoded)
 }
 
-func extractPPTXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) error {
-	packageReader, err := zip.OpenReader(path)
-	if err != nil {
-		return err
-	}
-	defer packageReader.Close()
-
-	slides, err := findOOXMLParts(packageReader.File, "ppt/slides/slide")
+func extractPPTXText(files []*zip.File, maxDecoded int64, text *ooxmlTextAccumulator) error {
+	slides, err := findOOXMLParts(files, "ppt/slides/slide")
 	if err != nil {
 		return err
 	}
@@ -110,23 +146,17 @@ func extractPPTXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) 
 			return err
 		}
 	}
-	return readRemainingOOXMLParts(packageReader.File, readParts, &consumed, maxDecoded)
+	return readRemainingOOXMLParts(files, readParts, &consumed, maxDecoded)
 }
 
 // extractXLSXText uses numeric sheetN.xml order as a best-effort cross-sheet
 // order because workbook relationship metadata is not required for extraction.
-func extractXLSXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) error {
-	packageReader, err := zip.OpenReader(path)
+func extractXLSXText(files []*zip.File, maxDecoded int64, text *ooxmlTextAccumulator) error {
+	sharedStringsPart, err := uniqueOOXMLPart(files, "xl/sharedStrings.xml")
 	if err != nil {
 		return err
 	}
-	defer packageReader.Close()
-
-	sharedStringsPart, err := uniqueOOXMLPart(packageReader.File, "xl/sharedStrings.xml")
-	if err != nil {
-		return err
-	}
-	worksheets, err := findOOXMLParts(packageReader.File, "xl/worksheets/sheet")
+	worksheets, err := findOOXMLParts(files, "xl/worksheets/sheet")
 	if err != nil {
 		return err
 	}
@@ -160,7 +190,7 @@ func extractXLSXText(path string, maxDecoded int64, text *ooxmlTextAccumulator) 
 			return err
 		}
 	}
-	return readRemainingOOXMLParts(packageReader.File, readParts, &consumed, maxDecoded)
+	return readRemainingOOXMLParts(files, readParts, &consumed, maxDecoded)
 }
 
 // uniqueOOXMLPart rejects duplicate package names instead of letting archive order pick the document we read.

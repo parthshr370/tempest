@@ -9,6 +9,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/work"
 )
@@ -278,7 +279,7 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	switch name {
 	case "read":
 		kind = "read"
-	case "write", "edit":
+	case "write", "edit", "hashline":
 		kind = "edit"
 	case "bash":
 		kind = "execute"
@@ -299,6 +300,18 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	if name == "bash" {
 		if cmd, ok := args["command"].(string); ok {
 			return "$ " + cmd, kind
+		}
+	}
+	if name == "message" {
+		if to, ok := args["to"].(string); ok && to != "" {
+			return "message → " + to, kind
+		}
+	}
+	if name == "hashline" {
+		if input, ok := args["input"].(string); ok {
+			if paths := hashline.SectionPaths(input); len(paths) > 0 {
+				return name + ": " + strings.Join(paths, ", "), kind
+			}
 		}
 	}
 	if name == "manifest_diff" {
@@ -342,18 +355,19 @@ func toolContent(v any) []map[string]any {
 }
 
 type workPayload struct {
-	Action          string          `json:"action,omitempty"`
-	Item            *work.QueueItem `json:"item,omitempty"`
-	Job             *work.Job       `json:"job,omitempty"`
-	JobID           string          `json:"jobId,omitempty"`
-	RunID           string          `json:"runId,omitempty"`
-	Bytes           int64           `json:"bytes,omitempty"`
-	CompactionID    string          `json:"compactionId,omitempty"`
-	SourceHash      string          `json:"sourceHash,omitempty"`
-	Reason          string          `json:"reason,omitempty"`
-	ChildSessionID  string          `json:"childSessionId,omitempty"`
-	ChildToolCallID string          `json:"childToolCallId,omitempty"`
-	Title           string          `json:"title,omitempty"`
+	Action          string             `json:"action,omitempty"`
+	Item            *work.QueueItem    `json:"item,omitempty"`
+	Job             *work.Job          `json:"job,omitempty"`
+	JobID           string             `json:"jobId,omitempty"`
+	RunID           string             `json:"runId,omitempty"`
+	Bytes           int64              `json:"bytes,omitempty"`
+	CompactionID    string             `json:"compactionId,omitempty"`
+	SourceHash      string             `json:"sourceHash,omitempty"`
+	Reason          string             `json:"reason,omitempty"`
+	ChildSessionID  string             `json:"childSessionId,omitempty"`
+	ChildToolCallID string             `json:"childToolCallId,omitempty"`
+	Title           string             `json:"title,omitempty"`
+	Message         *work.AgentMessage `json:"message,omitempty"`
 }
 
 func mapWorkUpdate(event work.Event, at time.Time) Update {
@@ -371,6 +385,8 @@ func mapWorkUpdate(event work.Event, at time.Time) Update {
 			payload.JobID = event.Job.ID
 		}
 		payload.Bytes = event.Bytes
+	case "message":
+		payload.Message = event.Message
 	case "compaction":
 		payload.CompactionID = event.CompactionID
 		payload.SourceHash = event.SourceHash

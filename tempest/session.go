@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hub"
+	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/jobs"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpclient"
@@ -115,6 +116,8 @@ type sessionCore struct {
 	baseMCPDefaults  map[string]permission.Decision
 	queues           *session.DurableQueues
 	jobs             *jobs.Manager
+	// irc is the session tree's message bus; nil without task children.
+	irc *irc.Bus
 }
 
 func open(ctx context.Context, o Options) (_ *Session, err error) {
@@ -427,6 +430,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	cfg.Journal, cfg.Loaded = store, loaded
 	c.queues = session.NewDurableQueues(store, loaded, c.publishWork)
 	cfg.QueueSource = c.queues
+	c.openMessaging(&cfg)
 	var recoveries []work.Recovery
 	if loaded != nil {
 		recoveries = loaded.Recoveries

@@ -20,6 +20,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/editdiff"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
@@ -29,7 +30,7 @@ import (
 func TestRegistry(t *testing.T) {
 	dir := t.TempDir()
 	all := AllTools(dir, ToolsOptions{})
-	if len(all) != 9 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil {
+	if len(all) != 10 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil {
 		t.Fatalf("registry = %v names=%v", all, AllToolNames)
 	}
 	for _, name := range LSPToolNames {
@@ -81,50 +82,6 @@ func TestSkillToolServesBody(t *testing.T) {
 	}
 }
 
-func TestReadToolResolvesSkillURI(t *testing.T) {
-	dir := t.TempDir()
-	base := filepath.Join(dir, "alpha")
-	asset := filepath.Join(base, "reference.md")
-	if err := os.MkdirAll(base, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(base, "SKILL.md"), []byte("---\ndescription: alpha\n---\nbody"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(asset, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	items := []skills.Skill{{Name: "alpha", Description: "alpha", FilePath: filepath.Join(base, "SKILL.md"), BaseDir: base}}
-	resolver, err := skills.NewResolver(items)
-	if err != nil {
-		t.Fatal(err)
-	}
-	read, err := NewTool(ReadTool, dir, ToolsOptions{ReadResolver: resolver})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := read.Execute(context.Background(), "", json.RawMessage(`{"path":"skill://alpha/reference.md:2-3"}`), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := resultText(result)
-	if !strings.Contains(text, "[skill://alpha/reference.md#") || !strings.Contains(text, "2:two") || strings.Contains(text, base) {
-		t.Fatalf("skill read = %q", text)
-	}
-}
-
-func TestReadToolReportsUnavailableSkillResolver(t *testing.T) {
-	read, err := NewTool(ReadTool, t.TempDir(), ToolsOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = read.Execute(context.Background(), "", json.RawMessage(`{"path":"skill://alpha/reference.md"}`), nil)
-	var resourceErr *ReadResourceError
-	if !errors.As(err, &resourceErr) || resourceErr.Code != "resolver_unavailable" {
-		t.Fatalf("skill read without resolver error = %v", err)
-	}
-}
-
 func TestWriteReadAndLsTools(t *testing.T) {
 	dir := t.TempDir()
 	queue := toolio.NewFileMutationQueue()
@@ -144,7 +101,7 @@ func TestWriteReadAndLsTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := resultText(readResult); got != fmt.Sprintf("[nested/file.txt#%s]\n2:line2\n\n[1 more lines in file. Use offset=3 to continue.]", editdiff.ContentAnchor([]byte("line1\nline2\nline3"))) {
+	if got := resultText(readResult); got != fmt.Sprintf("[nested/file.txt#%s]\n2:line2\n\n[1 more lines in file. Use offset=3 to continue.]", hashline.Tag([]byte("line1\nline2\nline3"))) {
 		t.Fatalf("read result = %q", got)
 	}
 
@@ -188,7 +145,7 @@ func TestReadToolPreservesSelectorTruncationContinuation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lineHeader := fmt.Sprintf("[lines.txt#%s]", editdiff.ContentAnchor([]byte(lineContent)))
+	lineHeader := fmt.Sprintf("[lines.txt#%s]", hashline.Tag([]byte(lineContent)))
 	lineNumbered := make([]string, truncate.DefaultMaxLines+1)
 	for index := range lineNumbered {
 		lineNumbered[index] = fmt.Sprintf("%d:x", index+1)
@@ -224,7 +181,7 @@ func TestReadToolPreservesSelectorTruncationContinuation(t *testing.T) {
 		t.Fatal(err)
 	}
 	nextLine := truncated.OutputLines + 1
-	byteHeader := fmt.Sprintf("[bytes.txt#%s]", editdiff.ContentAnchor([]byte(byteContent)))
+	byteHeader := fmt.Sprintf("[bytes.txt#%s]", hashline.Tag([]byte(byteContent)))
 	byteWant := fmt.Sprintf("%s\n%s\n\n[Showing lines 1-%d of selected lines 1-1000 (50.0KB limit). Use bytes.txt:%d-1000 to continue.]", byteHeader, truncated.Content, truncated.OutputLines, nextLine)
 	if got := resultText(byteResult); got != byteWant {
 		t.Fatalf("byte-cap selector output = %q", got)
@@ -312,7 +269,7 @@ func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := resultText(binary); got != fmt.Sprintf("[binary.bin#%s]\n[binary file, 3 bytes, not shown]", editdiff.ContentAnchor(binaryContent)) {
+	if got := resultText(binary); got != fmt.Sprintf("[binary.bin#%s]\n[binary file, 3 bytes, not shown]", hashline.Tag(binaryContent)) {
 		t.Fatalf("binary output = %q", got)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "image.png"), []byte("not-a-real-png"), 0o644); err != nil {
@@ -327,28 +284,37 @@ func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
 	}
 }
 
-func TestEditToolRejectsFormerShortAnchorCollisionWithoutMutation(t *testing.T) {
+// TestEditToolRejectsTagCollisionWithoutMutation: the 4-hex tag is only an
+// index. A file changed to different content that hashes to the same tag
+// must still be rejected as stale when the tag was minted for other content.
+func TestEditToolRejectsTagCollisionWithoutMutation(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "file.txt")
-	readContent := []byte("content-83")
-	currentContent := []byte("content-194")
+	readContent := []byte("content-0\n")
+	var currentContent []byte
+	for i := 1; currentContent == nil; i++ {
+		if candidate := fmt.Appendf(nil, "content-%d\n", i); hashline.Tag(candidate) == hashline.Tag(readContent) {
+			currentContent = candidate
+		}
+	}
 	if err := os.WriteFile(file, readContent, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	read, _ := NewTool(ReadTool, dir, ToolsOptions{})
+	options := ToolsOptions{MutationQueue: toolio.NewFileMutationQueue(), Hashline: hashline.NewStore()}
+	read, _ := NewTool(ReadTool, dir, options)
 	readResult, err := executeTool(t, read, map[string]any{"path": "file.txt"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	header := strings.SplitN(resultText(readResult), "\n", 2)[0]
 	anchor := strings.TrimSuffix(strings.TrimPrefix(header, "[file.txt#"), "]")
-	if len(anchor) != editdiff.AnchorLength {
-		t.Fatalf("read anchor length = %d", len(anchor))
+	if anchor != hashline.Tag(readContent) {
+		t.Fatalf("read header %q", header)
 	}
 	if err := os.WriteFile(file, currentContent, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	edit, _ := NewTool(EditTool, dir, ToolsOptions{MutationQueue: toolio.NewFileMutationQueue()})
+	edit, _ := NewTool(EditTool, dir, options)
 	_, err = executeTool(t, edit, map[string]any{"path": "file.txt", "edits": []map[string]string{{"old_text": "content", "new_text": "changed", "anchor": anchor}}})
 	if !errors.Is(err, editdiff.ErrStaleAnchor) {
 		t.Fatalf("collision edit error = %v", err)
@@ -399,7 +365,7 @@ func TestReadToolAnchorsAndLineRangeSelector(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHeader := fmt.Sprintf("[file.txt#%s]", editdiff.ContentAnchor([]byte(content)))
+	wantHeader := fmt.Sprintf("[file.txt#%s]", hashline.Tag([]byte(content)))
 	if got := resultText(result); got != wantHeader+"\n1:one\n2:two\n3:three\n4:four" {
 		t.Fatalf("read output = %q", got)
 	}
@@ -561,7 +527,7 @@ func TestGrepAndFindTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := resultText(grepResult); got != "b.txt:1: hello world" {
+	if got := resultText(grepResult); got != fmt.Sprintf("[b.txt#%s]\n1:hello world", hashline.Tag([]byte("hello world\n"))) {
 		t.Fatalf("grep result = %q", got)
 	}
 
@@ -587,7 +553,7 @@ func TestGrepLimitCountsMatchesNotContextLines(t *testing.T) {
 	lines := strings.Split(resultText(result), "\n")
 	matchLines := 0
 	for _, line := range lines {
-		if strings.Contains(line, ": needle") {
+		if strings.HasPrefix(line, "*") && strings.Contains(line, ":needle") {
 			matchLines++
 		}
 	}
@@ -631,7 +597,7 @@ func TestTodoToolCheckpointsOutsideWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkpoint := filepath.Join(sessionDataDir, progress.FileName)
-	if got := resultText(result); !strings.Contains(got, "Todo list updated with 1 item") || !strings.Contains(got, checkpoint) {
+	if got := resultText(result); !strings.Contains(got, "- [ ] `a` implement _(in progress, high priority)_") || !strings.Contains(got, checkpoint) {
 		t.Fatalf("todo result = %q", got)
 	}
 	data, err := os.ReadFile(checkpoint)

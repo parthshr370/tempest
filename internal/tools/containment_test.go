@@ -221,7 +221,7 @@ func TestGrepFindFallbackBackendDetail(t *testing.T) {
 		t.Fatalf("grep backend = %v, want go", grepDetails["backend"])
 	}
 	text := resultText(grepResult)
-	if !strings.Contains(text, "a.txt:1: needle one") || !strings.Contains(text, "a.txt:2: needle two") {
+	if !strings.Contains(text, "[a.txt#") || !strings.Contains(text, "\n1:needle one\n2:needle two") {
 		t.Fatalf("go grep output = %q", text)
 	}
 	if strings.Contains(text, "hidden.txt") || strings.Contains(text, "binary.txt") {

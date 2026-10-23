@@ -10,7 +10,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,10 +34,11 @@ import (
 	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/editdiff"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hashline"
+	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
-	"go.harness.dev/harness/internal/pathutil"
 	"go.harness.dev/harness/internal/progress"
-	"go.harness.dev/harness/internal/resource"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
@@ -52,6 +52,7 @@ type ToolName string
 // ReadTool reads a file at a path, with optional offset and limit inputs.
 // BashTool runs a command from the working directory, with an optional timeout.
 // EditTool replaces exact text in a file through path and edits inputs.
+// HashlineTool applies line-anchored PUT/CUT/REM/MV patches to existing files.
 // WriteTool writes content to a path, creating parent directories when needed.
 // GrepTool searches file contents with pattern, path, glob, and matching options.
 // FindTool finds files by pattern, with optional path and limit inputs.
@@ -65,12 +66,14 @@ type ToolName string
 // LSPDefinitionTool, LSPReferencesTool, LSPRenameTool and LSPDiagnosticsTool
 // query an enabled language server; rename only returns an edit plan.
 // ManifestDiffTool compares two rendered local manifest trees by resource.
+// MessageTool sends a message to the parent, a running child or all peers.
 //
 // These names keep tool lookup stable across prompts, clients, and persisted state.
 const (
 	ReadTool       ToolName = "read"
 	BashTool       ToolName = "bash"
 	EditTool       ToolName = "edit"
+	HashlineTool   ToolName = "hashline"
 	WriteTool      ToolName = "write"
 	GrepTool       ToolName = "grep"
 	FindTool       ToolName = "find"
@@ -85,6 +88,7 @@ const (
 	WaitTool       ToolName = "wait"
 	CancelTool     ToolName = "cancel"
 	LogsTool       ToolName = "logs"
+	MessageTool    ToolName = "message"
 
 	LSPDefinitionTool  ToolName = "lsp_definition"
 	LSPReferencesTool  ToolName = "lsp_references"
@@ -95,7 +99,7 @@ const (
 
 // AllToolNames is the set of every known ToolName. Configured tools can
 // never shadow these names, including the lsp_* names when LSP is disabled.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true}
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true}
 
 // LSPToolNames are the language-server tools, all read-tier calculations.
 var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
@@ -112,11 +116,14 @@ type ToolsOptions struct {
 	TaskTool        agent.AgentTool
 	ConfiguredTools []agent.AgentTool
 	Skills          []skills.Skill
-	ReadResolver    ReadResourceResolver
-	EnableWeb       bool
-	HTTPClient      *http.Client
-	ResolveIP       func(context.Context, string) ([]net.IP, error)
-	SearchURL       string
+	// Refs resolves skill://, job://, history:// and local:// for read,
+	// grep, write, edit and bash. A nil resolver reports each URL as
+	// unavailable.
+	Refs       *refs.Resolver
+	EnableWeb  bool
+	HTTPClient *http.Client
+	ResolveIP  func(context.Context, string) ([]net.IP, error)
+	SearchURL  string
 	// AttachmentRegistry + AttachmentReader enable the read-only attachment
 	// tool over the session's resolved attachments. Both must be set for the
 	// tool to register. Sanitize is applied to returned document text.
@@ -126,6 +133,9 @@ type ToolsOptions struct {
 	// Work is installed only on a journaled root session.
 	Work  work.Controller
 	Child bool
+	// Messenger registers the message tool: the agent's endpoint on its
+	// session tree's message bus.
+	Messenger *irc.Endpoint
 	// SessionDataDir is the journaled session's private directory
 	// (<journal>.d). todo_write checkpoints progress.md there, bash spills
 	// truncated output under tool-output/, and read may open exactly those
@@ -138,30 +148,11 @@ type ToolsOptions struct {
 	// canonical slash-separated path relative to the resolved cwd. It must
 	// only record the change: no I/O, waiting or error.
 	OnFileChanged func(canonicalPath string)
-}
-
-// ReadResourceResolver resolves non-filesystem read resources. It is defined
-// here because the read tool owns the dependency.
-type ReadResourceResolver interface {
-	Resolve(ctx context.Context, uri string) (resource.Content, error)
-}
-
-// ReadResourceError identifies a read resource setup failure.
-type ReadResourceError struct {
-	Code string
-	URI  string
-	Err  error
-}
-
-func (e *ReadResourceError) Error() string {
-	return fmt.Sprintf("read resource %s: %s", e.URI, e.Code)
-}
-
-func (e *ReadResourceError) Unwrap() error { return e.Err }
-
-func (e *ReadResourceError) Is(target error) bool {
-	other, ok := target.(*ReadResourceError)
-	return ok && e.Code == other.Code
+	// Hashline is the session's hashline state: the file versions read,
+	// grep, edit, write and hashline displayed (their [path#TAG] tags) and
+	// the named clipboard registers. AllTools and the tool-list helpers
+	// create one per call when it is nil, so the tools they build share it.
+	Hashline *hashline.Store
 }
 
 // These limits keep web responses bounded and prevent impractical command timeouts.
@@ -234,7 +225,7 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 	case WriteTool:
 		return newWriteTool(cwd, options), nil
 	case GrepTool:
-		return newGrepTool(cwd), nil
+		return newGrepTool(cwd, options), nil
 	case FindTool:
 		return newFindTool(cwd), nil
 	case LsTool:
@@ -251,6 +242,11 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 			return agent.AgentTool{}, fmt.Errorf("background management requires a durable root session")
 		}
 		return newManagementTool(toolName, options.Work), nil
+	case MessageTool:
+		if options.Messenger == nil {
+			return agent.AgentTool{}, fmt.Errorf("message requires a session with task children")
+		}
+		return newMessageTool(options.Messenger), nil
 	case SkillTool:
 		if len(options.Skills) == 0 {
 			return agent.AgentTool{}, fmt.Errorf("skill tool has no skills")
@@ -273,6 +269,8 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 		return newLSPTool(toolName, options.LSP), nil
 	case ManifestDiffTool:
 		return newManifestDiffTool(cwd), nil
+	case HashlineTool:
+		return newHashlineTool(cwd, options), nil
 	default:
 		return agent.AgentTool{}, fmt.Errorf("Unknown tool name: %s", toolName)
 	}
@@ -291,8 +289,9 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 // AllTools creates every known tool plus any pre-configured tools from
 // options, returning only the ones that were successfully created.
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
+	options = withHashlineStore(options)
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EditTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool} {
+	for _, name := range []ToolName{ReadTool, BashTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -356,54 +355,6 @@ func newSkillTool(items []skills.Skill) agent.AgentTool {
 				return agent.AgentToolResult{}, err
 			}
 			return textResult(body, map[string]any{"skill": skill.Name, "found": true}), nil
-		},
-	}
-}
-
-// newTodoTool builds the todo writer, using options.TodoStore when supplied.
-// Otherwise it checkpoints into the session data directory, never the
-// workspace, and keeps todos in memory when the session has no directory.
-func newTodoTool(options ToolsOptions) agent.AgentTool {
-	store := options.TodoStore
-	if store == nil {
-		store = progress.NewStore(progress.Path(options.SessionDataDir))
-	}
-	return agent.AgentTool{
-		Tool: types.Tool{
-			Name:        string(TodoTool),
-			Description: "Replace the session todo list with the full, current list. It is saved as the session's progress checkpoint, outside the workspace.",
-			Parameters: schema.Object(schema.JSON{
-				"todos": schema.JSON{
-					"type": "array",
-					"items": schema.JSON{
-						"type": "object",
-						"properties": schema.JSON{
-							"id":       schema.String(),
-							"content":  schema.String(),
-							"status":   schema.JSON{"type": "string", "enum": []string{"pending", "in_progress", "completed"}},
-							"priority": schema.JSON{"type": "string", "enum": []string{"high", "medium", "low"}},
-						},
-						"required": []string{"content", "status"},
-					},
-				},
-			}, "todos"),
-		},
-		Label: string(TodoTool),
-		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
-			var input struct {
-				Todos []progress.TodoItem `json:"todos"`
-			}
-			if err := decodeParams(params, &input); err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			if err := store.Update(ctx, input.Todos); err != nil {
-				return agent.AgentToolResult{}, err
-			}
-			text := fmt.Sprintf("Todo list updated with %d item(s).", len(input.Todos))
-			if path := store.Path(); path != "" {
-				text += " Progress checkpoint: " + path
-			}
-			return textResult(text, nil), nil
 		},
 	}
 }
@@ -523,6 +474,7 @@ func newWebSearchTool(options ToolsOptions) agent.AgentTool {
 
 // mustTools builds every named tool through NewTool and panics when any one can't be configured.
 func mustTools(cwd string, options ToolsOptions, names ...ToolName) []agent.AgentTool {
+	options = withHashlineStore(options)
 	tools := make([]agent.AgentTool, 0, len(names))
 	for _, name := range names {
 		tool, err := NewTool(name, cwd, options)
@@ -534,15 +486,25 @@ func mustTools(cwd string, options ToolsOptions, names ...ToolName) []agent.Agen
 	return tools
 }
 
+// withHashlineStore gives tools built together one shared hashline store,
+// so tags read and grep mint are the ones edit and hashline check.
+func withHashlineStore(options ToolsOptions) ToolsOptions {
+	if options.Hashline == nil {
+		options.Hashline = hashline.NewStore()
+	}
+	return options
+}
+
 // newReadTool builds the file reader rooted at cwd. It accepts path plus optional
 // offset and limit inputs so callers can page through text without loading it all at once.
 func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 	// One os.Root per tool keeps every read inside the working directory.
 	getRoot := rootOnce(cwd)
+	store := options.Hashline
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(ReadTool),
-			Description: fmt.Sprintf("Read a file. Text output starts with [path#anchor], where anchor is the full SHA-256 content digest used for edit guards. Parseable Go files are returned as structural outlines by default; use mode=raw, a line selector, offset, or limit for numbered content. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. Output is truncated to %d lines or %dKB (whichever is hit first).", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024),
+			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Parseable Go files are returned as structural outlines by default; use mode=raw, a line selector, offset, or limit for numbered content. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. Output is truncated to %d lines or %dKB (whichever is hit first).", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
 			Parameters: schema.Object(schema.JSON{
 				"path":   schema.String(),
 				"offset": schema.Number(),
@@ -573,36 +535,23 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			var data []byte
-			var absolutePath, displayPath string
-			isResource := strings.HasPrefix(selector.Path, "skill://")
-			if isResource {
-				if options.ReadResolver == nil {
-					return agent.AgentToolResult{}, &ReadResourceError{Code: "resolver_unavailable", URI: selector.Path}
-				}
-				content, err := options.ReadResolver.Resolve(ctx, selector.Path)
-				if err != nil {
-					return agent.AgentToolResult{}, fmt.Errorf("resolve read resource: %w", err)
-				}
-				data = content.Data
-				displayPath = content.URI
-			} else {
-				absolutePath = pathutil.ResolveReadPath(selector.Path, cwd)
-				relPath, err := rootRelPath(cwd, absolutePath)
-				if err == nil {
-					data, err = readFileInRoot(rootForRead, relPath)
-				} else if name, ok := sessionArtifactName(options.SessionDataDir, absolutePath); ok && errors.Is(err, ErrOutsideRoot) {
-					data, err = readSessionArtifact(options.SessionDataDir, name)
-				}
-				if err != nil {
-					return agent.AgentToolResult{}, err
-				}
-				if mimeType := imageMimeType(absolutePath); mimeType != "" {
-					return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("Read image file [" + mimeType + "]"), types.NewImage(base64.StdEncoding.EncodeToString(data), mimeType)}}, nil
-				}
-				displayPath = readDisplayPath(cwd, absolutePath, selector.Path)
+			source, early, err := loadReadSource(ctx, cwd, rootForRead, options, selector.Path)
+			if err != nil {
+				return agent.AgentToolResult{}, err
 			}
-			header := fmt.Sprintf("[%s#%s]", displayPath, editdiff.ContentAnchor(data))
+			if early != nil {
+				return *early, nil
+			}
+			data, absolutePath, displayPath, isResource := source.data, source.absolutePath, source.displayPath, source.isResource
+			header := fmt.Sprintf("[%s#%s]", displayPath, hashline.Tag(data))
+			// observe records the rows shown in full for workspace files, the
+			// ones hashline can edit; resources and session artifacts are not.
+			observe := func(displayed []int) {}
+			if store != nil && !isResource && absolutePath != "" {
+				if _, canonical, err := rootRelPaths(cwd, absolutePath); err == nil {
+					observe = func(displayed []int) { store.Observe(canonical, hashline.Decode(data).Text, displayed) }
+				}
+			}
 			if containsNUL(data) {
 				return textResult(fmt.Sprintf("%s\n[binary file, %d bytes, not shown]", header, len(data)), &readToolDetails{Binary: true}), nil
 			}
@@ -616,12 +565,14 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 					} else if truncation.Truncated {
 						output += "\n\n[Structural outline truncated in summary mode; no raw offset continuation is available. Use the recovery selectors above to read raw regions.]"
 					}
+					observe(nil)
 					return textResult(output, details), nil
 				}
 			}
 
 			allLines := splitReadLines(string(data))
 			if len(allLines) == 0 {
+				observe(nil)
 				return textResult(header, nil), nil
 			}
 			startLine := 0
@@ -678,6 +629,17 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 				nextOffset := startLine + userLimitedLines + 1
 				output += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", remaining, nextOffset)
 			}
+			if !truncation.FirstLineExceedsLimit {
+				shown := truncation.OutputLines
+				if truncation.LastLinePartial {
+					shown--
+				}
+				displayed := make([]int, 0, max(shown, 0))
+				for line := startLine + 1; line <= startLine+shown; line++ {
+					displayed = append(displayed, line)
+				}
+				observe(displayed)
+			}
 			return textResult(output, details), nil
 		},
 	}
@@ -687,10 +649,11 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 // serializing mutations through options.MutationQueue when one is provided.
 func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 	queue := mutationQueue(options)
+	store := options.Hashline
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(WriteTool),
-			Description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+			Description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories. " + localWriteHelp,
 			Parameters: schema.Object(schema.JSON{
 				"path":    schema.String(),
 				"content": schema.String(),
@@ -705,29 +668,35 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			rootForWrite, err := rootOnce(cwd)()
+			target, err := resolveMutationTarget(cwd, options, input.Path)
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			absolutePath := pathutil.ResolveToCwd(input.Path, cwd)
-			relPath, canonicalPath, err := rootRelPaths(cwd, absolutePath)
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
+			defer target.release()
+			rootForWrite, relPath, canonicalPath, absolutePath := target.root, target.relPath, target.canonicalPath, target.queueKey
+			var tagged string
 			err = queue.Do(absolutePath, func() error {
 				if err := abortErr(ctx); err != nil {
 					return err
+				}
+				before, err := readFileInRoot(rootForWrite, relPath)
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return fmt.Errorf("could not read %s before writing: %w", input.Path, err)
 				}
 				if err := writeFileInRoot(rootForWrite, relPath, []byte(input.Content)); err != nil {
 					return err
 				}
 				notifyFileChanged(options, canonicalPath)
+				if store != nil && canonicalPath != "" {
+					tag, preview := store.Written(canonicalPath, hashline.Decode(before).Text, hashline.Decode([]byte(input.Content)).Text)
+					tagged = taggedResult(input.Path, tag, preview)
+				}
 				return abortErr(ctx)
 			})
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			return textResult(fmt.Sprintf("Successfully wrote %d bytes to %s", len(input.Content), input.Path), nil), nil
+			return textResult(fmt.Sprintf("Successfully wrote %d bytes to %s", len(input.Content), input.Path)+tagged, nil), nil
 		},
 	}
 }
@@ -736,10 +705,11 @@ func newWriteTool(cwd string, options ToolsOptions) agent.AgentTool {
 // edits, then serializes each file mutation through options.MutationQueue.
 func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 	queue := mutationQueue(options)
+	store := options.Hashline
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(EditTool),
-			Description: "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file. Supply the anchor from read output on each edit to reject stale file contents before any change.",
+			Description: "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file. Supply the tag from the [path#TAG] header of read or grep output (or the full anchor an lsp_rename plan gives) as each edit's anchor to reject stale file contents before any change. " + localWriteHelp,
 			Parameters: schema.Object(schema.JSON{
 				"path": schema.String(),
 				"edits": schema.JSON{
@@ -766,16 +736,14 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if input.Path == "" || len(input.Edits) == 0 {
 				return agent.AgentToolResult{}, errors.New("edit requires path and at least one edit")
 			}
-			absolutePath := pathutil.ResolveToCwd(input.Path, cwd)
-			rootForEdit, err := rootOnce(cwd)()
+			target, err := resolveMutationTarget(cwd, options, input.Path)
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			relPath, canonicalPath, err := rootRelPaths(cwd, absolutePath)
-			if err != nil {
-				return agent.AgentToolResult{}, err
-			}
+			defer target.release()
+			rootForEdit, relPath, canonicalPath, absolutePath := target.root, target.relPath, target.canonicalPath, target.queueKey
 			var details *editToolDetails
+			var tagged string
 			err = queue.Do(absolutePath, func() error {
 				if err := abortErr(ctx); err != nil {
 					return err
@@ -790,13 +758,19 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 				actualAnchor := ""
 				var staleErr error
 				for index, edit := range input.Edits {
-					if edit.Anchor == "" {
+					if edit.Anchor == "" || staleErr != nil {
+						continue
+					}
+					if hashline.IsTag(edit.Anchor) {
+						if err := verifyEditTag(store, canonicalPath, input.Path, edit.Anchor, rawContent); err != nil {
+							staleErr = fmt.Errorf("edit hunk %d: %w", index+1, err)
+						}
 						continue
 					}
 					if actualAnchor == "" {
 						actualAnchor = editdiff.ContentAnchor(rawContent)
 					}
-					if edit.Anchor != actualAnchor && staleErr == nil {
+					if edit.Anchor != actualAnchor {
 						staleErr = fmt.Errorf("edit hunk %d: %w", index+1, &editdiff.StaleAnchorError{Path: input.Path, Expected: edit.Anchor, Actual: actualAnchor})
 					}
 				}
@@ -819,6 +793,10 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 				}
 				// Disk changed even if the caller cancels from here on.
 				notifyFileChanged(options, canonicalPath)
+				if store != nil && canonicalPath != "" {
+					tag, preview := store.Edited(canonicalPath, hashline.Decode(rawContent).Text, hashline.Decode([]byte(finalContent)).Text)
+					tagged = taggedResult(input.Path, tag, preview)
+				}
 				if err := abortErr(ctx); err != nil {
 					return err
 				}
@@ -833,7 +811,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			return textResult(fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(input.Edits), input.Path), details), nil
+			return textResult(fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(input.Edits), input.Path)+tagged, details), nil
 		},
 	}
 }
@@ -850,34 +828,58 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 		timeoutDefault = 10 * time.Minute
 	}
 	parameters := schema.JSON{"command": schema.String(), "timeout": schema.Number()}
+	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
 	if options.Work != nil && !options.Child {
 		parameters["async"] = schema.Bool()
+		parameters["name"] = schema.JSON{"type": "string", "description": "async only: a name unique among running jobs; jobs, wait, cancel and logs accept it in place of the job id"}
+		parameters["ready_log"] = schema.JSON{"type": "string", "description": "async only: RE2 regex; the call returns once an output line matches"}
+		parameters["ready_port"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": 65535, "description": "async only: the call returns once 127.0.0.1:<port> accepts TCP connections"}
+		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline, default 30000; on timeout the process is killed"}
+		description += " async:true starts a background job and returns its handle. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(BashTool),
-			Description: fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024),
+			Description: description,
 			Parameters:  schema.Object(parameters, "command"),
 		},
 		Label: string(BashTool),
+		// The permission gate sees prepared arguments, so it judges the
+		// command with internal URLs already rewritten to paths.
+		PrepareArguments: prepareBashArguments(options.Refs),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
-				Command string `json:"command"`
-				Timeout *int   `json:"timeout"`
-				Async   bool   `json:"async"`
+				Command        string `json:"command"`
+				Timeout        *int   `json:"timeout"`
+				Async          bool   `json:"async"`
+				Name           string `json:"name"`
+				ReadyLog       string `json:"ready_log"`
+				ReadyPort      int    `json:"ready_port"`
+				ReadyTimeoutMS int    `json:"ready_timeout_ms"`
 			}
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
+			}
+			if err := checkCommandURLs(options.Refs, input.Command); err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			service := input.ReadyLog != "" || input.ReadyPort != 0
+			if !input.Async && (service || input.Name != "" || input.ReadyTimeoutMS != 0) {
+				return agent.AgentToolResult{}, errors.New("name, ready_log, ready_port and ready_timeout_ms need async:true")
 			}
 			if input.Async {
 				if options.Work == nil || options.Child {
 					return agent.AgentToolResult{}, errors.New("async bash requires a durable root session; child bash is synchronous only")
 				}
 				timeoutSeconds := int(timeoutDefault / time.Second)
+				if service {
+					// A service lives as long as the run unless the model bounds it.
+					timeoutSeconds = maxTimeoutSeconds
+				}
 				if input.Timeout != nil && *input.Timeout > 0 {
 					timeoutSeconds = *input.Timeout
 				}
-				job, err := options.Work.StartBash(ctx, work.BashSpec{Command: input.Command, TimeoutSeconds: timeoutSeconds})
+				job, err := options.Work.StartBash(ctx, work.BashSpec{Command: input.Command, TimeoutSeconds: timeoutSeconds, Name: input.Name, ReadyLog: input.ReadyLog, ReadyPort: input.ReadyPort, ReadyTimeoutMS: input.ReadyTimeoutMS})
 				if err != nil {
 					return agent.AgentToolResult{}, err
 				}
@@ -949,11 +951,11 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 
 // newGrepTool builds the ripgrep-backed content searcher rooted at cwd. It accepts
 // pattern plus optional path, glob, case, literal, context, and limit inputs.
-func newGrepTool(cwd string) agent.AgentTool {
+func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(GrepTool),
-			Description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers.",
+			Description: "Search file contents for a pattern. Returns matching lines with file paths and line numbers. path may be an internal URL (skill://, job://, history://, local://).",
 			Parameters: schema.Object(schema.JSON{
 				"pattern":     schema.String(),
 				"path":        schema.String(),
@@ -966,17 +968,12 @@ func newGrepTool(cwd string) agent.AgentTool {
 		},
 		Label: string(GrepTool),
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
-			var input struct {
-				Pattern    string `json:"pattern"`
-				Path       string `json:"path"`
-				Glob       string `json:"glob"`
-				IgnoreCase bool   `json:"ignore_case"`
-				Literal    bool   `json:"literal"`
-				Context    int    `json:"context"`
-				Limit      int    `json:"limit"`
-			}
+			var input grepToolInput
 			if err := decodeParams(params, &input); err != nil {
 				return agent.AgentToolResult{}, err
+			}
+			if refs.IsURL(input.Path) {
+				return grepRefs(ctx, options, input)
 			}
 			rootForGrep, err := rootOnce(cwd)()
 			if err != nil {
@@ -987,8 +984,7 @@ func newGrepTool(cwd string) agent.AgentTool {
 				return agent.AgentToolResult{}, err
 			}
 			searchPath := filepath.Join(cwd, relSearch)
-			stat, err := statInRoot(rootForGrep, relSearch)
-			if err != nil {
+			if _, err := statInRoot(rootForGrep, relSearch); err != nil {
 				return agent.AgentToolResult{}, fmt.Errorf("Path not found: %s", searchPath)
 			}
 			limit := input.Limit
@@ -1091,74 +1087,7 @@ func newGrepTool(cwd string) agent.AgentTool {
 					return agent.AgentToolResult{}, err
 				}
 			}
-			if len(matches) == 0 {
-				return textResult("No matches found", nil), nil
-			}
-			outputLines := []string{}
-			linesTruncated := false
-			fileCache := map[string][]string{}
-			for _, match := range matches {
-				relativePath := formatSearchPath(searchPath, match.filePath, stat.IsDir())
-				if contextLines == 0 {
-					sanitized := strings.TrimSuffix(strings.ReplaceAll(strings.ReplaceAll(match.lineText, "\r\n", "\n"), "\r", ""), "\n")
-					truncatedLine := truncate.Line(sanitized, 0)
-					if truncatedLine.WasTruncated {
-						linesTruncated = true
-					}
-					outputLines = append(outputLines, fmt.Sprintf("%s:%d: %s", relativePath, match.lineNumber, truncatedLine.Text))
-					continue
-				}
-				lines, ok := fileCache[match.filePath]
-				if !ok {
-					if relMatch, relErr := filepath.Rel(cwd, match.filePath); relErr == nil {
-						if data, readErr := readFileInRoot(rootForGrep, filepath.ToSlash(relMatch)); readErr == nil {
-							lines = splitFileLines(string(data))
-						}
-					}
-					fileCache[match.filePath] = lines
-				}
-				if len(lines) == 0 {
-					outputLines = append(outputLines, fmt.Sprintf("%s:%d: (unable to read file)", relativePath, match.lineNumber))
-					continue
-				}
-				start := max(1, match.lineNumber-contextLines)
-				end := min(len(lines), match.lineNumber+contextLines)
-				for current := start; current <= end; current++ {
-					lineText := strings.ReplaceAll(lines[current-1], "\r", "")
-					truncatedLine := truncate.Line(lineText, 0)
-					if truncatedLine.WasTruncated {
-						linesTruncated = true
-					}
-					if current == match.lineNumber {
-						outputLines = append(outputLines, fmt.Sprintf("%s:%d: %s", relativePath, current, truncatedLine.Text))
-					} else {
-						outputLines = append(outputLines, fmt.Sprintf("%s-%d- %s", relativePath, current, truncatedLine.Text))
-					}
-				}
-			}
-			rawOutput := strings.Join(outputLines, "\n")
-			truncation := truncate.Head(rawOutput, truncate.Options{MaxLines: truncate.Int(int(^uint(0) >> 1))})
-
-			output := truncation.Content
-			details := map[string]any{}
-			notices := []string{}
-			if matchLimitReached {
-				notices = append(notices, fmt.Sprintf("%d matches limit reached. Use limit=%d for more, or refine pattern", limit, limit*2))
-				details["matchLimitReached"] = limit
-			}
-			if truncation.Truncated {
-				notices = append(notices, truncate.FormatSize(truncate.DefaultMaxBytes)+" limit reached")
-				details["truncation"] = truncation
-			}
-			if linesTruncated {
-				notices = append(notices, fmt.Sprintf("Some lines truncated to %d chars. Use read tool to see full lines", truncate.GrepMaxLineLength))
-				details["linesTruncated"] = true
-			}
-			details["backend"] = backend
-			if len(notices) > 0 {
-				output += "\n\n[" + strings.Join(notices, ". ") + "]"
-			}
-			return textResult(output, optionalMap(details)), nil
+			return formatGrepOutput(matches, workspaceGrepSource(cwd, rootForGrep), options.Hashline, contextLines, limit, matchLimitReached, backend), nil
 		},
 	}
 }
@@ -1591,7 +1520,7 @@ func decodeStrict(params json.RawMessage, target any) error {
 
 // notifyFileChanged reports a completed disk write to options.OnFileChanged.
 func notifyFileChanged(options ToolsOptions, canonicalPath string) {
-	if options.OnFileChanged != nil {
+	if options.OnFileChanged != nil && canonicalPath != "" {
 		options.OnFileChanged(canonicalPath)
 	}
 }

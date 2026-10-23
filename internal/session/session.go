@@ -60,11 +60,13 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 		}
 		switch tool.Name {
 		case "read":
-			snippets[tool.Name] = "Read file contents"
+			snippets[tool.Name] = "Read files, directories, archive members, office documents, JSON queries and internal URLs"
 		case "bash":
 			snippets[tool.Name] = "Execute bash commands (ls, grep, find, etc.)"
 		case "edit":
 			snippets[tool.Name] = "Make precise file edits with exact text replacement"
+		case "hashline":
+			snippets[tool.Name] = "Edit, move, rename or delete existing files with line-anchored [path#TAG] patches"
 		case "write":
 			snippets[tool.Name] = "Create or overwrite files"
 		case "grep":
@@ -74,9 +76,11 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 		case "ls":
 			snippets[tool.Name] = "List directory contents"
 		case "todo_write":
-			snippets[tool.Name] = "Update the session todo list and progress checkpoint"
+			snippets[tool.Name] = "Update the session todo list (full list or phased ops) and progress checkpoint"
 		case "task":
 			snippets[tool.Name] = "Delegate a focused task to a child agent"
+		case "message":
+			snippets[tool.Name] = "Message your parent, a running child or all peers"
 		case "web_search":
 			snippets[tool.Name] = "Search the web through the configured endpoint"
 		case "web_fetch":
