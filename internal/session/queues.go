@@ -74,11 +74,16 @@ func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (wor
 	if (input.Kind != work.Steer && input.Kind != work.FollowUp) || !utf8.ValidString(input.Text) || strings.TrimSpace(input.Text) == "" || !utf8.ValidString(input.Key) || len(input.Key) > 128 {
 		return work.QueueItem{}, ErrInvalidQueueInput
 	}
-	if input.SourceJobID == "" {
-		if len(input.Text) > 16<<10 || strings.HasPrefix(input.Key, "job:") {
+	switch {
+	case input.SourceAgent != "":
+		if input.SourceJobID != "" || input.Kind != work.Steer || len(input.Text) > 16<<10 || !strings.HasPrefix(input.Key, work.MessageKeyPrefix) {
 			return work.QueueItem{}, ErrInvalidQueueInput
 		}
-	} else if input.Kind != work.FollowUp || input.Key != "job:"+input.SourceJobID+":terminal" {
+	case input.SourceJobID == "":
+		if len(input.Text) > 16<<10 || strings.HasPrefix(input.Key, "job:") || strings.HasPrefix(input.Key, work.MessageKeyPrefix) {
+			return work.QueueItem{}, ErrInvalidQueueInput
+		}
+	case input.Kind != work.FollowUp || input.Key != "job:"+input.SourceJobID+":terminal":
 		return work.QueueItem{}, ErrInvalidQueueInput
 	}
 	q.mutation.Lock()
@@ -90,23 +95,30 @@ func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (wor
 	if id, ok := q.keys[input.Key]; input.Key != "" && ok {
 		prior := q.items[id]
 		q.mu.Unlock()
-		if prior.Kind != input.Kind || prior.Text != input.Text || prior.SourceJobID != input.SourceJobID {
+		if prior.Kind != input.Kind || prior.Text != input.Text || prior.SourceJobID != input.SourceJobID || prior.SourceAgent != input.SourceAgent {
 			return work.QueueItem{}, ErrQueueConflict
 		}
 		return prior, nil
 	}
-	item := work.QueueItem{ID: q.store.NewRunID(), Kind: input.Kind, Text: input.Text, Key: input.Key, SourceJobID: input.SourceJobID, EnqueuedAt: time.Now()}
+	item := work.QueueItem{ID: q.store.NewRunID(), Kind: input.Kind, Text: input.Text, Key: input.Key, SourceJobID: input.SourceJobID, SourceAgent: input.SourceAgent, EnqueuedAt: time.Now()}
 	encoded, _ := json.Marshal(item)
-	count, total := 0, len(encoded)
+	count, total, messages := 0, len(encoded), 0
 	for _, id := range q.pending {
 		v := q.items[id]
-		if v.SourceJobID == "" {
+		switch {
+		case v.SourceAgent != "":
+			messages++
+		case v.SourceJobID == "":
 			count++
 			b, _ := json.Marshal(v)
 			total += len(b)
 		}
 	}
-	if input.SourceJobID == "" && (count >= 32 || total > 256<<10) {
+	if input.SourceAgent != "" && messages >= work.MailboxCap {
+		q.mu.Unlock()
+		return work.QueueItem{}, fmt.Errorf("%w: %d unread messages, the mailbox limit", ErrQueueFull, messages)
+	}
+	if input.SourceAgent == "" && input.SourceJobID == "" && (count >= 32 || total > 256<<10) {
 		q.mu.Unlock()
 		return work.QueueItem{}, ErrQueueFull
 	}
@@ -115,7 +127,7 @@ func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (wor
 		return work.QueueItem{}, fmt.Errorf("%w: completion exceeds encoded 8 KiB", ErrInvalidQueueInput)
 	}
 	q.mu.Unlock()
-	raw, _ := json.Marshal(journal.QueueEnqueued{QueueID: item.ID, Kind: item.Kind, Text: item.Text, Key: item.Key, SourceJobID: item.SourceJobID})
+	raw, _ := json.Marshal(journal.QueueEnqueued{QueueID: item.ID, Kind: item.Kind, Text: item.Text, Key: item.Key, SourceJobID: item.SourceJobID, SourceAgent: item.SourceAgent})
 	meta, err := q.store.AppendAssigned(ctx, journal.WorkRecord{Type: journal.KindQueueEnqueued, Payload: raw})
 	if err != nil {
 		return work.QueueItem{}, err

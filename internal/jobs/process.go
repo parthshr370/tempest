@@ -98,7 +98,7 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	}
 	var readers sync.WaitGroup
 	readers.Add(2)
-	appendPipe := func(pipe *os.File) {
+	appendPipe := func(pipe *os.File, matcher *lineMatcher) {
 		defer readers.Done()
 		defer pipe.Close()
 		buffer := make([]byte, pipeBytes)
@@ -139,6 +139,8 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 				}
 				if failed {
 					cancel()
+				} else if matcher != nil {
+					matcher.write(buffer[:count])
 				}
 			}
 			if readErr != nil {
@@ -154,10 +156,27 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 			}
 		}
 	}
-	go appendPipe(stdout)
-	go appendPipe(stderr)
+	var pipeMatchers [2]*lineMatcher
+	if record.service != nil && record.service.pattern != nil {
+		pipeMatchers = [2]*lineMatcher{{manager: manager, record: record}, {manager: manager, record: record}}
+	}
+	go appendPipe(stdout, pipeMatchers[0])
+	go appendPipe(stderr, pipeMatchers[1])
 	if err = manager.running(context.WithoutCancel(ctx), record, cmd.Process.Pid, ""); err != nil {
 		cancel()
+	}
+	pollCtx, stopPolling := context.WithCancel(processCtx)
+	var pollers sync.WaitGroup
+	if record.service != nil {
+		readyDeadline := time.AfterFunc(record.service.timeout, func() {
+			if manager.readinessFailed(record, true) {
+				cancel()
+			}
+		})
+		defer readyDeadline.Stop()
+		if record.service.port != 0 {
+			pollers.Go(func() { manager.watchPort(pollCtx, record) })
+		}
 	}
 	// One Wait owner. The job worker remains available for bounded log syncing.
 	waited := make(chan error, 1)
@@ -196,6 +215,8 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	if !readerDeadline.Stop() {
 		<-closed
 	}
+	stopPolling()
+	pollers.Wait()
 	code := cmd.ProcessState.ExitCode()
 	job.ExitCode = &code
 	if err != nil {
@@ -248,8 +269,16 @@ func (manager *Manager) finishProcess(record *entry, job work.Job, output *proce
 	} else {
 		job.Output = &artifact
 	}
+	manager.readinessFailed(record, false)
 	manager.mu.Lock()
 	record.truncated = snapshot.Truncated
+	// The worker's copy predates readiness; keep what observeReady recorded.
+	job.Readiness = record.recovery.Job.Readiness
+	job.ReadyMatch = record.recovery.Job.ReadyMatch
+	if record.service != nil && record.service.timedOut {
+		job.State = "failed"
+		job.Reason = "ready_timeout"
+	}
 	manager.mu.Unlock()
 	manager.settle(record, job)
 }

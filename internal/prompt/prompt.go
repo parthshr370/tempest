@@ -72,6 +72,7 @@ func BuildSystemPrompt(options BuildSystemPromptOptions) string {
 		HasRead:             hasTool(tools, "read"),
 		HasBash:             hasTool(tools, "bash"),
 		HasEdit:             hasTool(tools, "edit"),
+		HasHashline:         hasTool(tools, "hashline"),
 		HasWrite:            hasTool(tools, "write"),
 		HasGrep:             hasTool(tools, "grep"),
 		HasFind:             hasTool(tools, "find"),
@@ -140,6 +141,9 @@ func CapabilitiesSection(names []string, snippets map[string]string, progressPat
 	}
 	if has(names, "todo_write") && progressPath != "" {
 		runtime = append(runtime, "- Your live progress checkpoint is "+progressPath+" (session data, outside the workspace); todo_write rewrites it on every update. Read it with the read tool to recover the plan and current step after an interruption.")
+	}
+	if has(names, "read") && progressPath != "" {
+		runtime = append(runtime, "- read and grep take internal URLs: skill://<name>/<file> (skill files), job:// and job://<id>/<artifact> (background jobs, e.g. output.log), history://<id> (a child session's transcript) and local://<path>, a private scratch directory shared by this session tree. To hand a large payload to a child or parent, write it to local://<name> and pass that URL. bash expands skill:// and local:// words to paths.")
 	}
 	return block + "\n\n<runtime>\n" + strings.Join(runtime, "\n") + "\n</runtime>"
 }

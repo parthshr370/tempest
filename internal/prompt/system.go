@@ -49,6 +49,7 @@ type PromptData struct {
 	HasRead             bool
 	HasBash             bool
 	HasEdit             bool
+	HasHashline         bool
 	HasWrite            bool
 	HasGrep             bool
 	HasFind             bool

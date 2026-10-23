@@ -48,6 +48,8 @@ type QueueEnqueued struct {
 	Text        string         `json:"text"`
 	Key         string         `json:"key,omitempty"`
 	SourceJobID string         `json:"source_job_id,omitempty"`
+	// SourceAgent marks an agent-to-agent message ("parent" or a job id).
+	SourceAgent string `json:"source_agent,omitempty"`
 }
 
 // QueueCancelled withdraws an accepted, unconsumed receipt.
@@ -231,9 +233,12 @@ func validateWorkRecord(r WorkRecord) error {
 	switch v := value.(type) {
 	case *QueueEnqueued:
 		valid = v.QueueID != "" && (v.Kind == work.Steer || v.Kind == work.FollowUp) && utf8.ValidString(v.Text) && strings.TrimSpace(v.Text) != "" && utf8.ValidString(v.Key) && len(v.Key) <= 128
-		if v.SourceJobID == "" {
+		switch {
+		case v.SourceAgent != "":
+			valid = valid && v.SourceJobID == "" && v.Kind == work.Steer && len(v.Text) <= 16<<10 && strings.HasPrefix(v.Key, "msg:")
+		case v.SourceJobID == "":
 			valid = valid && len(v.Text) <= 16<<10 && !strings.HasPrefix(v.Key, "job:")
-		} else {
+		default:
 			valid = valid && v.Kind == work.FollowUp && v.Key == "job:"+v.SourceJobID+":terminal"
 		}
 	case *QueueCancelled:

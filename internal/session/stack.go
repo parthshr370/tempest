@@ -13,10 +13,12 @@ import (
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/subagent"
@@ -70,12 +72,18 @@ type StackConfig struct {
 	PromptAdditions []string
 	BashTimeout     time.Duration
 	// Work and QueueSource bind the session-owned durable runtime.
-	Work           work.RunHooks
-	Controller     work.Controller
-	QueueSource    work.QueueSource
-	Journal        *journal.Store
-	Loaded         *journal.Loaded
-	Child          bool
+	Work        work.RunHooks
+	Controller  work.Controller
+	QueueSource work.QueueSource
+	Journal     *journal.Store
+	Loaded      *journal.Loaded
+	// RootJournal is the root session's journal for a child; internal URLs
+	// (local://, job://, history://) resolve against it. Empty uses Journal.
+	RootJournal string
+	Child       bool
+	// Messenger is this agent's endpoint on its session tree's message bus;
+	// non-nil registers the message tool.
+	Messenger      *irc.Endpoint
 	AllowedTools   []string
 	BeforeToolCall func(context.Context, agent.BeforeToolCallContext) *agent.BeforeToolCallResult
 
@@ -174,13 +182,15 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
 		taskTool = subagent.NewTool(cfg.Controller)
 	}
-	var readResolver tools.ReadResourceResolver
-	if len(cfg.Skills) > 0 {
-		resolver, err := skills.NewResolver(cfg.Skills)
-		if err != nil {
-			return nil, err
-		}
-		readResolver = resolver
+	// Internal URLs resolve against the root session, so a child shares
+	// its root's local:// directory, jobs and child transcripts.
+	rootJournal := cfg.RootJournal
+	if rootJournal == "" && cfg.Journal != nil {
+		rootJournal = cfg.Journal.Path()
+	}
+	refsResolver, err := refs.New(refs.Config{Skills: cfg.Skills, RootJournal: rootJournal})
+	if err != nil {
+		return nil, err
 	}
 	options := tools.ToolsOptions{
 		MutationQueue:      cfg.MutationQueue,
@@ -193,9 +203,10 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		AttachmentReader:   cfg.AttachmentReader,
 		Sanitize:           cfg.Sanitize,
 		Skills:             cfg.Skills,
-		ReadResolver:       readResolver,
+		Refs:               refsResolver,
 		Work:               cfg.Controller,
 		Child:              cfg.Child,
+		Messenger:          cfg.Messenger,
 		SessionDataDir:     sessionDataDir,
 	}
 	// Language servers are root-session-only: a child edits another

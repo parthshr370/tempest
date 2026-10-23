@@ -1,31 +1,24 @@
 package skills
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"go.harness.dev/harness/internal/resource"
 )
 
 // ResolveErrorCode classifies failures while resolving a skill URI.
 type ResolveErrorCode string
 
 const (
-	ResolveInvalidURI    ResolveErrorCode = "invalid_uri"
-	ResolveUnknownSkill  ResolveErrorCode = "unknown_skill"
-	ResolveInvalidPath   ResolveErrorCode = "invalid_path"
-	ResolvePathEscape    ResolveErrorCode = "path_escape"
-	ResolveNotFound      ResolveErrorCode = "not_found"
-	ResolveInvalidTarget ResolveErrorCode = "invalid_target"
-	ResolveReadFailed    ResolveErrorCode = "read_failed"
+	ResolveInvalidURI   ResolveErrorCode = "invalid_uri"
+	ResolveUnknownSkill ResolveErrorCode = "unknown_skill"
+	ResolveInvalidPath  ResolveErrorCode = "invalid_path"
+	ResolvePathEscape   ResolveErrorCode = "path_escape"
 )
 
 // ResolveError is a typed skill URI resolution failure. Path is always logical
@@ -53,7 +46,8 @@ func (e *ResolveError) Is(target error) bool {
 	return ok && e.Code == other.Code
 }
 
-// Resolver is an immutable index of canonical skill metadata.
+// Resolver is an immutable index of canonical skill metadata. It locates
+// skill:// URIs; internal/refs reads them.
 type Resolver struct {
 	items map[string]Skill
 }
@@ -80,110 +74,71 @@ func NewResolver(items []Skill) (*Resolver, error) {
 	return &Resolver{items: index}, nil
 }
 
-// Resolve reads a skill:// URI through an os.Root rooted at its indexed base.
-func (r *Resolver) Resolve(ctx context.Context, rawURI string) (resource.Content, error) {
-	if err := ctx.Err(); err != nil {
-		return resource.Content{}, err
-	}
+// Location is a validated skill:// target: the skill's base directory and
+// the cleaned path inside it. Locate does no I/O; callers open Rel through
+// an [os.Root] on BaseDir so symlinks cannot leave the skill.
+type Location struct {
+	Skill   string
+	BaseDir string
+	// Rel is the OS-cleaned path relative to BaseDir; "." is BaseDir itself.
+	Rel string
+	// Logical is Rel in slash form, safe to show without the disk location.
+	Logical string
+}
+
+// Locate parses and validates a skill:// URI without touching the disk.
+// skill://name and skill://name/ name the skill's own file.
+func (r *Resolver) Locate(rawURI string) (Location, error) {
 	u, err := url.Parse(rawURI)
 	if err != nil || u.Scheme != "skill" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(rawURI, "#") || u.Host == "" {
-		return resource.Content{}, &ResolveError{Code: ResolveInvalidURI, URI: rawURI, Err: err}
+		return Location{}, &ResolveError{Code: ResolveInvalidURI, URI: rawURI, Err: err}
 	}
 	skill, ok := r.items[u.Host]
 	if !ok {
-		return resource.Content{}, &ResolveError{Code: ResolveUnknownSkill, URI: rawURI, Skill: u.Host, Err: fs.ErrNotExist}
+		return Location{}, &ResolveError{Code: ResolveUnknownSkill, URI: rawURI, Skill: u.Host, Err: fs.ErrNotExist}
 	}
-
 	var target string
 	if u.EscapedPath() == "" || u.EscapedPath() == "/" {
 		target, err = filepath.Rel(skill.BaseDir, skill.FilePath)
 		if err != nil {
-			return resource.Content{}, &ResolveError{Code: ResolveInvalidPath, URI: rawURI, Skill: skill.Name, Err: err}
+			return Location{}, &ResolveError{Code: ResolveInvalidPath, URI: rawURI, Skill: skill.Name, Err: err}
 		}
 	} else {
 		escaped := strings.TrimPrefix(u.EscapedPath(), "/")
 		target, err = url.PathUnescape(escaped)
 		if err != nil {
-			return resource.Content{}, &ResolveError{Code: ResolveInvalidURI, URI: rawURI, Skill: skill.Name, Err: err}
+			return Location{}, &ResolveError{Code: ResolveInvalidURI, URI: rawURI, Skill: skill.Name, Err: err}
 		}
 	}
 	logical := filepath.ToSlash(target)
 	if filepath.IsAbs(target) || filepath.VolumeName(target) != "" || strings.ContainsRune(target, 0) || strings.Contains(target, `\`) {
-		return resource.Content{}, &ResolveError{Code: ResolveInvalidPath, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("invalid asset path")}
+		return Location{}, &ResolveError{Code: ResolveInvalidPath, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("invalid asset path")}
 	}
 	for _, part := range strings.FieldsFunc(target, func(r rune) bool { return r == '/' || r == filepath.Separator }) {
 		if part == ".." {
-			return resource.Content{}, &ResolveError{Code: ResolvePathEscape, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("path traversal")}
+			return Location{}, &ResolveError{Code: ResolvePathEscape, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("path traversal")}
 		}
 	}
 	target = filepath.Clean(target)
-	root, err := os.OpenRoot(skill.BaseDir)
-	if err != nil {
-		return resource.Content{}, &ResolveError{Code: ResolveReadFailed, URI: rawURI, Skill: skill.Name, Path: logical, Err: err}
-	}
-	defer root.Close()
-	info, err := root.Stat(target)
-	if err != nil {
-		code := ResolveReadFailed
-		if errors.Is(err, fs.ErrNotExist) {
-			code = ResolveNotFound
-		} else if targetEscapesBase(skill.BaseDir, target) {
-			code = ResolvePathEscape
-		}
-		return resource.Content{}, &ResolveError{Code: code, URI: rawURI, Skill: skill.Name, Path: logical, Err: err}
-	}
-	if !info.Mode().IsRegular() {
-		return resource.Content{}, &ResolveError{Code: ResolveInvalidTarget, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("target is not a regular file")}
-	}
-	file, err := root.Open(target)
-	if err != nil {
-		code := ResolveReadFailed
-		if errors.Is(err, fs.ErrNotExist) {
-			code = ResolveNotFound
-		} else if targetEscapesBase(skill.BaseDir, target) {
-			code = ResolvePathEscape
-		}
-		return resource.Content{}, &ResolveError{Code: code, URI: rawURI, Skill: skill.Name, Path: logical, Err: err}
-	}
-	defer file.Close()
-	info, err = file.Stat()
-	if err != nil {
-		return resource.Content{}, &ResolveError{Code: ResolveReadFailed, URI: rawURI, Skill: skill.Name, Path: logical, Err: err}
-	}
-	if !info.Mode().IsRegular() {
-		return resource.Content{}, &ResolveError{Code: ResolveInvalidTarget, URI: rawURI, Skill: skill.Name, Path: logical, Err: errors.New("target is not a regular file")}
-	}
-	if err := ctx.Err(); err != nil {
-		return resource.Content{}, err
-	}
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return resource.Content{}, &ResolveError{Code: ResolveReadFailed, URI: rawURI, Skill: skill.Name, Path: logical, Err: err}
-	}
-	if err := ctx.Err(); err != nil {
-		return resource.Content{}, err
-	}
-	mediaType := resource.TextMediaType
-	if strings.EqualFold(filepath.Ext(target), ".md") {
-		mediaType = resource.MarkdownMediaType
-	}
-	uriPath := filepath.ToSlash(target)
-	if uriPath == "." {
-		uriPath = ""
-	}
-	if uriPath == "" {
-		return resource.Content{URI: "skill://" + skill.Name, MediaType: mediaType, Data: data}, nil
-	}
-	return resource.Content{URI: "skill://" + skill.Name + (&url.URL{Path: "/" + uriPath}).EscapedPath(), MediaType: mediaType, Data: data}, nil
+	return Location{Skill: skill.Name, BaseDir: skill.BaseDir, Rel: target, Logical: filepath.ToSlash(target)}, nil
 }
 
-// targetEscapesBase identifies symlinks that [os.Root] rejects for leaving a skill's base directory.
-
-func targetEscapesBase(base, target string) bool {
-	path := filepath.Join(base, target)
+// TargetEscapesBase reports whether rel, resolved through symlinks, leaves
+// base. It classifies [os.Root] refusals for error messages; the root
+// remains the enforcement. A base behind a symlinked prefix (macOS /var)
+// is compared in both forms.
+func TargetEscapesBase(base, rel string) bool {
+	outside := func(target string) bool {
+		if !outsideBase(base, target) {
+			return false
+		}
+		evaluated, err := filepath.EvalSymlinks(base)
+		return err != nil || outsideBase(evaluated, target)
+	}
+	path := filepath.Join(base, rel)
 	resolved, err := filepath.EvalSymlinks(path)
 	if err == nil {
-		return outsideBase(base, resolved)
+		return outside(resolved)
 	}
 	info, lstatErr := os.Lstat(path)
 	if lstatErr != nil || info.Mode()&os.ModeSymlink == 0 {
@@ -196,7 +151,7 @@ func targetEscapesBase(base, target string) bool {
 	if !filepath.IsAbs(link) {
 		link = filepath.Join(filepath.Dir(path), link)
 	}
-	return outsideBase(base, filepath.Clean(link))
+	return outside(filepath.Clean(link))
 }
 
 // outsideBase uses path-aware containment so sibling directories sharing a prefix don't count as children.

@@ -94,12 +94,42 @@ then latency on success, or the typed failure code with the provider's HTTP stat
 and bounded, redacted message, e.g. `provider HTTP 404: {...}` for an
 account/endpoint restriction.
 
-### 02 · Hash-anchored edits that never corrupt a file
+### 02 · Line-anchored edits that never corrupt a file
 
-The model points at content by hash instead of retyping whole lines, so whitespace
-battles and "string not found" loops just stop. Edit a file that drifted and the
-anchors diverge — the patch is rejected before it can scramble your code, with a
-recovery hint the model uses to re-read and retry.
+`read` and `grep` label every file with a 4-hex content tag, `[path#TAG]`, and
+`LINE:TEXT` rows. The `hashline` tool edits by those line numbers instead of
+retyping old text, so whitespace battles and "string not found" loops just stop:
+
+```
+[internal/demo/demo.go#1A2B]
+PUT 8*:
++func Sub(a, b int) int {
++	return b - a
++}
+CUT 3.=6 @add
+[internal/demo/util.go#3C4D]
+PUT >$ @add
+```
+
+`PUT N.=M:` replaces lines, `PUT <N:`/`PUT >N:` insert (`<1` head, `>$` tail),
+`CUT` deletes and captures into a register that `PUT … @name` pastes (named
+registers persist across calls, the unlabeled one lasts one call), `REM` deletes
+the file and `MV DEST` renames it. `N*` targets the construct opening on line N
+without counting its lines: Go through `go/parser`, Markdown sections and code
+fences, brace matching for JS/TS, Java, C/C++, Rust, C#, Kotlin, Swift, PHP, Scala
+and JSON, and indentation for Python and YAML; other files use explicit ranges.
+
+Line numbers name the file as read, never shifted by earlier hunks. A section only
+applies if its tag names a version this session saw whose full SHA-256 matches the
+live file (a 16-bit tag collision is rejected), or, for a tag from before a
+resume, if the live content hashes to it. Hunks may touch only lines a `read`,
+`grep` or edit result actually displayed under that tag, may not overlap, and every
+section of a patch is validated before any file is written. Each result returns
+the new tag and a numbered preview of the changed lines to chain the next edit
+from; a stale tag is rejected with the current one and the rows around the lines
+you named. LF/CRLF endings and a UTF-8 BOM are preserved. `edit` (exact-text
+replacement) accepts the same 4-hex tag as its anchor, as well as the full anchor
+`lsp_rename` plans carry.
 
 ### 03 · Robust error handling that nudges the model back on track
 
@@ -303,15 +333,109 @@ job ids holding it, and the call that frees one (`wait`, `cancel`, ending the tu
 to receive pending notices, or `jobs` cleanup). Invalid task or command input
 names the field to fix.
 
+#### Messages between agents
+
+With `-enable-task`, the root and its running task children can talk through the
+`message` tool: `{"to":"parent"|"<job id>"|"all","body":"...","await_reply_ms":N}`.
+A send returns as soon as the message is durably in the recipient's mailbox; it
+never waits for the recipient to answer unless `await_reply_ms` (at most 300000)
+is set, in which case the call also returns the recipient's first message back
+(`reply`) or `reply_timed_out:true`. An awaited reply goes only to that call, never
+also into the transcript as a note. From the root, `all` is every running child;
+from a child it is the parent plus running siblings (a child coordinating a shared
+resource needs to reach both).
+
+A message is a steering item in the recipient's own durable queue, so a busy agent
+reads it at its next step boundary without being interrupted, and a root idling on
+its children is woken the way a completion notice wakes it. A child that is about
+to finish with a message pending takes another turn instead; once a child has
+finished, sending to it fails with its state. The recipient sees host text marked
+`[Message from parent]`, `[Message from job_… (child)]` or `(sibling)`, with the
+body flagged as untrusted and the `message` call to reply with. Each agent holds at
+most 100 unread messages; bodies are at most 8 KiB. Messages are journaled with
+idempotency keys derived from the sending tool call, so recovery delivers each
+exactly once. Plan mode denies `message` like `task`.
+
+#### Named background services
+
+Async `bash` takes an optional `name`, unique among the session's running jobs,
+and readiness conditions: `ready_log` (an RE2 regex matched against each output
+line) and/or `ready_port` (a TCP port on 127.0.0.1), with `ready_timeout_ms`
+(default 30000, at most 300000). With a condition the call returns once every
+condition holds, with `readiness:"ready"` and the matched line or port in
+`ready_match`; if the process exits first, or the deadline passes (the process is
+then killed, reason `ready_timeout`), the call fails with the output tail. A ready
+service doesn't keep the run open: it runs until it exits, until it is cancelled,
+or until the run ends, which stops it. Unless `timeout` is given it is not bounded
+by the bash timeout. `jobs` lists `name` and `readiness`; `cancel` and `logs` take
+`name` in place of `job_id`, and `wait` takes `names` besides `job_ids`. A name
+resolves to its running job, else the one started last. Starting a name that is
+already running fails with the job holding it; restart a service with `cancel
+{"name":…}` and start it again.
+
 ### 09 · Reads that summarize, not dump
 
 Point `read` at a source file and it returns a structural outline — declarations
 without bodies — so the agent orients in a large file without spending the context
 window on lines it doesn't need yet.
 
+`read` takes more than files. Every text output below starts with the
+`[path#TAG]` header and accepts the same `path:START-END` / `path:START+COUNT`
+line ranges and `offset`/`limit` paging:
+
+| Path | Output |
+|---|---|
+| `src/` | the directory's entries, directories with a trailing `/` (500 at most) |
+| `bundle.zip`, `.tar`, `.tar.gz`, `.tgz` | the archive's members with sizes (1000 at most) |
+| `bundle.zip:dir/file.txt` | one member, read in memory (16 MiB cap, nothing extracted to disk); `bundle.zip:dir` lists a folder |
+| `report.docx`, `.xlsx`, `.pptx` | the document's extracted text |
+| `package.json?q=.scripts \| keys` | a JSON query, printed as indented JSON |
+
+The JSON query is a small jq subset implemented in-house: `.` (identity),
+`.a.b`, `."any key"` and `.["any key"]`, `.[0]` and `.[-1]`, `.[]` (array
+elements or object values), `?` after any step to skip values of the wrong type
+instead of failing (`.items[]?.name?`), `keys`, `length`, and `|` pipes. Object
+keys print sorted. Queries combine with members (`bundle.zip:data.json?q=.a`).
+PDFs and SQLite databases are refused with a pointer to `pdftotext` or
+`sqlite3` through `bash`.
+
+#### Internal URLs
+
+`read` and `grep` resolve four schemes, so the agent can name things that do not
+live in the workspace:
+
+| URL | Resolves to |
+|---|---|
+| `skill://<name>` | the skill's `SKILL.md`; `skill://<name>/` lists the skill's directory and `skill://<name>/<path>` reads a file beside it |
+| `job://` | the session tree's background jobs, one per line |
+| `job://<job_id>` | one job's record: state, exit code, command or task, artifacts; `job://<job_id>/` lists its files |
+| `job://<job_id>/<file>` | one artifact: `output.log`, `result.txt`, `changes.patch` |
+| `history://` | the child sessions, with their job ids |
+| `history://<id>` | a child's transcript rendered as text, by task job id or child session id |
+| `local://<path>` | a private scratch directory, `<journal>.d/local/`, shared by the root session and its children |
+
+`local://` is the one writable scheme: `write` and `edit` accept it, so an agent
+hands a large payload to a child (or back to its parent) by writing
+`local://plan.md` and passing the URL instead of pasting the text. Every scheme is
+rooted: `..` is refused, file access goes through an `os.Root` on the scheme's
+directory, and a symlink that leads outside it is refused. A child resolves
+`local://`, `job://` and `history://` against its root session, so a session tree
+shares one namespace and other sessions stay out of reach. `job://`, `history://`
+and `local://` need a journaled session. `?`, `#` and `%` in names are
+percent-encoded, and so are spaces inside `bash` commands (`local://my%20notes.md`).
+
+In `bash`, a `skill://` or `local://` word is rewritten to its quoted absolute
+path before the command runs (`cat skill://deploy/SKILL.md`,
+`python3 local://extract.py > local://out.json`; a bare `skill://<name>` is the
+skill's directory). Only whole words expand, bare or quoted in full; a URL inside
+longer quoted text or glued to other characters stays as written. The rewrite
+happens before the permission gate, so the destructive-command guard and the
+cloud tiers judge the real paths, and a word that cannot resolve fails the call
+with the reason instead of running.
+
 ## Every tool, in one namespace
 
-Twenty-two built-in tools share one namespace, **13 of them on by default**; pin the
+Twenty-four built-in tools share one namespace, **14 of them on by default**; pin the
 active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
 All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
 fall back to pure Go when `rg`/`fd` are absent. Both search hidden files, honor
@@ -321,7 +445,8 @@ open this session's own job artifacts (`<journal>.d/jobs/<job>/` `changes.patch`
 `result.txt`, `output.log`), its `progress.md` checkpoint, and spilled tool output
 under `<journal>.d/tool-output/` (the "Full output: <path>" of truncated bash
 output, tool results cleared from context, and oversized MCP results). Child
-journals, worktrees and every other path outside the workspace stay refused.
+journals, worktrees and every other path outside the workspace stay refused,
+except through the internal URLs above (`local://` is writable).
 Spilled output lives as long as the session's files do.
 
 Model tools use snake_case keys in both arguments and results (`job_id`,
@@ -330,25 +455,27 @@ wire methods use camelCase (`jobId`, `jobIds`).
 
 **Files & search**
 
-- `read` — files, directories, and internal `://` resources through one path, with structural outlines for code.
-- `write` — create or overwrite a file.
-- `edit` — hash-anchored patches with stale-anchor rejection and recovery.
-- `grep` — regex search across the tree.
+- `read` — files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`), with structural outlines for code.
+- `write` — create or overwrite a file, or a `local://` scratch file.
+- `edit` — exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor); also edits `local://` files.
+- `hashline` — line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers; see [02](#02--line-anchored-edits-that-never-corrupt-a-file).
+- `grep` — regex search across the tree, or under an internal URL.
 - `find` — glob-based path lookup.
 - `ls` — directory listing.
 
 **Runtime**
 
-- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `async:true` starts a supervised background job.
-- `jobs` — page durable job summaries, or explicitly clean one exported worktree.
-- `wait` — wait for any requested job, without cancelling it on wait timeout.
-- `cancel` — cancel one task or background bash job.
-- `logs` — page a background command's bounded stdout/stderr by byte offset.
+- `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `async:true` starts a supervised background job, optionally a named service that returns once `ready_log`/`ready_port` holds.
+- `jobs` — page durable job summaries (with service name and readiness), or explicitly clean one exported worktree.
+- `wait` — wait for any requested job, by id or service name, without cancelling it on wait timeout.
+- `cancel` — cancel one task or background bash job, by id or service name.
+- `logs` — page a background command's bounded stdout/stderr by byte offset, by id or service name.
 
 **Coordination**
 
 - `task` — admit asynchronous children and return job handles *(behind `-enable-task`)*.
-- `todo_write` — ordered task list with phase tracking, checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace.
+- `message` — message the parent, a running child, or all peers, optionally awaiting the first reply *(behind `-enable-task`; children get it too)*.
+- `todo_write` — the task list, replaced in full (`todos`) or edited by one op naming todos by content (`init`, `append`, `start`, `done`, `block` with a reason, `drop`), with optional phases; checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace, and the result shows the updated list.
 
 **Context**
 
@@ -516,10 +643,12 @@ old conversation history. A slow consumer never blocks the agent: if the
 marker and the final report, stderr explains the incomplete stream, and
 the command exits 1. A broken pipe cancels and joins the run.
 
-Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output` and
-`tempest/compaction` updates as ACP/Go watchers. Output events only announce byte
-availability; read command logs separately. Child transcripts/thinking aren't
-forwarded into the parent stream, and the final run-report shape is unchanged.
+Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output`,
+`tempest/message` and `tempest/compaction` updates as ACP/Go watchers. Output
+events only announce byte availability; read command logs separately. Child
+transcripts/thinking aren't forwarded into the parent stream, but every
+agent-to-agent message is, as `tempest/message`. The final run-report shape is
+unchanged.
 
 ## MCP tools
 

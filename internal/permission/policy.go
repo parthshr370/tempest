@@ -143,9 +143,11 @@ func ClassifyTool(toolName string) Tier {
 	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
 		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff":
 		return TierRead
-	case "write", "edit", "todo_write":
+	case "write", "edit", "hashline", "todo_write":
 		return TierWrite
 	default:
+		// Includes message: it directs other agents' work, so plan mode
+		// denies it like task.
 		return TierExec
 	}
 }

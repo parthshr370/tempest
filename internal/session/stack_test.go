@@ -89,7 +89,7 @@ func TestBuildAndPlanStacksProjectTheirActiveToolSets(t *testing.T) {
 		t.Fatal(err)
 	}
 	planPrompt := planStack.Agent.State().SystemPrompt
-	if !strings.Contains(planPrompt, "- read: Read file contents") {
+	if !strings.Contains(planPrompt, "- read: Read files, directories") {
 		t.Fatalf("plan prompt did not project active read tool:\n%s", planPrompt)
 	}
 	if strings.Contains(planPrompt, "- write:") || strings.Contains(planPrompt, "- edit:") {

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"go.harness.dev/harness/internal/document"
+	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/skills"
 )
 
@@ -37,10 +38,12 @@ var originalToolSchemas = map[ToolName]string{
 	GrepTool:  `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"ignore_case":{"type":"boolean"},"literal":{"type":"boolean"},"context":{"type":"number"},"limit":{"type":"number"}},"required":["pattern"]}`,
 	FindTool:  `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"limit":{"type":"number"}},"required":["pattern"]}`,
 	LsTool:    `{"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"number"}}}`,
-	TodoTool:  `{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed"]},"priority":{"type":"string","enum":["high","medium","low"]}},"required":["content","status"]}}},"required":["todos"]}`,
+	TodoTool:  `{"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","completed","blocked","dropped"]},"priority":{"type":"string","enum":["high","medium","low"]},"phase":{"type":"string"},"blocker":{"type":"string"}},"required":["content","status"]}},"op":{"type":"string","enum":["init","start","done","block","append","drop"]},"phase":{"type":"string"},"items":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":[]}`,
 	SkillTool: `{"type":"object","properties":{"name":{"type":"string","description":"the skill name to load"},"command":{"type":"string"}},"required":[]}`,
 	WebFetch:  `{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"number"}},"required":["url"]}`,
 	WebSearch: `{"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"number"}},"required":["query"]}`,
+	// hashline postdates the migration; its fixture freezes the one-argument surface.
+	HashlineTool: `{"type":"object","properties":{"input":{"type":"string","description":"the hashline patch: [PATH#TAG] sections with PUT/CUT/REM/MV ops"}},"required":["input"]}`,
 }
 
 func TestToolSchemaParity(t *testing.T) {
@@ -75,6 +78,28 @@ func TestIntelligenceSchemasMatchDesign(t *testing.T) {
 	cwd := t.TempDir()
 	all := AllTools(cwd, ToolsOptions{LSP: newInertLSPManager(t, cwd)})
 	for name, want := range intelligenceToolSchemas {
+		tool, ok := all[name]
+		if !ok {
+			t.Fatalf("tool %s not built", name)
+		}
+		assertSchemaParity(t, string(name), tool.Parameters, want)
+	}
+}
+
+// coordinationToolSchemas are the message tool and the job tools of a durable
+// root session, where bash gains async and service arguments.
+var coordinationToolSchemas = map[ToolName]string{
+	MessageTool: `{"type":"object","properties":{"to":{"type":"string","description":"\"parent\", a running child's job id, or \"all\""},"body":{"type":"string","description":"message text, at most 8 KiB"},"await_reply_ms":{"type":"integer","minimum":0,"maximum":300000,"description":"wait this long for the recipient's first message back; 0 or absent returns at once"}},"required":["to","body"]}`,
+	BashTool:    `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"number"},"async":{"type":"boolean"},"name":{"type":"string","description":"async only: a name unique among running jobs; jobs, wait, cancel and logs accept it in place of the job id"},"ready_log":{"type":"string","description":"async only: RE2 regex; the call returns once an output line matches"},"ready_port":{"type":"integer","minimum":1,"maximum":65535,"description":"async only: the call returns once 127.0.0.1:<port> accepts TCP connections"},"ready_timeout_ms":{"type":"integer","minimum":1,"maximum":300000,"description":"readiness deadline, default 30000; on timeout the process is killed"}},"required":["command"]}`,
+	WaitTool:    `{"type":"object","properties":{"job_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"uniqueItems":true},"names":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":8,"uniqueItems":true,"description":"service names, in place of or besides job_ids"},"timeout":{"type":"number"}},"required":[]}`,
+	CancelTool:  `{"type":"object","properties":{"job_id":{"type":"string"},"name":{"type":"string","description":"an async bash service name, in place of job_id"}},"required":[]}`,
+	LogsTool:    `{"type":"object","properties":{"job_id":{"type":"string"},"name":{"type":"string","description":"an async bash service name, in place of job_id"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":[]}`,
+}
+
+func TestCoordinationSchemas(t *testing.T) {
+	bus := irc.New(nil, nil)
+	all := AllTools(t.TempDir(), ToolsOptions{Work: &serviceController{}, Messenger: bus.Register(irc.Parent, &memoryMailbox{})})
+	for name, want := range coordinationToolSchemas {
 		tool, ok := all[name]
 		if !ok {
 			t.Fatalf("tool %s not built", name)

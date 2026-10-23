@@ -19,11 +19,24 @@ const (
 	FollowUp QueueKind = "follow_up"
 )
 
+// MessageKeyPrefix reserves queue idempotency keys for agent-to-agent
+// messages; MailboxCap bounds one agent's unread messages.
+// DefaultReadyTimeoutMS and MaxReadyTimeoutMS bound a service's readiness wait.
+const (
+	MessageKeyPrefix      = "msg:"
+	MailboxCap            = 100
+	DefaultReadyTimeoutMS = 30000
+	MaxReadyTimeoutMS     = 300000
+)
+
 type QueueInput struct {
 	Kind        QueueKind
 	Text        string
 	Key         string // optional session-scoped idempotency key
 	SourceJobID string // internal only, never accepted from wire
+	// SourceAgent marks an agent-to-agent message: "parent" or the sending
+	// child's job id. Internal only, never accepted from wire.
+	SourceAgent string
 }
 type QueueItem struct {
 	ID          string    `json:"id"`
@@ -31,6 +44,7 @@ type QueueItem struct {
 	Text        string    `json:"text"`
 	Key         string    `json:"key,omitempty"`
 	SourceJobID string    `json:"sourceJobId,omitempty"`
+	SourceAgent string    `json:"sourceAgent,omitempty"`
 	EnqueuedAt  time.Time `json:"enqueuedAt"`
 }
 type QueuedMessage struct {
@@ -73,6 +87,13 @@ type TaskSpec struct {
 type BashSpec struct {
 	Command        string `json:"command"`
 	TimeoutSeconds int    `json:"timeout_seconds"` // normalized internal spec
+	// Name, unique among the session's running jobs, addresses a service.
+	Name string `json:"name,omitempty"`
+	// ReadyLog and ReadyPort are the service's readiness conditions; every
+	// condition given must hold before StartBash returns.
+	ReadyLog       string `json:"ready_log,omitempty"`
+	ReadyPort      int    `json:"ready_port,omitempty"`
+	ReadyTimeoutMS int    `json:"ready_timeout_ms,omitempty"`
 }
 
 // JobArtifactsDir is the directory inside a session's data directory
@@ -106,8 +127,11 @@ type Job struct {
 	ValueInResult  bool            `json:"valueInResult,omitempty"` // inline Value omitted to bound response
 	Usage          types.Usage     `json:"usage"`                   // this job; do not add to global total again
 	ExitCode       *int            `json:"exitCode,omitempty"`
-	Reason         string          `json:"reason,omitempty"`  // bounded machine reason, no raw args
-	Cleanup        string          `json:"cleanup,omitempty"` // none | retained | removed | blocked
+	Reason         string          `json:"reason,omitempty"`     // bounded machine reason, no raw args
+	Cleanup        string          `json:"cleanup,omitempty"`    // none | retained | removed | blocked
+	Name           string          `json:"name,omitempty"`       // bash service name
+	Readiness      string          `json:"readiness,omitempty"`  // waiting | ready | not_ready, for jobs with a readiness condition
+	ReadyMatch     string          `json:"readyMatch,omitempty"` // the matched log line and/or "127.0.0.1:<port>"
 }
 type JobPage struct {
 	Jobs       []Job  `json:"jobs"`
@@ -128,6 +152,9 @@ type Controller interface {
 	Cancel(context.Context, string) (Job, error)
 	Logs(context.Context, string, int64, int) (LogPage, error)
 	Cleanup(context.Context, string) (Job, error)
+	// JobByName resolves a service name: the running job with that name,
+	// else the most recently started one.
+	JobByName(context.Context, string) (Job, error)
 }
 type Fact struct {
 	Kind    string
@@ -135,9 +162,10 @@ type Fact struct {
 	Payload json.RawMessage
 }
 type Event struct {
-	Kind            string // job | job_output | queue | compaction
+	Kind            string // job | job_output | queue | compaction | message
 	Job             *Job
 	Queue           *QueueItem
+	Message         *AgentMessage
 	Action          string
 	Bytes           int64
 	Reason          string
@@ -147,6 +175,17 @@ type Event struct {
 	ChildSessionID  string
 	ChildToolCallID string
 	ChildTitle      string
+}
+
+// AgentMessage is one delivered agent-to-agent message as the wire reports it.
+// From and To are "parent" or a child's job id.
+type AgentMessage struct {
+	ID       string `json:"id"`
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Body     string `json:"body"`
+	Delivery string `json:"delivery"` // mailbox | reply (handed to the recipient's awaiting message call)
+	QueueID  string `json:"queueId,omitempty"`
 }
 type Ceiling struct {
 	Mode        string

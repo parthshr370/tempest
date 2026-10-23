@@ -17,6 +17,9 @@ type ToolHandle struct {
 	Kind           string `json:"kind"`
 	State          string `json:"state"`
 	ChildSessionID string `json:"child_session_id,omitempty"`
+	Name           string `json:"name,omitempty"`
+	Readiness      string `json:"readiness,omitempty"`
+	ReadyMatch     string `json:"ready_match,omitempty"`
 }
 
 // ToolJob is a Job as model tools render it. Run and tool-call correlation
@@ -42,6 +45,9 @@ type ToolJob struct {
 	ExitCode       *int            `json:"exit_code,omitempty"`
 	Reason         string          `json:"reason,omitempty"`
 	Cleanup        string          `json:"cleanup,omitempty"`
+	Name           string          `json:"name,omitempty"`
+	Readiness      string          `json:"readiness,omitempty"`
+	ReadyMatch     string          `json:"ready_match,omitempty"`
 }
 
 // ToolUsage is a job's token and cost usage as model tools render it.
@@ -73,7 +79,7 @@ type ToolLogPage struct {
 
 // Handle returns the admission handle for job.
 func (job Job) Handle() ToolHandle {
-	return ToolHandle{JobID: job.ID, Kind: job.Kind, State: job.State, ChildSessionID: job.ChildSessionID}
+	return ToolHandle{JobID: job.ID, Kind: job.Kind, State: job.State, ChildSessionID: job.ChildSessionID, Name: job.Name, Readiness: job.Readiness, ReadyMatch: job.ReadyMatch}
 }
 
 // ToolView returns job as model tools render it.
@@ -84,6 +90,7 @@ func (job Job) ToolView() ToolJob {
 		Cwd: job.Cwd, Isolation: job.Isolation, BaseCommit: job.BaseCommit, ResultText: job.ResultText,
 		Result: job.Result, Patch: job.Patch, Output: job.Output, Value: job.Value, ValueInResult: job.ValueInResult,
 		Usage: toolUsage(job.Usage), ExitCode: job.ExitCode, Reason: job.Reason, Cleanup: job.Cleanup,
+		Name: job.Name, Readiness: job.Readiness, ReadyMatch: job.ReadyMatch,
 	}
 }
 
