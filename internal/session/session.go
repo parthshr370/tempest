@@ -1,6 +1,9 @@
 package session
 
 import (
+	"slices"
+	"strings"
+
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/skills"
@@ -13,8 +16,10 @@ func BuildToolRegistry(cwd string, opts tools.ToolsOptions) map[tools.ToolName]a
 }
 
 // SelectActive filters a tool map by allowed/excluded name lists. When allowed
-// is empty, all tools are active (minus excluded); otherwise only those in
-// allowed but not in excluded are returned.
+// is empty, all tools are active (minus excluded) in name order; otherwise only
+// those in allowed but not in excluded are returned, in allowed order. The
+// order is deterministic because the tool list heads every provider request:
+// a reshuffle between requests or sessions would miss the prompt cache.
 func SelectActive(all map[tools.ToolName]agent.AgentTool, allowed, excluded []string, mode string) []agent.AgentTool {
 	allowAll := len(allowed) == 0
 	allowedSet := map[string]bool{}
@@ -34,6 +39,7 @@ func SelectActive(all map[tools.ToolName]agent.AgentTool, allowed, excluded []st
 			}
 			active = append(active, tool)
 		}
+		slices.SortFunc(active, func(left, right agent.AgentTool) int { return strings.Compare(left.Name, right.Name) })
 		return active
 	}
 

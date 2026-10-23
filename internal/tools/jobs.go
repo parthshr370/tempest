@@ -75,14 +75,14 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 		parameters = schema.ObjectRequired(schema.JSON{"cursor": schema.String(), "limit": schema.Number(), "action": schema.JSON{"type": "string", "enum": []string{"list", "cleanup"}}, "job_id": schema.String()}, []string{})
 		description = "List durable session jobs, or explicitly clean up one terminal job's owned worktree. Cleanup never applies its patch."
 	case WaitTool:
-		parameters = schema.ObjectRequired(schema.JSON{"job_ids": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true}, "names": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "service names, in place of or besides job_ids"}, "timeout": schema.Number()}, []string{})
-		description = "Wait for any requested job to settle. Pass job_ids, names (async bash service names) or both. Timeout stops waiting, not the jobs. Automatic completion follow-ups remain pending."
+		parameters = schema.ObjectRequired(schema.JSON{"job_ids": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true}, "names": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "background bash job names, in place of or besides job_ids"}, "timeout": schema.Number()}, []string{})
+		description = "Wait for any requested job to settle. Pass job_ids, names (the name given to a background bash job) or both. Timeout stops waiting, not the jobs. Automatic completion follow-ups remain pending."
 	case CancelTool:
-		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "an async bash service name, in place of job_id"}}, []string{})
-		description = "Durably request cancellation of one session-owned job, by job_id or by service name. Use wait for its joined terminal state."
+		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "a background bash job's name, in place of job_id"}}, []string{})
+		description = "Durably request cancellation of one session-owned job, by job_id or by background bash job name. Use wait for its joined terminal state."
 	case LogsTool:
-		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "an async bash service name, in place of job_id"}, "offset": schema.Number(), "limit": schema.Number()}, []string{})
-		description = "Read bounded background bash output using raw byte offsets, by job_id or by service name. Task output is its result artifact, not logs."
+		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "a background bash job's name, in place of job_id"}, "offset": schema.Number(), "limit": schema.Number()}, []string{})
+		description = "Read bounded background bash output using raw byte offsets, by job_id or by background bash job name. Task output is its result artifact, not logs."
 	}
 	return agent.AgentTool{Tool: types.Tool{Name: string(name), Description: description, Parameters: parameters}, Label: string(name), Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 		var input struct {

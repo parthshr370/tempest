@@ -67,8 +67,25 @@ func TestAsyncBashServiceArguments(t *testing.T) {
 	if _, err = tool.Execute(context.Background(), "raw", json.RawMessage(`{"command":"serve","async":true,"name":"plain"}`), nil); err != nil || controller.bash.TimeoutSeconds != 60 {
 		t.Fatalf("a name alone is not a service: timeout=%d %v", controller.bash.TimeoutSeconds, err)
 	}
-	if _, err = tool.Execute(context.Background(), "raw", json.RawMessage(`{"command":"true","name":"web"}`), nil); err == nil || !strings.Contains(err.Error(), "async:true") {
-		t.Fatalf("synchronous service=%v", err)
+	// A name or a readiness condition makes the command a background job
+	// without async; the benchmark model sent exactly these shapes.
+	for _, test := range []struct {
+		args string
+		want work.BashSpec
+	}{
+		{`{"command":"bash scripts/make_marker.sh","name":"make_marker","timeout":60}`, work.BashSpec{Command: "bash scripts/make_marker.sh", TimeoutSeconds: 60, Name: "make_marker"}},
+		{`{"command":"serve","name":"web","ready_port":8080}`, work.BashSpec{Command: "serve", TimeoutSeconds: maxTimeoutSeconds, Name: "web", ReadyPort: 8080}},
+		{`{"command":"serve","ready_log":"listening","async":false}`, work.BashSpec{Command: "serve", TimeoutSeconds: maxTimeoutSeconds, ReadyLog: "listening"}},
+	} {
+		controller.bash = work.BashSpec{}
+		result, err := tool.Execute(context.Background(), "raw", json.RawMessage(test.args), nil)
+		if err != nil || controller.bash != test.want || !strings.Contains(textOf(result), `"job_id":"job_web"`) {
+			t.Fatalf("%s: spec=%+v err=%v, want %+v", test.args, controller.bash, err, test.want)
+		}
+	}
+	child := newBashTool(t.TempDir(), ToolsOptions{Work: controller, Child: true, BashTimeout: time.Minute})
+	if _, err = child.Execute(context.Background(), "raw", json.RawMessage(`{"command":"true","name":"web"}`), nil); err == nil || !strings.Contains(err.Error(), "child bash runs in the foreground only") {
+		t.Fatalf("child named bash=%v", err)
 	}
 }
 

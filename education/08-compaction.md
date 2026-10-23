@@ -28,13 +28,11 @@ The fix is structural: rule bodies go into `GenericRules`, which `RebuildSystemP
 
 This is the "sticky-reattachment contract" verified in `item11-spec.md:60`. It matters because a second compaction would summarize the first compaction's summary message, but the system prompt is always the original text.
 
-### Tool-result projection: a staging pass before the threshold check
+### History stays byte-stable between compactions
 
-The conversation contains tool results — sometimes enormous (think `grep` output or a full file read). Before token estimation, a `TransformContext` pass runs `ProjectToolResults`: it walks messages backward, keeps the 16 most recent tool results, and clears the rest. When `SpillToolResults` is enabled, cleared results are written to disk (`.harness/tool-outputs/<hash>.txt`) and replaced with a path placeholder in context. Without spilling, they become an inline `[Tool result cleared...]` notice.
+Compaction is the only pass that rewrites history the model has already seen. Between compactions, every provider request is the previous request plus the new messages, byte for byte, so the provider's prompt cache serves the whole prefix and only the new turn is billed at the uncached rate.
 
-This projection is *not* compaction. It's a pre-pass that runs before *every* provider request, regardless of token budget. It ensures the context doesn't carry stale tool outputs that the model can't even inspect. The `TransformContext` callback is set in `stack.go:131` via `compaction.Transform(opts)`, and the agent loop calls it at the top of `streamAssistantResponse` before building the LLM context.
-
-The projection is also what makes token estimation tractable: without it, a single 50k-character `read` result would dominate the count, and the threshold check would trigger prematurely.
+An earlier design ran a per-request projection that kept the 16 most recent tool results and replaced older ones with "cleared" placeholders. Once a session passed 16 tool results, each request rewrote one more old result, deep in the history, so every request diverged from its predecessor early and the cached prefix stopped growing: in the 2026-10-23 cross-harness benchmark, every long Tempest run's cached tokens froze at about 4.9k from the 17th tool result on (`context/bench/results/20261023T131649Z`). The projection was removed. Tool output is already capped when the tool runs, and compaction, which estimates the full history, handles real context pressure.
 
 ### Compaction is a separate, non-streaming internal call
 
@@ -138,22 +136,6 @@ Rebuilds the message list:
 3. If the first kept message is a user message, merges the summary into it (prepends as a text block) to avoid two consecutive user turns, which Anthropic rejects
 4. Otherwise appends the summary as a standalone user message before the kept suffix
 
-### Tool-result projection
-
-```go
-// compaction.go:450-486
-func ProjectToolResults(ctx context.Context, messages []ptypes.Message, opts TransformOptions) ([]ptypes.Message, error)
-```
-
-Walks messages backward. Keeps the most recent `ToolUseWindow` (default 16) tool results. Clears older ones: either spills to disk with a path placeholder, or replaces with an inline `[Tool result cleared...]` notice.
-
-```go
-// compaction.go:439-447
-func Transform(opts TransformOptions) func(context.Context, []ptypes.Message) []ptypes.Message
-```
-
-Returns a `TransformContext`-compatible closure. On `ProjectToolResults` error, returns the original messages unchanged — the loop proceeds with untrimmed history rather than breaking.
-
 ### Session wiring
 
 ```go
@@ -189,24 +171,9 @@ The core gate: estimates tokens, checks the threshold, converts to entries, prep
 
 ## How it works
 
-The compaction pass has three phases: projection, threshold check, and summarization + re-injection.
+The compaction pass has two phases: threshold check, and summarization + re-injection. Nothing rewrites history before an ordinary request.
 
-### Phase 1: Projection (before every request)
-
-Every provider request passes through `TransformContext` (`stack.go:131`):
-
-```
-Agent.Prompt/Continue
-  → AgentLoopConfig.TransformContext   (compaction.Transform)
-    → ProjectToolResults(ctx, messages, opts)
-      → walk backward, keep 16 most recent tool results
-      → spill/clear older ones
-  → streamAssistantResponse            (builds LLM context from projected messages)
-```
-
-This runs unconditionally. It ensures stale tool outputs don't consume the token budget used for threshold decisions.
-
-### Phase 2: Threshold check (between turns)
+### Phase 1: Threshold check (between turns)
 
 After a turn completes, the agent loop calls `PrepareNextTurn` (which delegates to `PrepareNextTurnWithContext`):
 
@@ -223,7 +190,7 @@ AgentLoop.runAgentLoop
 
 `EstimateContextTokens` prefers real provider usage from the last assistant message. It falls back to character-count estimates (÷4) for messages after the last usage-carrying message. This prevents double-counting: prior-compacted entries are excluded from estimation because `buildSessionContext` skips entries before the last compaction's `FirstKeptEntryID`.
 
-### Phase 3: Summarization and re-injection
+### Phase 2: Summarization and re-injection
 
 When the threshold is crossed:
 
@@ -339,14 +306,14 @@ This is the "accept interfaces, return structs" pattern applied to compaction: `
 
 | File | Key symbols |
 |---|---|
-| `internal/compaction/compaction.go` | `ShouldCompact`, `PrepareCompaction`, `Compact`, `ApplyCompaction`, `GenerateSummary`, `runSummarization`, `ProjectToolResults`, `Transform`, `SerializeConversation`, `EstimateContextTokens`, `FindCutPoint`, `FindTurnStartIndex`, `FormatFileOperations`, `CompactionSettings`, `CompactionPreparation`, `SessionEntry`, `CutPointResult`, `TransformOptions` |
-| `internal/compaction/compaction_test.go` | threshold tests, cut-point tests, projection/spill tests, build-session-context tests |
+| `internal/compaction/compaction.go` | `ShouldCompact`, `PrepareCompaction`, `Compact`, `ApplyCompaction`, `GenerateSummary`, `runSummarization`, `SerializeConversation`, `EstimateContextTokens`, `FindCutPoint`, `FindTurnStartIndex`, `FormatFileOperations`, `CompactionSettings`, `CompactionPreparation`, `SessionEntry`, `CutPointResult` |
+| `internal/compaction/compaction_test.go` | threshold tests, cut-point tests, build-session-context tests |
 | `internal/compaction/compaction_apply_test.go` | `TestApplyCompactionMergesIntoKeptUser`, `TestApplyCompactionStandaloneBeforeAssistant`, `TestCompactGeneratesSummaryWithFileOps`, `TestCompactRejectsEmptySummary` |
 | `internal/compaction/compaction_ref_test.go` | reference parity tests |
 | `internal/session/compact.go` | `compactionRunner`, `newCompactionRunner`, `hook`, `maybeCompact`, `messagesToEntries` |
 | `internal/session/compact_test.go` | sticky-rules compaction persistence test |
 | `internal/session/stack.go:139-152` | `BuildAgentStack` wiring: `newCompactionRunner` → `runner.hook(Agt.SetMessages)` → `PrepareNextTurnWithContext` |
-| `internal/agent/runtime.go:84,93` | `TransformContext` (projection pass), `PrepareNextTurnWithContext` (compaction hook) |
+| `internal/agent/runtime.go:84,93` | `TransformContext` (optional per-request hook; the coding stack sets none), `PrepareNextTurnWithContext` (compaction hook) |
 | `internal/agent/loop.go:227-249` | `PrepareNextTurn` call site in the turn loop |
 | `internal/retry/error.go:100-124,196-198` | `Classify` → `isContextOverflow` → `CodeContextOverflow` (non-retryable); the boundary between retry and compaction |
 | `internal/retry/stream.go:46-50,138-180` | `Retrier.Stream`, `retryFailure`, `retryClassified` — transport retry that never touches compaction |

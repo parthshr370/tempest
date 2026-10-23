@@ -185,11 +185,13 @@ type Budget struct {
 }
 
 // ErrUnknownPrice is returned when a cost budget is set for a model whose
-// price is unknown: the budget could never trip, so the run must not start.
+// price is unknown and whose route does not report billed cost: the budget
+// could never trip, so the run must not start.
 var ErrUnknownPrice = errors.New("model price is unknown")
 
 // Validate rejects negative or non-finite limits and a cost budget that cannot
-// be enforced for model.
+// be enforced for model. A route that reports billed cost is enforceable
+// without a catalog price.
 func (b Budget) Validate(model types.Model) error {
 	if math.IsNaN(b.MaxCostUSD) || math.IsInf(b.MaxCostUSD, 0) {
 		return fmt.Errorf("budget max cost must be finite: %g", b.MaxCostUSD)
@@ -197,7 +199,7 @@ func (b Budget) Validate(model types.Model) error {
 	if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallTime < 0 {
 		return fmt.Errorf("budget limits must not be negative (max turns %d, max cost %g, max wall time %s)", b.MaxTurns, b.MaxCostUSD, b.MaxWallTime)
 	}
-	if b.MaxCostUSD > 0 && model.Cost.Unknown {
+	if b.MaxCostUSD > 0 && model.Cost.Unknown && !model.ReportsBilledCost() {
 		return fmt.Errorf("cost budget $%g cannot be enforced for %s/%s: %w", b.MaxCostUSD, model.Provider, model.ID, ErrUnknownPrice)
 	}
 	return nil

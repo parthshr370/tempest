@@ -1,9 +1,10 @@
 // Package compaction implements the context-compaction layer: when the
-// conversation grows too large, old tool results are summarized and spilled
-// outside the project directory, leaving named cleared-result placeholders in
-// context. A 16-tool-use projection window keeps the working set visible.
-// Prior-compacted entries are skipped in token counting so the estimate doesn't
-// inflate across multiple compaction passes.
+// estimated context approaches the model's window, older turns are summarized
+// and replaced by one summary message, keeping recent turns verbatim.
+// Compaction is the only rewrite of history the model has seen: between
+// compactions every request extends the previous one, so the provider's prompt
+// cache keeps the whole prefix. Prior-compacted entries are skipped in token
+// counting so the estimate doesn't inflate across multiple compaction passes.
 package compaction
 
 import (
@@ -11,14 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"math"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"go.harness.dev/harness/internal/agent"
 	ptypes "go.harness.dev/harness/internal/engine/types"
@@ -34,8 +31,6 @@ const (
 	// estimate.EstimatedDocumentPageChars so ShouldCompact and the context
 	// clamp weight attachments the same way.
 	EstimatedDocumentPageChars = 3000 * 4
-	// DefaultToolWindow is the default number of recent tool results to keep visible when projecting.
-	DefaultToolWindow = 16
 
 	compactionSummaryPrefix = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
 	compactionSummarySuffix = "\n</summary>"
@@ -107,16 +102,6 @@ type CompactionPreparation struct {
 	PreviousSummary     string
 	FileOps             *FileOperations
 	Settings            CompactionSettings
-}
-
-// TransformOptions configures tool-result projection, including the window size and whether to spill results to disk.
-type TransformOptions struct {
-	Cwd              string
-	ToolUseWindow    int
-	SpillToolResults bool
-	// SpillDir is the absolute, outside-project directory for spilled tool output.
-	// It is required when SpillToolResults is true.
-	SpillDir string
 }
 
 // CreateFileOps starts empty read, written, and edited file sets for one conversation.
@@ -435,56 +420,6 @@ func PrepareCompaction(pathEntries []SessionEntry, settings CompactionSettings) 
 	return &CompactionPreparation{FirstKeptEntryID: firstKeptEntryID, MessagesToSummarize: messagesToSummarize, TurnPrefixMessages: turnPrefixMessages, IsSplitTurn: cutPoint.IsSplitTurn, TokensBefore: tokensBefore, PreviousSummary: previousSummary, FileOps: fileOps, Settings: settings}
 }
 
-// Transform returns a function that projects tool results onto messages according to opts. On error, the original messages are returned unchanged.
-func Transform(opts TransformOptions) func(context.Context, []ptypes.Message) []ptypes.Message {
-	return func(ctx context.Context, messages []ptypes.Message) []ptypes.Message {
-		projected, err := ProjectToolResults(ctx, messages, opts)
-		if err != nil {
-			return messages
-		}
-		return projected
-	}
-}
-
-// ProjectToolResults walks messages backward, clearing oldest tool results to fit within the tool-use window. When spilling is enabled, cleared results are written to disk and replaced with a path placeholder.
-func ProjectToolResults(ctx context.Context, messages []ptypes.Message, opts TransformOptions) ([]ptypes.Message, error) {
-	window := opts.ToolUseWindow
-	if window <= 0 {
-		window = DefaultToolWindow
-	}
-	spill := opts.SpillToolResults
-	if spill && opts.SpillDir == "" {
-		return nil, fmt.Errorf("compaction: SpillToolResults enabled without SpillDir")
-	}
-	keepRemaining := window
-	out := make([]ptypes.Message, len(messages))
-	copy(out, messages)
-	for i := len(out) - 1; i >= 0; i-- {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		result, ok := asToolResult(out[i])
-		if !ok {
-			continue
-		}
-		if keepRemaining > 0 {
-			keepRemaining--
-			continue
-		}
-		if spill {
-			path, err := spillToolResult(opts.SpillDir, result)
-			if err != nil {
-				return nil, err
-			}
-			result.Content = []ptypes.ContentBlock{ptypes.NewText(fmt.Sprintf("[Tool result cleared to save context. Tool: %s. Tool call ID: %s. Full output: %s]", result.ToolName, result.ToolCallID, path))}
-		} else {
-			result.Content = []ptypes.ContentBlock{ptypes.NewText(fmt.Sprintf("[Tool result cleared to save context. Tool: %s. Tool call ID: %s.]", result.ToolName, result.ToolCallID))}
-		}
-		out[i] = result
-	}
-	return out, nil
-}
-
 // findValidCutPoints never starts a kept slice on a tool result, so its call
 // stays in context with the result that answers it.
 
@@ -733,40 +668,6 @@ func truncateForSummary(text string, maxChars int) string {
 	return fmt.Sprintf("%s\n\n[... %d more characters truncated]", text[:maxChars], truncatedChars)
 }
 
-func spillToolResult(spillDir string, result ptypes.ToolResultMessage) (string, error) {
-	dir := spillDir
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return "", err
-	}
-	name := safeFileName(result.ToolCallID)
-	if name == "" {
-		name = fmt.Sprintf("tool-%d", time.Now().UnixNano())
-	} else {
-		name = name + "-" + shortHash(result.ToolCallID)
-	}
-	path := filepath.Join(dir, name+".txt")
-	content := fmt.Sprintf("Tool: %s\nTool call ID: %s\n\n%s", result.ToolName, result.ToolCallID, toolResultText(result))
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
-func safeFileName(id string) string {
-	var b strings.Builder
-	for _, r := range id {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '.' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
-	}
-	return strings.Trim(b.String(), ".")
-}
-
 func formatToolArgs(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -818,12 +719,6 @@ func orderedJSONObject(raw json.RawMessage) ([]orderedJSONValue, bool) {
 	return values, true
 }
 
-func shortHash(value string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(value))
-	return fmt.Sprintf("%08x", h.Sum32())
-}
-
 func jsonString(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return "{}"
@@ -849,18 +744,6 @@ func asAssistant(message ptypes.Message) (ptypes.AssistantMessage, bool) {
 		}
 	}
 	return ptypes.AssistantMessage{}, false
-}
-
-func asToolResult(message ptypes.Message) (ptypes.ToolResultMessage, bool) {
-	switch value := message.(type) {
-	case ptypes.ToolResultMessage:
-		return value, true
-	case *ptypes.ToolResultMessage:
-		if value != nil {
-			return *value, true
-		}
-	}
-	return ptypes.ToolResultMessage{}, false
 }
 
 func ceilDiv(n, d int) int {

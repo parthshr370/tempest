@@ -55,3 +55,11 @@ type OpenAICompat struct {
 func (m Model) SupportsVision() bool {
 	return slices.Contains(m.Input, "image")
 }
+
+// ReportsBilledCost reports whether the route returns each request's billed
+// USD cost with its usage (OpenRouter usage accounting). Such a route's cost
+// is known per call even without a price-list entry, so a cost budget can be
+// enforced; a call that arrives without a billed cost stays unknown.
+func (m Model) ReportsBilledCost() bool {
+	return m.Provider == "openrouter"
+}

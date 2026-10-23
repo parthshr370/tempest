@@ -203,13 +203,26 @@ func TestReadToolPreservesSelectorTruncationContinuation(t *testing.T) {
 	}
 }
 
-func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
+func TestReadToolGoContentOutlineModeAndBinary(t *testing.T) {
 	dir := t.TempDir()
 	read, _ := NewTool(ReadTool, dir, ToolsOptions{})
 	goSource := "package demo\n\nimport \"fmt\"\n\ntype ID = string\n\ntype Celsius float64\n\ntype Set[T comparable] map[T]struct{}\n\ntype Service struct {\n\tname string\n\ttags []string\n}\n\nconst MaxLen = 64\n\nvar client *Service\n\nfunc (s Service) Run(x int) error {\n\treturn fmt.Errorf(\"%d\", x)\n}\n"
 	writeFile(t, filepath.Join(dir, "demo.go"), goSource)
 
-	outlineResult, err := executeTool(t, read, map[string]any{"path": "demo.go"})
+	// A file that fits one read comes back as its numbered content.
+	whole, err := executeTool(t, read, map[string]any{"path": "demo.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var numbered []string
+	for i, line := range strings.Split(strings.TrimSuffix(goSource, "\n"), "\n") {
+		numbered = append(numbered, fmt.Sprintf("%d:%s", i+1, line))
+	}
+	if got, want := resultText(whole), fmt.Sprintf("[demo.go#%s]\n%s", hashline.Tag([]byte(goSource)), strings.Join(numbered, "\n")); got != want {
+		t.Fatalf("default read = %q, want %q", got, want)
+	}
+
+	outlineResult, err := executeTool(t, read, map[string]any{"path": "demo.go", "mode": "outline"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +262,19 @@ func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
 			t.Fatal(executeErr)
 		}
 		if !strings.Contains(resultText(result), testCase.expectedRaw) {
-			t.Fatalf("raw escape failed for %#v: %q", testCase.args, resultText(result))
+			t.Fatalf("raw read failed for %#v: %q", testCase.args, resultText(result))
+		}
+	}
+	for _, testCase := range []struct {
+		args map[string]any
+		want string
+	}{
+		{args: map[string]any{"path": "demo.go:20-22", "mode": "outline"}, want: "covers the whole file"},
+		{args: map[string]any{"path": "demo.go", "offset": 3, "mode": "outline"}, want: "covers the whole file"},
+		{args: map[string]any{"path": "demo.go", "mode": "summary"}, want: "mode must be"},
+	} {
+		if _, executeErr := executeTool(t, read, testCase.args); executeErr == nil || !strings.Contains(executeErr.Error(), testCase.want) {
+			t.Fatalf("%#v: err = %v, want %q", testCase.args, executeErr, testCase.want)
 		}
 	}
 
@@ -260,6 +285,9 @@ func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
 	}
 	if got := resultText(plain); !strings.Contains(got, "1:plain") {
 		t.Fatalf("non-Go read was summarized: %q", got)
+	}
+	if _, err := executeTool(t, read, map[string]any{"path": "plain.txt", "mode": "outline"}); err == nil || !strings.Contains(err.Error(), "needs a workspace Go file") {
+		t.Fatalf("outline of a non-Go file: %v", err)
 	}
 	binaryContent := []byte{'a', 0, 'b'}
 	if err := os.WriteFile(filepath.Join(dir, "binary.bin"), binaryContent, 0o644); err != nil {
@@ -281,6 +309,65 @@ func TestReadToolGoOutlineRawEscapesAndBinary(t *testing.T) {
 	}
 	if len(image.Content) != 2 || image.Content[0].Text != "Read image file [image/png]" {
 		t.Fatalf("image output changed: %+v", image.Content)
+	}
+}
+
+// TestReadToolOutlinesOnlyGoFilesOverTheBudget: a whole-file read of a Go
+// file too large for one read returns the declaration outline with how to
+// read a range, and the range it names is then editable.
+func TestReadToolOutlinesOnlyGoFilesOverTheBudget(t *testing.T) {
+	dir := t.TempDir()
+	var source strings.Builder
+	source.WriteString("package big\n")
+	for i := range 700 {
+		fmt.Fprintf(&source, "\nfunc F%d() int {\n\treturn %d\n}\n", i, i)
+	}
+	writeFile(t, filepath.Join(dir, "big.go"), source.String())
+	lines := strings.Count(source.String(), "\n")
+	if lines <= truncate.DefaultMaxLines {
+		t.Fatalf("fixture has %d lines, not over the read budget", lines)
+	}
+	all := hashlineTools(t, dir, nil)
+	result, err := executeTool(t, all[ReadTool], map[string]any{"path": "big.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := resultText(result)
+	if details, _ := json.Marshal(result.Details); !strings.Contains(string(details), `"summary":true`) {
+		t.Fatalf("details = %s", details)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("big.go has %d lines", lines),
+		"structural outline of its declarations, not the file's content",
+		`read "big.go:START-END"`,
+		"3: func F0() int [recover: big.go:3-5]",
+		"2799: func F699() int [recover: big.go:2799-2801]",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("overflow read missing %q: %q", want, text)
+		}
+	}
+	if strings.Contains(text, "return 0") {
+		t.Fatalf("overflow outline leaked a body: %q", text)
+	}
+	tag := tagOf(t, text, "big.go")
+	patch := fmt.Sprintf("[big.go#%s]\nPUT 4.=4:\n+\treturn -1\n", tag)
+	var unseen *hashline.UnseenLinesError
+	if _, err := runHashline(t, all[HashlineTool], patch); !errors.As(err, &unseen) {
+		t.Fatalf("edit after the outline alone: %v", err)
+	}
+	if _, err := executeTool(t, all[ReadTool], map[string]any{"path": "big.go:3-5"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runHashline(t, all[HashlineTool], patch); err != nil {
+		t.Fatalf("edit after reading the outlined range: %v", err)
+	}
+	raw, err := executeTool(t, all[ReadTool], map[string]any{"path": "big.go", "mode": "raw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := resultText(raw); !strings.Contains(text, "\n4:\treturn -1\n") || !strings.Contains(text, "Use offset=2001 to continue.") {
+		t.Fatalf("mode=raw page = %q", text[max(0, len(text)-200):])
 	}
 }
 

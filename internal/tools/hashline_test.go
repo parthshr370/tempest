@@ -64,16 +64,14 @@ func Sub(a, b int) int {
 }
 `
 
+// TestHashlineToolEditsMovesAndChains starts from a default read: a file that
+// fits one read shows every line, so hashline can edit any of them.
 func TestHashlineToolEditsMovesAndChains(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "demo.go"), goSource)
 	var changed []string
 	all := hashlineTools(t, dir, &changed)
-	read, err := executeTool(t, all[ReadTool], map[string]any{"path": "demo.go", "mode": "raw"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tag := tagOf(t, resultText(read), "demo.go")
+	tag := tagOf(t, readThrough(t, all, "demo.go"), "demo.go")
 	out, err := runHashline(t, all[HashlineTool], fmt.Sprintf("[demo.go#%s]\nPUT 8*:\n+func Sub(a, b int) int {\n+\treturn b - a\n+}\nCUT 3* @add\nPUT >$ @add\nPUT >1:\n+\n+// Demo.\n", tag))
 	if err != nil {
 		t.Fatal(err)

@@ -398,7 +398,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.BoolVar(&continueRecent, "continue", false, "continue the most recent session for this directory")
 	var budget agent.Budget
 	fs.IntVar(&budget.MaxTurns, "max-turns", 0, "stop the run after this many model calls (0 = unlimited)")
-	fs.Float64Var(&budget.MaxCostUSD, "max-cost", 0, "stop the run once its model calls cost this many USD (0 = unlimited; refused when the model's price is unknown)")
+	fs.Float64Var(&budget.MaxCostUSD, "max-cost", 0, "stop the run once its model calls cost this many USD (0 = unlimited; refused when the model's price is unknown and its route doesn't report billed cost)")
 	fs.DurationVar(&budget.MaxWallTime, "max-wall-time", 0, "stop the run at the first turn boundary after this much time, e.g. 10m (0 = unlimited)")
 	if err := fs.Parse(args); err != nil {
 		return commandOptions{}, usageFailure(err)

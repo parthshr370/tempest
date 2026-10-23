@@ -137,7 +137,7 @@ func CapabilitiesSection(names []string, snippets map[string]string, progressPat
 		"- The sandbox is ephemeral: nothing persists beyond this build session. Network access exists and can be flaky or limited; retry transient failures when appropriate. Destructive shell commands are refused.",
 	}
 	if has(names, "read") {
-		runtime = append(runtime, `- Tool output is capped. When a result ends with "Full output: <path>" or a "[Tool result cleared to save context. ... Full output: <path>]" placeholder, the complete output is saved at that path. Read it back with the read tool instead of re-running the command.`)
+		runtime = append(runtime, `- Tool output is capped. When a result ends with "Full output: <path>", the complete output is saved at that path. Read it back with the read tool instead of re-running the command.`)
 	}
 	if has(names, "todo_write") && progressPath != "" {
 		runtime = append(runtime, "- Your live progress checkpoint is "+progressPath+" (session data, outside the workspace); todo_write rewrites it on every update. Read it with the read tool to recover the plan and current step after an interruption.")
