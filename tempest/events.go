@@ -27,14 +27,23 @@ type eventMapper struct {
 	started        time.Time
 	turn           int
 	usage          UsageState
-	announced      map[string]bool
-	childJobs      map[string]string
+	// announced holds calls that already emitted tool_call; denied holds calls the gate refused.
+	announced map[string]bool
+	denied    map[string]bool
+	childJobs map[string]string
 }
 
 func newMapper(id string, model types.Model) *eventMapper {
-	return &eventMapper{sessionID: id, model: model, announced: make(map[string]bool), childJobs: make(map[string]string), usage: UsageState{ContextSize: model.ContextWindow}}
+	return &eventMapper{sessionID: id, model: model, announced: make(map[string]bool), denied: make(map[string]bool), childJobs: make(map[string]string), usage: UsageState{ContextSize: model.ContextWindow}}
 }
 func (m *eventMapper) nextMessage() string { m.counter++; return fmt.Sprintf("msg_%d", m.counter) }
+
+// announce emits the tool_call that must precede every update for the call.
+func (m *eventMapper) announce(ev agent.AgentEvent, status string, at time.Time) Update {
+	input := rawInput(ev.Args)
+	title, kind := toolDescription(ev.ToolName, input)
+	return update("tool_call", map[string]any{"toolCallId": ev.ToolCallID, "status": status, "title": title, "kind": kind, "rawInput": input}, at)
+}
 func update(kind string, p map[string]any, at time.Time) Update {
 	if !strings.HasPrefix(kind, "tempest/") {
 		p["sessionUpdate"] = kind
@@ -67,6 +76,7 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 		m.started = at
 		m.turn = 0
 		clear(m.announced)
+		clear(m.denied)
 		return []Update{update("tempest/run", map[string]any{"status": "started", "runId": m.runID, "logicalRunId": m.logicalRunID, "continuationOf": m.continuationOf, "model": m.model.ID}, at)}
 	case agent.EventTurnStart, agent.EventTurnEnd:
 		phase := "end"
@@ -110,7 +120,8 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 				out = append(out, update("user_message_chunk", map[string]any{"messageId": id, "content": b}, at))
 			}
 			if ev.QueueID != "" {
-				out = append(out, mapWorkUpdate(work.Event{Kind: "queue", Action: "consumed", Queue: &work.QueueItem{ID: ev.QueueID}}, at))
+				// The consumed text is already the user message above; send only the id.
+				out = append(out, update("tempest/queue", map[string]any{"action": "consumed", "item": map[string]any{"id": ev.QueueID}}, at))
 			}
 			return out
 		case types.AssistantMessage:
@@ -171,29 +182,31 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			return nil
 		}
 		p := ev.Permission
-		if p.Prompted {
-			m.announced[ev.ToolCallID] = true
+		var out []Update
+		// A prompted call was already announced by the hub's pending ask.
+		if !p.Prompted && !m.announced[ev.ToolCallID] {
+			out = append(out, m.announce(ev, "pending", at))
 		}
+		m.announced[ev.ToolCallID] = true
 		decision := "deny"
 		status := "failed"
 		if p.Allow {
 			decision = "allow"
 			status = "pending"
-		}
-		return []Update{update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": status, "_meta": map[string]any{"tempest": map[string]any{"permission": map[string]any{"decision": decision, "source": p.Source, "waitMs": p.Wait.Milliseconds()}}}}, at)}
-	case agent.EventToolExecutionStart:
-		kind := "tool_call"
-		p := map[string]any{"toolCallId": ev.ToolCallID, "status": "in_progress"}
-		if m.announced[ev.ToolCallID] {
-			kind = "tool_call_update"
 		} else {
-			title, k := toolDescription(ev.ToolName, rawInput(ev.Args))
-			p["title"] = title
-			p["kind"] = k
-			p["rawInput"] = rawInput(ev.Args)
-			m.announced[ev.ToolCallID] = true
+			m.denied[ev.ToolCallID] = true
 		}
-		return []Update{update(kind, p, at)}
+		return append(out, update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": status, "_meta": map[string]any{"tempest": map[string]any{"permission": map[string]any{"decision": decision, "source": p.Source, "waitMs": p.Wait.Milliseconds()}}}}, at))
+	case agent.EventToolExecutionStart:
+		if m.denied[ev.ToolCallID] {
+			// A denied call never runs; its end update carries the refusal.
+			return nil
+		}
+		if !m.announced[ev.ToolCallID] {
+			m.announced[ev.ToolCallID] = true
+			return []Update{m.announce(ev, "in_progress", at)}
+		}
+		return []Update{update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": "in_progress"}, at)}
 	case agent.EventToolExecutionUpdate:
 		p := map[string]any{"toolCallId": ev.ToolCallID}
 		if content := toolContent(ev.PartialResult); len(content) > 0 {
@@ -206,6 +219,7 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			status = "failed"
 		}
 		delete(m.announced, ev.ToolCallID)
+		delete(m.denied, ev.ToolCallID)
 		return []Update{update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": status, "rawOutput": rawInput(ev.Result), "content": toolContent(ev.Result)}, at)}
 	case agent.EventAgentEnd:
 		var cost *float64

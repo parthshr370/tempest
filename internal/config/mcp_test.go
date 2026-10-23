@@ -38,6 +38,17 @@ func TestMCPConfigSources(t *testing.T) {
 		t.Fatal("secret map shared")
 	}
 }
+func TestMCPConfigFileClaudeShapeResolvesRelativeCommand(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "claude.json")
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"local":{"command":"./bin/server","args":["--stdio"]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	servers, err := resolveMCP(StringInput{Set: true, Value: path}, "", fileSettings{})
+	if err != nil || len(servers) != 1 || servers[0].Name != "local" || servers[0].Transport != "stdio" || servers[0].Command != filepath.Join(directory, "bin", "server") {
+		t.Fatalf("claude shape: %#v %v", servers, err)
+	}
+}
 func TestMCPConfigFileStrictness(t *testing.T) {
 	for name, contents := range map[string]string{"unknown": `{"mcpServers":[],"other":true}`, "unknown-server": `{"mcpServers":[{"name":"x","transport":"stdio","command":"fixture","other":true}]}`, "null": `{"mcpServers":null}`, "trailing": `{"mcpServers":[]} {}`} {
 		t.Run(name, func(t *testing.T) {

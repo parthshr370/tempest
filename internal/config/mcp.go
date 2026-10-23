@@ -1,8 +1,6 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -55,30 +53,19 @@ func resolveMCP(flag StringInput, env string, settings fileSettings) ([]mcpconfi
 	if len(data) > 1<<20 {
 		return nil, errors.New("MCP config exceeds 1 MiB")
 	}
-	var file struct {
-		Servers []mcpconfig.Server `json:"mcpServers"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err = dec.Decode(&file); err != nil {
-		return nil, fmt.Errorf("invalid MCP file: %w", err)
-	}
-	var extra json.RawMessage
-	if dec.Decode(&extra) != io.EOF {
-		return nil, errors.New("trailing JSON in MCP config")
-	}
-	if file.Servers == nil {
-		return nil, errors.New("mcpServers must be an array")
+	servers, err := mcpconfig.ParseFile(data)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MCP file %s: %w", path, err)
 	}
 	base, err := filepath.Abs(filepath.Dir(path))
 	if err != nil {
 		return nil, err
 	}
-	for i := range file.Servers {
-		s := &file.Servers[i]
+	for i := range servers {
+		s := &servers[i]
 		if s.Transport == "stdio" && strings.ContainsAny(s.Command, "/\\") && !filepath.IsAbs(s.Command) {
 			s.Command = filepath.Join(base, s.Command)
 		}
 	}
-	return mcpconfig.Normalize(file.Servers)
+	return mcpconfig.Normalize(servers)
 }

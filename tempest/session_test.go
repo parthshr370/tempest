@@ -572,3 +572,32 @@ func TestBeginRegistersRunAndWaitIsRepeatable(t *testing.T) {
 		t.Fatalf("repeated Wait=%+v err=%v", second, err)
 	}
 }
+
+// Hosts such as serve pass -skill through StackConfig; per-session discovery must use it.
+func TestOpenDiscoversStackSkillPaths(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	skillDir := filepath.Join(t.TempDir(), "greeter")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: greeter\ndescription: Greets with the stack skill marker\n---\nbody"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := faux.New(faux.Options{})
+	var systemPrompt string
+	f.SetResponses(func(c types.Context, _ *types.StreamOptions, _ faux.State, _ types.Model) (types.AssistantMessage, error) {
+		systemPrompt = c.SystemPrompt
+		return types.AssistantMessage{Content: []types.ContentBlock{types.NewText("ok")}}, nil
+	})
+	s, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{}, Stack: &StackConfig{Model: f.Model(), StreamFn: f.StreamSimple, SkillPaths: []string{filepath.Dir(skillDir)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+	if _, err := s.Prompt(t.Context(), Prompt{Text: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(systemPrompt, "stack skill marker") {
+		t.Fatalf("skill missing from system prompt:\n%s", systemPrompt)
+	}
+}

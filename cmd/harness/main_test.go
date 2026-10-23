@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
@@ -101,6 +103,39 @@ func TestCLIHelpPrintsZeroValueFlagsWithoutPanic(t *testing.T) {
 	}
 	if got := (skillPathsFlag{}).String(); got != "" {
 		t.Fatalf("zero flag String() = %q", got)
+	}
+}
+
+func TestTopLevelHelpNamesTempestAndListsSubcommands(t *testing.T) {
+	var stdout, stderr strings.Builder
+	run([]string{"-help"}, &stdout, &stderr)
+	text := stderr.String()
+	for _, want := range []string{"tempest -p <prompt>", "\n  serve ", "\n  mcp ", "\n  doctor ", "\n  version "} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("help lacks %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "harness") {
+		t.Fatalf("help still names the binary harness:\n%s", text)
+	}
+}
+
+func TestUnknownAllowDenyToolNamesWarnButMCPNamesDoNot(t *testing.T) {
+	var stderr strings.Builder
+	warnUnknownToolNames(&stderr, "-allow-tool", []string{"bash", "mcp__everything__echo", "nosuchtool"})
+	text := stderr.String()
+	if strings.Count(text, "warning:") != 1 || !strings.Contains(text, `"nosuchtool"`) || strings.Contains(text, `"bash"`) || strings.Contains(text, `"mcp__everything__echo"`) {
+		t.Fatalf("warnings = %q", text)
+	}
+}
+
+func TestMCPStartupFailureHintNamesServerAndHowToDisable(t *testing.T) {
+	err := fmt.Errorf("open: %w", &mcpclient.StartupError{Server: "broken", Phase: "transport", Err: errors.New("exec: not found")})
+	if hint := mcpStartupHint(err); !strings.Contains(hint, `"broken"`) || !strings.Contains(hint, `"disabled": true`) || !strings.Contains(hint, `-mcp-config ""`) {
+		t.Fatalf("hint = %q", hint)
+	}
+	if hint := mcpStartupHint(errors.New("other")); hint != "" {
+		t.Fatalf("non-MCP error got hint %q", hint)
 	}
 }
 

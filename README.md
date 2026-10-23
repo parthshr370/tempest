@@ -83,11 +83,14 @@ go test ./internal/catalog/...
 TEMPEST_LIVE=1 go test ./internal/catalog/ -run TestVerifyOpenRouter
 ```
 
-`./bin/tempest doctor` is offline and never prints credentials. `./bin/tempest doctor --ping`
-makes one billable request per configured provider: prompt `hi`, output cap 1 token,
-using the catalog model with the lowest input-plus-output price. It reports the
-model and latency on success, or a typed failure code. Endpoint/account restrictions
-can still reject a discovered model.
+`./bin/tempest doctor` is offline and never prints credentials; it prints a one-line
+catalog count, and `-models` lists every catalog model with its prices.
+`./bin/tempest doctor --ping` makes one billable request (prompt `hi`, output cap
+16 tokens) to each configured model: the default model, plus the plan and smol
+models when they differ. Each line names the roles and the exact model it pinged,
+then latency on success, or the typed failure code with the provider's HTTP status
+and bounded, redacted message, e.g. `provider HTTP 404: {...}` for an
+account/endpoint restriction.
 
 ### 02 · Hash-anchored edits that never corrupt a file
 
@@ -246,8 +249,11 @@ fall back to pure Go when `rg`/`fd` are absent.
 
 A run is one `-p` prompt. The model calls tools, sees their results, and keeps going.
 A reply with no tool calls reaches quiescence: the run waits for owned background
-jobs and consumes their result follow-ups before completing. No detached next run
-is started automatically. Every run ends with a stop reason:
+jobs and consumes their result follow-ups before completing. A result follow-up is a
+short host notice in the transcript: job id, kind, state, exit code or reason, a
+bounded output/result preview, artifact paths, and the `wait`/`logs` calls that
+return the full details. No detached next run is started automatically. Every run
+ends with a stop reason:
 
 | Stop reason | Meaning | Exit code |
 |---|---|---|
@@ -318,6 +324,19 @@ are also supported (flags win). An explicit empty path disables MCP.
 Settings may instead supply `mcp_servers`; a selected file replaces that
 array completely. Repository `.mcp.json` files are never auto-loaded.
 
+A file holds one `mcpServers` key. It may be an object keyed by server name, the
+Claude Desktop/Cursor shape, or Tempest's array of named servers:
+
+```json
+{
+  "mcpServers": {
+    "everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything@2025.11.25"], "env": {"DEBUG": "1"}},
+    "docs": {"url": "https://docs.example/mcp", "headers": {"Authorization": "Bearer ..."}, "permission": "deny"},
+    "off": {"command": "broken-mcp", "disabled": true}
+  }
+}
+```
+
 ```json
 {
   "mcpServers": [
@@ -326,6 +345,13 @@ array completely. Repository `.mcp.json` files are never auto-loaded.
   ]
 }
 ```
+
+`transport` (or `type`) is `stdio` or `http`; when omitted, `command` means stdio and
+`url` means Streamable HTTP. `"disabled": true` skips an entry. Other fields are
+`startupTimeout` (default `30s`), `callTimeout` (default `2m`) and `permission`;
+unknown fields are errors that list the supported ones. Every configured server
+must start: one that fails aborts startup with an error naming the server, so fix
+it, disable it, or pass `-mcp-config ""` to run without MCP.
 
 Both stdio and Streamable HTTP clients support MCP `2025-11-25`
 (preferred) and `2025-06-18`. The handshake-free `2026-07-28` era, legacy
@@ -381,6 +407,9 @@ or `-log-file`. For WebSocket clients, set a listener:
 TEMPEST_TOKEN=change-me ./bin/tempest serve -listen 127.0.0.1:7777
 ```
 
+Once bound, it prints one stderr line such as
+`tempest serve listening on http://127.0.0.1:7777 (ACP /acp, A2A /a2a)`;
+with `-listen 127.0.0.1:0` the line shows the port the OS picked.
 Connect to `ws://127.0.0.1:7777/acp` with `Authorization: Bearer change-me`
 or `?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required
 off loopback; when one is configured, loopback connections need it too.
@@ -395,6 +424,10 @@ token as ACP; new A2A routes don't accept query tokens. `SendMessage`,
 `SubscribeToTask` operate on runs in the server's fixed startup workspace.
 Set `-a2a-base-url https://agent.example` behind a proxy or for a
 non-loopback listener; numeric loopback derives the actual bound address.
+A2A 0.3 method names (`message/send`, `message/stream`, `tasks/get`,
+`tasks/cancel`, ...) fail with `-32601` and a message naming the 1.0 method; a
+missing or unsupported `A2A-Version` fails with `-32009` and asks for
+`A2A-Version: 1.0`.
 
 Pending host permissions appear as `TASK_STATE_INPUT_REQUIRED`.
 **A2A cannot approve them**: text saying “yes” isn't permission. Answer
@@ -416,7 +449,9 @@ implemented.
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout`
 (30m), `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model,
 permission, budget, and bash-timeout flags supply defaults for new sessions.
-Tools run on the server host, not the client.
+`serve` and `mcp` also take `-enable-task`, `-enable-web`, and repeatable
+`-skill` with the same meaning as in one-shot mode; each flag overrides its
+`HARNESS_*` variable. Tools run on the server host, not the client.
 
 SIGINT or SIGTERM stops admission, cancels runs, and flushes journals before
 exit, even if a stdio client keeps stdin open. A second signal exits with
@@ -430,6 +465,12 @@ notifications carry progress while it runs. ACP reports `end_turn`,
 `cancelled`, or `max_turn_requests`; `_meta.tempest.stopReason` preserves the
 exact Tempest reason.
 
+`session/new`, `session/load` and `session/resume` take an absolute `cwd` that
+must be an existing directory; anything else fails with `-32602` before a
+session opens. Every tool call starts with a `tool_call` update; its permission
+decision (`_meta.tempest.permission`), progress and result follow as
+`tool_call_update`s with the same `toolCallId`.
+
 `tempest/watch` returns an atomic snapshot followed by live updates.
 Reconnect with `session/resume` and watch again: an accepted prompt keeps
 running after its connection closes. A slow watcher is dropped with
@@ -437,7 +478,10 @@ running after its connection closes. A slow watcher is dropped with
 Use `tempest/history` to page older updates. Frames are limited to 1 MiB;
 an oversized history page fails with `-32000`, so request a smaller page.
 After compaction, late-attach history shows the compacted view, not the full
-journal transcript.
+journal transcript. The snapshot's `budget` and the `tempest/set_budget`
+result use the request shape `{maxTurns, maxCostUsd, maxWallSeconds}`; builds
+before this one sent Go field names (`MaxTurns`, `MaxCostUSD`, and
+`MaxWallTime` in nanoseconds).
 
 Permissions arrive as `session/request_permission` requests with
 `allow_once`, `allow_always`, `reject_once`, and `reject_always` choices.
@@ -534,6 +578,8 @@ The example is a separate module with a local `replace`; build it with
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-enable-web` | Enable the gated `web_search` and `web_fetch` tools. |
 | `-skill <path>` | Additional skill location; repeatable. |
+| `-permission-mode <mode>` | Tool gate mode: `default`, `plan`, `acceptEdits` or `bypass`. |
+| `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning. |
 
 ## Configuration
 
@@ -555,7 +601,8 @@ not read `.env` — export variables before running it.
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
-Run `./bin/tempest -help` for the full flag list.
+Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`
+and `version` subcommands.
 
 ## Development
 

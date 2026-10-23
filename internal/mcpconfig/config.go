@@ -47,7 +47,7 @@ func Normalize(servers []Server) ([]Server, error) {
 			return nil, fmt.Errorf("mcp_config: server %q: %s", s.Name, reason)
 		}
 		if !serverName.MatchString(s.Name) || strings.Contains(s.Name, "__") {
-			return fail("invalid name")
+			return fail(`invalid name: use 1-32 letters, digits, "_" or "-", starting with a letter, without "__"`)
 		}
 		if seen[s.Name] {
 			return fail("duplicate name")
@@ -70,7 +70,7 @@ func Normalize(servers []Server) ([]Server, error) {
 			s.Permission = "prompt"
 		}
 		if s.Permission != "prompt" && s.Permission != "allow" && s.Permission != "deny" {
-			return fail("invalid permission")
+			return fail(`invalid permission: use "prompt", "allow" or "deny"`)
 		}
 		switch s.Transport {
 		case "stdio":
@@ -117,7 +117,7 @@ func Normalize(servers []Server) ([]Server, error) {
 				}
 			}
 		default:
-			return fail("unknown transport")
+			return fail(`unknown transport: use "stdio" (with command) or "http" (with url)`)
 		}
 		s.Args = append([]string(nil), s.Args...)
 		s.Env = maps.Clone(s.Env)

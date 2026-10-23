@@ -26,14 +26,28 @@ func TestServerCommandsHonorEnableTask(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, command := range []string{"serve", "mcp"} {
-		for _, enabled := range []bool{false, true} {
-			t.Run(command+"/enabled="+strconv.FormatBool(enabled), func(t *testing.T) {
+		for _, test := range []struct {
+			name, env string
+			flag      bool
+			enabled   bool
+		}{
+			{"env=false", "false", false, false},
+			{"env=true", "true", false, true},
+			// The flag overrides the environment, as in one-shot mode.
+			{"flag", "false", true, true},
+		} {
+			enabled := test.enabled
+			t.Run(command+"/"+test.name, func(t *testing.T) {
 				sessions := t.TempDir()
 				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
-				process := exec.CommandContext(ctx, binary, command, "-faux-script", script, "-session-dir", sessions, "-mcp-config", "", "-permission-mode", "bypass")
+				args := []string{command, "-faux-script", script, "-session-dir", sessions, "-mcp-config", "", "-permission-mode", "bypass"}
+				if test.flag {
+					args = append(args, "-enable-task")
+				}
+				process := exec.CommandContext(ctx, binary, args...)
 				process.Dir = workspace
-				process.Env = append(os.Environ(), "HOME="+workspace, "HARNESS_ENABLE_TASK="+strconv.FormatBool(enabled))
+				process.Env = append(os.Environ(), "HOME="+workspace, "HARNESS_ENABLE_TASK="+test.env)
 				input, err := process.StdinPipe()
 				if err != nil {
 					t.Fatal(err)

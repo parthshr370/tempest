@@ -333,6 +333,28 @@ func TestBashIntentWithoutRunningIsUnknown(t *testing.T) {
 	}
 }
 
+// A reloaded job reports the admission time the live job reported, in UTC,
+// not the later local-zone write time of its journal line.
+func TestJobStartedAtSurvivesReload(t *testing.T) {
+	s := newTestStore(t, t.TempDir())
+	appendAll(t, s, RunStartedRecord{Meta: Meta{RunID: "root"}, Model: "m"})
+	admitted := time.Date(2026, 10, 22, 14, 5, 25, 883391000, time.UTC)
+	bgFact(t, s, "root", KindJobStarted, JobStarted{JobID: "job_bash", IdentityDigest: strings.Repeat("a", 64), CallID: "message:0", ToolCallID: "raw", LogicalRunID: "root", StartedAt: admitted, Kind: "bash", Spec: json.RawMessage(`{"command":"true","timeout_seconds":60}`), Cwd: "/tmp", OutputPath: s.Path() + ".d/jobs/job_bash/output.log"})
+	finished := time.Date(2026, 10, 22, 19, 40, 0, 0, time.FixedZone("IST", 5*3600+1800))
+	bgFact(t, s, "root", KindJobFinished, JobFinished{JobID: "job_bash", State: "completed", FinishedAt: finished, Cleanup: "none"})
+	l, err := Load(context.Background(), s.Path())
+	if err != nil || len(l.Jobs) != 1 {
+		t.Fatalf("load=%+v err=%v", l, err)
+	}
+	job := l.Jobs[0]
+	if !job.StartedAt.Equal(admitted) || job.StartedAt.Location() != time.UTC {
+		t.Fatalf("startedAt=%v want %v", job.StartedAt, admitted)
+	}
+	if !job.FinishedAt.Equal(finished) || job.FinishedAt.Location() != time.UTC {
+		t.Fatalf("finishedAt=%v", job.FinishedAt)
+	}
+}
+
 func TestLookupBoundAndDuplicateRunIdentity(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

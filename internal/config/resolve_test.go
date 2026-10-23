@@ -192,6 +192,13 @@ func TestResolveValidationErrors(t *testing.T) {
 	}
 }
 
+func TestUnknownPermissionModeListsValidModes(t *testing.T) {
+	_, err := Config{Flags: FlagValues{PermissionMode: StringInput{Value: "yolo", Set: true}}, SettingsPath: filepath.Join(t.TempDir(), "missing.json"), LookupEnv: func(string) string { return "" }}.Resolve()
+	if err == nil || !strings.Contains(err.Error(), `"yolo"`) || !strings.Contains(err.Error(), "default, plan, acceptEdits, bypass") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestSkillPathsResolutionAndDefensiveCopy(t *testing.T) {
 	settingsPath := filepath.Join(t.TempDir(), "settings.json")
 	if err := os.WriteFile(settingsPath, []byte(`{"skill_paths":["settings-one","settings-two"]}`), 0o600); err != nil {

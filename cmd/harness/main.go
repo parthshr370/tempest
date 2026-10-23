@@ -1,9 +1,10 @@
-// Command harness runs Tempest once or serves durable agent sessions.
+// Command harness builds the tempest binary: it runs one prompt or serves durable agent sessions.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -21,10 +23,12 @@ import (
 	"go.harness.dev/harness/internal/discovery"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/tempest"
 )
 
@@ -87,7 +91,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 // runOneShot wires resolved CLI config into one non-interactive agent run, including discovery and optional session continuity.
 func runOneShot(args []string, stdout, stderr io.Writer) int {
-	opts, err := parseCommandOptions(args, stderr)
+	opts, err := parseCommandOptions("", args, stderr)
 	if err != nil {
 		return 1
 	}
@@ -110,7 +114,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
 	if opts.Prompt == "" {
-		fmt.Fprintln(stderr, "usage: harness -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION]")
+		fmt.Fprintln(stderr, "usage: tempest -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION] (tempest -help lists flags and commands)")
 		return 1
 	}
 	permissionMode, err := permission.ParseMode(opts.Config.PermissionModeDefault())
@@ -118,6 +122,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	warnUnknownToolNames(stderr, "-allow-tool", opts.Config.PermissionAllowTools())
+	warnUnknownToolNames(stderr, "-deny-tool", opts.Config.PermissionDenyTools())
 	permissionPolicy := buildPermissionPolicy(opts.Config.PermissionAllowTools(), opts.Config.PermissionDenyTools())
 	var retryConfig *retry.Config
 	if settings := opts.Config.Retry(); settings.Enabled {
@@ -237,6 +243,9 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}, opts.Resume, opts.Continue)
 	if err != nil {
 		fmt.Fprintf(stderr, "session error: %v\n", err)
+		if hint := mcpStartupHint(err); hint != "" {
+			fmt.Fprintln(stderr, hint)
+		}
 		return 1
 	}
 	defer func() {
@@ -336,10 +345,19 @@ func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
 }
 
 // parseCommandOptions tracks explicitly passed settings separately so config resolution can preserve precedence.
-func parseCommandOptions(args []string, stderr io.Writer) (commandOptions, error) {
+// command selects the -help text: "" for the one-shot CLI, or a subcommand name.
+func parseCommandOptions(command string, args []string, stderr io.Writer) (commandOptions, error) {
 	var values config.FlagValues
-	fs := flag.NewFlagSet("harness", flag.ContinueOnError)
+	fs := flag.NewFlagSet(strings.TrimSpace("tempest "+command), flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		if command == "doctor" {
+			fmt.Fprint(fs.Output(), doctorUsage)
+		} else {
+			fmt.Fprint(fs.Output(), topUsage)
+		}
+		fs.PrintDefaults()
+	}
 	fs.StringVar(&values.Model.Value, "model", "", "model ID")
 	fs.StringVar(&values.PlanModel.Value, "plan-model", "", "model ID for the read-only plan agent")
 	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
@@ -592,4 +610,54 @@ func setupLogging(levelValue, path string, maxBytes int64) {
 			slog.SetDefault(newLogger(io.MultiWriter(os.Stderr, rw)))
 		}
 	}
+}
+
+const topUsage = `Usage:
+  tempest -p <prompt> [flags]   run one prompt non-interactively
+  tempest <command> [flags]
+
+Commands:
+  serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
+  mcp       run as a stdio MCP server that exposes the tempest_run tool
+  doctor    check configuration and credentials offline; --ping probes the configured models
+  version   print build version
+
+Run 'tempest <command> -help' for that command's flags.
+
+Flags:
+`
+
+const doctorUsage = `Usage: tempest doctor [--ping] [-models] [flags]
+
+Prints the resolved configuration and credential checks without network access.
+  --ping    send one 1-token request to each configured model (default, plan, smol); billable
+  -models   also list the embedded model catalog with prices
+
+Flags:
+`
+
+// warnUnknownToolNames flags allow/deny entries that match no built-in tool.
+// MCP tools are discovered after startup, so mcp__ names are never warned about.
+func warnUnknownToolNames(stderr io.Writer, flagName string, names []string) {
+	for _, name := range names {
+		if tools.AllToolNames[tools.ToolName(name)] || strings.HasPrefix(name, "mcp__") {
+			continue
+		}
+		known := make([]string, 0, len(tools.AllToolNames))
+		for tool := range tools.AllToolNames {
+			known = append(known, string(tool))
+		}
+		slices.Sort(known)
+		fmt.Fprintf(stderr, "warning: %s %q matches no built-in tool (known: %s; MCP tools are named mcp__<server>__<tool>)\n", flagName, name, strings.Join(known, ", "))
+	}
+}
+
+// mcpStartupHint tells the operator how to get past a server that failed to
+// start; per 05-interop.md a startup failure aborts the session on purpose.
+func mcpStartupHint(err error) string {
+	var startup *mcpclient.StartupError
+	if !errors.As(err, &startup) {
+		return ""
+	}
+	return fmt.Sprintf(`hint: MCP server %q failed to start, so no session was opened. Fix its entry, remove it or set "disabled": true on it in the -mcp-config file, or pass -mcp-config "" to run without MCP.`, startup.Server)
 }

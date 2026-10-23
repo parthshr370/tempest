@@ -11,8 +11,8 @@ func TestMetadataFromInjectedLinkerValues(t *testing.T) {
 }
 
 func TestCurrentMetadataIsComplete(t *testing.T) {
-	if Name != "harness" {
-		t.Fatalf("Name = %q, want harness", Name)
+	if Name != "tempest" {
+		t.Fatalf("Name = %q, want tempest", Name)
 	}
 	got := Current()
 	if got.Version == "" || got.Commit == "" || got.Date == "" {

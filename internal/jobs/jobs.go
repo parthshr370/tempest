@@ -840,32 +840,11 @@ func (manager *Manager) deliver(ctx context.Context, record *entry) error {
 	manager.mu.Lock()
 	job := cloneJob(record.recovery.Job)
 	manager.mu.Unlock()
-	completion := struct {
-		JobID   string          `json:"jobId"`
-		State   string          `json:"state"`
-		Reason  string          `json:"reason,omitempty"`
-		Preview string          `json:"preview,omitempty"`
-		Result  *work.Artifact  `json:"result,omitempty"`
-		Patch   *work.Artifact  `json:"patch,omitempty"`
-		Output  *work.Artifact  `json:"output,omitempty"`
-		Value   json.RawMessage `json:"value,omitempty"`
-		Note    string          `json:"note"`
-	}{job.ID, job.State, job.Reason, preview(job.ResultText, 1024), job.Result, job.Patch, job.Output, job.Value, "Use wait for full job details. Patch is not applied to parent; ignored files and empty directories are not included."}
-	encoded, err := json.Marshal(completion)
+	text, err := completionNotice(job)
 	if err != nil {
 		return err
 	}
-	if len(encoded) > maxCompletionBytes {
-		completion.Value = nil
-		encoded, err = json.Marshal(completion)
-		if err != nil {
-			return err
-		}
-	}
-	if len(encoded) > maxCompletionBytes {
-		return errors.New("completion artifact references exceed encoded limit")
-	}
-	if _, err = manager.host.Enqueue(ctx, work.QueueInput{Kind: work.FollowUp, Text: string(encoded), Key: "job:" + job.ID + ":terminal", SourceJobID: job.ID}); err != nil {
+	if _, err = manager.host.Enqueue(ctx, work.QueueInput{Kind: work.FollowUp, Text: text, Key: "job:" + job.ID + ":terminal", SourceJobID: job.ID}); err != nil {
 		manager.fail(err)
 		return err
 	}

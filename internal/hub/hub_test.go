@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/agent"
 )
@@ -201,5 +202,30 @@ func TestReplayCapturesStreamingAndReservesLiveSlack(t *testing.T) {
 	snapshot.History[0].Update[0] = '!'
 	if !json.Valid(h.Snapshot().History[0].Update) {
 		t.Fatal("replay aliases hub history")
+	}
+}
+
+func TestSnapshotBudgetUsesWireCasing(t *testing.T) {
+	snap := Snapshot{SessionID: "s", PermissionMode: "plan", Budget: agent.Budget{MaxTurns: 3, MaxCostUSD: 0.5, MaxWallTime: 90 * time.Second}}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		SessionID string          `json:"sessionId"`
+		Budget    json.RawMessage `json:"budget"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.SessionID != "s" || string(wire.Budget) != `{"maxTurns":3,"maxCostUsd":0.5,"maxWallSeconds":90}` {
+		t.Fatalf("snapshot = %s", raw)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SessionID != "s" || decoded.PermissionMode != "plan" || decoded.Budget != snap.Budget {
+		t.Fatalf("round trip = %+v", decoded)
 	}
 }

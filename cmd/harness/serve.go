@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -49,7 +50,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 }
 
 func runServerCommand(command string, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet(command, flag.ContinueOnError)
+	fs := flag.NewFlagSet("tempest "+command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var values config.FlagValues
 	var listen, token, a2aBaseURL string
@@ -74,6 +75,9 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.StringVar(&values.FauxScript.Value, "faux-script", "", "scripted provider responses")
 	fs.StringVar(&values.LogFile.Value, "log-file", "", "diagnostic log file")
 	fs.StringVar(&values.LogLevel.Value, "log-level", "", "diagnostic log level")
+	fs.BoolVar(&values.EnableTask.Value, "enable-task", false, "enable the delegated task tool with explore and general subagents")
+	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
+	fs.Var(skillPathsFlag{input: &values.SkillPaths}, "skill", "additional skill path (repeatable)")
 	fs.IntVar(&maxTurns, "max-turns", 0, "default maximum model turns")
 	fs.Float64Var(&maxCost, "max-cost", 0, "default maximum model cost in USD")
 	fs.DurationVar(&maxWall, "max-wall-time", 0, "default maximum run duration")
@@ -102,6 +106,10 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.LogFile.Set = true
 		case "log-level":
 			values.LogLevel.Set = true
+		case "enable-task":
+			values.EnableTask.Set = true
+		case "enable-web":
+			values.EnableWeb.Set = true
 		}
 	})
 	cfg, err := (config.Config{Flags: values}).Resolve()
@@ -170,7 +178,10 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		}
 		return 0
 	}
-	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack})
+	onListen := func(addr net.Addr) {
+		fmt.Fprintf(stderr, "tempest serve listening on http://%s (ACP /acp, A2A /a2a)\n", addr)
+	}
+	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, OnListen: onListen})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

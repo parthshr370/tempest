@@ -1,4 +1,4 @@
-// Package build holds build/version metadata for the harness binary.
+// Package build holds build/version metadata for the tempest binary.
 package build
 
 import "runtime/debug"
@@ -21,8 +21,8 @@ var Commit = defaultCommit
 // -ldflags "-X go.harness.dev/harness/internal/build.Date=...".
 var Date = defaultDate
 
-// Name is the binary/product name.
-const Name = "harness"
+// Name is the binary/product name printed by usage and version output.
+const Name = "tempest"
 
 // Metadata is the complete, immutable build identity printed by the CLI.
 type Metadata struct {
