@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math/rand/v2"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -227,5 +228,48 @@ func TestSnapshotBudgetUsesWireCasing(t *testing.T) {
 	}
 	if decoded.SessionID != "s" || decoded.PermissionMode != "plan" || decoded.Budget != snap.Budget {
 		t.Fatalf("round trip = %+v", decoded)
+	}
+}
+
+func TestSubscriberQueueBoundsBytesAndReclaimsConsumedBytes(t *testing.T) {
+	h := New(Snapshot{SessionID: "s"}, nil)
+	defer h.Close()
+	_, slow, stop := h.Watch(100)
+	defer stop()
+	_, fast, stopFast := h.Watch(100)
+	defer stopFast()
+	raw, _ := json.Marshal(map[string]string{"text": strings.Repeat("x", maxSubscriberBytes/3)})
+	for range 4 {
+		h.Emit(Update{Kind: "notice", Update: raw})
+		if u := <-fast; u.Kind == "tempest/gap" {
+			t.Fatal("consumed bytes were not reclaimed")
+		}
+	}
+	if u := <-slow; u.Kind != "tempest/gap" {
+		t.Fatalf("byte limit did not evict queued data: %s", u.Kind)
+	}
+	if _, open := <-slow; open {
+		t.Fatal("byte overflow did not terminate watcher")
+	}
+}
+
+func TestSnapshotHistoryTailBoundsBytesWithoutLosingPagedHistory(t *testing.T) {
+	h := New(Snapshot{SessionID: "s"}, nil)
+	defer h.Close()
+	raw, _ := json.Marshal(map[string]string{"text": strings.Repeat("x", 12000)})
+	for range 120 {
+		h.Emit(Update{Kind: "user_message_chunk", Update: raw})
+	}
+	snapshot := h.Snapshot()
+	encoded, err := json.Marshal(snapshot)
+	if err != nil || len(encoded) > maxSnapshotHistoryBytes+4096 || len(snapshot.History) == 0 || snapshot.HistoryLen != 120 {
+		t.Fatalf("snapshot tail: bytes=%d updates=%d total=%d error=%v", len(encoded), len(snapshot.History), snapshot.HistoryLen, err)
+	}
+	history, err := h.History(snapshot.HistoryEpoch, 0, snapshot.HistoryLen)
+	if err != nil || len(history) != 120 {
+		t.Fatalf("byte bound discarded paged history: %d %v", len(history), err)
+	}
+	if snapshot.History[len(snapshot.History)-1].Seq != history[len(history)-1].Seq {
+		t.Fatal("snapshot omitted newest update")
 	}
 }

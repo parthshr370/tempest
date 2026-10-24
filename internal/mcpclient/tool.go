@@ -176,7 +176,7 @@ func (s *server) discover(ctx context.Context, client *mcpwire.Client) ([]agent.
 			if label == "" {
 				label = remote.Name
 			}
-			tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
+			tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, OutputSchema: append(json.RawMessage(nil), remote.OutputSchema...), Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
 		}
 		cursor = result.NextCursor
 		if cursor == "" {

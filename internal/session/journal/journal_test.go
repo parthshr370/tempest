@@ -71,11 +71,7 @@ func TestAppendAndReplayLinearChain(t *testing.T) {
 		t.Fatalf("messages = %#v", loaded.Messages)
 	}
 
-	contents, err := os.ReadFile(store.Path())
-	if err != nil {
-		t.Fatalf("read journal: %v", err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(contents)), "\n")
+	lines := journalEntryLines(t, store.Path())
 	var previous string
 	for index, line := range lines[1:] {
 		var record struct {
@@ -534,11 +530,7 @@ func TestParallelAppendsPreserveChain(t *testing.T) {
 		}
 	}
 	closeStore(t, store)
-	contents, err := os.ReadFile(store.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(contents)), "\n")
+	lines := journalEntryLines(t, store.Path())
 	if len(lines) != count+1 {
 		t.Fatalf("line count = %d, want %d", len(lines), count+1)
 	}
@@ -605,7 +597,7 @@ func closeStore(t *testing.T, store *Store) {
 func testHeader() Header {
 	return Header{
 		Type:      "session",
-		Version:   JournalVersion,
+		Version:   3,
 		ID:        "0000000000000001",
 		Timestamp: time.Date(2024, time.January, 2, 3, 4, 5, 0, time.UTC),
 		Cwd:       "/workspace/project",

@@ -327,6 +327,13 @@ func (s *server) answer(id json.RawMessage, method string, params json.RawMessag
 		return
 	}
 	switch method {
+	case "fixture/publishDiagnostics":
+		var p struct {
+			TextDocument struct{ URI string } `json:"textDocument"`
+		}
+		_ = json.Unmarshal(params, &p)
+		s.publishNow(p.TextDocument.URI)
+		s.reply(id, nil)
 	case "textDocument/definition":
 		s.reply(id, s.definition(params))
 	case "textDocument/references":
@@ -708,16 +715,20 @@ func diagnosticsFor(text string) []any {
 }
 
 func (s *server) publish(uri string) {
-	if s.cfg.Push == "none" || s.cfg.PullDiagnostics {
+	if s.cfg.Push == "none" || s.cfg.Push == "manual" || s.cfg.PullDiagnostics {
 		return
 	}
+	s.publishNow(uri)
+}
+
+func (s *server) publishNow(uri string) {
 	s.mu.Lock()
 	doc := s.docs[uri]
 	text, version := doc.text, doc.version
 	s.mu.Unlock()
 	params := map[string]any{"uri": uri, "diagnostics": diagnosticsFor(text)}
 	switch s.cfg.Push {
-	case "versioned":
+	case "versioned", "manual":
 		params["version"] = version
 	case "future":
 		params["version"] = version + 5

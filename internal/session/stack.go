@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/evalkernel"
+	"go.harness.dev/harness/internal/extensionhost"
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
@@ -29,6 +31,7 @@ import (
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 // PermissionModeFunc is a live-mode accessor called from the permission gate
@@ -81,6 +84,8 @@ type StackConfig struct {
 	ConfiguredTools []agent.AgentTool
 	PromptAdditions []string
 	BashTimeout     time.Duration
+	// AdmitProcess holds the host slot for each actual subprocess lifetime.
+	AdmitProcess func(context.Context) (func(), error)
 	// Hooks are operator settings. Resolved hooks are inherited by task children.
 	Hooks         hooks.Settings
 	HooksResolved bool
@@ -102,6 +107,8 @@ type StackConfig struct {
 	Messenger      *irc.Endpoint
 	AllowedTools   []string
 	BeforeToolCall func(context.Context, agent.BeforeToolCallContext) *agent.BeforeToolCallResult
+	Extensions     *extensionhost.Runtime
+	ResolvePreset  func(string) (extension.AgentPreset, error)
 
 	// Plan selects a read-only stack. Zero PlanModel uses Model.
 	Plan bool
@@ -205,7 +212,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		if err != nil {
 			rawArgs = nil
 		}
-		outcome := permission.GateInDirectory(ctx, modeFunc(), c.ToolCall.Name, rawArgs, policy, cwd, c.ToolCall.ID)
+		outcome := permission.GateDefinition(ctx, modeFunc(), c.ToolCall.Name, c.Definition.Identity, c.Definition.Effect, rawArgs, policy, cwd, c.ToolCall.ID)
 		return &agent.BeforeToolCallResult{Block: !outcome.Allow, Reason: outcome.Reason, Permission: &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}}
 	}
 	if cfg.BeforeToolCall != nil {
@@ -235,6 +242,9 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if err != nil {
 		return nil, err
 	}
+	if hookRunner != nil {
+		hookRunner.AdmitProcess = cfg.AdmitProcess
+	}
 	if cfg.Loaded != nil {
 		hookRunner.MarkResumed()
 	}
@@ -252,6 +262,9 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	var taskTool agent.AgentTool
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
 		taskTool = subagent.NewTool(cfg.Controller)
+		if cfg.Extensions != nil {
+			taskTool = subagent.NewPresetTool(cfg.Controller, nil, cfg.Extensions.ResolvePresetContext)
+		}
 	}
 	// Internal URLs resolve against the root session, so a child shares
 	// its root's local:// directory, jobs and child transcripts.
@@ -280,11 +293,12 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if cfg.Loaded != nil {
 		lostKernels = cfg.Loaded.EvalLanguages
 	}
-	kernels := evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels)
+	kernels := evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels, cfg.AdmitProcess)
 	options := tools.ToolsOptions{
 		MutationQueue:      cfg.MutationQueue,
 		EnableWeb:          cfg.EnableWeb,
 		BashTimeout:        cfg.BashTimeout,
+		AdmitProcess:       cfg.AdmitProcess,
 		SearchURL:          cfg.WebSearchURL,
 		ConfiguredTools:    cfg.ConfiguredTools,
 		TaskTool:           taskTool,
@@ -331,10 +345,15 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	var active []agent.AgentTool
 	if cfg.Plan {
 		active = SelectActive(allTools, PlanToolNames(), cfg.ExcludeTools, "")
+		if cfg.AllowedTools != nil {
+			active = slices.DeleteFunc(active, func(tool agent.AgentTool) bool {
+				return !slices.Contains(cfg.AllowedTools, tool.Name)
+			})
+		}
 	} else {
 		active = SelectActive(allTools, cfg.AllowedTools, cfg.ExcludeTools, "")
 	}
-	if cfg.Child && len(cfg.AllowedTools) == 0 {
+	if cfg.Child && cfg.AllowedTools == nil {
 		active = nil
 	}
 
@@ -357,6 +376,9 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	var compact func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error)
 	if runner := newCompactionRunner(model, cfg.StreamFn); runner != nil {
 		runner.hooks = hookRunner
+		if cfg.Extensions != nil {
+			runner.beforeCompaction = cfg.Extensions.BeforeCompactionSource
+		}
 		compact = runner.hookE(func(messages []ptypes.Message) {
 			agt.SetMessages(messages)
 			if cfg.OnMessagesChanged != nil {
@@ -380,6 +402,22 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 			return nil, nil
 		}
 	}
+	var extensionRuntime agent.ExtensionRuntime
+	if cfg.Extensions != nil {
+		cfg.Extensions.BasePrompt = systemPrompt
+		cfg.Extensions.BaseTools = append([]agent.AgentTool(nil), active...)
+		cfg.Extensions.CommandHooks = len(cfg.Hooks.Hooks) != 0
+		extensionRuntime = cfg.Extensions
+		cfg.Extensions.AllowTool = func(name string, effect extension.EffectClass) bool {
+			if slices.Contains(cfg.ExcludeTools, name) || cfg.Plan && effect != extension.EffectRead {
+				return false
+			}
+			return !cfg.Child && cfg.AllowedTools == nil || slices.Contains(cfg.AllowedTools, name)
+		}
+		cfg.Extensions.ExecuteTool = func(ctx context.Context, tools []agent.AgentTool, call ptypes.ContentBlock) (agent.AgentToolResult, error) {
+			return agent.ExecuteScopedTool(ctx, tools, call, agent.AgentLoopConfig{Hooks: hookRunner, Extensions: extensionRuntime, BeforeToolCall: beforeToolCall, Child: cfg.Child})
+		}
+	}
 	agt = agent.NewAgent(agent.AgentOptions{
 		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, ThinkingLevel: thinkingLevel(reasoning), Tools: active, Messages: cfg.InitialMessages},
 		StreamFn:         cfg.StreamFn,
@@ -389,6 +427,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		BeforeToolCall:   beforeToolCall,
 		SessionID:        sessionID,
 		Hooks:            hookRunner,
+		Extensions:       extensionRuntime,
 		Child:            cfg.Child,
 	})
 	if hookRunner != nil {

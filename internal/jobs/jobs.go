@@ -57,22 +57,24 @@ type Options struct {
 	CommandPrefix string
 	BashTimeout   time.Duration
 	OnError       func(error)
+	AdmitProcess  func(context.Context) (func(), error)
 }
 
 type entry struct {
-	transition  sync.Mutex
-	recovery    work.Recovery
-	schema      *outputschema.Schema
-	cancel      context.CancelFunc
-	done        chan struct{}
-	live        bool
-	credited    bool
-	delivered   bool
-	joined      bool
-	truncated   bool
-	outputBytes int64
-	service     *service  // set for an async bash job with a readiness condition
-	input       *jobInput // set for a bash job this manager launched; write_stdin's channel
+	transition     sync.Mutex
+	recovery       work.Recovery
+	schema         *outputschema.Schema
+	cancel         context.CancelFunc
+	done           chan struct{}
+	live           bool
+	credited       bool
+	delivered      bool
+	joined         bool
+	truncated      bool
+	outputBytes    int64
+	service        *service  // set for an async bash job with a readiness condition
+	input          *jobInput // set for a bash job this manager launched; write_stdin's channel
+	releaseProcess func()
 }
 
 // Manager owns every worker until its terminal fact and completion delivery settle.
@@ -660,6 +662,13 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 	if err = manager.capacity("bash", false, false); err != nil {
 		return nil, work.Job{}, err
 	}
+	var releaseProcess func()
+	if manager.options.AdmitProcess != nil {
+		releaseProcess, err = manager.options.AdmitProcess(ctx)
+		if err != nil {
+			return nil, work.Job{}, err
+		}
+	}
 	manager.mu.Lock()
 	run := manager.run
 	manager.mu.Unlock()
@@ -668,7 +677,11 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 		job.Readiness = "waiting"
 	}
 	record := &entry{recovery: work.Recovery{Job: job, Invocation: invocation, IdentityDigest: digest, Bash: &spec}, done: make(chan struct{}), credited: true, service: readiness, input: newJobInput(spec.PTY, spec.Stdin)}
+	record.releaseProcess = releaseProcess
 	if err = manager.commitStart(ctx, record); err != nil {
+		if releaseProcess != nil {
+			releaseProcess()
+		}
 		return nil, work.Job{}, err
 	}
 	manager.launch(record, false)
@@ -692,6 +705,9 @@ func (manager *Manager) launch(record *entry, resume bool) {
 	go func() {
 		defer manager.workers.Done()
 		defer cancel()
+		if record.releaseProcess != nil {
+			defer record.releaseProcess()
+		}
 		defer func() {
 			if failure := recover(); failure != nil {
 				job.State = "failed"

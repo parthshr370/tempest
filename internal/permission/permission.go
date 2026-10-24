@@ -211,6 +211,37 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 // rules (also in bypass); bypass; per-call approval for the destructive guard
 // or destructive/opaque command intent; cloud writes (exact allow_write grant
 // or per-call approval); then the ordinary session/configured/mode policy.
+// effectTierKey carries operator-installed immutable effect metadata.
+type effectTierKey struct{}
+
+// GateDefinition uses identity/effect metadata instead of trusting a display name.
+func GateDefinition(ctx context.Context, mode Mode, name, identity, effect string, args json.RawMessage, policy *Policy, cwd, callID string) Outcome {
+	if effect == "" {
+		return GateInDirectory(ctx, mode, name, args, policy, cwd, callID)
+	}
+	tier := TierExec
+	switch effect {
+	case "read":
+		tier = TierRead
+	case "write":
+		tier = TierWrite
+	case "execute":
+	default:
+		return Outcome{Reason: "Unknown extension effect class", Source: SourceMode}
+	}
+	ctx = context.WithValue(ctx, effectTierKey{}, tier)
+	// Both the stable identity and model name remain eligible for explicit deny.
+	if policy != nil {
+		policyMu.Lock()
+		decision, present := policy.Overrides[identity]
+		policyMu.Unlock()
+		if present && decision == DecideDeny {
+			return Outcome{Reason: "Tool " + identity + " denied by policy", Source: SourceOverride}
+		}
+	}
+	return GateInDirectory(ctx, mode, name, args, policy, cwd, callID)
+}
+
 func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, cwd string, toolCallID ...string) Outcome {
 	hookDecision, hookReason := hooks.ToolDecision(ctx)
 	if hookDecision == "deny" {
@@ -234,6 +265,9 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 	}
 	isMCP := strings.HasPrefix(toolName, "mcp__")
 	tier := toolTier(toolName, args)
+	if declared, ok := ctx.Value(effectTierKey{}).(Tier); ok {
+		tier = declared
+	}
 	shell := inspectShell(toolName, args, cwd)
 	if mode == ModePlan {
 		if reason := planDenial(toolName, tier, shell); reason != "" {

@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+func isolatedMCPBinaryEnv(home string) []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "HARNESS_") || strings.HasPrefix(entry, "LYRA_") || strings.HasPrefix(entry, "HOME=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env, "HOME="+home)
+}
+
 func TestCLIMCPRealBinary(t *testing.T) {
 	tmp := t.TempDir()
 	exe := filepath.Join(tmp, "tempest")
@@ -31,7 +42,7 @@ func TestCLIMCPRealBinary(t *testing.T) {
 	sessionDir := filepath.Join(tmp, "sessions")
 	command := exec.Command(exe, "mcp", "-faux-script", script, "-session-dir", sessionDir, "-max-turns", "4", "-permission-timeout", "1s", "-shutdown-timeout", "2s", "-mcp-config", "")
 	command.Dir = tmp
-	command.Env = append(os.Environ(), "HARNESS_MCP_CONFIG="+filepath.Join(tmp, "must-not-load.json"))
+	command.Env = append(isolatedMCPBinaryEnv(tmp), "HARNESS_MCP_CONFIG="+filepath.Join(tmp, "must-not-load.json"))
 	input, err := command.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +218,7 @@ func TestCLIMCPRealBinary(t *testing.T) {
 		sigDir := filepath.Join(tmp, "signal-sessions")
 		cmd := exec.CommandContext(ctx, exe, "mcp", "-faux-script", script, "-session-dir", sigDir, "-shutdown-timeout", "2s")
 		cmd.Dir = tmp
+		cmd.Env = isolatedMCPBinaryEnv(tmp)
 		in, err := cmd.StdinPipe()
 		if err != nil {
 			t.Fatal(err)
@@ -260,7 +272,7 @@ func TestCLIMCPRealBinary(t *testing.T) {
 		}
 		cmd := exec.Command(exe, "-p", "stream", "-faux-script", textScript, "-session-dir", filepath.Join(tmp, "stream-sessions"), "-print", "json", "-output-format", "stream-json", "-mcp-config", "")
 		cmd.Dir = tmp
-		cmd.Env = append(os.Environ(), "HARNESS_MCP_CONFIG="+filepath.Join(tmp, "must-not-load.json"))
+		cmd.Env = append(isolatedMCPBinaryEnv(tmp), "HARNESS_MCP_CONFIG="+filepath.Join(tmp, "must-not-load.json"))
 		out, err := cmd.Output()
 		if err != nil {
 			t.Fatal(err)

@@ -17,6 +17,8 @@ import (
 	"time"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/outputschema"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // ErrSessionLocked reports that another writer already owns the journal.
@@ -32,19 +34,27 @@ type Options struct {
 // Store is an append-only session journal writer. It is safe for concurrent
 // use; appends are serialized and each line is written with one write call.
 type Store struct {
-	path   string
-	id     string
-	file   *os.File
-	mu     sync.Mutex
-	lastID string
-	seq    uint64
+	onCommit func()
+	path     string
+	id       string
+	file     *os.File
+	mu       sync.Mutex
+	lastID   string
+	seq      uint64
 	// failed is the first write or sync error. A failed write may have left a
 	// partial line, so the store refuses further appends rather than splice
 	// valid lines after it.
-	failed       error
-	clock        func() time.Time
-	newID        func() string
-	usageSources map[string]ptypes.Usage
+	failed         error
+	clock          func() time.Time
+	newID          func() string
+	usageSources   map[string]ptypes.Usage
+	lock           *os.File
+	durable        durable.Store
+	external       bool
+	closed         bool
+	schemas        map[string]*outputschema.Schema
+	releaseOwner   func()
+	catalogLastRun *RunSummary
 }
 
 // Create opens a new journal for cwd under dir and writes its header.
@@ -107,7 +117,19 @@ func Create(ctx context.Context, dir, cwd string, opts Options) (*Store, error) 
 		cleanup()
 		return nil, fmt.Errorf("sync journal directory: %w", err)
 	}
-	return &Store{path: path, id: id, file: file, clock: clock, newID: newID}, nil
+	stable, err := acquireStableLock(path)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	if err := syncDirectory(journalDir); err != nil {
+		_ = stable.Close()
+		cleanup()
+		return nil, err
+	}
+	store := &Store{path: path, id: id, file: file, lock: stable, clock: clock, newID: newID}
+	store.initDurable()
+	return store, nil
 }
 
 // ID returns the session id.
@@ -160,12 +182,19 @@ func (s *Store) AppendAssigned(ctx context.Context, entry Entry) (Meta, error) {
 		return Meta{}, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	committed := false
+	defer func() {
+		observer := s.onCommit
+		s.mu.Unlock()
+		if committed && observer != nil {
+			observer()
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return Meta{}, err
 	}
-	if s.file == nil {
-		return Meta{}, fmt.Errorf("append journal entry: store closed")
+	if s.closed || s.file == nil && !s.external {
+		return Meta{}, fmt.Errorf("append journal entry: %w", durable.ErrClosed)
 	}
 	if s.failed != nil {
 		return Meta{}, fmt.Errorf("journal failed earlier: %w", s.failed)
@@ -188,22 +217,15 @@ func (s *Store) AppendAssigned(ctx context.Context, entry Entry) (Meta, error) {
 	if err != nil {
 		return Meta{}, fmt.Errorf("marshal journal entry: %w", err)
 	}
-	if err := writeLine(s.file, line); err != nil {
-		s.failed = err
-		return Meta{}, fmt.Errorf("write journal entry: %w", err)
-	}
-	permission, effectiveArgs := entry.(PermissionRecord)
-	if syncsAfter(kind) || effectiveArgs && len(permission.Args) > 0 {
-		if err := s.file.Sync(); err != nil {
-			s.failed = err
-			return Meta{}, fmt.Errorf("sync journal after %s: %w", kind, err)
-		}
+	if err := s.appendEnvelope(ctx, line, meta, kind); err != nil {
+		return Meta{}, err
 	}
 	s.rememberUsage(entry, meta)
 	s.seq = meta.Seq
 	if meta.ID != "" {
 		s.lastID = meta.ID
 	}
+	committed = true
 	return meta, nil
 }
 
@@ -212,6 +234,14 @@ func (s *Store) AppendAssigned(ctx context.Context, entry Entry) (Meta, error) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.external {
+		if s.releaseOwner != nil {
+			s.releaseOwner()
+			s.releaseOwner = nil
+		}
+		s.closed = true
+		return nil
+	}
 	if s.file == nil {
 		return nil
 	}
@@ -219,13 +249,18 @@ func (s *Store) Close() error {
 	s.file = nil
 	syncErr := file.Sync()
 	closeErr := file.Close()
+	var lockErr error
+	if s.lock != nil {
+		lockErr = s.lock.Close()
+		s.lock = nil
+	}
 	if syncErr != nil {
 		return fmt.Errorf("sync journal: %w", syncErr)
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close journal: %w", closeErr)
 	}
-	return nil
+	return lockErr
 }
 
 func lockJournal(file *os.File) error {

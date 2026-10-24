@@ -315,9 +315,14 @@ func TestMCPServerProgressPrecedesResponseAndBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	busy, err := c.run(RunInput{Prompt: "busy", SessionID: id}, nil)
-	if err != nil || !busy.IsError {
-		t.Fatalf("busy=%+v err=%v id=%s", busy, err, id)
+	for _, requestID := range []string{"", "new-key"} {
+		ctx, cancel := context.WithTimeout(c.ctx, time.Second)
+		var busy toolResult
+		err := c.conn.Call(ctx, "tools/call", map[string]any{"name": "tempest_run", "arguments": RunInput{Prompt: "busy", SessionID: id, RequestID: requestID}}, &busy)
+		cancel()
+		if err != nil || !busy.IsError {
+			t.Fatalf("busy request %q=%+v err=%v id=%s", requestID, busy, err, id)
+		}
 	}
 	close(release)
 	out := <-done

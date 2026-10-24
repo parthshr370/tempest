@@ -21,7 +21,7 @@ func TestMCPReadIsNeverReplayed(t *testing.T) {
 		t.Fatalf("interrupted: %#v", loaded.Interrupted)
 	}
 	last := loaded.Messages[len(loaded.Messages)-1].(types.ToolResultMessage)
-	if !last.IsError || !strings.Contains(last.Content[0].Text, "outcome unknown") || !strings.Contains(last.Content[0].Text, textNoRerun) || strings.Contains(last.Content[0].Text, "safe to run again") {
+	if !last.IsError || !strings.Contains(last.Content[0].Text, "outcome unknown") || !strings.Contains(last.Content[0].Text, textNoRerun) || loaded.Interrupted[0].Replay != "" {
 		t.Fatalf("unsafe retry advice: %#v", last)
 	}
 }

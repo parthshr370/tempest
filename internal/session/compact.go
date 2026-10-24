@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 // compactionSummaryTimeout bounds a single summarization turn so a stalled
@@ -25,15 +27,16 @@ const compactionSummaryTimeout = 120 * time.Second
 // the model's window. It is wired into the agent loop's between-turn hook so a
 // long, tool-heavy build never silently overflows the context window.
 type compactionRunner struct {
-	contextWindow int
-	model         ptypes.Model
-	streamFn      agent.StreamFn
-	settings      compaction.CompactionSettings
-	store         *journal.Store
-	agt           *agent.Agent
-	parts         map[string]journal.CompactionPart
-	hooks         *hooks.Runner
-	hookCache     *hookCache
+	contextWindow    int
+	model            ptypes.Model
+	streamFn         agent.StreamFn
+	settings         compaction.CompactionSettings
+	store            *journal.Store
+	agt              *agent.Agent
+	parts            map[string]journal.CompactionPart
+	hooks            *hooks.Runner
+	hookCache        *hookCache
+	beforeCompaction func(context.Context, string) error
 }
 
 // newCompactionRunner builds a runner for the given model and provider seam. It
@@ -127,6 +130,14 @@ func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Messag
 	}
 	if hookResult.Decision == "deny" || hookResult.Stop {
 		return messages, false, nil
+	}
+	if r.beforeCompaction != nil {
+		if err := r.beforeCompaction(ctx, source); err != nil {
+			if errors.Is(err, extension.ErrDenied) {
+				return messages, false, nil
+			}
+			return nil, false, err
+		}
 	}
 	history := "No prior history."
 	if len(prep.MessagesToSummarize) > 0 || !prep.IsSplitTurn {

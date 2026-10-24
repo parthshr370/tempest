@@ -82,26 +82,32 @@ type startup struct {
 
 // Manager gives each language its own namespace. Close also kills descendants.
 type Manager struct {
-	mu        sync.Mutex
-	cwd       string
-	outputDir string
-	kernels   map[string]*kernel
-	lost      map[string]bool
-	gates     map[string]chan struct{}
-	starting  map[string]startup
-	closed    bool
+	mu           sync.Mutex
+	cwd          string
+	outputDir    string
+	kernels      map[string]*kernel
+	lost         map[string]bool
+	gates        map[string]chan struct{}
+	starting     map[string]startup
+	closed       bool
+	admitProcess func(context.Context) (func(), error)
 }
 
 // New doesn't start a runtime. Lost languages require an explicit reset after resume.
-func New(cwd, outputDir string, lost map[string]bool) *Manager {
+func New(cwd, outputDir string, lost map[string]bool, admit ...func(context.Context) (func(), error)) *Manager {
 	copied := make(map[string]bool, len(lost))
 	for language, stateLost := range lost {
 		copied[language] = stateLost
 	}
+	var admitProcess func(context.Context) (func(), error)
+	if len(admit) > 0 {
+		admitProcess = admit[0]
+	}
 	return &Manager{
 		cwd: cwd, outputDir: outputDir, kernels: make(map[string]*kernel), lost: copied,
-		gates:    map[string]chan struct{}{"py": make(chan struct{}, 1), "js": make(chan struct{}, 1)},
-		starting: make(map[string]startup),
+		gates:        map[string]chan struct{}{"py": make(chan struct{}, 1), "js": make(chan struct{}, 1)},
+		starting:     make(map[string]startup),
+		admitProcess: admitProcess,
 	}
 }
 
@@ -223,7 +229,7 @@ func (m *Manager) acquire(ctx context.Context, language string, reset bool) (*ke
 	if process != nil {
 		process.stop()
 	}
-	replacement, err := startKernel(startCtx, m.cwd, language)
+	replacement, err := startKernel(startCtx, m.cwd, language, m.admitProcess)
 	m.mu.Lock()
 	delete(m.starting, language)
 	if err == nil {
@@ -248,7 +254,21 @@ func (m *Manager) acquire(ctx context.Context, language string, reset bool) (*ke
 	return replacement, nil
 }
 
-func startKernel(ctx context.Context, cwd, language string) (*kernel, error) {
+func startKernel(ctx context.Context, cwd, language string, admit ...func(context.Context) (func(), error)) (*kernel, error) {
+	release := func() {}
+	if len(admit) > 0 && admit[0] != nil {
+		var err error
+		release, err = admit[0](ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			release()
+		}
+	}()
 	runtime, driver, args := "python3", pythonDriver, []string{"-I", "-u", "-c"}
 	if language == "js" {
 		runtime, driver, args = "node", javascriptDriver, []string{"-e"}
@@ -306,7 +326,8 @@ func startKernel(ctx context.Context, cwd, language string) (*kernel, error) {
 		lifeWrite.Close()
 		return nil, err
 	}
-	go func() { _ = cmd.Wait(); close(process.waited) }()
+	transferred = true
+	go func() { _ = cmd.Wait(); release(); close(process.waited) }()
 	ready := make(chan error, 1)
 	go func() {
 		response, err := readEvent(responseRead)

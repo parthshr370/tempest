@@ -72,22 +72,51 @@ func TestLSPDiagnosticsFreshness(t *testing.T) {
 		}
 	})
 	t.Run("wait zero synchronizes but doesn't wait", func(t *testing.T) {
-		h := startHarness(t, setup{fixture: map[string]any{"push_delay_ms": 300}})
+		h := startHarness(t, setup{fixture: map[string]any{"push": "manual"}})
 		h.ws.write(t, "a.go", "ERR\n")
-		if got := diagnosticSummary(h.mustQuery(diagnosticsQuery("a.go", 0))); got != "fresh=false freshness=pending total=0 omitted=0 []" {
+		value := h.mustQuery(diagnosticsQuery("a.go", 0))
+		if got := diagnosticSummary(value); got != "fresh=false freshness=pending total=0 omitted=0 []" {
 			t.Fatal(got)
 		}
+		if value["version"].(float64) != 1 || value["anchor"] != anchorOf("ERR\n") {
+			t.Fatalf("wait 0 didn't capture the opened document: %v", value)
+		}
+		h.m.mu.Lock()
+		srv := h.m.slots["go"].srv
+		h.m.mu.Unlock()
+		publish := func() {
+			t.Helper()
+			// The reply follows the publication in read order. Unlike a ledger
+			// read after Notify, this proves the server consumed earlier changes.
+			ctx, cancel := context.WithTimeout(context.Background(), wait)
+			defer cancel()
+			if _, err := srv.call(ctx, "fixture/publishDiagnostics", map[string]any{"textDocument": textDocumentID{URI: srv.uri("a.go")}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		publish()
 		if h.count("go", "textDocument/didOpen") != 1 {
 			t.Fatal("wait 0 must still synchronize")
 		}
-		value := h.mustQuery(diagnosticsQuery("a.go", wait))
+		value = h.mustQuery(diagnosticsQuery("a.go", wait))
 		if value["freshness"] != "current" {
 			t.Fatal(diagnosticSummary(value))
 		}
 		// After an edit, the cached publication for version 1 is outdated, not current.
 		h.ws.write(t, "a.go", "ERR WARN\n")
 		h.m.Changed("a.go")
-		if got := diagnosticSummary(h.mustQuery(diagnosticsQuery("a.go", 50*time.Millisecond))); got != "fresh=false freshness=outdated total=1 omitted=0 [error@1:1-1:4 F1 ERR found]" {
+		value = h.mustQuery(diagnosticsQuery("a.go", 0))
+		if got := diagnosticSummary(value); got != "fresh=false freshness=outdated total=1 omitted=0 [error@1:1-1:4 F1 ERR found]" {
+			t.Fatal(got)
+		}
+		if value["version"].(float64) != 2 || value["anchor"] != anchorOf("ERR WARN\n") {
+			t.Fatalf("wait 0 didn't synchronize didChange: %v", value)
+		}
+		publish()
+		if h.count("go", "textDocument/didChange") != 1 {
+			t.Fatal("wait 0 must synchronize pending didChange")
+		}
+		if got := diagnosticSummary(h.mustQuery(diagnosticsQuery("a.go", 0))); got != "fresh=true freshness=current total=2 omitted=0 [error@1:1-1:4 F1 ERR found warning@1:5-1:9 F2 WARN found]" {
 			t.Fatal(got)
 		}
 	})

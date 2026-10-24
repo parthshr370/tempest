@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -195,5 +196,21 @@ func TestCompactionPersistsAcrossPrompts(t *testing.T) {
 	}
 	if !turnSawMarker[len(turnSawMarker)-1] {
 		t.Fatal("second prompt's request did not start from the persisted summary")
+	}
+}
+
+func TestExtensionCompactionHookOnlyRunsAtActualBoundary(t *testing.T) {
+	provider := faux.New(faux.Options{})
+	refused := errors.New("compaction refused")
+	calls := 0
+	runner := &compactionRunner{contextWindow: 200000, model: provider.Model(), streamFn: provider.StreamSimple, settings: compaction.DefaultCompactionSettings, beforeCompaction: func(context.Context, string) error { calls++; return refused }}
+	if _, changed, err := runner.compact(context.Background(), []ptypes.Message{cUser("short")}); err != nil || changed || calls != 0 {
+		t.Fatalf("hook ran without compaction: %t %d %v", changed, calls, err)
+	}
+	runner.contextWindow = 100
+	runner.settings = compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10}
+	messages := []ptypes.Message{cUser(strings.Repeat("A", 400)), cAssistant(strings.Repeat("B", 400)), cUser("recent")}
+	if _, _, err := runner.compact(context.Background(), messages); !errors.Is(err, refused) || calls != 1 || provider.CallCount() != 0 {
+		t.Fatalf("unapproved summary sent: calls=%d provider=%d err=%v", calls, provider.CallCount(), err)
 	}
 }

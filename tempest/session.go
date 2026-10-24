@@ -35,17 +35,21 @@ import (
 
 // Run is an admitted run. Wait may be called more than once.
 type Run struct {
-	cancel     context.CancelFunc
-	done       chan struct{}
-	started    time.Time
-	result     RunResult
-	err        error
-	ready      chan struct{}
-	readyOnce  sync.Once
-	startID    string
-	text       string
-	last       Message
-	finishedAt time.Time
+	cancel        context.CancelFunc
+	done          chan struct{}
+	started       time.Time
+	result        RunResult
+	err           error
+	ready         chan struct{}
+	readyOnce     sync.Once
+	startID       string
+	text          string
+	last          Message
+	finishedAt    time.Time
+	requestID     string
+	admittedRunID string
+	release       func()
+	submission    *Submission
 }
 
 // Wait returns the run's terminal result.
@@ -88,30 +92,44 @@ type approvalResult struct {
 	err    error
 }
 type sessionCore struct {
-	mu       sync.Mutex
-	id       string
-	agent    *agent.Agent
-	store    *journal.Store
-	hub      *hub.Hub
-	model    types.Model
-	budget   Budget
-	mode     PermissionMode
-	prompter Prompter
-	pending  map[string]*approval
+	mu                 sync.Mutex
+	admission          sync.Mutex
+	submissionRuns     map[string]*Run
+	documents          map[string]documentSpec
+	durablePublishMu   sync.Mutex
+	durablePublished   uint64
+	submissionNotifyMu sync.Mutex
+	submissionChanged  chan struct{}
+	authorize          Authorizer
+	clientNamespace    func(context.Context) string
+	id                 string
+	agent              *agent.Agent
+	store              *journal.Store
+	hub                *hub.Hub
+	model              types.Model
+	budget             Budget
+	mode               PermissionMode
+	prompter           Prompter
+	pending            map[string]*approval
 	// logger reports diagnostics that have no run to attach to, such as a
 	// resumed child's edit-batch recovery.
-	logger        *slog.Logger
-	active        *Run
-	closed        bool
-	closeOnce     sync.Once
-	closeErr      error
-	detachJournal func()
-	detachHub     func()
-	lastText      string
-	runID         string
-	delivery      *session.MediaDelivery
-	mcp           *mcpclient.Manager
-	mcpEnabled    bool
+	logger           *slog.Logger
+	active           *Run
+	closed           bool
+	closeOnce        sync.Once
+	closeErr         error
+	detachJournal    func()
+	detachHub        func()
+	lastText         string
+	runID            string
+	delivery         *session.MediaDelivery
+	mcp              *mcpclient.Manager
+	mcpEnabled       bool
+	mcpServers       []MCPServerConfig
+	resumeExtensions func(context.Context) error
+	providerConfig   ProviderConfig
+	customStream     bool
+	admitRun         func(context.Context) (func(), error)
 	// lsp is the root session's language-server manager, owned and closed
 	// here; nil when language servers are disabled or supplied by the host.
 	lsp              *lsp.Manager
@@ -188,7 +206,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	var loaded *journal.Loaded
 	if o.Resume != nil {
 		path := o.Resume.Path
-		if path == "" {
+		if path == "" && o.Store == nil {
 			if o.Resume.SessionID == "" {
 				return nil, errors.New("resume needs SessionID or Path")
 			}
@@ -197,7 +215,11 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 				return nil, err
 			}
 		}
-		store, loaded, err = journal.OpenForResume(ctx, path, journal.Options{})
+		if o.Store != nil {
+			store, loaded, err = journal.OpenBackend(ctx, o.Store, dir, o.Resume.SessionID, journal.Options{})
+		} else {
+			store, loaded, err = journal.OpenForResume(ctx, path, journal.Options{})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -209,6 +231,11 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cwd = loaded.Header.Cwd
 		cfg.Cwd = cwd
 		cfg.InitialMessages = loaded.Messages
+	}
+	if store != nil {
+		if err = restoreAgent(ctx, &o, &cfg, store, &selectedMCP); err != nil {
+			return nil, err
+		}
 	}
 	if o.Hooks != nil {
 		cfg.Hooks = o.Hooks.Clone()
@@ -262,6 +289,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 		cfg.PlanModel = cfg.Model
 	}
+	providerConfig := o.Provider
+	customStream := cfg.StreamFn != nil
 	if cfg.StreamFn == nil {
 		provider := o.Provider
 		if defaults != nil {
@@ -284,6 +313,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if modelSpec != "" {
 			provider.ModelID = modelSpec
 		}
+		providerConfig = provider
 		router, e := adapter.NewProviderRouter(provider)
 		if e != nil {
 			return nil, e
@@ -321,7 +351,11 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 	}
 	if store == nil {
-		store, err = journal.Create(ctx, dir, cwd, journal.Options{})
+		if o.Store != nil {
+			store, err = journal.CreateBackend(ctx, o.Store, dir, cwd, journal.Options{})
+		} else {
+			store, err = journal.Create(ctx, dir, cwd, journal.Options{})
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -342,6 +376,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 	}
 	c := &sessionCore{id: store.ID(), store: store, model: runtimeModel, budget: budget, mode: mode, prompter: o.Prompter, pending: make(map[string]*approval), logger: logger}
+	c.authorize, c.clientNamespace = o.Authorize, o.ClientNamespace
+	c.providerConfig, c.customStream = providerConfig, customStream
+	c.admitRun = o.admitRun
 	s := &Session{core: c}
 	mapper := newMapper(c.id, runtimeModel)
 	seed := Snapshot{SessionID: c.id, Cwd: cwd, Model: runtimeModel.ID, PermissionMode: string(mode), Budget: budget, Usage: mapper.usage}
@@ -369,6 +406,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		logger.Warn("interrupted edit batch", "diagnostic", message)
 	}
 	c.hub = hub.New(seed, mapper.mapEvent)
+	store.ObserveCommit(func() { s.publishDurable(context.Background()) })
 	if loaded != nil {
 		// Replay reconciled messages through the same mapping before any watcher exists.
 		listener := c.hub.Listener()
@@ -431,11 +469,13 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	cfg.PermissionPolicy.MCPDefaults = make(map[string]permission.Decision)
 	c.permissionPolicy = &cfg.PermissionPolicy
 	// MCP spills sit with the session's other tool output, where read can open them.
-	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(tools.ToolOutputDir(store.Path()+".d"), "mcp"), selectedMCP, logger)
+	cfg.AdmitProcess = o.admitProcess
+	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(tools.ToolOutputDir(store.Path()+".d"), "mcp"), selectedMCP, logger, o.admitProcess)
 	if err != nil {
 		return nil, err
 	}
 	c.mcpEnabled = len(selectedMCP) != 0
+	c.mcpServers = selectedMCP
 	defer func() {
 		if err != nil {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -461,6 +501,35 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	c.excludeTools = append([]string(nil), cfg.ExcludeTools...)
 	c.plan = cfg.Plan
 	cfg.Journal, cfg.Loaded = store, loaded
+	extensionClose, extensionErr := configureExtensions(ctx, o, &cfg, store, loaded)
+	if extensionErr != nil {
+		return nil, extensionErr
+	}
+	defer func() {
+		if err != nil && extensionClose != nil {
+			_ = extensionClose()
+		}
+	}()
+	if cfg.Extensions != nil {
+		c.resumeExtensions = func(ctx context.Context) error {
+			recoveries, err := cfg.Extensions.ResumePending(ctx)
+			if err != nil {
+				return err
+			}
+			reduced, err := store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			c.agent.SetMessages(reduced.Messages)
+			if cfg.OnMessagesChanged != nil {
+				cfg.OnMessagesChanged(reduced.Messages)
+			}
+			for _, recovery := range recoveries {
+				c.hub.Emit(update("tempest/recovery", map[string]any{"callId": recovery.CallID, "state": recovery.State, "reason": recovery.Reason, "result": recovery.Result}, time.Now()))
+			}
+			return nil
+		}
+	}
 	c.queues = session.NewDurableQueues(store, loaded, c.publishWork)
 	cfg.QueueSource = c.queues
 	c.openMessaging(&cfg)
@@ -478,7 +547,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		RunTask: func(ctx context.Context, launch work.TaskLaunch) (work.TaskResult, error) {
 			return c.runTask(ctx, cfg, launch)
 		},
-	}, jobs.Options{BashTimeout: cfg.BashTimeout, OnError: func(error) { s.Cancel() }}, recoveries)
+	}, jobs.Options{BashTimeout: cfg.BashTimeout, OnError: func(error) { s.Cancel() }, AdmitProcess: o.admitProcess}, recoveries)
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +559,13 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	c.agent = stack.Agent
 	c.checkpoints = stack.Checkpoints
-	c.stackClose = stack.Close
+	c.stackClose = func() error {
+		var extensionErr error
+		if extensionClose != nil {
+			extensionErr = extensionClose()
+		}
+		return errors.Join(stack.Close(), extensionErr)
+	}
 	mcpNames := make(map[string]bool)
 	for _, tool := range c.mcp.Tools() {
 		mcpNames[tool.Name] = true
@@ -504,7 +579,14 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if cfg.AttachmentReader != nil || cfg.AttachmentRegistry != nil {
 		c.delivery = &session.MediaDelivery{Reader: cfg.AttachmentReader, Registry: cfg.AttachmentRegistry, ContextWindow: runtimeModel.ContextWindow, Sanitize: cfg.Sanitize}
 	}
-	c.detachJournal = session.AttachJournalWithOptions(c.agent, store, session.RecordOptions{Queues: c.queues, Started: func(id string) {
+	c.detachJournal = session.AttachJournalWithOptions(c.agent, store, session.RecordOptions{Queues: c.queues, NextRunID: func() string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.active != nil {
+			return c.active.admittedRunID
+		}
+		return ""
+	}, Started: func(id string) {
 		state := c.agent.RunState()
 		mapper.mu.Lock()
 		mapper.runID = id
@@ -553,12 +635,39 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 				}
 			}
 		}
-		return c.hub.Listener()(ctx, ev)
+		if err := c.hub.Listener()(ctx, ev); err != nil {
+			return err
+		}
+		s.publishDurable(ctx)
+		return nil
 	})
+	if err = store.RegisterDocuments(ctx, o.Documents); err != nil {
+		return nil, err
+	}
+	if err = s.initializeDocuments(ctx); err != nil {
+		return nil, err
+	}
+	if err = s.persistAgent(ctx, o, cfg, metadataModel, selectedMCP); err != nil {
+		return nil, err
+	}
+	s.publishDurable(ctx)
 	return s, nil
 }
-func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
+func (s *Session) start(ctx context.Context, p *Prompt, requestID string, release func()) (*Run, error) {
 	c := s.core
+	if release == nil && c.admitRun != nil {
+		var err error
+		release, err = c.admitRun(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	launched := false
+	defer func() {
+		if !launched && release != nil {
+			release()
+		}
+	}()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -581,12 +690,35 @@ func (s *Session) begin(ctx context.Context, p *Prompt) (*Run, error) {
 		}
 	}
 	runCtx, cancel := context.WithCancel(ctx)
-	r := &Run{cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), started: time.Now()}
+	r := &Run{cancel: cancel, done: make(chan struct{}), ready: make(chan struct{}), started: time.Now(), requestID: requestID}
+	r.release = release
+	if requestID != "" {
+		v, err := s.submissionRecord(ctx, requestID)
+		if err != nil {
+			cancel()
+			c.mu.Unlock()
+			return nil, err
+		}
+		r.admittedRunID = v.RunID
+		v.State = "running"
+		if err = s.saveSubmission(ctx, v, "dispatch:"+requestID); err != nil {
+			cancel()
+			c.mu.Unlock()
+			return nil, err
+		}
+	}
+	if c.submissionRuns == nil {
+		c.submissionRuns = make(map[string]*Run)
+	}
+	if requestID != "" {
+		c.submissionRuns[requestID] = r
+	}
 	c.active = r
 	c.lastText = ""
 	c.runID = ""
 	c.mu.Unlock()
 	go s.execute(runCtx, p, schema, r)
+	launched = true
 	return r, nil
 }
 
@@ -601,12 +733,20 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, schema *outputschem
 		if r.startID == "" && r.err == nil {
 			r.err = errors.New("run ended before durable start")
 		}
+		c.mu.Unlock()
+		s.finishSubmission(r)
+		c.mu.Lock()
 		r.readyOnce.Do(func() { close(r.ready) })
 		c.active = nil
+		delete(c.submissionRuns, r.requestID)
 		closed := c.closed
 		c.mu.Unlock()
 		if closed {
 			c.finishClose()
+		}
+		s.publishDurable(context.Background())
+		if r.release != nil {
+			r.release()
 		}
 		close(r.done)
 	}()

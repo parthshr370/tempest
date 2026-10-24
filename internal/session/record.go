@@ -41,11 +41,13 @@ func AttachJournalWithRunID(agt *agent.Agent, store *journal.Store, started func
 type RecordOptions struct {
 	Started func(string)
 	Queues  *DurableQueues
+	// NextRunID preserves an ID assigned by durable admission.
+	NextRunID func() string
 }
 
 // AttachJournalWithOptions installs the durable recorder before public listeners.
 func AttachJournalWithOptions(agt *agent.Agent, store *journal.Store, opts RecordOptions) func() {
-	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: opts.Started, queues: opts.Queues, sources: map[string]ptypes.Usage{}}
+	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: opts.Started, queues: opts.Queues, sources: map[string]ptypes.Usage{}, nextRunID: opts.NextRunID}
 	return agt.Subscribe(r.record)
 }
 
@@ -57,6 +59,7 @@ type recorder struct {
 	queues     *DurableQueues
 	toolStarts map[string]time.Time
 	sources    map[string]ptypes.Usage
+	nextRunID  func() string
 }
 
 func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
@@ -77,12 +80,24 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			}
 		}
 	case agent.EventAgentStart:
-		loaded, loadErr := journal.Load(ctx, r.store.Path())
-		if loadErr != nil {
-			return loadErr
+		var loaded *journal.Loaded
+		if ev.Resume {
+			var loadErr error
+			loaded, loadErr = r.store.Load(ctx)
+			if loadErr != nil {
+				return loadErr
+			}
+			r.sources = loaded.UsageSources
+		} else {
+			// Fresh input doesn't need transcript or interrupted-run recovery.
+			r.sources = r.store.UsageSources()
 		}
-		r.sources = loaded.UsageSources
 		state := agent.RunState{SessionID: r.store.ID(), RunID: r.store.NewRunID(), StartedAt: time.Now(), UsageSources: r.sources}
+		if r.nextRunID != nil {
+			if id := r.nextRunID(); id != "" {
+				state.RunID = id
+			}
+		}
 		state.LogicalRunID = state.RunID
 		if ev.Resume && loaded.LastRun != nil && !loaded.LastRun.Finished {
 			state.ContinuationOf = loaded.LastRun.RunID
@@ -153,7 +168,7 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			break
 		}
 		r.toolStarts[callKey] = ev.At
-		err = r.store.Append(ctx, journal.ToolStartedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args)})
+		err = r.store.Append(ctx, journal.ToolStartedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args), DefinitionID: ev.Definition.Identity, DefinitionRevision: ev.Definition.Revision, Environment: ev.Definition.Environment, Replay: ev.Definition.Replay, SchemaHash: ev.Definition.SchemaHash, ArgumentsHash: ev.Definition.ArgumentsHash})
 	case agent.EventToolExecutionEnd:
 		finished := journal.ToolFinishedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, OK: !ev.IsError}
 		if started, ok := r.toolStarts[callKey]; ok {

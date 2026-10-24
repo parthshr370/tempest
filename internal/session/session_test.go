@@ -19,6 +19,9 @@ func TestSelectActive(t *testing.T) {
 	if len(active) != 11 {
 		t.Fatalf("all active = %d", len(active))
 	}
+	if active := SelectActive(all, []string{}, nil, ""); len(active) != 0 {
+		t.Fatalf("explicit empty allowlist activated %d tools", len(active))
+	}
 	readonly := SelectActive(all, []string{"read", "grep", "find", "ls"}, nil, "")
 	if len(readonly) != 4 || names(readonly) != "read,grep,find,ls" {
 		t.Fatalf("readonly = %s", names(readonly))

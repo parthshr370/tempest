@@ -20,6 +20,7 @@ import (
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 func TestResolveOutputFormat(t *testing.T) {
@@ -559,6 +560,24 @@ func countEntryType(t *testing.T, path, entryType string) int {
 		}
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			t.Fatal(err)
+		}
+		if entry.Type == "commit" {
+			envelope, err := durable.DecodeEnvelope(path, []byte(line))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, change := range envelope.Commit.Changes {
+				if change.Kind != durable.EntryKind || change.Namespace != "_tempest/journal" {
+					continue
+				}
+				if err := json.Unmarshal(change.Value, &entry); err != nil {
+					t.Fatal(err)
+				}
+				if entry.Type == entryType {
+					count++
+				}
+			}
+			continue
 		}
 		if entry.Type == entryType {
 			count++

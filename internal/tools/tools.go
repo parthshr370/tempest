@@ -118,6 +118,7 @@ var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameToo
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
 type ToolsOptions struct {
+	AdmitProcess  func(context.Context) (func(), error)
 	Checkpoints   *checkpoint.Manager
 	MutationQueue *toolio.FileMutationQueue
 	ShellPath     string
@@ -880,6 +881,13 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 					}
 					return err
 				}
+			}
+			if options.AdmitProcess != nil {
+				release, err := options.AdmitProcess(execCtx)
+				if err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				defer release()
 			}
 			acc := toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{TempFilePrefix: "harness-bash", TempDir: ToolOutputDir(options.SessionDataDir)})
 			writer := &bashOutputWriter{accumulator: acc, cancel: cancel}

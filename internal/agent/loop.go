@@ -424,6 +424,8 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 // executing tools, so a truncated stream doesn't run half-formed tool calls.
 func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 	config := &run.config
+	releaseExtensions := func() {}
+	defer func() { releaseExtensions() }()
 	firstTurn := true
 	quiescentResume := config.Resume && (len(current.Messages) == 0 || current.Messages[len(current.Messages)-1].Role() == "assistant")
 	pendingMessages, err := run.take(ctx, work.Steer)
@@ -487,6 +489,16 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return err
 				}
 			}
+			if config.Extensions != nil {
+				var extensionErr error
+				releaseExtensions()
+				var releasePrepared func()
+				ctx, current, releasePrepared, extensionErr = config.Extensions.Prepare(ctx, current)
+				if extensionErr != nil {
+					return extensionErr
+				}
+				releaseExtensions = releasePrepared
+			}
 			release, stop, err := run.accounting.admit(ctx, config.Model)
 			if stop != "" || err != nil {
 				release()
@@ -511,6 +523,11 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				return err
 			}
 			run.messages = append(run.messages, message)
+			if config.Extensions != nil {
+				if err := config.Extensions.AfterResponse(ctx, message); err != nil {
+					return err
+				}
+			}
 
 			if message.StopReason == types.StopError || message.StopReason == types.StopAborted {
 				if err := run.emit(ctx, TurnEnd(message, []types.ToolResultMessage{})); err != nil {

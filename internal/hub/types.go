@@ -10,6 +10,7 @@ import (
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // ErrStaleEpoch means a compaction replaced the requested transcript.
@@ -98,27 +99,32 @@ type UsageState struct {
 
 // Snapshot is a detached view captured atomically with subscriber registration.
 type Snapshot struct {
-	Seq            uint64                    `json:"seq"`
-	SessionID      string                    `json:"sessionId"`
-	Cwd            string                    `json:"cwd"`
-	Model          string                    `json:"model"`
-	PermissionMode string                    `json:"permissionMode"`
-	Budget         agent.Budget              `json:"budget"`
-	Run            RunState                  `json:"run"`
-	LastRun        *RunSummary               `json:"lastRun,omitempty"`
-	HistoryEpoch   int                       `json:"historyEpoch"`
-	HistoryLen     int                       `json:"historyLen"`
-	History        []Update                  `json:"history"`
-	Streaming      *StreamingMessage         `json:"streaming,omitempty"`
-	Tools          []ToolState               `json:"tools"`
-	PendingAsks    []Ask                     `json:"pendingAsks"`
-	Usage          UsageState                `json:"usage"`
-	Interrupted    []journal.InterruptedTool `json:"interrupted"`
-	Diagnostics    []string                  `json:"diagnostics"`
-	Queues         []work.QueueItem          `json:"queues"`
-	Jobs           []work.Job                `json:"jobs"`
-	JobsTruncated  bool                      `json:"jobsTruncated"`
-	JobsCursor     string                    `json:"jobsCursor,omitempty"`
+	Seq               uint64                    `json:"seq"`
+	SessionID         string                    `json:"sessionId"`
+	Cwd               string                    `json:"cwd"`
+	Model             string                    `json:"model"`
+	PermissionMode    string                    `json:"permissionMode"`
+	Budget            agent.Budget              `json:"budget"`
+	Run               RunState                  `json:"run"`
+	LastRun           *RunSummary               `json:"lastRun,omitempty"`
+	HistoryEpoch      int                       `json:"historyEpoch"`
+	HistoryLen        int                       `json:"historyLen"`
+	History           []Update                  `json:"history"`
+	Streaming         *StreamingMessage         `json:"streaming,omitempty"`
+	Tools             []ToolState               `json:"tools"`
+	PendingAsks       []Ask                     `json:"pendingAsks"`
+	Usage             UsageState                `json:"usage"`
+	Interrupted       []journal.InterruptedTool `json:"interrupted"`
+	Diagnostics       []string                  `json:"diagnostics"`
+	Queues            []work.QueueItem          `json:"queues"`
+	Jobs              []work.Job                `json:"jobs"`
+	JobsTruncated     bool                      `json:"jobsTruncated"`
+	JobsCursor        string                    `json:"jobsCursor,omitempty"`
+	DurableSeq        uint64                    `json:"durableSeq"`
+	Documents         []durable.Record          `json:"documents"`
+	Submissions       []durable.Record          `json:"submissions"`
+	DocumentsCursor   string                    `json:"documentsCursor,omitempty"`
+	SubmissionsCursor string                    `json:"submissionsCursor,omitempty"`
 }
 
 // WireBudget is the ACP form of [agent.Budget], matching the session/new and

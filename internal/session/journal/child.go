@@ -1,12 +1,10 @@
 package journal
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,7 +92,14 @@ func CreateChild(ctx context.Context, parentPath, childID, cwd string, opts Opti
 		_ = f.Close()
 		return nil, fmt.Errorf("create child journal: %w", err)
 	}
-	return &Store{path: path, id: childID, file: f, clock: clock, newID: newID}, nil
+	stable, err := acquireStableLock(path)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	store := &Store{path: path, id: childID, file: f, lock: stable, clock: clock, newID: newID}
+	store.initDurable()
+	return store, nil
 }
 func syncDirectory(path string) error {
 	f, e := os.Open(path)
@@ -103,48 +108,4 @@ func syncDirectory(path string) error {
 	}
 	defer f.Close()
 	return f.Sync()
-}
-
-func upgradeHeader(f *os.File, version int) error {
-	if version == JournalVersion {
-		return nil
-	}
-	contents, err := os.ReadFile(f.Name())
-	if err != nil {
-		return err
-	}
-	line, _, _ := bytes.Cut(contents, []byte{'\n'})
-	d := json.NewDecoder(bytes.NewReader(line))
-	token, err := d.Token()
-	if err != nil || token != json.Delim('{') {
-		return fmt.Errorf("upgrade: invalid header object")
-	}
-	var offset int64 = -1
-	for d.More() {
-		token, err = d.Token()
-		if err != nil {
-			return err
-		}
-		var raw json.RawMessage
-		if err = d.Decode(&raw); err != nil {
-			return err
-		}
-		if token == "version" {
-			if offset != -1 || len(raw) != 1 || raw[0] != byte('0'+version) {
-				return fmt.Errorf("upgrade: noncanonical version token")
-			}
-			offset = d.InputOffset() - int64(len(raw))
-		}
-	}
-	if offset < 0 {
-		return fmt.Errorf("upgrade: missing version token")
-	}
-	if _, err = f.WriteAt([]byte{'3'}, offset); err != nil {
-		return fmt.Errorf("upgrade header: %w", err)
-	}
-	if err = f.Sync(); err != nil {
-		return fmt.Errorf("sync upgraded header: %w", err)
-	}
-	_, err = f.Seek(0, io.SeekEnd)
-	return err
 }

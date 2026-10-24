@@ -7,13 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
-	"slices"
 	"strings"
 	"time"
 
@@ -70,58 +67,35 @@ func (s *Server) configureA2A(base string) error {
 	s.origin = u.Scheme + "://" + u.Host
 	return nil
 }
-func sameMCP(a, b []tempest.MCPServerConfig) bool {
-	return slices.EqualFunc(a, b, func(a, b tempest.MCPServerConfig) bool {
-		if !slices.Equal(a.Args, b.Args) || !maps.Equal(a.Env, b.Env) || len(a.Headers) != len(b.Headers) {
-			return false
-		}
-		for key, value := range a.Headers {
-			found := false
-			for other, candidate := range b.Headers {
-				if strings.EqualFold(key, other) && value == candidate {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
-			}
-		}
-		a.Args, b.Args, a.Env, b.Env, a.Headers, b.Headers = nil, nil, nil, nil, nil, nil
-		return reflect.DeepEqual(a, b)
-	})
-}
 func (s *Server) openContext(parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(s.ctx, cancel)
 	return ctx, func() { stop(); cancel() }
 }
-func (s *Server) resumeOpen(ctx context.Context, cwd, id string, servers []tempest.MCPServerConfig, explicit bool, pending *opening) (session *tempest.Session, err error) {
+func (s *Server) resumeOpen(ctx context.Context, cwd, id string, servers []tempest.MCPServerConfig, pending *opening) (session *tempest.Session, err error) {
 	defer s.openers.Done()
 	defer func() { s.mu.Lock(); pending.err = err; delete(s.opening, id); close(pending.done); s.mu.Unlock() }()
-	if !explicit {
-		servers, err = mcpconfig.Normalize(s.opts.DefaultNew.MCPServers)
-		if err != nil {
-			return nil, err
-		}
-	}
 	ctx, cancel := s.openContext(ctx)
 	defer cancel()
 	settings := tempest.ResumeSession{SessionID: id, Budget: s.opts.DefaultNew.Budget, PermissionMode: s.opts.DefaultNew.PermissionMode, MCPServers: servers}
-	session, err = tempest.Open(ctx, tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, Resume: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: s.broker})
+	session, err = s.host.OpenWithOptions(ctx, id, settings)
 	if err != nil {
 		return nil, err
 	}
+	if cwd != "" && session.Snapshot().Cwd != cwd {
+		_ = s.host.CloseSession(context.Background(), session.ID())
+		return nil, errors.New("workspace differs from resumed session")
+	}
 	s.mu.Lock()
 	if !s.closed {
-		s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now(), mcpServers: servers}
+		s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now()}
 		s.mu.Unlock()
 		return session, nil
 	}
 	s.mu.Unlock()
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 	defer closeCancel()
-	_ = session.Close(closeCtx)
+	_ = s.host.CloseSession(closeCtx, session.ID())
 	return nil, tempest.ErrClosed
 }
 func (s *Server) authorize(queryToken, checkOrigin bool, next http.Handler) http.Handler {

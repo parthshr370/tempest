@@ -31,8 +31,9 @@ const MaxRequest = 1 << 20
 
 // Handlers receives server requests and notifications outside transport locks.
 type Handlers struct {
-	Request func(context.Context, string, json.RawMessage) (any, *rpc.Error)
-	Notify  func(string, json.RawMessage)
+	Request      func(context.Context, string, json.RawMessage) (any, *rpc.Error)
+	Notify       func(string, json.RawMessage)
+	AdmitProcess func(context.Context) (func(), error)
 }
 
 type transport interface {

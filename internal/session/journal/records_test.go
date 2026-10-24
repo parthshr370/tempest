@@ -50,7 +50,7 @@ func TestVersion1JournalLoadsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeStore(t, store)
-	lines := journalLines(t, path)
+	lines := journalEntryLines(t, path)
 	var appended struct {
 		Seq      uint64 `json:"seq"`
 		ParentID string `json:"parent_id"`
@@ -86,7 +86,7 @@ func TestRecordsShareOneSeqAndStayOutOfTheEntryChain(t *testing.T) {
 	closeStore(t, store)
 
 	var previousID string
-	for index, line := range journalLines(t, store.Path())[1:] {
+	for index, line := range journalEntryLines(t, store.Path())[1:] {
 		var wire wireEntry
 		if err := json.Unmarshal([]byte(line), &wire); err != nil {
 			t.Fatal(err)
@@ -175,8 +175,8 @@ func TestReconcileWordsEachMissingResultFromTheRecords(t *testing.T) {
 	if text := loaded.Messages[3].(ptypes.ToolResultMessage).Content[0].Text; !strings.Contains(text, textNoRerun) {
 		t.Fatalf("bash result lacks the no-rerun note: %q", text)
 	}
-	if text := loaded.Messages[5].(ptypes.ToolResultMessage).Content[0].Text; !strings.Contains(text, textSafeToRerun) {
-		t.Fatalf("grep result lacks the safe-to-rerun note: %q", text)
+	if text := loaded.Messages[5].(ptypes.ToolResultMessage).Content[0].Text; !strings.Contains(text, textNoRerun) {
+		t.Fatalf("old grep intent must remain Never: %q", text)
 	}
 	if len(loaded.Interrupted) != 1 || loaded.Interrupted[0].ToolCallID != "unknown" || loaded.Interrupted[0].Tool != "bash" || string(loaded.Interrupted[0].Args) != `{"command":"make"}` {
 		t.Fatalf("interrupted = %#v", loaded.Interrupted)
@@ -246,7 +246,7 @@ func TestTornTailIsTrimmedAndUnterminatedTailIsKept(t *testing.T) {
 		wantKept bool
 	}{
 		{name: "partial json", tail: func(line string) string { return line[:len(line)/2] }},
-		{name: "missing newline", tail: func(line string) string { return line }, wantKept: true},
+		{name: "missing newline", tail: func(line string) string { return line }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := newTestStore(t, t.TempDir())
@@ -319,6 +319,10 @@ func TestUnknownRecordKindAndSeqRegressionAreDiagnosed(t *testing.T) {
 	appendAll(t, store, RunStartedRecord{Meta: run, Model: "m"})
 	closeStore(t, store)
 	contents, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, _, err = expandV4(testContext, store.Path(), contents)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +414,25 @@ func journalLines(t *testing.T, path string) []string {
 	contents, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return strings.Split(strings.TrimRight(string(contents), "\n"), "\n")
+}
+
+func journalEntryLines(t *testing.T, path string) []string {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header Header
+	if err = json.Unmarshal([]byte(strings.SplitN(string(contents), "\n", 2)[0]), &header); err != nil {
+		t.Fatal(err)
+	}
+	if header.Version == 4 {
+		contents, _, err = expandV4(testContext, path, contents)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	return strings.Split(strings.TrimRight(string(contents), "\n"), "\n")
 }

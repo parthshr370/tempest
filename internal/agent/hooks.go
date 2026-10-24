@@ -91,6 +91,18 @@ func (run *loopRun) completeWithHooks(ctx context.Context) ([]work.QueuedMessage
 	if len(pending) > 0 {
 		run.hookFollowUp = true
 	}
+	if len(pending) == 0 && run.result.StopReason == StopCompleted && run.config.Extensions != nil && ctx.Err() == nil && run.stopHookContinuations < 8 {
+		text, err := run.config.Extensions.Yield(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if text != "" {
+			run.stopHookContinuations++
+			run.result.StopReason, run.result.Output = "", nil
+			run.hookFollowUp = true
+			return []work.QueuedMessage{{Message: hookMessage("on_yield", text)}}, nil
+		}
+	}
 	if len(pending) > 0 || run.result.StopReason != StopCompleted || run.config.Hooks == nil || ctx.Err() != nil {
 		return pending, nil
 	}

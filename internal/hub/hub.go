@@ -13,6 +13,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // Mapper runs under the hub lock, so its per-session counters need no other lock.
@@ -24,11 +25,24 @@ type Hub struct {
 	view      Snapshot
 	history   []Update
 	streaming []Update
-	subs      map[uint64]chan Update
+	subs      map[uint64]*subscription
 	next      uint64
 	mapper    Mapper
 	closed    bool
 	jobs      map[string]work.Job
+}
+
+const (
+	maxSubscriberBytes      = 4 << 20
+	maxSnapshotHistoryBytes = 512 << 10
+	updateEnvelopeBytes     = 256
+)
+
+type subscription struct {
+	ch          chan Update
+	sizes       []int
+	head, count int
+	bytes       int
 }
 
 // New seeds a hub without consulting the agent's independently locked state.
@@ -36,7 +50,7 @@ func New(seed Snapshot, mapper Mapper) *Hub {
 	if seed.Run.Status == "" {
 		seed.Run.Status = "idle"
 	}
-	h := &Hub{view: seed, subs: make(map[uint64]chan Update), mapper: mapper}
+	h := &Hub{view: seed, subs: make(map[uint64]*subscription), mapper: mapper}
 	h.jobs = make(map[string]work.Job)
 	for _, job := range seed.Jobs {
 		h.jobs[job.ID] = SummarizeJob(job)
@@ -73,6 +87,36 @@ func (h *Hub) Emit(u Update) {
 	}
 }
 
+// SetDurable publishes a bounded committed projection and its watermark together.
+func (h *Hub) SetDurable(seq uint64, documents, submissions durable.Page) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || seq <= h.view.DurableSeq {
+		return
+	}
+	h.view.DurableSeq = seq
+	h.view.Documents = cloneRecords(documents.Records)
+	h.view.Submissions = cloneRecords(submissions.Records)
+	h.view.DocumentsCursor = documents.NextCursor
+	h.view.SubmissionsCursor = submissions.NextCursor
+	raw, _ := json.Marshal(struct {
+		Seq               uint64           `json:"durableSeq"`
+		Documents         []durable.Record `json:"documents"`
+		Submissions       []durable.Record `json:"submissions"`
+		DocumentsCursor   string           `json:"documentsCursor,omitempty"`
+		SubmissionsCursor string           `json:"submissionsCursor,omitempty"`
+	}{seq, h.view.Documents, h.view.Submissions, documents.NextCursor, submissions.NextCursor})
+	h.emit(Update{Kind: "tempest/durable", Update: raw})
+}
+
+func cloneRecords(records []durable.Record) []durable.Record {
+	out := slices.Clone(records)
+	for i := range out {
+		out[i].Value = append(json.RawMessage(nil), out[i].Value...)
+	}
+	return out
+}
+
 // AddAsk publishes a pending approval and makes it visible in the same snapshot.
 func (h *Hub) AddAsk(ask Ask) {
 	h.mu.Lock()
@@ -104,23 +148,33 @@ func (h *Hub) emit(u Update) {
 	}
 	u.Update = append(json.RawMessage(nil), u.Update...)
 	h.fold(u)
-	for id, ch := range h.subs {
-		select {
-		case ch <- cloneUpdate(u):
-		default:
-			// Drop queued data to reserve one terminal gap, even for a one-slot buffer.
-			// The receiver may already have consumed a prefix; it must re-snapshot.
-			for len(ch) > 0 {
-				select {
-				case <-ch:
-				default:
-				}
-			}
-			raw, _ := json.Marshal(map[string]any{"lastSeq": u.Seq})
-			ch <- Update{Seq: u.Seq, At: u.At, SessionID: u.SessionID, Kind: "tempest/gap", Update: raw}
-			close(ch)
-			delete(h.subs, id)
+	for id, sub := range h.subs {
+		ch := sub.ch
+		consumed := sub.count - len(ch)
+		for range consumed {
+			sub.bytes -= sub.sizes[sub.head]
+			sub.head = (sub.head + 1) % len(sub.sizes)
+			sub.count--
 		}
+		size := len(u.Update) + len(u.Kind) + len(u.SessionID) + updateEnvelopeBytes
+		if size <= maxSubscriberBytes-sub.bytes && len(ch) < cap(ch) {
+			ch <- cloneUpdate(u)
+			sub.sizes[(sub.head+sub.count)%len(sub.sizes)] = size
+			sub.count++
+			sub.bytes += size
+			continue
+		}
+		// A byte or message limit is a terminal gap, never a partial update.
+		for len(ch) > 0 {
+			select {
+			case <-ch:
+			default:
+			}
+		}
+		raw, _ := json.Marshal(map[string]any{"lastSeq": u.Seq})
+		ch <- Update{Seq: u.Seq, At: u.At, SessionID: u.SessionID, Kind: "tempest/gap", Update: raw}
+		close(ch)
+		delete(h.subs, id)
 	}
 }
 func (h *Hub) fold(u Update) {
@@ -294,15 +348,16 @@ func (h *Hub) watch(buf int, replay bool) (Snapshot, <-chan Update, func()) {
 	h.mu.Lock()
 	snap := h.snapshot(replay)
 	if replay {
-		buf += len(snap.History)
+		buf += min(len(snap.History), maxSubscriberBytes/128)
 	}
+	buf = max(1, min(buf, maxSubscriberBytes/128))
 	ch := make(chan Update, buf)
 	h.next++
 	id := h.next
 	if h.closed {
 		close(ch)
 	} else {
-		h.subs[id] = ch
+		h.subs[id] = &subscription{ch: ch, sizes: make([]int, buf)}
 	}
 	h.mu.Unlock()
 	var once sync.Once
@@ -318,16 +373,29 @@ func (h *Hub) watch(buf int, replay bool) (Snapshot, <-chan Update, func()) {
 	}
 }
 
-// Snapshot returns a detached view with at most 200 transcript updates.
+// Snapshot returns a detached view with a byte-bounded tail of at most 200 updates.
 func (h *Hub) Snapshot() Snapshot { h.mu.Lock(); defer h.mu.Unlock(); return h.snapshot(false) }
 func (h *Hub) snapshot(replay bool) Snapshot {
 	s := h.view
+	s.Documents = cloneRecords(s.Documents)
+	s.Submissions = cloneRecords(s.Submissions)
 	s.HistoryLen = len(h.history)
 	start := max(0, len(h.history)-200)
 	streaming := 0
 	if replay {
 		start = 0
 		streaming = len(h.streaming)
+	} else {
+		bytes := 0
+		for i := len(h.history) - 1; i >= start; i-- {
+			update := h.history[i]
+			size := len(update.Update) + len(update.Kind) + len(update.SessionID) + updateEnvelopeBytes
+			if size > maxSnapshotHistoryBytes-bytes {
+				start = i + 1
+				break
+			}
+			bytes += size
+		}
 	}
 	s.History = make([]Update, 0, len(h.history)-start+streaming)
 	for _, update := range h.history[start:] {
@@ -417,8 +485,8 @@ func (h *Hub) Close() {
 		return
 	}
 	h.closed = true
-	for id, ch := range h.subs {
-		close(ch)
+	for id, sub := range h.subs {
+		close(sub.ch)
 		delete(h.subs, id)
 	}
 }

@@ -3,6 +3,7 @@ package acp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // SessionInfo is a journal listing entry.
@@ -104,10 +106,14 @@ func failure(err error) *rpc.Error {
 		return wire
 	}
 	switch {
-	case errors.Is(err, tempest.ErrQueueFull):
-		return rpc.NewError(-32014, "queue_full", err.Error())
 	case errors.Is(err, tempest.ErrQueueConflict):
 		return rpc.NewError(-32015, "queue_conflict", err.Error())
+	case errors.Is(err, durable.ErrConflict):
+		return rpc.NewError(-32024, "durable_conflict", err.Error())
+	case errors.Is(err, tempest.ErrHostLimit):
+		return rpc.NewError(-32025, "host_limit", err.Error())
+	case errors.Is(err, tempest.ErrQueueFull):
+		return rpc.NewError(-32014, "queue_full", err.Error())
 	case errors.Is(err, tempest.ErrQueueNotFound):
 		return rpc.NewError(-32016, "queue_not_found", err.Error())
 	case errors.Is(err, tempest.ErrQueueTooLate):
@@ -145,7 +151,7 @@ func failure(err error) *rpc.Error {
 // Provider, wait, log and git work remain deferred.
 func (c *Client) admit(ctx context.Context, method string, raw json.RawMessage) (any, *rpc.Error) {
 	switch method {
-	case "initialize", "session/prompt", "tempest/continue", "session/cancel", "tempest/steer", "tempest/follow_up", "tempest/cancel_queued":
+	case "initialize", "session/prompt", "tempest/continue", "session/cancel", "tempest/steer", "tempest/follow_up", "tempest/cancel_queued", "_tempest/durable/submit", "_tempest/durable/withdraw", "_tempest/durable/commit":
 		return c.Handle(ctx, method, raw)
 	default:
 		return rpc.Deferred(func() (any, *rpc.Error) { return c.Handle(ctx, method, raw) }), nil
@@ -173,7 +179,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		c.initialized = true
 		c.notices = p.ClientCapabilities.Session.Notices
 		c.mu.Unlock()
-		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
+		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"_meta": map[string]any{"tempest": map[string]any{"durable": map[string]any{"version": 1, "methods": []string{"_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read"}, "notifications": []string{"_tempest/durable/update"}}}}, "loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
 	}
 	c.mu.Lock()
 	initialized := c.initialized
@@ -182,6 +188,8 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		return nil, rpc.NewError(-32002, "not_initialized", "initialize must come first")
 	}
 	switch method {
+	case "_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read":
+		return c.handleDurable(ctx, method, raw)
 	case "tempest/steer", "tempest/follow_up", "tempest/cancel_queued", "tempest/jobs", "tempest/wait", "tempest/cancel_job", "tempest/logs", "tempest/cleanup_job":
 		return c.handleWork(ctx, method, raw)
 	}
@@ -231,6 +239,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 				// JSON Schema; the response's _meta.tempest.output carries
 				// the validated answer.
 				OutputSchema json.RawMessage `json:"outputSchema"`
+				RequestID    string          `json:"requestId"`
 			} `json:"tempest"`
 		} `json:"_meta"`
 	}
@@ -283,6 +292,31 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			}
 			prompt.OutputSchema = p.Meta.Tempest.OutputSchema
 		}
+		if method == "session/prompt" && p.Meta.Tempest.RequestID != "" {
+			remove := c.broker.add(s.ID(), c.conn)
+			submission, err := s.Submit(ctx, tempest.Input{RequestID: p.Meta.Tempest.RequestID, Prompt: prompt, Placement: tempest.PlacementInput})
+			if err != nil {
+				remove()
+				return nil, failure(err)
+			}
+			if submission.State == "accepted" {
+				if err := s.ResumePending(ctx); err != nil {
+					remove()
+					return nil, failure(err)
+				}
+			}
+			retainLease = true
+			return rpc.Deferred(func() (any, *rpc.Error) {
+				defer release()
+				defer remove()
+				settled, err := s.WaitSubmission(ctx, submission.RequestID)
+				if err != nil {
+					return nil, failure(err)
+				}
+				c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
+				return promptCompletion(settled.Result, nil)
+			}), nil
+		}
 		remove := c.broker.add(s.ID(), c.conn)
 		var run *tempest.Run
 		if method == "session/prompt" {
@@ -311,38 +345,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			if result.RunID != "" {
 				c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
 			}
-			if result.StopReason == "error" || result.StopReason == "output_invalid" || result.StopReason == "repeated_failure" {
-				code, name, message := -32009, "run_error", "run failed"
-				switch result.StopReason {
-				case "output_invalid":
-					code, name = -32022, "output_invalid"
-				case "repeated_failure":
-					code, name = -32023, "repeated_failure"
-				}
-				if result.Err != nil {
-					message = result.Err.Error()
-				}
-				return nil, rpc.NewError(code, name, message)
-			}
-			if err != nil {
-				return nil, failure(err)
-			}
-			reason := "end_turn"
-			switch result.StopReason {
-			case "aborted":
-				reason = "cancelled"
-			case "max_turns", "max_cost", "max_wall_time":
-				reason = "max_turn_requests"
-			}
-			var cost any
-			if !result.Usage.Cost.Unknown {
-				cost = result.Usage.Cost.Total
-			}
-			meta := map[string]any{"stopReason": result.StopReason, "runId": result.RunID, "turns": result.Turns, "usage": result.Usage, "costUsd": cost, "elapsedMs": result.ElapsedMS}
-			if result.Output != nil {
-				meta["output"] = result.Output
-			}
-			return map[string]any{"stopReason": reason, "_meta": map[string]any{"tempest": meta}}, nil
+			return promptCompletion(result, err)
 		}), nil
 	case "session/cancel":
 		s.Cancel()
@@ -633,5 +636,8 @@ func convertPrompt(blocks []contentBlock) (tempest.Prompt, *rpc.Error) {
 		}
 	}
 	p.Text = strings.Join(text, "\n\n")
+	raw, _ := json.Marshal(blocks)
+	digest := sha256.Sum256(raw)
+	p.ContentIdentity, _ = json.Marshal(fmt.Sprintf("sha256:%x", digest))
 	return p, nil
 }

@@ -21,6 +21,7 @@ These pages hold the command, tool, and protocol reference.
 |---|---|
 | [Subagents and jobs](subagents.md) | Worktrees, three-way integration, messages, services, limits, stdin, and PTYs |
 | [Hooks](hooks.md) | Claude Code-compatible command hooks, trust, events, permissions, and lifetime |
+| [Extensions](extensions.md) | Named Go and subprocess bundles, prompt sections, typed hooks, memos, replay policy, and hot installation |
 | [Code intelligence](code-intelligence.md) | Language servers, rename plans, diagnostic freshness, and Kubernetes manifest diffs |
 | [Eval](eval.md) | Persistent Python and JavaScript kernels, runtime requirements, resets, and side effects |
 

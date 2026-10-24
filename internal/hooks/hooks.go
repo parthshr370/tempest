@@ -228,6 +228,8 @@ type Runner struct {
 	PermissionMode func() string
 	// Once journals keyed lifecycle effects before execution and reuses settled results.
 	Once func(context.Context, string, string, func(context.Context) (Result, error)) (Result, error)
+	// AdmitProcess holds the host's process slot until this command has joined.
+	AdmitProcess func(context.Context) (func(), error)
 }
 
 // New compiles settings. Project resolution belongs to the root composition layer.
@@ -356,12 +358,10 @@ func (r *Runner) run(ctx context.Context, input Input) (Result, error) {
 			if err != nil {
 				return result, err
 			}
-			if start, ok := ctx.Value(commandStartKey{}).(func() error); ok {
-				if err := start(); err != nil {
-					return result, err
-				}
+			report, err := r.executeAdmitted(ctx, command, input.Event, input.Cwd, payload)
+			if err != nil {
+				return result, err
 			}
-			report := execute(ctx, command, input.Event, input.Cwd, payload)
 			slog.Info("hook completed", "event", report.Event, "command", report.Command, "exit_code", report.ExitCode, "stdout", report.Stdout, "stderr", report.Stderr, "error", report.Error)
 			if state, _ := ctx.Value(runKey{}).(*runState); state != nil && state.report != nil {
 				if err := state.report(context.WithoutCancel(ctx), report); err != nil {
@@ -479,6 +479,22 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 		_, _ = b.Buffer.Write(p[:min(remaining, n)])
 	}
 	return n, nil
+}
+
+func (r *Runner) executeAdmitted(ctx context.Context, command Command, event, cwd string, payload []byte) (Report, error) {
+	if r.AdmitProcess != nil {
+		release, err := r.AdmitProcess(ctx)
+		if err != nil {
+			return Report{}, err
+		}
+		defer release()
+	}
+	if start, ok := ctx.Value(commandStartKey{}).(func() error); ok {
+		if err := start(); err != nil {
+			return Report{}, err
+		}
+	}
+	return execute(ctx, command, event, cwd, payload), nil
 }
 
 func execute(ctx context.Context, command Command, event, cwd string, payload []byte) Report {

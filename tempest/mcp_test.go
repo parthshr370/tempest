@@ -276,12 +276,7 @@ func TestRunStartedRejectsUndurableID(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := session.Begin(context.Background(), Prompt{Text: "journal cannot record the start"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, startErr := run.Started(context.Background())
-	result, waitErr := run.Wait()
-	if id != "" || result.RunID != "" || startErr == nil || waitErr == nil {
-		t.Fatalf("undurable ID published: %q %#v %v %v", id, result, startErr, waitErr)
+	if err == nil || run != nil || provider.CallCount() != 0 {
+		t.Fatalf("undurable admission published: run=%v err=%v calls=%d", run, err, provider.CallCount())
 	}
 }

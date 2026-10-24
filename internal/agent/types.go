@@ -49,8 +49,11 @@ const (
 
 // AgentToolResult is the final or partial result produced by a tool.
 type AgentToolResult struct {
-	Content []types.ContentBlock
-	Details json.RawMessage
+	Content           []types.ContentBlock
+	Details           json.RawMessage
+	StructuredContent json.RawMessage
+	Usage             json.RawMessage
+	Control           string
 	// IsError preserves protocol-level failures without discarding their content.
 	IsError   bool
 	Terminate bool
@@ -62,7 +65,9 @@ type AgentToolUpdateCallback func(AgentToolResult)
 // AgentTool is a runtime tool definition used by the agent loop.
 type AgentTool struct {
 	types.Tool
+	Definition       ToolDefinition
 	Label            string
+	OutputSchema     json.RawMessage
 	PrepareArguments func(args json.RawMessage) json.RawMessage
 	ExecutionMode    ToolExecutionMode
 	Execute          func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate AgentToolUpdateCallback) (AgentToolResult, error)
@@ -121,6 +126,7 @@ type BeforeToolCallContext struct {
 	AssistantMessage types.AssistantMessage
 	ToolCall         types.ContentBlock
 	Args             any
+	Definition       ToolDefinition
 	Context          AgentContext
 }
 
@@ -158,6 +164,7 @@ type AgentLoopConfig struct {
 	ToolExecution ToolExecutionMode
 	Hooks         *hooks.Runner
 	Child         bool
+	Extensions    ExtensionRuntime
 
 	ConvertToLlm        func(messages []types.Message) []types.Message
 	TransformContext    func(ctx context.Context, messages []types.Message) []types.Message
@@ -303,6 +310,7 @@ type AgentEvent struct {
 	IsError               bool
 	Permission            *PermissionOutcome
 	Work                  *work.Event
+	Definition            ToolDefinition
 	Hook                  *hooks.Report
 	QueueID               string
 	UsageSource           string

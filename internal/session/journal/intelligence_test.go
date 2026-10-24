@@ -58,8 +58,8 @@ func TestRenamePlanRecoveryNeverAppliesRemainingEdits(t *testing.T) {
 			t.Fatalf("%s must be an unknown outcome that is never re-run: %q", id, text)
 		}
 	}
-	if text := results["diff"].Content[0].Text; !strings.Contains(text, "outcome unknown") || !strings.Contains(text, textSafeToRerun) {
-		t.Fatalf("manifest_diff should carry the safe-to-rerun wording: %q", text)
+	if text := results["diff"].Content[0].Text; !strings.Contains(text, "outcome unknown") || !strings.Contains(text, textNoRerun) {
+		t.Fatalf("old manifest_diff intent must remain Never: %q", text)
 	}
 	interrupted := map[string]bool{}
 	for _, item := range loaded.Interrupted {
