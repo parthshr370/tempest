@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -319,7 +320,7 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	if err != nil {
 		return nil, &immediateOutcome{result: createErrorToolResult(err.Error()), isError: true}
 	}
-	hookResult, hookErr := config.Hooks.Run(ctx, hooks.Input{Event: "PreToolUse", ToolName: toolCall.Name, ToolUseID: toolCall.ID, ToolInput: validatedArgs})
+	hookResult, hookErr := config.Hooks.Run(ctx, hooks.Input{Key: hookInvocationKey(ctx, "PreToolUse"), Event: "PreToolUse", ToolName: toolCall.Name, ToolUseID: toolCall.ID, ToolInput: validatedArgs})
 	if hookErr != nil {
 		return nil, &immediateOutcome{result: createErrorToolResult(hookErr.Error()), isError: true}
 	}
@@ -345,6 +346,24 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 			return nil, &immediateOutcome{result: createErrorToolResult("Hook updatedInput: " + err.Error()), isError: true}
 		}
 	}
+	if config.Extensions != nil {
+		approvedArgs := validatedArgs
+		rewritten, extensionErr := config.Extensions.BeforeTool(ctx, preparedCall)
+		if extensionErr != nil {
+			return nil, &immediateOutcome{result: createErrorToolResult(extensionErr.Error()), isError: true}
+		}
+		preparedCall.Arguments = rewritten
+		validatedArgs, err = validate.ValidateToolArguments(tool.Tool, preparedCall)
+		if err != nil {
+			return nil, &immediateOutcome{result: createErrorToolResult("Extension rewrite: " + err.Error()), isError: true}
+		}
+		if hookResult.Decision == "allow" && !bytes.Equal(approvedArgs, validatedArgs) {
+			hookResult.Decision = ""
+			hookResult.Reason = ""
+		}
+	}
+	// Persist and gate the same normalized bytes that Execute receives.
+	preparedCall.Arguments = validatedArgs
 	if config.Hooks != nil {
 		ctx = hooks.WithToolDecision(ctx, hookResult.Decision, hookResult.Reason)
 		ctx = hooks.WithNotification(ctx, func(notifyCtx context.Context, reason string) error {
@@ -359,6 +378,7 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 			ToolCall:         preparedCall,
 			Args:             validatedArgs,
 			Context:          currentContext,
+			Definition:       tool.Definition,
 		})
 		if beforeResult != nil {
 			outcome = beforeResult.Permission
@@ -405,7 +425,13 @@ func emitPreparedStart(ctx context.Context, call types.ContentBlock, prepared *p
 			return err
 		}
 	}
-	return emit(ctx, ToolExecutionStart(call.ID, call.Name, call.Arguments))
+	event := ToolExecutionStart(call.ID, call.Name, call.Arguments)
+	if prepared != nil {
+		event.Definition = prepared.tool.Definition
+		digest := sha256.Sum256(call.Arguments)
+		event.Definition.ArgumentsHash = fmt.Sprintf("%x", digest[:])
+	}
+	return emit(ctx, event)
 }
 
 // executePreparedToolCall runs the tool's Execute and forwards partial updates
@@ -534,7 +560,7 @@ func finalizeExecutedToolCall(ctx context.Context, currentContext AgentContext, 
 		} else {
 			response = map[string]any{"content": result.Content, "is_error": isError}
 		}
-		hookResult, err := config.Hooks.Run(ctx, hooks.Input{Event: "PostToolUse", ToolName: prepared.toolCall.Name, ToolUseID: prepared.toolCall.ID, ToolInput: prepared.args, ToolResponse: response})
+		hookResult, err := config.Hooks.Run(ctx, hooks.Input{Key: hookInvocationKey(ctx, "PostToolUse"), Event: "PostToolUse", ToolName: prepared.toolCall.Name, ToolUseID: prepared.toolCall.ID, ToolInput: prepared.args, ToolResponse: response})
 		if err != nil {
 			result.Content = append(result.Content, types.NewText("PostToolUse hook error: "+err.Error()))
 		}
@@ -548,13 +574,24 @@ func finalizeExecutedToolCall(ctx context.Context, currentContext AgentContext, 
 	for _, text := range prepared.hookContext {
 		result.Content = append(result.Content, types.NewText("PreToolUse hook context: "+text))
 	}
+	if config.Extensions != nil {
+		result.IsError = isError
+		updated, err := config.Extensions.AfterTool(ctx, prepared.toolCall, result)
+		if err != nil {
+			result = updated
+			isError = true
+		} else {
+			result = updated
+			isError = result.IsError
+		}
+	}
 
 	return finalizedOutcome{toolCall: prepared.toolCall, result: result, isError: isError}
 }
 
 // createErrorToolResult builds a tool result whose content is the error text.
 func createErrorToolResult(message string) AgentToolResult {
-	return AgentToolResult{Content: []types.ContentBlock{types.NewText(message)}, Details: nil}
+	return AgentToolResult{Content: []types.ContentBlock{types.NewText(message)}, IsError: true}
 }
 
 // unknownToolMessage names the tools the session does have, so a call to a

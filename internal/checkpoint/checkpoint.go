@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -64,8 +63,9 @@ type pending struct {
 	Entry  journal.RewindEntry `json:"entry"`
 	Before map[string]file     `json:"before"`
 	After  map[string]file     `json:"after"`
-	// JournalOffset identifies this transaction's append even after later turns.
-	JournalOffset int64 `json:"journal_offset,omitempty"`
+	// JournalSeq survives atomic journal format replacement.
+	JournalSeq    uint64 `json:"journal_seq,omitempty"`
+	JournalOffset int64  `json:"journal_offset,omitempty"`
 }
 
 // Info identifies a retained workspace and conversation checkpoint.
@@ -768,11 +768,7 @@ func (m *Manager) Rewind(ctx context.Context, id, report string, force bool) (me
 				return err
 			}
 			defer root.Close()
-			journalInfo, err := os.Stat(m.store.Path())
-			if err != nil {
-				return err
-			}
-			transaction := pending{Entry: entry, Before: current, After: desired, JournalOffset: journalInfo.Size()}
+			transaction := pending{Entry: entry, Before: current, After: desired, JournalSeq: m.store.Position().Seq}
 			if err := persist(m, "pending.json", transaction); err != nil {
 				return err
 			}
@@ -857,7 +853,7 @@ func (m *Manager) recover(ctx context.Context) error {
 				return err
 			}
 		}
-		loaded, err := journal.Load(ctx, m.store.Path())
+		loaded, err := m.store.Load(ctx)
 		if err != nil {
 			return err
 		}
@@ -877,26 +873,7 @@ func (m *Manager) recover(ctx context.Context) error {
 }
 
 func (m *Manager) committed(transaction pending) (bool, error) {
-	journalFile, err := os.Open(m.store.Path())
-	if err != nil {
-		return false, err
-	}
-	defer journalFile.Close()
-	if _, err := journalFile.Seek(transaction.JournalOffset, 0); err != nil {
-		return false, err
-	}
-	var envelope struct {
-		Type    string              `json:"type"`
-		Payload journal.RewindEntry `json:"payload"`
-	}
-	if err := json.NewDecoder(journalFile).Decode(&envelope); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return false, nil
-		}
-		return false, err
-	}
-	return envelope.Type == "rewind" && envelope.Payload.Checkpoint == transaction.Entry.Checkpoint &&
-		envelope.Payload.Report == transaction.Entry.Report && reflect.DeepEqual(envelope.Payload.Messages, transaction.Entry.Messages), nil
+	return m.store.ContainsAfter(context.Background(), journal.Position{Seq: transaction.JournalSeq, LegacyOffset: transaction.JournalOffset}, transaction.Entry)
 }
 
 func (m *Manager) observeOutside(files map[string]file) {
@@ -925,7 +902,7 @@ func (m *Manager) settleRequest(ctx context.Context) error {
 		return nil
 	}
 	notice := types.UserMessage{Content: types.StringContent("Rewind request " + m.state.RewindRequest + " was interrupted before its safe turn boundary. It was abandoned, not replayed. Inspect the workspace and explicitly request rewind again if needed.")}
-	loaded, err := journal.Load(ctx, m.store.Path())
+	loaded, err := m.store.Load(ctx)
 	if err != nil {
 		return err
 	}
@@ -933,7 +910,7 @@ func (m *Manager) settleRequest(ctx context.Context) error {
 		if err := m.store.AppendMessage(ctx, notice); err != nil {
 			return err
 		}
-		loaded, err = journal.Load(ctx, m.store.Path())
+		loaded, err = m.store.Load(ctx)
 		if err != nil {
 			return err
 		}

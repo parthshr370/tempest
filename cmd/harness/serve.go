@@ -54,6 +54,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.SetOutput(stderr)
 	var values config.FlagValues
 	var listen, token, a2aBaseURL string
+	var extensionConfig string
 	var idleTimeout, permissionTimeout, shutdownTimeout, maxWall time.Duration
 	var maxTurns int
 	var maxCost float64
@@ -67,6 +68,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.DurationVar(&shutdownTimeout, "shutdown-timeout", 10*time.Second, "wait for runs during shutdown")
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session journal directory")
 	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
+	fs.StringVar(&extensionConfig, "extension-config", "", "trusted operator JSON array of extension process definitions")
 	addIntelligenceFlags(fs, &values)
 	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
 	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
@@ -156,6 +158,11 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	}
 	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers()}
 	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers()}
+	processes, err := loadExtensionProcesses(extensionConfig, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
 	if command == "mcp" {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -177,7 +184,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			case <-finished:
 			}
 		}()
-		err := mcpserver.Serve(ctx, newStdioStream(os.Stdin, stdout), mcpserver.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, DefaultNew: defaults, Provider: provider, Stack: &stack, PermissionTimeout: permissionTimeout, IdleTimeout: idleTimeout, ShutdownTimeout: shutdownTimeout})
+		err := mcpserver.Serve(ctx, newStdioStream(os.Stdin, stdout), mcpserver.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, DefaultNew: defaults, Provider: provider, Stack: &stack, ExtensionProcesses: processes, PermissionTimeout: permissionTimeout, IdleTimeout: idleTimeout, ShutdownTimeout: shutdownTimeout})
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
@@ -187,7 +194,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	onListen := func(addr net.Addr) {
 		fmt.Fprintf(stderr, "tempest serve listening on http://%s (ACP /acp, A2A /a2a)\n", addr)
 	}
-	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, OnListen: onListen})
+	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, ExtensionProcesses: processes, OnListen: onListen})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

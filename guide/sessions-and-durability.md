@@ -10,8 +10,12 @@ Every run is journaled to an append-only JSONL file as it happens: each message,
 each tool call's start and finish, per-call usage, and how the run ended. A tool's
 start is on disk before the tool runs.
 
-- `-continue` picks up the most recent session for the current directory.
-- `-resume <id>` restores a specific one.
+- `-continue -p "new input"` opens the most recent session for this directory.
+- `-resume <id> -p "new input"` opens a specific session.
+- Without `-p`, `-continue` or `-resume <id>` explicitly continues existing work.
+  It resumes accepted input and reconciles interrupted tool calls using their
+  recorded replay policy. Safe calls require a compatible implementation.
+  Never calls report an unknown outcome instead of running again.
 - The CLI prints the id on stderr in text mode and as `session_id` in JSON reports.
 - You can pass the journal filename (with or without `.jsonl`) instead of the bare
   id. Ambiguous ids are rejected with filename hints.
@@ -48,11 +52,71 @@ sequenceDiagram
 
 ### Journal format
 
-Journals use format **v3**. Opening a v1 or v2 journal upgrades it in place under
-the writer lock before new facts are written. Older binaries refuse v3: this is an
-intentional on-disk downgrade barrier, not a protocol-version change. Back up or
-move each `.jsonl` together with its `.jsonl.d` directory. Committed compaction
-snapshots and child journals are required recovery data, not caches.
+Journals use format **v4**. Opening a v1, v2 or v3 journal migrates it under a
+stable writer lock before new facts are written. Atomic batches include a checksum
+and a prior sequence. A torn final batch is absent; invalid middle data is an error.
+Older binaries refuse v4. Back up each journal with its lock, `.jsonl.blobs` and
+`.jsonl.d` directories. Large transcript and submission batches use immutable,
+content-addressed blobs; their references commit only after the blobs are synced.
+Missing or modified blobs are corruption. Committed snapshots and child journals
+are recovery data, not caches. The `.jsonl.catalog` metadata index is rebuildable.
+
+The JSONL adapter retains the full raw committed history in memory. Read pages
+have bounded sizes and immutable sequence cuts, but the adapter is not
+disk-indexed and does not have a bounded memory working set. Context compaction
+does not remove that retained history.
+
+Fresh prompts in an open session reuse the writer's committed usage receipts;
+they don't replay and checksum the entire archive at each run start. Explicit
+continuation still loads the archive to recover interrupted logical-run state.
+
+Document namespaces with the `latest` history policy allow only current-value
+reads. Historical cuts, revision history, and cursors pinned before later commits
+are rejected, including broad queries and extension callback reads.
+The agent document stores the effective ordered extension selection, including
+required subprocess bundles. Resume fails visibly if one is unavailable; it never
+silently drops a safety bundle. Persisted tool choices intersect the operator's
+current allowlist and exclusions, so a resume cannot restore removed authority.
+
+
+### Durable prompt retries
+
+Pass `-request-id KEY` to give a prompt a durable identity. You can retry the
+identical command without adding `-continue` or `-resume`:
+
+```sh
+tempest -session-dir ./sessions -request-id fix-1 -p "fix the failing check"
+```
+
+With no explicit session selector, Tempest finds the session that already holds
+the key in that session directory and working directory (the same scope as
+`-continue`). It returns the original receipt and answer, or resumes accepted work.
+Changed input conflicts; use the same prompt, images, output schema and placement.
+A filesystem lock serializes concurrent commands for that key through session
+close. A killed process releases the lock; the journal, not the lockfile, owns the
+receipt. The rebuildable catalog index accelerates lookup; missing or stale index
+data falls back to the committed journal.
+
+With `-resume SESSION` or `-continue`, the selected session owns the key instead.
+Keys in different explicitly selected sessions are independent. Text mode prints
+the session and submission IDs after acceptance, before waiting for the answer.
+JSON and stream-json final reports include `submission_id` and `request_id`.
+The keyed CLI command explicitly resumes accepted input that never dispatched.
+It does not replay a provider call whose outcome is unknown.
+
+Same-key retries return the original submission, even after consumption,
+withdrawal or restart. Changed input conflicts. A withdrawn request stays withdrawn.
+A new request needs a new key. Keys have no silent expiry while the session exists.
+
+Acceptance is synced before success is returned. Losing a connection or cancelling
+a wait does not withdraw accepted input. After a crash, opening and reading remain
+side-effect-free. Explicit continuation or host resume decides whether pending work
+runs. Interrupted provider calls and outside effects are not exactly-once promises.
+
+Application state uses the same commit boundary. Document writes support expected
+revisions and atomic batches. A failed comparison adopts nothing. File storage
+syncs commits; the memory backend deliberately has no crash-durability guarantee.
+
 
 ## Error handling
 

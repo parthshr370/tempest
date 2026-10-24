@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 type taskController struct {
@@ -54,8 +55,8 @@ func TestTaskRequiresDurableHostAndPropagatesAdmissionFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-func TestRegistryListing(t *testing.T) {
-	listing := RegistryListing(Registry{"general": {Description: "Writer"}, "explore": {Description: "Reader"}})
+func TestPresetListing(t *testing.T) {
+	listing := PresetListing(map[string]extension.AgentPreset{"general": {Description: "Writer"}, "explore": {Description: "Reader"}})
 	for _, want := range []string{"<available_subagents>", "- explore: Reader", "- general: Writer", "general-purpose"} {
 		if !strings.Contains(listing, want) {
 			t.Fatal(listing)
@@ -64,7 +65,26 @@ func TestRegistryListing(t *testing.T) {
 	if strings.Index(listing, "explore") > strings.Index(listing, "general:") {
 		t.Fatal("not sorted")
 	}
-	if RegistryListing(nil) != "" {
+	if PresetListing(nil) != "" {
 		t.Fatal("empty listing")
+	}
+}
+
+func TestNamedPresetUsesExistingDurableChildAdmission(t *testing.T) {
+	controller := &taskController{}
+	tool := NewPresetTool(controller, []string{"sample/reviewer"}, func(_ context.Context, id string) (extension.AgentPreset, error) {
+		if id != "sample/reviewer" {
+			return extension.AgentPreset{}, errors.New("unknown preset")
+		}
+		return extension.AgentPreset{ID: "reviewer", Version: 3, Instructions: "Review only"}, nil
+	})
+	if !strings.Contains(string(tool.Parameters), "sample/reviewer") {
+		t.Fatal("preset absent from model schema")
+	}
+	if _, err := tool.Execute(context.Background(), "call", json.RawMessage(`{"prompt":"review","subagent_type":"sample/reviewer"}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if controller.spec.SubagentType != "general" || controller.spec.PresetID != "sample/reviewer" || controller.spec.PresetVersion != 3 {
+		t.Fatalf("preset not in durable admission: %+v", controller.spec)
 	}
 }

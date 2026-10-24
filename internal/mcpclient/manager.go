@@ -3,12 +3,10 @@ package mcpclient
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,14 +34,15 @@ func (e *StartupError) Unwrap() error { return e.Err }
 
 // Manager owns connections and complete catalogs for one Tempest session.
 type Manager struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	cwd       string
-	spillDir  string
-	logger    *slog.Logger
-	servers   []*server
-	closeOnce sync.Once
-	closeErr  error
+	ctx          context.Context
+	cancel       context.CancelFunc
+	cwd          string
+	spillDir     string
+	logger       *slog.Logger
+	servers      []*server
+	closeOnce    sync.Once
+	closeErr     error
+	admitProcess func(context.Context) (func(), error)
 }
 
 type progressCall struct {
@@ -70,7 +69,7 @@ type server struct {
 }
 
 // Open discovers every configured server or closes all partially opened peers.
-func Open(ctx context.Context, cwd, spillDir string, configs []mcpconfig.Server, logger *slog.Logger) (*Manager, error) {
+func Open(ctx context.Context, cwd, spillDir string, configs []mcpconfig.Server, logger *slog.Logger, admitProcess func(context.Context) (func(), error)) (*Manager, error) {
 	normalized, err := mcpconfig.Normalize(configs)
 	if err != nil {
 		return nil, err
@@ -91,7 +90,7 @@ func Open(ctx context.Context, cwd, spillDir string, configs []mcpconfig.Server,
 		logger = slog.Default()
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger}
+	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger, admitProcess: admitProcess}
 	for _, cfg := range normalized {
 		peer := &server{manager: manager, config: cfg, startupTimeout: mustDuration(cfg.StartupTimeout), callTimeout: mustDuration(cfg.CallTimeout), token: make(chan struct{}, 1), progress: map[string]*progressCall{}}
 		peer.token <- struct{}{}
@@ -108,17 +107,7 @@ func Open(ctx context.Context, cwd, spillDir string, configs []mcpconfig.Server,
 
 // Tools returns detached definitions in model-name order, without mutable catalog slices.
 func (m *Manager) Tools() []agent.AgentTool {
-	var tools []agent.AgentTool
-	for _, peer := range m.servers {
-		peer.mu.Lock()
-		for _, tool := range peer.tools {
-			tool.Parameters = append(json.RawMessage(nil), tool.Parameters...)
-			tools = append(tools, tool)
-		}
-		peer.mu.Unlock()
-	}
-	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
-	return tools
+	return m.bundleTools()
 }
 
 // Defaults returns per-tool trusted server defaults for the currently installed catalog.
@@ -186,7 +175,7 @@ func (s *server) startRefreshLocked(ctx context.Context, reconnect bool) {
 				_ = client.Close(closeCtx)
 				closeCancel()
 			}
-			client, err = mcpwire.Dial(refreshCtx, s.config, s.manager.cwd, mcpwire.Handlers{Notify: s.notification})
+			client, err = mcpwire.Dial(refreshCtx, s.config, s.manager.cwd, mcpwire.Handlers{Notify: s.notification, AdmitProcess: s.manager.admitProcess})
 			s.mu.Lock()
 			s.client = client
 			s.mu.Unlock()

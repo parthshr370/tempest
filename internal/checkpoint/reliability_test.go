@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 func bindEmpty(manager *Manager) {
@@ -484,11 +485,7 @@ func TestPendingCommittedForkPreservesLaterConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(store.Path())
-	if err != nil {
-		t.Fatal(err)
-	}
-	transaction := pending{Entry: entry, Before: before, After: before, JournalOffset: info.Size()}
+	transaction := pending{Entry: entry, Before: before, After: before, JournalSeq: store.Position().Seq}
 	if err := persist(manager, "pending.json", transaction); err != nil {
 		t.Fatal(err)
 	}
@@ -504,6 +501,87 @@ func TestPendingCommittedForkPreservesLaterConversation(t *testing.T) {
 	loaded, err := journal.Load(t.Context(), store.Path())
 	if err != nil || len(loaded.Messages) != 2 {
 		t.Fatalf("recovery lost later conversation: %+v %v", loaded, err)
+	}
+}
+
+func TestPendingLegacyEOFCompletesAfterMigration(t *testing.T) {
+	manager, store := testManager(t)
+	writeWorkspace(t, manager, "file", "original")
+	saved, err := manager.Create(t.Context(), "save", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.AppendMessage(t.Context(), types.UserMessage{Content: types.StringContent("before rewind")}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := journal.Load(t.Context(), store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.Read(t.Context(), durable.Query{Kind: durable.EntryKind, Namespace: "_tempest/journal", History: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := loaded.Header
+	header.Version = 3
+	raw, err := json.Marshal(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy bytes.Buffer
+	legacy.Write(raw)
+	legacy.WriteByte('\n')
+	for _, record := range page.Records {
+		legacy.Write(record.Value)
+		legacy.WriteByte('\n')
+	}
+	writeWorkspace(t, manager, "file", "investigation")
+	observe(t, manager)
+	before := manager.state.Expected
+	after := manager.state.Snapshots[len(manager.state.Snapshots)-1].Files
+	writeWorkspace(t, manager, "file", "original")
+	entry, err := journal.NewRewindEntry(saved.ID, "findings", []types.Message{types.UserMessage{Content: types.StringContent("retained")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := pending{Entry: entry, Before: before, After: after, JournalOffset: int64(legacy.Len())}
+	if err = persist(manager, "pending.json", transaction); err != nil {
+		t.Fatal(err)
+	}
+	path := store.Path()
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path, legacy.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		resumed, _, err := journal.OpenForResume(t.Context(), path, journal.Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		recovered, err := New(t.Context(), manager.cwd, resumed, manager.queue)
+		if err != nil {
+			resumed.Close()
+			t.Fatal(err)
+		}
+		loaded, err := resumed.Load(t.Context())
+		if err != nil || len(loaded.Messages) != 1 {
+			resumed.Close()
+			t.Fatalf("legacy pending rewind abandoned: %+v %v", loaded, err)
+		}
+		message, ok := loaded.Messages[0].(types.UserMessage)
+		if !ok || message.Content.Text != "retained" {
+			resumed.Close()
+			t.Fatalf("workspace/transcript diverged: %+v", loaded.Messages)
+		}
+		if recovered.state.Uncertain {
+			resumed.Close()
+			t.Fatal("successful migrated recovery marked uncertain")
+		}
+		if err = resumed.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

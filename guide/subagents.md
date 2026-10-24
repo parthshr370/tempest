@@ -20,6 +20,13 @@ only selected built-ins. Their launch-time permission ceiling intersects the
 parent's live policy at every call. Child approval requests route to the root
 prompter with allow-once and reject-once only.
 
+Selected extension bundles can add versioned named agent presets. Pass
+`<bundle>/<preset>` as `subagent_type`. The host resolves the stored preset ID
+and version, applies its instructions and model, and intersects its allowed tools
+with the same child ceiling. `explore` and `general` remain built-in presets.
+Preset definitions are data, not executable project configuration. See
+[extensions](extensions.md).
+
 ### Worktrees and isolation
 
 A general child in an eligible git repository gets a **detached worktree**. A clean

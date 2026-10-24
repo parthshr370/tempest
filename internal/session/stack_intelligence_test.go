@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/extensionhost"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/tools"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 func inertManager(t *testing.T, cwd string) *lsp.Manager {
@@ -94,5 +96,22 @@ func TestStackConfigFromConfigCarriesIntelligenceSettings(t *testing.T) {
 	}
 	if cfg.LSPManager != nil {
 		t.Fatal("configuration must never construct a manager")
+	}
+}
+
+func TestRootEmptyAllowlistAndPlanCeilingRemainRestricted(t *testing.T) {
+	for _, plan := range []bool{false, true} {
+		runtime := &extensionhost.Runtime{}
+		names := stackToolNames(t, StackConfig{Cwd: t.TempDir(), Plan: plan, AllowedTools: []string{}, Extensions: runtime})
+		if len(names) != 0 {
+			t.Fatalf("plan=%t empty allowlist activated %v", plan, names)
+		}
+		if runtime.AllowTool("ext__sample__tool", extension.EffectRead) {
+			t.Fatalf("plan=%t empty allowlist admitted an extension tool", plan)
+		}
+	}
+	names := stackToolNames(t, StackConfig{Cwd: t.TempDir(), Plan: true, AllowedTools: []string{"read", "bash"}})
+	if !slices.Equal(names, []string{"read"}) {
+		t.Fatalf("plan ignored operator tool ceiling: %v", names)
 	}
 }

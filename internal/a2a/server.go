@@ -23,6 +23,7 @@ import (
 	"go.harness.dev/harness/internal/build"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 const (
@@ -331,12 +332,20 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			t.mu.Lock()
 			terminal := t.value.Status.State.Terminal()
 			run := t.run
+			session := t.session
 			t.mu.Unlock()
-			if terminal || run == nil {
+			if terminal || (run == nil && session == nil) {
 				writeResponse(w, req.ID, nil, protocolError(-32002, "", nil))
 				return
 			}
-			run.Cancel()
+			if run != nil {
+				run.Cancel()
+			} else {
+				if err := session.CancelSubmission(r.Context(), t.requestID); err != nil {
+					writeResponse(w, req.ID, nil, protocolError(-32002, "", nil))
+					return
+				}
+			}
 			select {
 			case <-t.done:
 			case <-r.Context().Done():
@@ -531,29 +540,44 @@ func (s *Server) send(ctx context.Context, p *model.SendMessageRequest, prompt s
 		}
 	}
 	snap, updates, stop := session.Watch(s.backend.RunContext(), tempest.WatchOptions{Buffer: taskQueueSize})
-	run, err := session.Begin(s.backend.RunContext(), tempest.Prompt{Text: prompt})
+	contentIdentity, _ := json.Marshal(p.Message.Parts)
+	submission, err := session.Submit(ctx, tempest.Input{RequestID: p.Message.ID, Prompt: tempest.Prompt{Text: prompt, ContentIdentity: contentIdentity}, Placement: tempest.PlacementInput})
 	if err != nil {
 		stop()
 		release()
 		return nil, admissionError(err)
 	}
-	// Once Begin accepts, connection cancellation only stops waiting. Started
-	// and the observer belong to the server, including pre-start failures.
-	id, err := run.Started(context.Background())
-	if err != nil {
-		stop()
-		release()
-		return nil, admissionError(err)
+	if submission.State == "accepted" {
+		if err = session.ResumePending(ctx); err == nil {
+			submission, err = session.Submission(ctx, submission.RequestID)
+		}
+		if err != nil {
+			stop()
+			release()
+			return nil, admissionError(err)
+		}
+	}
+	// Transport correlation IDs are not submission keys. Message identity is
+	// scoped to this durable session and survives observer retention.
+	id := submission.RunID
+	if id == "" {
+		id = submission.ID
 	}
 	now := s.now().UTC()
 	msg := &model.Message{ID: p.Message.ID, ContextID: session.ID(), TaskID: model.TaskID(id), Role: model.MessageRoleUser, Parts: model.ContentParts{model.NewTextPart(prompt)}}
 	t := &task{
-		run: run, session: session, done: make(chan struct{}), changed: make(chan struct{}),
+		requestID: submission.RequestID, session: session, done: make(chan struct{}), changed: make(chan struct{}),
 		subscribers: make(map[*subscriber]struct{}),
 		value:       model.Task{ID: model.TaskID(id), ContextID: session.ID(), Status: model.TaskStatus{State: model.TaskStateWorking, Timestamp: &now}, History: []*model.Message{msg}},
 	}
 	t.publishMetadataLocked()
 	s.mu.Lock()
+	if existing := s.tasks[t.value.ID]; existing != nil {
+		s.mu.Unlock()
+		stop()
+		release()
+		return existing, nil
+	}
 	s.pending--
 	s.serial++
 	t.serial = s.serial
@@ -564,12 +588,18 @@ func (s *Server) send(ctx context.Context, p *model.SendMessageRequest, prompt s
 		defer s.observers.Done()
 		defer stop()
 		defer release()
-		t.observe(snap, updates, stop, s.backend.RunContext())
+		t.observe(snap, updates, stop, context.WithoutCancel(ctx))
 	}()
 	return t, nil
 }
 func admissionError(err error) *rpcError {
-	if errors.Is(err, journal.ErrSessionNotFound) {
+	if errors.Is(err, tempest.ErrHostLimit) {
+		return protocolError(-32004, "host_limit", nil)
+	}
+	if errors.Is(err, durable.ErrConflict) {
+		return protocolError(-32004, "request_conflict", nil)
+	}
+	if errors.Is(err, journal.ErrSessionNotFound) || errors.Is(err, tempest.ErrInvalidQueueInput) {
 		return invalid()
 	}
 	if errors.Is(err, tempest.ErrRunActive) || errors.Is(err, tempest.ErrSessionLocked) || errors.Is(err, tempest.ErrMCPConfigConflict) || errors.Is(err, tempest.ErrClosed) {

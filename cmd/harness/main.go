@@ -37,17 +37,19 @@ const exitAborted = 130
 
 // commandOptions keeps parsed CLI-only inputs beside the resolved config and secret lookup they feed into the runtime.
 type commandOptions struct {
-	flags        config.FlagValues
-	Config       *config.ResolvedConfig
-	Secrets      config.SecretResolver
-	Prompt       string
-	PrintMode    string
-	OutputFormat string
-	ExcludeTools string
-	Resume       string
-	Continue     bool
-	Version      bool
-	Budget       agent.Budget
+	flags           config.FlagValues
+	Config          *config.ResolvedConfig
+	Secrets         config.SecretResolver
+	Prompt          string
+	PrintMode       string
+	OutputFormat    string
+	ExcludeTools    string
+	Resume          string
+	RequestID       string
+	ExtensionConfig string
+	Continue        bool
+	Version         bool
+	Budget          agent.Budget
 	// OutputSchemaPath names a JSON Schema file for the run's final answer.
 	OutputSchemaPath string
 	// ImagePaths are image files attached to the prompt.
@@ -123,8 +125,12 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
-	if opts.Prompt == "" {
+	if opts.Prompt == "" && opts.Resume == "" && !opts.Continue {
 		fmt.Fprintln(stderr, "usage: tempest -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION] (tempest -help lists flags and commands)")
+		return 1
+	}
+	if opts.Prompt == "" && (opts.RequestID != "" || opts.OutputSchemaPath != "" || len(opts.ImagePaths) != 0) {
+		fmt.Fprintln(stderr, "-request-id, -output-schema and -image require -p; a prompt-free resume continues existing work")
 		return 1
 	}
 	permissionMode, err := permission.ParseMode(opts.Config.PermissionModeDefault())
@@ -244,10 +250,32 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.GenericRules = inputs.GenericRules
 	stack.AttachmentRegistry = attachRegistry
 	stack.AttachmentReader = attachReader
+	processes, err := loadExtensionProcesses(opts.ExtensionConfig, stderr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if opts.RequestID != "" && opts.Resume == "" && !opts.Continue {
+		requestLock, err := journal.LockRequest(runCtx, opts.Config.SessionDir(), cwd, opts.RequestID)
+		if err != nil {
+			fmt.Fprintf(stderr, "request error: %v\n", err)
+			return 1
+		}
+		defer requestLock.Close()
+		path, err := journal.ResolveRequest(runCtx, opts.Config.SessionDir(), cwd, opts.RequestID)
+		if err != nil && !errors.Is(err, journal.ErrSessionNotFound) {
+			fmt.Fprintf(stderr, "request error: %v\n", err)
+			return 1
+		}
+		if err == nil {
+			opts.Resume = filepath.Base(path)
+		}
+	}
 	sess, err := openSession(runCtx, tempest.Options{
-		SessionDir: opts.Config.SessionDir(),
-		Cwd:        cwd,
-		Stack:      &stack,
+		SessionDir:         opts.Config.SessionDir(),
+		Cwd:                cwd,
+		Stack:              &stack,
+		ExtensionProcesses: processes,
 		New: &tempest.NewSession{
 			Model:          selectedModel.ID,
 			Budget:         opts.Budget,
@@ -267,7 +295,13 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			slog.Warn("session close failed", "error", err)
 		}
 	}()
-	outcome, outputErr := executeOneShot(runCtx, sess, prompt, mode, stdout, stderr, 256)
+	var outcome runOutcome
+	var outputErr error
+	if opts.Prompt == "" {
+		outcome, outputErr = executeContinuation(runCtx, sess, mode, stdout, stderr, 256)
+	} else {
+		outcome, outputErr = executeOneShot(runCtx, sess, prompt, mode, stdout, stderr, 256, opts.RequestID)
+	}
 	if outputErr != nil {
 		fmt.Fprintf(stderr, "output error: %v\n", outputErr)
 		return 1
@@ -298,15 +332,19 @@ type runOutcome struct {
 	SessionID         string
 	Elapsed           time.Duration
 	LastAssistantText string
+	SubmissionID      string
+	RequestID         string
 }
 
 // runReport is the -output-format json result of one run.
 type runReport struct {
-	SessionID  string           `json:"session_id"`
-	StopReason agent.StopReason `json:"stop_reason"`
-	Error      string           `json:"error,omitempty"`
-	Turns      int              `json:"turns"`
-	Usage      ptypes.Usage     `json:"usage"`
+	SessionID    string           `json:"session_id"`
+	StopReason   agent.StopReason `json:"stop_reason"`
+	Error        string           `json:"error,omitempty"`
+	SubmissionID string           `json:"submission_id,omitempty"`
+	RequestID    string           `json:"request_id,omitempty"`
+	Turns        int              `json:"turns"`
+	Usage        ptypes.Usage     `json:"usage"`
 	// CostUSD is null when any call's price was unknown: unknown is not free.
 	CostUSD   *float64 `json:"cost_usd"`
 	ElapsedMS int64    `json:"elapsed_ms"`
@@ -350,6 +388,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 
 func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
 	report := runReport{SessionID: outcome.SessionID, StopReason: outcome.StopReason, Turns: outcome.Turns, Usage: outcome.Usage, ElapsedMS: outcome.Elapsed.Milliseconds(), Text: outcome.LastAssistantText, Message: last, Output: outcome.Output}
+	report.SubmissionID, report.RequestID = outcome.SubmissionID, outcome.RequestID
 	if outcome.Err != nil {
 		report.Error = outcome.Err.Error()
 	}
@@ -404,7 +443,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
 	var prompt, printMode, outputFormat, excludeTools string
 	var version bool
-	var resume string
+	var resume, requestID, extensionConfig string
 	var continueRecent bool
 	fs.StringVar(&prompt, "p", "", "single prompt to run (non-interactive)")
 	fs.StringVar(&printMode, "print", "text", "legacy output mode alias: text, json, stream-json")
@@ -412,6 +451,8 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 	fs.StringVar(&excludeTools, "exclude-tools", "", "comma-separated tool names to exclude")
 	fs.BoolVar(&version, "version", false, "print build version")
 	fs.StringVar(&resume, "resume", "", "resume a session by id")
+	fs.StringVar(&requestID, "request-id", "", "durable prompt key; identical retries reuse the original session in this directory")
+	fs.StringVar(&extensionConfig, "extension-config", "", "trusted operator JSON array of extension process definitions")
 	fs.BoolVar(&continueRecent, "continue", false, "continue the most recent session for this directory")
 	var outputSchemaPath string
 	var imagePaths config.StringsInput
@@ -486,7 +527,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 		}
 	})
 	secrets := secretResolver(values)
-	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, Continue: continueRecent, Budget: budget, OutputSchemaPath: outputSchemaPath, ImagePaths: imagePaths.Values}, nil
+	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, RequestID: requestID, ExtensionConfig: extensionConfig, Continue: continueRecent, Budget: budget, OutputSchemaPath: outputSchemaPath, ImagePaths: imagePaths.Values}, nil
 }
 
 // resolveCommandConfig rejects incompatible session flags before resolving the config's precedence layers.

@@ -38,6 +38,8 @@ type entry struct {
 	cwd, model string
 	busy       bool
 	last       time.Time
+	ready      chan struct{}
+	requestID  string
 }
 
 type server struct {
@@ -252,16 +254,56 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	if in.SessionID != "" {
 		reserved = s.sessions[in.SessionID]
 		if reserved != nil && reserved.busy {
+			if in.RequestID != "" && (reserved.requestID == in.RequestID || reserved.session != nil) {
+				owner := reserved
+				ready := owner.ready
+				sameRequest := owner.requestID == in.RequestID
+				s.mu.Unlock()
+				return rpc.Deferred(func() (value any, wire *rpc.Error) {
+					defer cancel()
+					defer func() {
+						s.mu.Lock()
+						if c.cancelled {
+							value, wire = rpc.NoResponse{}, nil
+						}
+						delete(s.calls, id)
+						s.mu.Unlock()
+					}()
+					if sameRequest && ready != nil {
+						select {
+						case <-ready:
+						case <-c.ctx.Done():
+							return failure(c.ctx.Err()), nil
+						}
+					}
+					s.mu.Lock()
+					session := owner.session
+					s.mu.Unlock()
+					if session == nil {
+						return failure(fmt.Errorf("session did not open")), nil
+					}
+					if !sameRequest {
+						if _, err := session.Submission(c.ctx, in.RequestID); err != nil {
+							if errors.Is(err, tempest.ErrQueueNotFound) {
+								return failure(tempest.ErrRunActive), nil
+							}
+							return failure(err), nil
+						}
+					}
+					return s.submit(c.ctx, session, in, false), nil
+				}), nil
+			}
 			delete(s.calls, id)
 			s.mu.Unlock()
 			cancel()
 			return failure(tempest.ErrRunActive), nil
 		}
 		if reserved == nil {
-			reserved = &entry{busy: true}
+			reserved = &entry{busy: true, ready: make(chan struct{}), requestID: in.RequestID}
 			s.sessions[in.SessionID] = reserved
 		} else {
 			reserved.busy = true
+			reserved.requestID = in.RequestID
 		}
 	}
 	s.mu.Unlock()
@@ -290,11 +332,22 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 				e.busy = false
 				e.last = time.Now()
 			}
+			if e.ready != nil {
+				close(e.ready)
+				e.ready = nil
+			}
 			s.mu.Unlock()
 		}
 	}()
 	if err := c.ctx.Err(); err != nil {
 		return failure(err)
+	}
+	if e != nil && e.session != nil && in.RequestID != "" {
+		if _, err := e.session.Submission(c.ctx, in.RequestID); err == nil {
+			return s.submit(c.ctx, e.session, in, false)
+		} else if !errors.Is(err, tempest.ErrQueueNotFound) {
+			return failure(err)
+		}
 	}
 	if in.Cwd != "" {
 		in.Cwd = filepath.Clean(in.Cwd)
@@ -312,7 +365,7 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 		}
 	} else {
 		router := &routingPrompter{conn: s.conn, timeout: s.opts.PermissionTimeout}
-		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Logger: s.opts.Logger}
+		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Logger: s.opts.Logger, ExtensionProcesses: s.opts.ExtensionProcesses}
 		if in.SessionID != "" {
 			path, loaded, err := s.lookup(c.ctx, in.SessionID)
 			if err != nil {
@@ -341,6 +394,11 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 		e.busy = true
 		key = sess.ID()
 		s.sessions[key] = e
+		e.requestID = in.RequestID
+		if e.ready != nil {
+			close(e.ready)
+			e.ready = nil
+		}
 		s.mu.Unlock()
 	}
 	if err := e.session.SetBudget(settings.Budget); err != nil {
@@ -352,6 +410,9 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 	defer unwatch()
 	if err := c.ctx.Err(); err != nil {
 		return failure(err)
+	}
+	if in.RequestID != "" {
+		return s.submit(c.ctx, e.session, in, true)
 	}
 	run, err := e.session.Begin(c.ctx, tempest.Prompt{Text: in.Prompt})
 	if err != nil {
@@ -402,6 +463,33 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 	}
 }
 
+func (s *server) submit(ctx context.Context, session *tempest.Session, in RunInput, cancelRun bool) toolResult {
+	submission, err := session.Submit(ctx, tempest.Input{RequestID: in.RequestID, Prompt: tempest.Prompt{Text: in.Prompt}, Placement: tempest.PlacementInput})
+	if err != nil {
+		return failure(err)
+	}
+	if submission.State == "accepted" {
+		if err := session.ResumePending(ctx); err != nil {
+			return failure(err)
+		}
+	}
+	waitCtx := ctx
+	if cancelRun {
+		stopCancel := context.AfterFunc(ctx, func() {
+			if err := session.CancelSubmission(context.WithoutCancel(ctx), submission.RequestID); err != nil && !errors.Is(err, tempest.ErrQueueTooLate) {
+				s.opts.Logger.Warn("MCP submission cancellation failed", "sessionId", session.ID(), "error", err)
+			}
+		})
+		defer stopCancel()
+		waitCtx = context.WithoutCancel(ctx)
+	}
+	settled, err := session.WaitSubmission(waitCtx, submission.RequestID)
+	if err != nil {
+		return failure(err)
+	}
+	return makeTextResult(s.opts.SessionDir, session, settled.Answer, settled.Result, settled)
+}
+
 func (s *server) lookup(ctx context.Context, id string) (string, *journal.Loaded, error) {
 	var found string
 	var loaded *journal.Loaded
@@ -449,7 +537,7 @@ func (s *server) reap(ctx context.Context) {
 			var expired []*tempest.Session
 			s.mu.Lock()
 			for id, e := range s.sessions {
-				if !e.busy && e.session != nil && time.Since(e.last) >= s.opts.IdleTimeout {
+				if !e.busy && e.session != nil && e.session.Snapshot().Run.Status != "running" && time.Since(e.last) >= s.opts.IdleTimeout {
 					delete(s.sessions, id)
 					expired = append(expired, e.session)
 				}

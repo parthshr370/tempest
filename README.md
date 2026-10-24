@@ -10,11 +10,12 @@ agent protocols, or embeds in a Go application, without a Node runtime or interp
 
 - **One static Go binary**, with no runtime dependencies for the harness itself.
 - **Every model route in one harness**: 20 endpoint presets, six protocol adapters, custom endpoints, and exact model IDs.
-- **Crash-safe durable sessions** that never silently re-run a side effect whose outcome is unknown.
+- **Crash-safe durable sessions**, with atomic state commits and request-keyed prompt receipts, without silently repeating unknown outside effects.
 - **Hashline edits** anchored to the file you read, with atomic writes and batch rollback recovery.
 - **Permissions and plan mode**, with per-call guards for destructive commands and cloud changes.
 - **Subagents in worktrees**, with durable jobs, messages, and explicit three-way integration.
 - **Claude Code-compatible hooks**, with explicit trust for project commands.
+- **Go and subprocess extensions**, with named bundles, scoped memos, typed hooks, and pinned result wrappers.
 - **Checkpoint and rewind**, restoring files and branching the conversation without touching your Git index.
 - **Persistent eval kernels** for Python and JavaScript, started only when needed.
 - **ACP, A2A, MCP, and a Go SDK**, sharing durable sessions, permissions, and cost budgets with billed cost.
@@ -109,6 +110,9 @@ See [providers](guide/providers.md) for model routes and credentials.
 - **Destructive and cloud guards** ask per call; they are guardrails, not a sandbox.
 - **Checkpoint and rewind** restore protected files and retain an auditable conversation branch.
 - **Text, JSON, or NDJSON output**, with locally validated structured final answers.
+
+The JSONL journal adapter keeps raw committed history in memory. Bounded read
+pages do not imply disk indexing or a bounded memory working set.
 
 [Sessions and durability](guide/sessions-and-durability.md) · [Permissions](guide/permissions.md) · [Checkpoints](guide/checkpoints.md)
 

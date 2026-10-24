@@ -16,6 +16,7 @@ import (
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 const (
@@ -34,7 +35,8 @@ type Diagnostic struct {
 // Loaded is the reconstructed runtime view of a journal: the reduction of its
 // entries and records.
 type Loaded struct {
-	Header Header
+	Header           Header
+	extensionResults map[string]recordedToolResult
 	// Messages is the reconciled transcript: every tool call the provider
 	// will see has exactly one result, synthesized when the journal holds no
 	// real one.
@@ -97,6 +99,10 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 }
 
 func loadContents(ctx context.Context, path string, contents []byte, withSnapshots bool) (*Loaded, error) {
+	return loadContentsWithResults(ctx, path, contents, withSnapshots, nil)
+}
+
+func loadContentsWithResults(ctx context.Context, path string, contents []byte, withSnapshots bool, results map[string]recordedToolResult) (*Loaded, error) {
 	lines := bytes.Split(contents, []byte{'\n'})
 	if len(lines) == 0 || len(lines[0]) == 0 {
 		return nil, fmt.Errorf("read journal header: missing header")
@@ -108,8 +114,32 @@ func loadContents(ctx context.Context, path string, contents []byte, withSnapsho
 	if err := validateHeader(header); err != nil {
 		return nil, err
 	}
+	if header.Version == 4 {
+		expanded, state, err := expandV4(ctx, path, contents)
+		if err != nil {
+			return nil, err
+		}
+		results, err := readExtensionResults(ctx, state, header.ID, 0)
+		if err != nil {
+			return nil, err
+		}
+		loaded, err := loadContentsWithResults(ctx, path, expanded, withSnapshots, results)
+		if err != nil {
+			return nil, err
+		}
+		loaded.Header = header
+		page, err := state.Read(ctx, durable.Query{Limit: 1})
+		if err != nil {
+			return nil, err
+		}
+		loaded.lastSeq = page.Seq
+		if !bytes.HasSuffix(contents, []byte{'\n'}) && len(lines) > 1 && len(lines[len(lines)-1]) > 0 {
+			loaded.diagnose("dropped torn final line: incomplete commit envelope")
+		}
+		return loaded, nil
+	}
 
-	loaded := &Loaded{Header: header}
+	loaded := &Loaded{Header: header, extensionResults: results}
 	entries := make([]Entry, 0, len(lines))
 	lastContent := len(lines) - 1
 	if lastContent > 0 && len(lines[lastContent]) == 0 {
@@ -163,6 +193,7 @@ func loadContents(ctx context.Context, path string, contents []byte, withSnapsho
 		return loaded, nil
 	}
 	reduce(loaded, entries)
+	loaded.extensionResults = nil
 	return loaded, nil
 }
 
@@ -172,6 +203,16 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 	if err := ctx.Err(); err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
 	}
+	stable, err := acquireStableLock(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = stable.Close()
+		}
+	}()
 	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open journal for resume: %w", err)
@@ -189,11 +230,23 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 		_ = file.Close()
 		return nil, nil, err
 	}
-	if err := upgradeHeader(file, loaded.Header.Version); err != nil {
+	migrated, migrateErr := migrateV4(ctx, file, loaded.Header)
+	if migrateErr != nil {
+		_ = file.Close()
+		return nil, nil, migrateErr
+	}
+	file = migrated
+	priorDiagnostics := loaded.Diagnostics
+	loaded, err = Load(ctx, path)
+	if err != nil {
 		_ = file.Close()
 		return nil, nil, err
 	}
-	loaded.Header.Version = JournalVersion
+	for _, diagnostic := range priorDiagnostics {
+		if strings.Contains(diagnostic.Message, "torn final line") {
+			loaded.Diagnostics = append(loaded.Diagnostics, diagnostic)
+		}
+	}
 	if _, err := file.Seek(0, 2); err != nil {
 		_ = file.Close()
 		return nil, nil, err
@@ -204,15 +257,23 @@ func OpenForResume(ctx context.Context, path string, opts Options) (*Store, *Loa
 	}
 	clock, newID := resolveOptions(opts)
 	store := &Store{
-		path:         path,
-		id:           loaded.Header.ID,
-		file:         file,
-		lastID:       loaded.LastID,
-		seq:          loaded.lastSeq,
-		clock:        clock,
-		newID:        newID,
-		usageSources: maps.Clone(loaded.UsageSources),
+		path:           path,
+		id:             loaded.Header.ID,
+		file:           file,
+		lastID:         loaded.LastID,
+		seq:            loaded.lastSeq,
+		clock:          clock,
+		newID:          newID,
+		usageSources:   maps.Clone(loaded.UsageSources),
+		catalogLastRun: loaded.LastRun,
 	}
+	store.lock = stable
+	store.initDurable()
+	if err := store.restoreDurable(ctx); err != nil {
+		_ = store.Close()
+		return nil, nil, err
+	}
+	success = true
 	return store, loaded, nil
 }
 
@@ -246,6 +307,19 @@ func repairTail(ctx context.Context, file *os.File) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("repair journal tail: %w", err)
+	}
+	var header Header
+	if first := bytes.IndexByte(contents, '\n'); first >= 0 {
+		_ = json.Unmarshal(contents[:first], &header)
+	}
+	if header.Version == 4 {
+		if !terminated {
+			if err := file.Truncate(int64(start)); err != nil {
+				return err
+			}
+			return file.Sync()
+		}
+		return nil
 	}
 	_, err = decodeEntry(contents[start:end])
 	var unknown unknownEntryError

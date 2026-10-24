@@ -86,10 +86,12 @@ type RunHooks interface {
 // internal/work/context.go (the only additional work file owned by A).
 
 type TaskSpec struct {
-	Description  string          `json:"description,omitempty"`
-	Prompt       string          `json:"prompt"`
-	SubagentType string          `json:"subagent_type"`
-	OutputSchema json.RawMessage `json:"output_schema,omitempty"`
+	Description   string          `json:"description,omitempty"`
+	Prompt        string          `json:"prompt"`
+	SubagentType  string          `json:"subagent_type"`
+	OutputSchema  json.RawMessage `json:"output_schema,omitempty"`
+	PresetID      string          `json:"preset_id,omitempty"`
+	PresetVersion uint32          `json:"preset_version,omitempty"`
 }
 type BashSpec struct {
 	Command        string `json:"command"`

@@ -21,6 +21,8 @@ import (
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 // Options selects a new or existing journal and its runtime configuration.
@@ -47,6 +49,23 @@ type Options struct {
 	CloudRules []CloudRule
 	// Hooks replaces operator hook settings. Project commands still require explicit trust.
 	Hooks *HookSettings
+	// Registry contains operator-installed executable bundles.
+	Registry *extension.Registry
+	// Extensions selects ordered named bundles for this conversation.
+	Extensions []extension.Selection
+	// ExtensionProcesses contains operator-selected subprocess definitions.
+	ExtensionProcesses []extension.ProcessOptions
+	// Documents grants application namespaces and their validation policies.
+	Documents []durable.DocumentDefinition
+	// Store injects a caller-owned transaction domain; Host owns its close.
+	Store durable.Store
+	// Authorize checks host authority before accessing session state.
+	Authorize Authorizer
+	// ClientNamespace derives submission identity from authenticated context.
+	ClientNamespace func(context.Context) string
+	admitRun        func(context.Context) (func(), error)
+	admitProcess    func(context.Context) (func(), error)
+	hostCreate      bool
 }
 
 // NewSession configures a new conversation.
@@ -133,7 +152,10 @@ type ToolDefinition = types.Tool
 type Prompt struct {
 	Text         string
 	Media        []Media
-	OutputSchema json.RawMessage
+	OutputSchema json.RawMessage `json:",omitempty"`
+	// ContentIdentity preserves original protocol block order for admission.
+	// It affects identity only; execution uses Text and Media.
+	ContentIdentity json.RawMessage
 }
 
 // WatchOptions bounds the live queue; Approver is interpreted by the server.
@@ -282,13 +304,23 @@ func (s *Session) Begin(ctx context.Context, p Prompt) (*Run, error) { return s.
 // BeginContinue registers a run without adding a user message.
 func (s *Session) BeginContinue(ctx context.Context) (*Run, error) { return s.begin(ctx, nil) }
 
-// Prompt waits for a newly admitted user message to finish.
+// Prompt waits for admitted input and cancels and joins its run when ctx ends.
 func (s *Session) Prompt(ctx context.Context, p Prompt) (RunResult, error) {
 	run, err := s.Begin(ctx, p)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return RunResult{StopReason: agent.StopAborted}, nil
+		}
 		return RunResult{}, err
 	}
-	return run.Wait()
+	select {
+	case <-ctx.Done():
+		run.cancel()
+		<-run.done
+		return run.result, run.err
+	case <-run.done:
+		return run.result, run.err
+	}
 }
 
 // Continue resumes the current transcript without adding a user message.

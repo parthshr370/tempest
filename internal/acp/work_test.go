@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 func TestWorkErrorsKeepExactExtensionCodes(t *testing.T) {
@@ -18,6 +19,7 @@ func TestWorkErrorsKeepExactExtensionCodes(t *testing.T) {
 		{tempest.ErrJobNotFound, -32018, "job_not_found"}, {tempest.ErrJobLimit, -32019, "job_limit"},
 		{tempest.ErrJobNotCleanupable, -32020, "job_not_cleanupable"}, {tempest.ErrRecoveryRequired, -32021, "recovery_required"},
 		{tempest.ErrInvalidQueueInput, -32602, "invalid_params"}, {tempest.ErrInvalidJobInput, -32602, "invalid_params"},
+		{durable.ErrConflict, -32024, "durable_conflict"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {

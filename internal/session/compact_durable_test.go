@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 func TestCompactionPaidPhaseReusedAndUnknownNeverRetried(t *testing.T) {
@@ -145,5 +147,24 @@ func TestResumeUnknownCompactionStopsBeforeProvider(t *testing.T) {
 	result, err := a.Continue(ctx)
 	if err != nil || result.StopReason != agent.StopError || result.Err == nil || !strings.Contains(result.Err.Error(), "outcome_unknown") || result.Turns != 0 || f.CallCount() != 0 {
 		t.Fatalf("resume=%+v err=%v calls=%d", result, err, f.CallCount())
+	}
+}
+
+func TestExtensionCompactionDenySkipsWithoutCallingProvider(t *testing.T) {
+	provider := faux.New(faux.Options{})
+	model := provider.Model()
+	model.ContextWindow = 100
+	runner := newCompactionRunner(model, provider.StreamSimple)
+	runner.settings = compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10}
+	runner.beforeCompaction = func(context.Context, string) error { return extension.ErrDenied }
+	messages := []types.Message{cUser(strings.Repeat("a", 400)), cAssistant(strings.Repeat("b", 400)), cUser(strings.Repeat("c", 400)), cAssistant(strings.Repeat("d", 400)), cUser("keep recent")}
+	result, changed, err := runner.compact(context.Background(), messages)
+	if err != nil || changed || !reflect.DeepEqual(result, messages) || provider.CallCount() != 0 {
+		t.Fatalf("denied compaction changed run: changed=%t err=%v provider=%d", changed, err, provider.CallCount())
+	}
+	fault := errors.New("extension fault")
+	runner.beforeCompaction = func(context.Context, string) error { return fault }
+	if _, _, err := runner.compact(context.Background(), messages); !errors.Is(err, fault) {
+		t.Fatalf("extension fault was suppressed: %v", err)
 	}
 }

@@ -91,7 +91,7 @@ func TestSessionPermissionRoundTripAndJournalOrder(t *testing.T) {
 						Source   string `json:"source"`
 					} `json:"payload"`
 				}
-				if json.Unmarshal([]byte(line), &entry) != nil {
+				if json.Unmarshal([]byte(journalEntryLine(line)), &entry) != nil {
 					continue
 				}
 				if entry.Type == "permission" && permissionIndex < 0 {
@@ -173,7 +173,7 @@ func TestAnswerWinsAndCancelsSuppliedPrompter(t *testing.T) {
 		t.Fatalf("approved removal didn't run: %v", err)
 	}
 }
-func TestPreCancelledSessionHasZeroCallsAndDurableAbortedRun(t *testing.T) {
+func TestPreCancelledSessionHasZeroCallsAndNoAdmission(t *testing.T) {
 	f := faux.New(faux.Options{})
 	s := openFaux(t, f, nil)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -186,8 +186,8 @@ func TestPreCancelledSessionHasZeroCallsAndDurableAbortedRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.LastRun == nil || !loaded.LastRun.Finished || loaded.LastRun.StopReason != "aborted" {
-		t.Fatalf("durable run=%+v", loaded.LastRun)
+	if loaded.LastRun != nil {
+		t.Fatalf("cancelled preadmission must not create a run: %+v", loaded.LastRun)
 	}
 }
 func TestResumeSeedsTranscriptAndDiagnostics(t *testing.T) {

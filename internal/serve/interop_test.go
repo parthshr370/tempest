@@ -76,7 +76,7 @@ func a2aOK(t *testing.T, s *Server, method string, params, result any) {
 	}
 }
 func sendParams(text, contextID string, immediate bool) map[string]any {
-	return map[string]any{"message": map[string]any{"messageId": "client-id", "role": "ROLE_USER", "parts": []any{map[string]any{"text": text}}, "contextId": contextID}, "configuration": map[string]any{"returnImmediately": immediate}}
+	return map[string]any{"message": map[string]any{"messageId": "client-" + text, "role": "ROLE_USER", "parts": []any{map[string]any{"text": text}}, "contextId": contextID}, "configuration": map[string]any{"returnImmediately": immediate}}
 }
 func admitted(t *testing.T, s *Server, params any) *model.Task {
 	t.Helper()
@@ -225,7 +225,7 @@ func TestA2AStateArtifactAndOldCancel(t *testing.T) {
 	if len(history.History) != 0 {
 		t.Fatal("historyLength=0 ignored")
 	}
-	if len(first.History) != 2 || first.History[0].ID != "client-id" || first.History[1].Role != model.MessageRoleAgent {
+	if len(first.History) != 2 || first.History[0].ID != "client-first" || first.History[1].Role != model.MessageRoleAgent {
 		t.Fatal("task history", first.History)
 	}
 }

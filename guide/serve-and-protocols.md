@@ -4,6 +4,24 @@ Tempest can call MCP tools, act as an MCP server, and serve durable sessions ove
 ACP and A2A. All of these share the same journals, permission gate and budgets as
 the CLI.
 
+## Trusted extension processes
+
+Pass `-extension-config PATH` to one-shot runs, `serve` or `mcp` to launch
+operator-selected extensions. The file contains a JSON array:
+
+```json
+[{"ID":"local-peer","Argv":["python3","/opt/tempest/peer.py"],"Capabilities":["read","commit","memo","output","next"]}]
+```
+
+`Argv` executes directly, without shell interpolation. `Env` is an optional array
+of environment assignments; `Cwd` selects the process workspace. `Timeout` uses Go
+duration units as integer nanoseconds. Diagnostics go to stderr. Stdout is reserved
+for `tempest-extension/1` JSON-RPC frames.
+
+This file grants executable authority. Select it explicitly from trusted operator
+configuration. Repository manifests do not launch processes automatically. This
+extension protocol is not an ACP or MCP feature claim.
+
 ## MCP client tools
 
 Select trusted MCP servers explicitly with `-mcp-config PATH` on one-shot runs,
@@ -59,7 +77,9 @@ or trust all current and future tools of a locally configured server with
 Server startup itself executes arbitrary code before tool approval: configuration
 and credentials must come from a trusted operator. Environment and header values are
 not interpolated or stored in the journal; resume must resupply runtime MCP
-configuration. Unknown-outcome MCP calls are never automatically replayed.
+configuration. Serve keeps its startup MCP defaults for resumes that omit endpoint
+overrides, including after idle reap or server restart. Unknown-outcome MCP calls
+are never automatically replayed.
 
 ## MCP server
 
@@ -72,15 +92,22 @@ MCP HTTP endpoint. Initialize with `2025-11-25` or `2025-06-18`, then send
 `notifications/initialized`.
 
 Its one tool, `tempest_run`, accepts `prompt`, optional absolute `cwd`, `sessionId`,
-`model`, and a `budget` (`maxTurns`, `maxCostUsd`, `maxWallSeconds`). A caller's
+`requestId`, `model`, and a `budget` (`maxTurns`, `maxCostUsd`, `maxWallSeconds`). A caller's
 `model` cannot override an endpoint with `@<base-url>`; endpoints come from the
 server's provider configuration. Per-call budgets may tighten but not relax host
 caps. Results include final text, structured run and session ids, usage, stop reason
-and nullable cost. Reuse `sessionId` for continuity; busy sessions fail immediately
-instead of queuing.
+and nullable cost. Reuse `sessionId` for continuity; busy sessions reject new keys
+immediately instead of queuing.
+Supply both `sessionId` and `requestId` when retrying a durable call. Reusing a
+known key and prompt returns the original outcome or attaches to its active
+submission, even while another request is busy. Changing that prompt conflicts.
+Cancelling a duplicate wait does not
+withdraw or cancel the original submission. The JSON-RPC request ID only correlates
+this connection.
 
 Clients may request tokened progress and cancel by the original JSON-RPC request id.
-A cancelled call's reply is suppressed; its journal can still resume by session id.
+Cancelling the owning call aborts only its run and suppresses that call's reply.
+The terminal outcome remains available through its durable request key.
 With client form-elicitation support, host tool prompts become an allow-once boolean
 form. Absent support, decline, malformed answers and timeout deny. There are no
 always approvals over MCP. Idle sessions close after 30m. EOF or signals cancel and
@@ -147,6 +174,15 @@ interrupted work through ACP or Go Continue with a new run or task id. No push
 notifications, task follow-up, uploaded-file input, or file-change artifacts are
 implemented.
 
+Within an existing `contextId`, a message's `messageId` is its durable request key.
+Retry with the same context, message ID and content to recover the original logical
+submission. Use the returned context ID after the first call creates a session.
+JSON-RPC IDs may change between retries.
+`CancelTask` targets only that task's original submission. A stale task ID cannot
+cancel a later run in the same session. Shutdown captures the committed terminal
+outcome before closing healthy task streams.
+
+
 ### Server flags and shutdown
 
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout` (30m),
@@ -177,6 +213,29 @@ Every tool call starts with a `tool_call` update; its permission decision
 (`_meta.tempest.permission`), progress and result follow as `tool_call_update`s with
 the same `toolCallId`.
 
+### Durable controls
+
+ACP initialization advertises durable version 1 and its methods in
+`agentCapabilities._meta.tempest.durable`. All methods require `sessionId`:
+
+| Method | Additional parameters |
+|---|---|
+| `_tempest/durable/submit` | `requestId`, ACP content blocks in `prompt`, optional `placement` (`input`, `steer`, `follow_up`) and `outputSchema`. Returns a synced submission receipt. |
+| `_tempest/durable/get_submission` | `requestId`. Returns the original receipt and current state. |
+| `_tempest/durable/withdraw` | `requestId`. Withdraws pending input explicitly. |
+| `_tempest/durable/commit` | `commit`. Uses the public durable commit vocabulary with expected revisions. |
+| `_tempest/durable/read` | `query`. Returns a bounded page with an opaque cursor and immutable cut. |
+
+For an ordinary ACP completion, put `requestId` in `session/prompt`'s
+`_meta.tempest`. It waits on the same durable receipt but still returns ACP
+`stopReason` and `_meta.tempest` run details. Retrying under another JSON-RPC ID
+does not admit another prompt. Changed content under the key conflicts.
+
+Transport disconnect cancels only the wait. Opening, history and watch do not
+resume pending work. Existing steer and follow-up methods share the admission
+receipts rather than maintaining a separate transport deduplication cache.
+
+
 ### Watching and history
 
 `tempest/watch` returns an atomic snapshot followed by live updates. Reconnect with
@@ -185,9 +244,20 @@ connection closes. A slow watcher is dropped with `tempest/gap`, never allowed t
 stall the run; re-watch for a fresh snapshot. Use `tempest/history` to page older
 updates.
 
-Frames are limited to 1 MiB; an oversized history page fails with `-32000`, so
-request a smaller page. After compaction, late-attach history shows the compacted
-view, not the full journal transcript.
+Snapshots expose byte-bounded `documents` and `submissions` metadata projections
+with `durableSeq`, `documentsCursor` and `submissionsCursor`. Submission payloads,
+answers and document values stay out of the shared projection. Read full values
+through `_tempest/durable/read` or `_tempest/durable/get_submission`.
+`_tempest/durable/update`, advertised in the durable capability's `notifications`
+list, publishes the committed watermark and projection together. Each watch queue
+has a 4 MiB byte limit as well as its message limit. Live token updates may be
+newer than `durableSeq`; they are not durable output receipts.
+
+Default snapshot transcript tails contain at most 200 updates within a 512 KiB
+budget. `historyLen` still counts the full paged history. Frames are limited to
+1 MiB; an oversized explicit history tail or page fails with `-32000`, so request
+a smaller page. After compaction, late-attach history shows the compacted view,
+not the full journal transcript.
 
 The snapshot's `budget` and the `tempest/set_budget` result use the request shape
 `{maxTurns, maxCostUsd, maxWallSeconds}`. Builds before this one sent Go field names

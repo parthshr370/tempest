@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go.harness.dev/harness/tempest/durable"
 	"io"
 	"strings"
 	"time"
@@ -50,6 +51,10 @@ type QueueEnqueued struct {
 	SourceJobID string         `json:"source_job_id,omitempty"`
 	// SourceAgent marks an agent-to-agent message ("parent" or a job id).
 	SourceAgent string `json:"source_agent,omitempty"`
+	// Prompt retains the original ordered input used for request identity.
+	Prompt          json.RawMessage `json:"prompt,omitempty"`
+	RequestID       string          `json:"request_id,omitempty"`
+	ClientNamespace string          `json:"client_namespace,omitempty"`
 }
 
 // QueueCancelled withdraws an accepted, unconsumed receipt.
@@ -233,6 +238,9 @@ func validateWorkRecord(r WorkRecord) error {
 	switch v := value.(type) {
 	case *QueueEnqueued:
 		valid = v.QueueID != "" && (v.Kind == work.Steer || v.Kind == work.FollowUp) && utf8.ValidString(v.Text) && strings.TrimSpace(v.Text) != "" && utf8.ValidString(v.Key) && len(v.Key) <= 128
+		if v.ClientNamespace != "" || v.RequestID != "" && v.Key != v.RequestID {
+			valid = v.QueueID != "" && (v.Kind == work.Steer || v.Kind == work.FollowUp) && utf8.ValidString(v.Text) && strings.TrimSpace(v.Text) != "" && len(v.ClientNamespace) <= 128 && len(v.RequestID) <= 128 && (v.Key == durable.SubmissionKey(v.ClientNamespace, v.RequestID) || v.RequestID == "" && v.Key == "")
+		}
 		switch {
 		case v.SourceAgent != "":
 			valid = valid && v.SourceJobID == "" && v.Kind == work.Steer && len(v.Text) <= 16<<10 && strings.HasPrefix(v.Key, "msg:")

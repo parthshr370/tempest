@@ -216,7 +216,7 @@ func TestMeteredFallbackAndSourceDeduplication(t *testing.T) {
 		t.Fatal("conflicting receipt accepted")
 	}
 }
-func TestUpgradePreservesInodeAndChildPath(t *testing.T) {
+func TestUpgradeReplacesInodeAndRetainsStableLock(t *testing.T) {
 	for _, version := range []int{1, 2} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "old.jsonl")
@@ -231,11 +231,11 @@ func TestUpgradePreservesInodeAndChildPath(t *testing.T) {
 			}
 			defer s.Close()
 			after, _ := os.Stat(path)
-			if !os.SameFile(before, after) || l.Header.Version != 3 {
-				t.Fatal("upgrade replaced locked inode")
+			if os.SameFile(before, after) || l.Header.Version != 4 {
+				t.Fatal("upgrade must replace the data inode under its stable lock")
 			}
 			raw, _ := os.ReadFile(path)
-			if !bytes.Contains(raw, []byte(`"version":3`)) {
+			if !bytes.Contains(raw, []byte(`"version":4`)) {
 				t.Fatal("version not committed")
 			}
 			if _, _, err := OpenForResume(context.Background(), path, Options{}); !errors.Is(err, ErrSessionLocked) {

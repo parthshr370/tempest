@@ -108,7 +108,17 @@ func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers H
 		_ = wire.stream.Close()
 		return nil, err
 	}
+	release := func() {}
+	if handlers.AdmitProcess != nil {
+		release, err = handlers.AdmitProcess(ctx)
+		if err != nil {
+			_ = stdoutWriter.Close()
+			_ = wire.stream.Close()
+			return nil, err
+		}
+	}
 	if err = command.Start(); err != nil {
+		release()
 		_ = stdoutWriter.Close()
 		_ = wire.stream.Close()
 		return nil, err
@@ -130,7 +140,7 @@ func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers H
 			return rpc.Deferred(func() (any, *rpc.Error) { return handlers.Request(ctx, method, params) }), nil
 		})
 	}()
-	go func() { _ = command.Wait(); close(wire.exited) }()
+	go func() { _ = command.Wait(); release(); close(wire.exited) }()
 	return wire, nil
 }
 func (s *stdioTransport) alive() bool {

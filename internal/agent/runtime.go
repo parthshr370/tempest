@@ -90,6 +90,7 @@ type AgentOptions struct {
 	BeforeToolCall func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall  func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
 	Hooks          *hooks.Runner
+	Extensions     ExtensionRuntime
 	Child          bool
 	// PrepareNextTurn is called after each turn for a stateless config swap.
 	PrepareNextTurn func() *AgentLoopTurnUpdate
@@ -167,6 +168,7 @@ type Agent struct {
 	BeforeToolCall             func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall              func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
 	Hooks                      *hooks.Runner
+	Extensions                 ExtensionRuntime
 	Child                      bool
 	PrepareNextTurn            func() *AgentLoopTurnUpdate
 	PrepareNextTurnWithContext func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
@@ -256,6 +258,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		BeforeToolCall:             opts.BeforeToolCall,
 		AfterToolCall:              opts.AfterToolCall,
 		Hooks:                      opts.Hooks,
+		Extensions:                 opts.Extensions,
 		Child:                      opts.Child,
 		PrepareNextTurn:            opts.PrepareNextTurn,
 		PrepareNextTurnWithContext: opts.PrepareNextTurnWithContext,
@@ -623,6 +626,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		BeforeToolCall:   a.BeforeToolCall,
 		AfterToolCall:    a.AfterToolCall,
 		Hooks:            a.Hooks,
+		Extensions:       a.Extensions,
 		Child:            a.Child,
 		ConvertToLlm:     convertToLlm,
 		TransformContext: a.TransformContext,

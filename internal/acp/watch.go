@@ -154,7 +154,11 @@ func (c *Client) sendUpdate(ctx context.Context, u tempest.Update) error {
 				payload["lastSeq"] = u.Seq
 			}
 		}
-		return c.conn.Notify(ctx, u.Kind, payload)
+		method := u.Kind
+		if method == "tempest/durable" {
+			method = "_tempest/durable/update"
+		}
+		return c.conn.Notify(ctx, method, payload)
 	}
 	if u.Kind == "notice" {
 		c.mu.Lock()

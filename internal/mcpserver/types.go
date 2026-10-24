@@ -19,6 +19,7 @@ import (
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/obs"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 // Options supplies host policy and the sessions owned by one MCP connection.
@@ -27,6 +28,7 @@ type Options struct {
 	DefaultNew                                      tempest.NewSession
 	Provider                                        tempest.ProviderConfig
 	Stack                                           *tempest.StackConfig
+	ExtensionProcesses                              []extension.ProcessOptions
 	PermissionTimeout, IdleTimeout, ShutdownTimeout time.Duration
 	Logger                                          *slog.Logger
 }
@@ -36,6 +38,7 @@ type RunInput struct {
 	Prompt    string     `json:"prompt"`
 	Cwd       string     `json:"cwd,omitempty"`
 	SessionID string     `json:"sessionId,omitempty"`
+	RequestID string     `json:"requestId,omitempty"`
 	Model     string     `json:"model,omitempty"`
 	Budget    *RunBudget `json:"budget,omitempty"`
 }
@@ -49,17 +52,19 @@ type RunBudget struct {
 
 // RunOutput reports one admitted run, including its durable identity.
 type RunOutput struct {
-	Text       string             `json:"text"`
-	StopReason tempest.StopReason `json:"stopReason"`
-	Usage      tempest.Usage      `json:"usage"`
-	SessionID  string             `json:"sessionId"`
-	RunID      string             `json:"runId"`
-	Turns      int                `json:"turns"`
-	CostUSD    *float64           `json:"costUsd"`
-	ElapsedMS  int64              `json:"elapsedMs"`
-	Error      string             `json:"error,omitempty"`
-	Truncated  bool               `json:"truncated,omitempty"`
-	OutputPath string             `json:"outputPath,omitempty"`
+	Text         string             `json:"text"`
+	StopReason   tempest.StopReason `json:"stopReason"`
+	Usage        tempest.Usage      `json:"usage"`
+	SessionID    string             `json:"sessionId"`
+	RunID        string             `json:"runId"`
+	SubmissionID string             `json:"submissionId,omitempty"`
+	RequestID    string             `json:"requestId,omitempty"`
+	Turns        int                `json:"turns"`
+	CostUSD      *float64           `json:"costUsd"`
+	ElapsedMS    int64              `json:"elapsedMs"`
+	Error        string             `json:"error,omitempty"`
+	Truncated    bool               `json:"truncated,omitempty"`
+	OutputPath   string             `json:"outputPath,omitempty"`
 }
 
 type textContent struct {
@@ -72,7 +77,7 @@ type toolResult struct {
 	IsError           bool          `json:"isError"`
 }
 
-var toolDefinition = json.RawMessage(`{"name":"tempest_run","description":"Run a bounded Tempest coding-agent session in the server host workspace. Reuse sessionId for conversation continuity. Tools remain subject to host permissions.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"cwd":{"type":"string"},"sessionId":{"type":"string"},"model":{"type":"string"},"budget":{"type":"object","properties":{"maxTurns":{"type":"integer","minimum":0},"maxCostUsd":{"type":"number","minimum":0},"maxWallSeconds":{"type":"number","minimum":0}},"additionalProperties":false}},"required":["prompt"],"additionalProperties":false}}`)
+var toolDefinition = json.RawMessage(`{"name":"tempest_run","description":"Run a bounded Tempest coding-agent session in the server host workspace. Reuse sessionId for conversation continuity and requestId for durable retries. Tools remain subject to host permissions.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"cwd":{"type":"string"},"sessionId":{"type":"string"},"requestId":{"type":"string","minLength":1},"model":{"type":"string"},"budget":{"type":"object","properties":{"maxTurns":{"type":"integer","minimum":0},"maxCostUsd":{"type":"number","minimum":0},"maxWallSeconds":{"type":"number","minimum":0}},"additionalProperties":false}},"required":["prompt"],"additionalProperties":false}}`)
 
 var inputValidator = sync.OnceValues(func() (*jsonschema.Schema, error) {
 	var tool struct {
@@ -181,7 +186,14 @@ func failure(err error) toolResult {
 }
 
 func makeResult(dir string, sess *tempest.Session, run *tempest.Run, result tempest.RunResult) toolResult {
-	out := RunOutput{Text: run.Text(), StopReason: result.StopReason, Usage: result.Usage, SessionID: sess.ID(), RunID: result.RunID, Turns: result.Turns, ElapsedMS: result.ElapsedMS}
+	return makeTextResult(dir, sess, run.Text(), result)
+}
+
+func makeTextResult(dir string, sess *tempest.Session, text string, result tempest.RunResult, submissions ...tempest.Submission) toolResult {
+	out := RunOutput{Text: text, StopReason: result.StopReason, Usage: result.Usage, SessionID: sess.ID(), RunID: result.RunID, Turns: result.Turns, ElapsedMS: result.ElapsedMS}
+	if len(submissions) > 0 {
+		out.SubmissionID, out.RequestID = submissions[0].ID, submissions[0].RequestID
+	}
 	if result.Err != nil {
 		out.Error = obs.RedactTruncate(result.Err.Error(), 8192)
 	}

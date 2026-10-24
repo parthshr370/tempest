@@ -70,6 +70,7 @@ type task struct {
 	serial       uint64
 	askSeq       uint64
 	run          *tempest.Run
+	requestID    string
 	session      *tempest.Session
 	done         chan struct{}
 	changed      chan struct{}
@@ -142,8 +143,25 @@ func (t *task) waitInterrupted(ctx context.Context) error {
 }
 func (t *task) observe(initial tempest.Snapshot, updates <-chan tempest.Update, stop func(), ctx context.Context) {
 	defer func() { stop() }()
-	resultCh := make(chan tempest.RunResult, 1)
-	go func() { result, _ := t.run.Wait(); resultCh <- result }()
+	type completion struct {
+		result tempest.RunResult
+		text   string
+		at     time.Time
+	}
+	resultCh := make(chan completion, 1)
+	go func() {
+		if t.requestID != "" {
+			value, err := t.session.WaitSubmission(context.WithoutCancel(ctx), t.requestID)
+			if err != nil && value.Result.Err == nil {
+				value.Result.Err = err
+				value.Result.StopReason = "error"
+			}
+			resultCh <- completion{value.Result, value.Answer, time.Now().UTC()}
+		} else {
+			result, _ := t.run.Wait()
+			resultCh <- completion{result, t.run.Text(), t.run.FinishedAt()}
+		}
+	}()
 	t.projectAsks(initial, time.Now().UTC())
 	t.projectJobs(initial)
 	for {
@@ -163,8 +181,8 @@ func (t *task) observe(initial tempest.Snapshot, updates <-chan tempest.Update, 
 					updates = nil
 				}
 			}
-			t.terminalAt = t.run.FinishedAt()
-			t.finish(result, t.run.Text())
+			t.terminalAt = result.at
+			t.finish(result.result, result.text)
 			return
 		case u, ok := <-updates:
 			if !ok {

@@ -54,7 +54,7 @@ func TestStreamJSONOrderAndImmediateDelta(t *testing.T) {
 		return dst
 	}
 	s := streamSession(t, f, fn, tempest.Budget{})
-	_, captured, stop := s.Watch(context.Background(), tempest.WatchOptions{Buffer: 256})
+	initial, captured, stop := s.Watch(context.Background(), tempest.WatchOptions{Buffer: 256})
 	defer stop()
 	reader, writer := io.Pipe()
 	done := make(chan error, 1)
@@ -85,7 +85,7 @@ func TestStreamJSONOrderAndImmediateDelta(t *testing.T) {
 	if scanner.Err() != nil {
 		t.Fatal(scanner.Err())
 	}
-	var seq uint64
+	seq := initial.Seq
 	for i, line := range lines[:len(lines)-1] {
 		var update tempest.Update
 		if err := json.Unmarshal(line, &update); err != nil {
@@ -295,8 +295,16 @@ func TestStreamJSONResumeDoesNotReplayHistory(t *testing.T) {
 	if json.Unmarshal(lines[0], &first) != nil || first.Seq != before+1 {
 		t.Fatalf("first event=%s snapshot seq=%d", lines[0], before)
 	}
-	if bytes.Contains(stdout.Bytes(), []byte("old assistant text")) || bytes.Contains(stdout.Bytes(), []byte("old user text")) {
-		t.Fatal("resumed stream replayed history")
+	for _, line := range lines[:len(lines)-1] {
+		var update tempest.Update
+		if err := json.Unmarshal(line, &update); err != nil {
+			t.Fatal(err)
+		}
+		if update.Kind == "agent_message_chunk" || update.Kind == "user_message_chunk" {
+			if bytes.Contains(update.Update, []byte("old assistant text")) || bytes.Contains(update.Update, []byte("old user text")) {
+				t.Fatal("resumed stream replayed transcript history")
+			}
+		}
 	}
 }
 

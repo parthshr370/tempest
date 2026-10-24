@@ -15,6 +15,17 @@ func (s *Store) UsageSource(source string) (types.Usage, bool) {
 	return usage, ok
 }
 
+// UsageSources copies the writer's committed receipts without replaying the archive.
+func (s *Store) UsageSources() map[string]types.Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sources := make(map[string]types.Usage, len(s.usageSources))
+	for source, usage := range s.usageSources {
+		sources[source] = usage
+	}
+	return sources
+}
+
 func (s *Store) rememberUsage(entry Entry, meta Meta) {
 	var source string
 	var usage types.Usage

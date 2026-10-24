@@ -6,16 +6,24 @@ import (
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // InterruptedTool is a tool call whose intent was recorded but whose result
 // was not. It may or may not have run; nothing re-runs it automatically.
 type InterruptedTool struct {
-	RunID      string
-	ToolCallID string
-	Tool       string
-	Args       json.RawMessage
-	StartedAt  time.Time
+	RunID              string
+	ToolCallID         string
+	Tool               string
+	Args               json.RawMessage
+	StartedAt          time.Time
+	CallID             string
+	DefinitionID       string
+	DefinitionRevision string
+	Environment        string
+	Replay             durable.ReplayPolicy
+	SchemaHash         string
+	ArgumentsHash      string
 }
 
 // RunSummary says how the most recent run in a journal ended.
@@ -38,15 +46,9 @@ type RunSummary struct {
 const (
 	textOutcomeUnknown = "outcome unknown: the harness process ended before this tool's result was recorded; do not assume it ran or did not run."
 	textNotExecuted    = "not executed: the run stopped before this tool call started."
-	textSafeToRerun    = " It is read-only and safe to run again if you still need its output."
+	textSafeToRerun    = " Its recorded effective chain permits explicit compatible replay."
 	textNoRerun        = " It will not be re-run automatically."
 )
-
-// safeToRerun names the shipped tools whose re-execution has no side effects
-// (docs/design/03-durable-core.md section 6). Everything else defaults to
-// never re-run. The lsp_* tools stay off: a query may start a language
-// server, which is trusted executable code.
-var safeToRerun = map[string]bool{"read": true, "grep": true, "find": true, "ls": true, "manifest_diff": true}
 
 // toolKey identifies the queue of occurrences sharing an endpoint's call id.
 type toolKey struct {
@@ -55,9 +57,10 @@ type toolKey struct {
 }
 
 type toolState struct {
-	started  *ToolStartedRecord
-	finished *ToolFinishedRecord
-	job      *work.Job
+	started   *ToolStartedRecord
+	finished  *ToolFinishedRecord
+	job       *work.Job
+	recovered *recordedToolResult
 }
 
 type replayTool struct {
@@ -174,6 +177,9 @@ func reduce(loaded *Loaded, entries []Entry) {
 			}
 			record := e
 			state.started = &record
+			if result, ok := loaded.extensionResults[e.CallID]; e.CallID != "" && ok {
+				state.recovered = &result
+			}
 			for _, recovery := range loaded.Recoveries {
 				if recovery.Invocation.RunID == e.RunID && recovery.Invocation.CallID == e.CallID && e.CallID != "" {
 					job := recovery.Job
@@ -209,7 +215,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 		loaded.LastRun = &last
 	}
 	for _, state := range startOrder {
-		if state.finished != nil || loaded.LastRun == nil || state.started.RunID != loaded.LastRun.RunID {
+		if state.recovered != nil || state.finished != nil || loaded.LastRun == nil || state.started.RunID != loaded.LastRun.RunID {
 			continue
 		}
 		loaded.Interrupted = append(loaded.Interrupted, InterruptedTool{
@@ -218,6 +224,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 			Tool:       state.started.Tool,
 			Args:       state.started.Args,
 			StartedAt:  state.started.Timestamp,
+			CallID:     state.started.CallID, DefinitionID: state.started.DefinitionID, DefinitionRevision: state.started.DefinitionRevision, Environment: state.started.Environment, Replay: state.started.Replay, SchemaHash: state.started.SchemaHash, ArgumentsHash: state.started.ArgumentsHash,
 		})
 	}
 	// Like Interrupted, the warning is scoped to LastRun: a later run_started
@@ -281,6 +288,9 @@ func reconcile(messages []replayMessage) []ptypes.Message {
 // written inside a run, where tool_started always precedes execution; calls
 // from version 1 or external writers are left untouched.
 func synthesizeResult(call ptypes.ContentBlock, runID string, state *toolState, timestamp int64) (ptypes.ToolResultMessage, bool) {
+	if state != nil && state.recovered != nil {
+		return ptypes.ToolResultMessage{ToolCallID: call.ID, ToolName: call.Name, Content: state.recovered.Content, IsError: state.recovered.IsError, Timestamp: state.started.Timestamp.UnixMilli()}, true
+	}
 	var text string
 	if state != nil && state.job != nil {
 		job := state.job
@@ -305,7 +315,7 @@ func synthesizeResult(call ptypes.ContentBlock, runID string, state *toolState, 
 	default:
 		return ptypes.ToolResultMessage{}, false
 	}
-	if safeToRerun[call.Name] {
+	if state != nil && state.started != nil && state.started.Replay == durable.ReplaySafe {
 		text += textSafeToRerun
 	} else {
 		text += textNoRerun

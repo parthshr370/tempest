@@ -6,13 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"net"
 	"net/http"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,21 +19,23 @@ import (
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/extension"
 )
 
 // Options sets process-wide session defaults and lifecycle deadlines.
 type Options struct {
-	SessionDir        string
-	IdleTimeout       time.Duration
-	ShutdownTimeout   time.Duration
-	PermissionTimeout time.Duration
-	Token             string
-	DefaultNew        tempest.NewSession
-	Provider          tempest.ProviderConfig
-	Stack             *tempest.StackConfig
-	Clock             acp.Clock
-	A2ABaseURL        string
-	Cwd               string
+	SessionDir         string
+	IdleTimeout        time.Duration
+	ShutdownTimeout    time.Duration
+	PermissionTimeout  time.Duration
+	Token              string
+	DefaultNew         tempest.NewSession
+	Provider           tempest.ProviderConfig
+	Stack              *tempest.StackConfig
+	ExtensionProcesses []extension.ProcessOptions
+	Clock              acp.Clock
+	A2ABaseURL         string
+	Cwd                string
 	// OnListen, when set, receives the bound address before ListenAndServe accepts connections.
 	OnListen func(net.Addr)
 }
@@ -48,13 +45,13 @@ type entry struct {
 	refs       int
 	lastActive time.Time
 	closing    bool
-	mcpServers []tempest.MCPServerConfig
 }
 
 // Server owns all journal writers and accepted connections in this process.
 type Server struct {
 	mu          sync.Mutex
 	opts        Options
+	host        *tempest.Host
 	sessions    map[string]*entry
 	connections map[*rpc.Conn]struct{}
 	opening     map[string]*opening
@@ -100,6 +97,12 @@ func New(opts Options) (*Server, error) {
 		cancel()
 		return nil, err
 	}
+	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	s.host = host
 	go s.reaper()
 	return s, nil
 }
@@ -134,20 +137,20 @@ func (s *Server) New(ctx context.Context, cwd string, n *tempest.NewSession) (*t
 	defer s.openers.Done()
 	ctx, cancel := s.openContext(ctx)
 	defer cancel()
-	session, err := tempest.Open(ctx, tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: s.broker})
+	session, err := s.host.Create(ctx, tempest.AgentOptions{Cwd: cwd, New: &settings})
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
 	if !s.closed {
-		s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now(), mcpServers: servers}
+		s.sessions[session.ID()] = &entry{session: session, lastActive: time.Now()}
 		s.mu.Unlock()
 		return session, nil
 	}
 	s.mu.Unlock()
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 	defer closeCancel()
-	_ = session.Close(closeCtx)
+	_ = s.host.CloseSession(closeCtx, session.ID())
 	return nil, tempest.ErrClosed
 }
 
@@ -179,7 +182,7 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 				s.mu.Unlock()
 				return nil, tempest.ErrClosed
 			}
-			if explicit && !sameMCP(servers, e.mcpServers) {
+			if explicit && !e.session.MCPServersEqual(servers) {
 				s.mu.Unlock()
 				return nil, tempest.ErrMCPConfigConflict
 			}
@@ -207,7 +210,7 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 		s.opening[id] = pending
 		s.openers.Add(1)
 		s.mu.Unlock()
-		return s.resumeOpen(ctx, cwd, id, servers, explicit, pending)
+		return s.resumeOpen(ctx, cwd, id, servers, pending)
 	}
 }
 
@@ -236,71 +239,28 @@ func (s *Server) CloseSession(ctx context.Context, id string) error {
 	}
 	e.closing = true
 	s.mu.Unlock()
-	err := e.session.Close(ctx)
+	err := s.host.CloseSession(ctx, id)
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
 	return err
 }
 
-// List pages durable journals, newest first, using an offset cursor.
+// List pages durable journals newest first with an opaque snapshot cursor.
 func (s *Server) List(ctx context.Context, cwd, cursor string) ([]acp.SessionInfo, string, error) {
-	if cursor != "" {
-		if _, err := strconv.Atoi(cursor); err != nil {
-			return nil, "", rpc.NewError(-32602, "invalid_params", "invalid cursor")
-		}
-	}
-	var result []acp.SessionInfo
-	err := filepath.WalkDir(s.opts.SessionDir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if errors.Is(walkErr, fs.ErrNotExist) {
-				return nil
-			}
-			return walkErr
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
-			return nil
-		}
-		loaded, err := journal.Load(ctx, path)
-		if err != nil {
-			return err
-		}
-		if cwd != "" && loaded.Header.Cwd != cwd {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		result = append(result, acp.SessionInfo{SessionID: loaded.Header.ID, Cwd: loaded.Header.Cwd, Title: loaded.Header.Title, UpdatedAt: info.ModTime(), LastRun: loaded.LastRun})
-		return nil
-	})
+	page, err := s.host.List(ctx, tempest.ListOptions{Cwd: cwd, Cursor: cursor, Limit: 100})
 	if err != nil {
 		return nil, "", err
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].UpdatedAt.Equal(result[j].UpdatedAt) {
-			return result[i].SessionID > result[j].SessionID
+	result := make([]acp.SessionInfo, 0, len(page.Sessions))
+	for _, info := range page.Sessions {
+		var last *journal.RunSummary
+		if info.LastRun != nil {
+			last = &journal.RunSummary{RunID: info.LastRun.RunID, StopReason: info.LastRun.StopReason, Error: info.LastRun.Error, Finished: info.LastRun.Finished, FinishedAt: info.LastRun.FinishedAt}
 		}
-		return result[i].UpdatedAt.After(result[j].UpdatedAt)
-	})
-	offset := 0
-	if cursor != "" {
-		offset, _ = strconv.Atoi(cursor)
+		result = append(result, acp.SessionInfo{SessionID: info.SessionID, Cwd: info.Cwd, Title: info.Title, UpdatedAt: info.UpdatedAt, LastRun: last})
 	}
-	if offset < 0 || offset > len(result) {
-		return nil, "", rpc.NewError(-32602, "invalid_params", "invalid cursor")
-	}
-	end := min(offset+100, len(result))
-	next := ""
-	if end < len(result) {
-		next = strconv.Itoa(end)
-	}
-	page := append([]acp.SessionInfo{}, result[offset:end]...)
-	return page, next, nil
+	return result, page.NextCursor, nil
 }
 
 func (s *Server) reaper() {
@@ -329,7 +289,7 @@ func (s *Server) reap(now time.Time) {
 	for _, e := range stale {
 		ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 		// Close permanently rejects admission, even when its wait expires.
-		_ = e.session.Close(ctx)
+		_ = s.host.CloseSession(ctx, e.session.ID())
 		cancel()
 		s.mu.Lock()
 		delete(s.sessions, e.session.ID())
@@ -466,7 +426,7 @@ func (s *Server) shutdown() {
 	errCh := make(chan error, len(entries))
 	for _, e := range entries {
 		wg.Go(func() {
-			if err := e.session.Close(ctx); err != nil {
+			if err := s.host.CloseSession(ctx, e.session.ID()); err != nil {
 				errCh <- err
 			}
 		})
@@ -483,6 +443,7 @@ func (s *Server) shutdown() {
 		s.closeErr = errors.Join(s.closeErr, err)
 	default:
 	}
+	s.closeErr = errors.Join(s.closeErr, s.host.Close(ctx))
 	if s.a2a != nil {
 		s.closeErr = errors.Join(s.closeErr, s.a2a.Close(ctx))
 	}

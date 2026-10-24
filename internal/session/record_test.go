@@ -17,6 +17,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 func TestChildUsageIsJournaledWithoutChildMessages(t *testing.T) {
@@ -232,7 +233,7 @@ func readRawLines(t *testing.T, path string) []rawLine {
 	var lines []rawLine
 	for _, text := range strings.Split(strings.TrimRight(string(contents), "\n"), "\n")[1:] {
 		var line rawLine
-		if err := json.Unmarshal([]byte(text), &line); err != nil {
+		if err := json.Unmarshal([]byte(entryLine(text)), &line); err != nil {
 			t.Fatalf("journal line after resume repair does not decode: %v", err)
 		}
 		lines = append(lines, line)
@@ -493,7 +494,7 @@ func TestCrashAtEveryJournalBoundaryResumesHonestly(t *testing.T) {
 
 func lineKind(line string) string {
 	var raw rawLine
-	if err := json.Unmarshal([]byte(line), &raw); err != nil {
+	if err := json.Unmarshal([]byte(entryLine(line)), &raw); err != nil {
 		return "?"
 	}
 	switch {
@@ -537,6 +538,60 @@ func TestAttachJournalRecordsAFullRunInOrder(t *testing.T) {
 	}
 }
 
+type archiveReadBarrier struct {
+	*durable.Log
+	block   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *archiveReadBarrier) Read(ctx context.Context, q durable.Query) (durable.Page, error) {
+	if b.block && q.Kind == durable.EntryKind && q.Namespace == "_tempest/journal" && q.History {
+		close(b.entered)
+		<-b.release
+	}
+	return b.Log.Read(ctx, q)
+}
+
+func TestFreshPromptDoesNotWaitForArchiveReplay(t *testing.T) {
+	ctx := context.Background()
+	backend := &archiveReadBarrier{Log: durable.NewMemory(), entered: make(chan struct{}), release: make(chan struct{})}
+	store, err := journal.CreateBackend(ctx, backend, t.TempDir(), "/workspace/project", journal.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	f := faux.New(faux.Options{})
+	f.SetResponses(faux.Respond(faux.Text("first")), faux.Respond(faux.Text("second")))
+	a := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: f.Model()}, StreamFn: f.StreamSimple})
+	defer AttachJournal(a, store)()
+	if result, err := a.PromptText(ctx, "first"); err != nil || result.Err != nil {
+		t.Fatalf("first prompt: %+v, %v", result, err)
+	}
+	backend.block = true
+	done := make(chan error, 1)
+	go func() {
+		result, err := a.PromptText(ctx, "second")
+		done <- errors.Join(err, result.Err)
+	}()
+	select {
+	case <-backend.entered:
+		close(backend.release)
+		<-done
+		t.Fatal("fresh prompt waited for the complete archive instead of the writer's committed usage receipts")
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if f.CallCount() != 2 {
+		t.Fatalf("provider calls = %d, want 2", f.CallCount())
+	}
+	if len(a.RunState().UsageSources) == 0 {
+		t.Fatal("fresh prompt lost the previous run's usage receipts")
+	}
+}
+
 func TestAttachJournalStopsTheRunWhenTheJournalIsDead(t *testing.T) {
 	ctx := context.Background()
 	store, err := journal.Create(ctx, t.TempDir(), "/workspace/project", journal.Options{})
@@ -561,4 +616,16 @@ func TestAttachJournalStopsTheRunWhenTheJournalIsDead(t *testing.T) {
 	if executions, _ := ledger.snapshot(); f.CallCount() != 0 || len(executions) != 0 {
 		t.Fatalf("run continued on a dead journal: %d model calls, executions %v", f.CallCount(), executions)
 	}
+}
+
+func entryLine(line string) string {
+	var envelope durable.Envelope
+	if json.Unmarshal([]byte(line), &envelope) == nil && envelope.Type == "commit" {
+		for _, change := range envelope.Commit.Changes {
+			if change.Kind == durable.EntryKind && change.Namespace == "_tempest/journal" {
+				return string(change.Value)
+			}
+		}
+	}
+	return line
 }

@@ -13,6 +13,7 @@ import (
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 var (
@@ -71,6 +72,11 @@ func (q *DurableQueues) notifyLocked() { close(q.changed); q.changed = make(chan
 
 // Enqueue fsyncs acceptance before making the item visible or returning its receipt.
 func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (work.QueueItem, error) {
+	return q.EnqueuePrompt(ctx, input, nil)
+}
+
+// EnqueuePrompt shares admission with Enqueue while preserving source blocks.
+func (q *DurableQueues) EnqueuePrompt(ctx context.Context, input work.QueueInput, original json.RawMessage) (work.QueueItem, error) {
 	if (input.Kind != work.Steer && input.Kind != work.FollowUp) || !utf8.ValidString(input.Text) || strings.TrimSpace(input.Text) == "" || !utf8.ValidString(input.Key) || len(input.Key) > 128 {
 		return work.QueueItem{}, ErrInvalidQueueInput
 	}
@@ -86,10 +92,47 @@ func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (wor
 	case input.Kind != work.FollowUp || input.Key != "job:"+input.SourceJobID+":terminal":
 		return work.QueueItem{}, ErrInvalidQueueInput
 	}
+	requestID, namespace := input.Key, durable.ClientNamespace(ctx)
+	if input.SourceAgent != "" || input.SourceJobID != "" {
+		namespace = ""
+	}
+	if len(namespace) > 128 {
+		return work.QueueItem{}, ErrInvalidQueueInput
+	}
+	if input.Key != "" && input.SourceAgent == "" && input.SourceJobID == "" {
+		input.Key = durable.SubmissionKey(namespace, input.Key)
+	}
 	q.mutation.Lock()
 	defer q.mutation.Unlock()
 	if err := ctx.Err(); err != nil {
 		return work.QueueItem{}, err
+	}
+	if len(original) == 0 {
+		original, _ = json.Marshal(struct {
+			Text            string
+			Media           json.RawMessage
+			OutputSchema    json.RawMessage `json:",omitempty"`
+			ContentIdentity json.RawMessage
+		}{Text: input.Text})
+	}
+	if input.Key != "" {
+		page, err := q.store.Read(ctx, durable.Query{Kind: durable.SubmissionKind, Namespace: "_tempest/submissions", ID: input.Key, Limit: 1})
+		if err != nil {
+			return work.QueueItem{}, err
+		}
+		if len(page.Records) > 0 {
+			var prior durable.Submission
+			if err = json.Unmarshal(page.Records[0].Value, &prior); err != nil {
+				return work.QueueItem{}, err
+			}
+			hash, err := durable.SubmissionHash(string(input.Kind), original)
+			if err != nil {
+				return work.QueueItem{}, err
+			}
+			if prior.RequestHash != hash {
+				return work.QueueItem{}, ErrQueueConflict
+			}
+		}
 	}
 	q.mu.Lock()
 	if id, ok := q.keys[input.Key]; input.Key != "" && ok {
@@ -127,7 +170,7 @@ func (q *DurableQueues) Enqueue(ctx context.Context, input work.QueueInput) (wor
 		return work.QueueItem{}, fmt.Errorf("%w: completion exceeds encoded 8 KiB", ErrInvalidQueueInput)
 	}
 	q.mu.Unlock()
-	raw, _ := json.Marshal(journal.QueueEnqueued{QueueID: item.ID, Kind: item.Kind, Text: item.Text, Key: item.Key, SourceJobID: item.SourceJobID, SourceAgent: item.SourceAgent})
+	raw, _ := json.Marshal(journal.QueueEnqueued{QueueID: item.ID, Kind: item.Kind, Text: item.Text, Key: item.Key, SourceJobID: item.SourceJobID, SourceAgent: item.SourceAgent, Prompt: original, RequestID: requestID, ClientNamespace: namespace})
 	meta, err := q.store.AppendAssigned(ctx, journal.WorkRecord{Type: journal.KindQueueEnqueued, Payload: raw})
 	if err != nil {
 		return work.QueueItem{}, err

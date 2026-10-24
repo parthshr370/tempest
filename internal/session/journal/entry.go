@@ -10,11 +10,12 @@ import (
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // JournalVersion is the on-disk format version this package writes. Version 1
 // files (entries only, no seq or records) still load.
-const JournalVersion = 3
+const JournalVersion = 4
 
 // LaneMain is the only lane in M1. Every line carries it so adding lanes later
 // does not change the format.
@@ -161,11 +162,17 @@ func (e RunStartedRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 // before the tool executes; without a matching ToolFinishedRecord the call's
 // outcome is unknown.
 type ToolStartedRecord struct {
-	Meta       `json:"-"`
-	ToolCallID string          `json:"tool_call_id"`
-	Tool       string          `json:"tool"`
-	Args       json.RawMessage `json:"args,omitempty"`
-	CallID     string          `json:"call_id,omitempty"`
+	Meta               `json:"-"`
+	ToolCallID         string               `json:"tool_call_id"`
+	Tool               string               `json:"tool"`
+	Args               json.RawMessage      `json:"args,omitempty"`
+	CallID             string               `json:"call_id,omitempty"`
+	DefinitionID       string               `json:"definition_id,omitempty"`
+	DefinitionRevision string               `json:"definition_revision,omitempty"`
+	Environment        string               `json:"environment,omitempty"`
+	Replay             durable.ReplayPolicy `json:"replay,omitempty"`
+	SchemaHash         string               `json:"schema_hash,omitempty"`
+	ArgumentsHash      string               `json:"arguments_hash,omitempty"`
 }
 
 func (ToolStartedRecord) kind() EntryType            { return KindToolStarted }
