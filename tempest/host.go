@@ -20,6 +20,7 @@ import (
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/environment"
 	"go.harness.dev/harness/tempest/extension"
 )
 
@@ -37,26 +38,29 @@ var ErrHostLimit = errors.New("host resource limit reached")
 // HostOptions supplies runtime configuration shared by hosted conversations.
 // Store ownership transfers only after OpenHost succeeds.
 type HostOptions struct {
-	SessionDir      string
-	Provider        ProviderConfig
-	Stack           *StackConfig
-	Prompter        Prompter
-	Logger          *slog.Logger
-	FauxScript      string
-	MCPServers      []MCPServerConfig
-	Store           durable.Store
-	Registry        *extension.Registry
-	Extensions      []extension.Selection
-	Options         Options
-	Authorize       Authorizer
-	ClientNamespace func(context.Context) string
-	Limits          HostLimits
+	SessionDir          string
+	Provider            ProviderConfig
+	Stack               *StackConfig
+	Prompter            Prompter
+	Questioner          QuestionHandler
+	Logger              *slog.Logger
+	FauxScript          string
+	MCPServers          []MCPServerConfig
+	Store               durable.Store
+	Registry            *extension.Registry
+	Extensions          []extension.Selection
+	Options             Options
+	Authorize           Authorizer
+	ClientNamespace     func(context.Context) string
+	Limits              HostLimits
+	EnvironmentResolver environment.Resolver
 }
 
 // AgentOptions selects a new session and its workspace.
 type AgentOptions struct {
-	Cwd string
-	New *NewSession
+	Cwd         string
+	New         *NewSession
+	Environment environment.Reference
 }
 
 // ListOptions selects a bounded page of published sessions.
@@ -128,15 +132,7 @@ func OpenHost(ctx context.Context, options HostOptions) (*Host, error) {
 		return nil, fmt.Errorf("host limits must not be negative")
 	}
 	if options.SessionDir == "" {
-		cwd := options.Options.Cwd
-		if cwd == "" {
-			var err error
-			cwd, err = os.Getwd()
-			if err != nil {
-				return nil, err
-			}
-		}
-		resolved, err := (config.Config{WorkingDir: cwd}).Resolve()
+		resolved, err := (config.Config{SkipProject: true}).Resolve()
 		if err != nil {
 			return nil, err
 		}
@@ -202,6 +198,9 @@ func (host *Host) sessionOptions() Options {
 	options.Store = host.options.Store
 	options.admitRun = host.admitRun
 	options.admitProcess = host.admitProcess
+	if host.options.EnvironmentResolver != nil {
+		options.EnvironmentResolver = host.options.EnvironmentResolver
+	}
 	if host.options.Authorize != nil {
 		options.Authorize = host.options.Authorize
 	}
@@ -219,6 +218,9 @@ func (host *Host) sessionOptions() Options {
 	}
 	if host.options.Prompter != nil {
 		options.Prompter = host.options.Prompter
+	}
+	if host.options.Questioner != nil {
+		options.Questioner = host.options.Questioner
 	}
 	if host.options.Logger != nil {
 		options.Logger = host.options.Logger
@@ -336,6 +338,9 @@ func (host *Host) Create(ctx context.Context, agent AgentOptions) (created *Sess
 	defer cancel()
 	options := host.sessionOptions()
 	options.Cwd = agent.Cwd
+	if agent.Environment.ID != "" {
+		options.Environment = agent.Environment
+	}
 	options.New = agent.New
 	options.Resume = nil
 	options.hostCreate = true

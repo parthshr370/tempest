@@ -16,6 +16,7 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/cloudcmd"
+	"go.harness.dev/harness/internal/dap"
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
@@ -106,6 +107,8 @@ type FlagValues struct {
 	NoHooks               BoolInput
 	TrustProjectHooks     BoolInput
 	TrustProjectProviders BoolInput
+	Environment           StringInput
+	EnvironmentCommand    StringInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -138,6 +141,8 @@ type Config struct {
 	LookupEnv    func(string) string
 	SettingsPath string
 	WorkingDir   string
+	// SkipProject prevents host-path discovery for a remote workspace.
+	SkipProject bool
 }
 
 // ResolvedConfig is the immutable runtime configuration used after startup.
@@ -177,6 +182,9 @@ type ResolvedConfig struct {
 	hooks                  hooks.Settings
 	providers              map[string]adapter.ProviderConfig
 	untrustedProviderFiles []string
+	debugAdapters          map[string]dap.Adapter
+	environment            string
+	environments           map[string]EnvironmentProcess
 }
 
 // Model returns the default model specification.
@@ -345,6 +353,9 @@ type fileSettings struct {
 	TrustedHookProjects     []string                          `json:"trusted_hook_projects"`
 	Providers               map[string]adapter.ProviderConfig `json:"providers"`
 	TrustedProviderProjects []string                          `json:"trusted_provider_projects"`
+	DebugAdapters           map[string]dap.Adapter            `json:"debug_adapters"`
+	Environment             *string                           `json:"environment"`
+	Environments            map[string]EnvironmentProcess     `json:"environments"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -388,11 +399,15 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	environmentName, environments, err := resolveEnvironments(c.Flags, lookup, settings)
+	if err != nil {
+		return nil, err
+	}
 	trustProviders, err := resolveBool(c.Flags.TrustProjectProviders, lookup("HARNESS_TRUST_PROJECT_PROVIDERS"), nil, false)
 	if err != nil {
 		return nil, &Error{Field: "trust_project_providers", Err: err}
 	}
-	providers, untrustedProviderFiles, err := resolveProviders(settings, c.WorkingDir, trustProviders)
+	providers, untrustedProviderFiles, err := resolveProviders(settings, c.WorkingDir, trustProviders, c.SkipProject || environmentName != "")
 	if err != nil {
 		return nil, &Error{Field: "providers", Err: err}
 	}
@@ -536,7 +551,13 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	}
 	permissionAllowTools := resolveToolList(c.Flags.PermissionAllowTools, lookup("HARNESS_PERMISSION_ALLOW_TOOLS"), settings.PermissionAllowTools)
 	permissionDenyTools := resolveToolList(c.Flags.PermissionDenyTools, lookup("HARNESS_PERMISSION_DENY_TOOLS"), settings.PermissionDenyTools)
+	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
+	if err != nil {
+		return nil, &Error{Field: "debug_adapters", Err: err}
+	}
 	resolved := &ResolvedConfig{
+		environment:           environmentName,
+		environments:          environments,
 		model:                 resolveString(c.Flags.Model, lookup("HARNESS_MODEL"), settings.Model, defaultModel),
 		planModel:             resolveString(c.Flags.PlanModel, lookup("HARNESS_PLAN_MODEL"), settings.PlanModel, ""),
 		smolModel:             resolveString(c.Flags.SmolModel, lookup("HARNESS_SMOL_MODEL"), settings.SmolModel, ""),
@@ -573,6 +594,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		hooks:                  hookSettings,
 		providers:              providers,
 		untrustedProviderFiles: untrustedProviderFiles,
+		debugAdapters:          debugAdapters,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,
@@ -631,6 +653,26 @@ func validateResolved(c *ResolvedConfig) error {
 
 // Hooks returns an owned snapshot of the operator's hook settings.
 func (c *ResolvedConfig) Hooks() hooks.Settings { return c.hooks.Clone() }
+
+// DebugAdapters returns an owned snapshot of trusted debugger definitions.
+func (c *ResolvedConfig) DebugAdapters() map[string]dap.Adapter {
+	result := make(map[string]dap.Adapter, len(c.debugAdapters))
+	for name, adapter := range c.debugAdapters {
+		adapter.Args = slices.Clone(adapter.Args)
+		adapter.Launch = cloneDebugArguments(adapter.Launch)
+		adapter.Attach = cloneDebugArguments(adapter.Attach)
+		result[name] = adapter
+	}
+	return result
+}
+
+func cloneDebugArguments(arguments map[string]json.RawMessage) map[string]json.RawMessage {
+	result := make(map[string]json.RawMessage, len(arguments))
+	for key, value := range arguments {
+		result[key] = slices.Clone(value)
+	}
+	return result
+}
 
 // loadSettings treats a missing settings file as no overrides, but keeps real
 // I/O and decode failures tied to the settings field.

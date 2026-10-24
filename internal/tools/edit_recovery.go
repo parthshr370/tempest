@@ -23,3 +23,10 @@ func RecoverEditBatches(sessionDataDirs []string, queue *toolio.FileMutationQueu
 	}
 	return outcomes, errors.Join(errs...)
 }
+
+func editStateDir(options ToolsOptions) string {
+	if options.EditStateDir != "" {
+		return options.EditStateDir
+	}
+	return options.SessionDataDir
+}

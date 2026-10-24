@@ -29,10 +29,14 @@ func (c *ResolvedConfig) UntrustedProviderFiles() []string {
 	return slices.Clone(c.untrustedProviderFiles)
 }
 
-func resolveProviders(settings fileSettings, cwd string, trusted bool) (map[string]adapter.ProviderConfig, []string, error) {
+func resolveProviders(settings fileSettings, cwd string, trusted, skipProject bool) (map[string]adapter.ProviderConfig, []string, error) {
 	providers := maps.Clone(settings.Providers)
 	if providers == nil {
 		providers = map[string]adapter.ProviderConfig{}
+	}
+	if skipProject {
+		_, err := adapter.Providers(providers)
+		return providers, nil, err
 	}
 	if cwd == "" {
 		var err error

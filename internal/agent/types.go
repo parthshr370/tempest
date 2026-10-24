@@ -146,6 +146,8 @@ type ShouldStopAfterTurnContext struct {
 	ToolResults []types.ToolResultMessage
 	Context     AgentContext
 	NewMessages []types.Message
+	Handoff     *string
+	Overflow    bool
 }
 
 // AgentLoopTurnUpdate replaces selected state before the next provider request.
@@ -153,6 +155,7 @@ type AgentLoopTurnUpdate struct {
 	Context       *AgentContext
 	Model         *types.Model
 	ThinkingLevel ThinkingLevel
+	Stop          bool
 }
 
 // AgentLoopConfig configures the low-level loop. Hooks return plain values; the

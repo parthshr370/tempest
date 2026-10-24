@@ -268,7 +268,7 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 	if declared, ok := ctx.Value(effectTierKey{}).(Tier); ok {
 		tier = declared
 	}
-	shell := inspectShell(toolName, args, cwd)
+	shell, settingsReason := inspectWorkspaceForGate(ctx, toolName, args, cwd)
 	if mode == ModePlan {
 		if reason := planDenial(toolName, tier, shell); reason != "" {
 			return Outcome{Reason: reason, Source: SourceMode}
@@ -282,13 +282,25 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 	if len(toolCallID) != 0 {
 		req.ToolCallID = toolCallID[0]
 	}
-	if reason := hookSettingsReason(toolName, args, cwd); reason != "" {
+	if reason := settingsReason; reason != "" {
 		req.Reason = reason
 		outcome := resolvePrompt(ctx, policy, req)
 		if !outcome.Allow && outcome.Source == SourceNoPrompter && shell.guardReason != "" {
 			outcome.Source = SourceGuard
 		}
 		return outcome
+	}
+	if toolName == "debug" {
+		var request struct {
+			Action string `json:"action"`
+		}
+		if json.Unmarshal(args, &request) == nil && (request.Action == "launch" || request.Action == "attach") {
+			req.Reason = "Debug launch/attach can execute adapter-specific commands and requires per-call approval"
+			if policy.Prompter == nil {
+				return Outcome{Reason: req.Reason, Source: SourceGuard}
+			}
+			return resolvePrompt(ctx, policy, req)
+		}
 	}
 	if mode == ModeBypass && hookDecision != "ask" {
 		return Outcome{Allow: true, Source: SourceBypass}
@@ -388,12 +400,17 @@ type shellFacts struct {
 }
 
 func inspectShell(toolName string, args json.RawMessage, cwd string) shellFacts {
-	if toolName == "eval" {
+	if toolName == "eval" || toolName == "debug" {
 		var request struct {
-			Code string `json:"code"`
+			Code       string `json:"code"`
+			Action     string `json:"action"`
+			Expression string `json:"expression"`
 		}
-		if json.Unmarshal(args, &request) != nil {
+		if json.Unmarshal(args, &request) != nil || (toolName == "debug" && request.Action != "evaluate") {
 			return shellFacts{analysis: cloudcmd.Analysis{Effect: cloudcmd.EffectNone}}
+		}
+		if toolName == "debug" {
+			request.Code = request.Expression
 		}
 		facts := shellFacts{command: request.Code, analysis: cloudcmd.AnalyzeInline(request.Code)}
 		if inlineDestructivePattern.MatchString(request.Code) {

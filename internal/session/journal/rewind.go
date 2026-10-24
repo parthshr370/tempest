@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // KindRewind forks the visible transcript without removing journal history.
@@ -17,6 +18,7 @@ type RewindEntry struct {
 	Checkpoint string            `json:"checkpoint"`
 	Report     string            `json:"report,omitempty"`
 	Messages   []json.RawMessage `json:"messages"`
+	Documents  []durable.Change  `json:"documents,omitempty"`
 }
 
 func (RewindEntry) kind() EntryType         { return KindRewind }

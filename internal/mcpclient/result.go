@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/mcpwire"
+	"go.harness.dev/harness/internal/refs"
 )
 
 const maxInlineContent = 256 << 10
@@ -61,8 +63,21 @@ type resultSpill struct {
 	base        string
 	directory   string
 	outputPath  string
+	localRoot   string
 	original    []byte
 	binaryIndex int
+}
+
+func (s *resultSpill) reference(path string) string {
+	if s.localRoot == "" {
+		return path
+	}
+	relative, err := filepath.Rel(s.localRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return path
+	}
+	escaped := (&url.URL{Path: "/" + filepath.ToSlash(relative)}).EscapedPath()
+	return "local://" + strings.TrimPrefix(escaped, "/")
 }
 
 func (s *resultSpill) ensure() error {
@@ -111,7 +126,7 @@ func (s *resultSpill) binaryBytes(decoded []byte) (string, error) {
 	if err := exclusiveFile(path, decoded); err != nil {
 		return "", fmt.Errorf("mcp_spill: %w", err)
 	}
-	return path, nil
+	return s.reference(path), nil
 }
 func utf8Head(text string, limit int) string {
 	if len(text) <= limit {
@@ -157,6 +172,9 @@ func mapResult(spillDir, serverName, toolName string, raw json.RawMessage, outpu
 	result := agent.AgentToolResult{IsError: remote.IsError}
 	details := resultDetails{MCP: mcpDetails{Server: serverName, Tool: toolName, IsError: remote.IsError}}
 	spill := resultSpill{base: spillDir, original: raw}
+	if filepath.Base(filepath.Dir(spillDir)) == refs.LocalDirName {
+		spill.localRoot = filepath.Dir(spillDir)
+	}
 	contentBytes, textBytes := 2, 0
 	appendBlock := func(block types.ContentBlock) error {
 		budget := maxInlineContent - spillReferenceReserve - contentBytes
@@ -302,11 +320,12 @@ func mapResult(spillDir, serverName, toolName string, raw json.RawMessage, outpu
 			return agent.AgentToolResult{}, err
 		}
 		details.MCP.StructuredContent = nil
-		details.MCP.StructuredContentPath = spill.outputPath
+		details.MCP.StructuredContentPath = spill.reference(spill.outputPath)
 	}
 	if spill.outputPath != "" {
-		details.MCP.OutputPath = spill.outputPath
-		reference := types.NewText("Full MCP result saved locally: " + spill.outputPath)
+		outputReference := spill.reference(spill.outputPath)
+		details.MCP.OutputPath = outputReference
+		reference := types.NewText("Full MCP result saved locally: " + outputReference)
 		// Space for this generated reference was reserved before accepting remote content.
 		if serializedSize(reference)+contentBytes > maxInlineContent || serializedSize(reference)+textBytes > maxInlineText {
 			return agent.AgentToolResult{}, errors.New("mcp_spill: generated output path exceeds inline budget")

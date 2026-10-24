@@ -245,7 +245,7 @@ func TestResolveCommandConfigRejectsResumeContinueConflict(t *testing.T) {
 
 func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 	ctx := context.Background()
-	cwd := "/workspace/project"
+	cwd := t.TempDir()
 	open := func(dir, resume, model string) (*tempest.Session, error) {
 		f := faux.New(faux.Options{})
 		return openSession(ctx, tempest.Options{

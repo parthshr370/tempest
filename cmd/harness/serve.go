@@ -99,7 +99,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
+		case "environment", "environment-command", "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
 			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true
@@ -152,12 +152,17 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "server timeouts must be positive")
 		return 1
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
+	var cwd string
+	if cfg.Environment() == "" {
+		cwd, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	} else {
+		cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
 	}
-	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers()}
+	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers(), Environment: stack.EnvironmentReference}
 	provider := serverProvider(cfg)
 	processes, err := loadExtensionProcesses(extensionConfig, stderr)
 	if err != nil {

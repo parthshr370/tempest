@@ -249,7 +249,7 @@ func newASTTool(name ToolName, cwd string, options ToolsOptions) (agent.AgentToo
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				if err := editbatch.New(options.SessionDataDir).Apply(root, "ast_edit call "+id, changes); err != nil {
+				if err := editbatch.New(editStateDir(options)).Apply(root, "ast_edit call "+id, changes); err != nil {
 					return err
 				}
 				for _, file := range files {

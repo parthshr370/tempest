@@ -32,6 +32,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/checkpoint"
+	"go.harness.dev/harness/internal/dap"
 	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/editdiff"
 	"go.harness.dev/harness/internal/engine/types"
@@ -40,12 +41,14 @@ import (
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/progress"
+	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/truncate"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 // ToolName identifies a coding tool by its canonical name.
@@ -110,12 +113,15 @@ const (
 	ASTEditTool        ToolName = "ast_edit"
 	GHTool             ToolName = "gh"
 	GHCheckoutTool     ToolName = "gh_checkout"
+	AskTool            ToolName = "ask"
+	DebugTool          ToolName = "debug"
+	SearchHistoryTool  ToolName = "search_history"
 )
 
 // AllToolNames is the set of every known ToolName. Configured tools can
 // never shadow these names, including the lsp_* names when LSP is disabled.
 var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EvalTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true, CheckpointTool: true, RewindTool: true,
-	ASTGrepTool: true, ASTEditTool: true, GHTool: true, GHCheckoutTool: true}
+	ASTGrepTool: true, ASTEditTool: true, GHTool: true, GHCheckoutTool: true, AskTool: true, DebugTool: true, SearchHistoryTool: true}
 
 // LSPToolNames are the language-server tools, all read-tier calculations.
 var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
@@ -123,6 +129,8 @@ var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameToo
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
 type ToolsOptions struct {
+	// Environment owns every workspace operation. Nil retains host-local behavior.
+	Environment   environment.Lease
 	AdmitProcess  func(context.Context) (func(), error)
 	Checkpoints   *checkpoint.Manager
 	MutationQueue *toolio.FileMutationQueue
@@ -161,6 +169,9 @@ type ToolsOptions struct {
 	// batches (hashline, integrate) journal there under edit-rollback/;
 	// without it they still roll back in process but not across a crash.
 	SessionDataDir string
+	// EditStateDir retains daemon rollback records independently of output artifacts.
+	// Empty uses the journaled session's SessionDataDir.
+	EditStateDir string
 	// LSP registers the lsp_* tools when non-nil. Its owner closes it.
 	LSP *lsp.Manager
 	// OnFileChanged is called by write and edit after a successful disk
@@ -178,6 +189,13 @@ type ToolsOptions struct {
 	ImageInput bool
 	// Kernels belongs to the session; its owner must close it.
 	Kernels *evalkernel.Manager
+	// AskUser is absent in headless sessions. Children don't receive it.
+	AskUser   question.Handler
+	SessionID string
+	// Debugger belongs to the stack and is closed with it.
+	Debugger *dap.Manager
+	// HistorySearch reads the session archive, never the workspace.
+	HistorySearch func(context.Context, string, string, int) (json.RawMessage, error)
 	// ApproveHookSettings gates computed mutation targets before any write.
 	ApproveHookSettings func(ctx context.Context, tool, callID string, paths []string) error
 }
@@ -219,6 +237,18 @@ type editToolDetails struct {
 	FirstChangedLine *int   `json:"firstChangedLine,omitempty"`
 }
 
+const maxEditDetailBytes = 16 << 10
+
+func boundedEditDetail(text string) string {
+	const marker = "\n[edit detail truncated; summary retained]"
+	if len(text) <= maxEditDetailBytes {
+		return text
+	}
+	limit := maxEditDetailBytes - len(marker)
+	result := truncate.Head(text, truncate.Options{MaxBytes: truncate.Int(limit)})
+	return result.Content + marker
+}
+
 // readPathSelector keeps a parsed line range separate from a literal colon in a path.
 type readPathSelector struct {
 	Path  string
@@ -242,16 +272,29 @@ var defaultMutationQueue = toolio.NewFileMutationQueue()
 // DefaultMutationQueue shares file locks with SDK workspace controls.
 func DefaultMutationQueue() *toolio.FileMutationQueue { return defaultMutationQueue }
 
-// NewTool creates the coding tool named toolName. It returns an error for
-// unknown tool names and for tools whose prerequisites aren't met (e.g.
-// web_search when EnableWeb is false).
-func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTool, error) {
+// newLocalTool supplies the shared schema and the workspace host's implementation.
+func newLocalTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTool, error) {
 	switch toolName {
+	case SearchHistoryTool:
+		if options.HistorySearch == nil {
+			return agent.AgentTool{}, errors.New("search_history requires a durable session")
+		}
+		return newHistoryTool(options.HistorySearch), nil
 	case CheckpointTool, RewindTool:
 		if options.Checkpoints == nil {
 			return agent.AgentTool{}, fmt.Errorf("%s requires a durable session", toolName)
 		}
 		return options.Checkpoints.Tool(string(toolName)), nil
+	case AskTool:
+		if options.Child {
+			return agent.AgentTool{}, errors.New("ask is unavailable in child sessions; report questions to the parent")
+		}
+		return newAskTool(options.SessionID, options.AskUser), nil
+	case DebugTool:
+		if options.Debugger == nil {
+			return agent.AgentTool{}, errors.New("debug requires a session-owned adapter manager")
+		}
+		return newDebugTool(cwd, options.Debugger), nil
 	case ReadTool:
 		return newReadTool(cwd, options), nil
 	case BashTool:
@@ -345,8 +388,14 @@ func CodingTools(cwd string, options ToolsOptions) []agent.AgentTool {
 // ReadOnlyTools returns workspace search/read tools and authenticated GitHub reads.
 func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 	result := mustTools(cwd, options, ReadTool, GrepTool, FindTool, LsTool, GHTool)
+	if tool, err := NewTool(AskTool, cwd, options); err == nil {
+		result = append(result, tool)
+	}
 	if tool, err := NewTool(ASTGrepTool, cwd, options); err == nil {
 		result = append(result, tool)
+	}
+	if options.HistorySearch != nil {
+		result = append(result, newHistoryTool(options.HistorySearch))
 	}
 	return result
 }
@@ -357,7 +406,7 @@ func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	options = withHashlineStore(options)
 	out := map[ToolName]agent.AgentTool{}
 	for _, name := range []ToolName{ReadTool, BashTool, EvalTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool, CheckpointTool, RewindTool,
-		ASTGrepTool, ASTEditTool, GHTool, GHCheckoutTool} {
+		ASTGrepTool, ASTEditTool, GHTool, GHCheckoutTool, AskTool, DebugTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -783,8 +832,8 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 				}
 				diff := editdiff.GenerateDiffString(applied.BaseContent, applied.NewContent, 4)
 				details = &editToolDetails{
-					Diff:             diff.Diff,
-					Patch:            editdiff.GenerateUnifiedPatch(input.Path, applied.BaseContent, applied.NewContent, 4),
+					Diff:             boundedEditDetail(diff.Diff),
+					Patch:            boundedEditDetail(editdiff.GenerateUnifiedPatch(input.Path, applied.BaseContent, applied.NewContent, 4)),
 					FirstChangedLine: diff.FirstChangedLine,
 				}
 				return nil

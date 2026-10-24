@@ -28,13 +28,49 @@ const FileName = "progress.md"
 // stateFileName holds the todo list progress.md renders.
 const stateFileName = "progress.json"
 
-// Path returns the checkpoint path inside sessionDataDir, or "" when the
-// session has no data directory and todos stay in memory.
+// Path returns the checkpoint path inside the session's local:// directory,
+// or "" when the session has no data directory and todos stay in memory.
 func Path(sessionDataDir string) string {
 	if sessionDataDir == "" {
 		return ""
 	}
-	return filepath.Join(sessionDataDir, FileName)
+	return filepath.Join(sessionDataDir, "local", FileName)
+}
+
+// Migrate moves the former top-level progress files into local:// once.
+func Migrate(sessionDataDir string) error {
+	if sessionDataDir == "" {
+		return nil
+	}
+	for _, name := range []string{FileName, stateFileName} {
+		oldPath := filepath.Join(sessionDataDir, name)
+		newPath := filepath.Join(sessionDataDir, "local", name)
+		if _, err := os.Stat(oldPath); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if _, err := os.Stat(newPath); err == nil {
+			return fmt.Errorf("progress migration: both %s and %s exist", oldPath, newPath)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		localDir := filepath.Dir(newPath)
+		if err := os.Mkdir(localDir, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("progress migration: %w", err)
+		}
+		info, err := os.Lstat(localDir)
+		if err != nil {
+			return fmt.Errorf("progress migration: %w", err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("progress migration: local directory %s is not a real directory", localDir)
+		}
+		if err := os.Rename(oldPath, newPath); err != nil {
+			return fmt.Errorf("progress migration: %w", err)
+		}
+	}
+	return nil
 }
 
 // The todo statuses.

@@ -31,6 +31,7 @@ type runtimeBindings struct {
 	state       RunState
 	receipt     string
 	invocations []work.Invocation
+	accounting  *runAccounting
 }
 
 func (b *runtimeBindings) snapshot() RunState {
@@ -139,10 +140,39 @@ func AdmitProvider(ctx context.Context, model types.Model) (func(), error) {
 	return release, nil
 }
 
+// BackgroundProviderContext shares the live run's cost gate, not its cancellation.
+// Its second result attributes the durable receipt to that run.
+func (a *Agent) BackgroundProviderContext(ctx context.Context) (context.Context, string) {
+	a.bindings.mu.Lock()
+	accounting := a.bindings.accounting
+	runID := a.bindings.state.RunID
+	a.bindings.mu.Unlock()
+	if accounting == nil {
+		return ctx, ""
+	}
+	ctx = context.WithValue(ctx, accountingKey{}, accounting)
+	return context.WithValue(ctx, durableProviderKey{}, true), runID
+}
+
+type durableProviderKey struct{}
+
 // AccountProviderUsage forwards an already durable compaction receipt exactly once.
 func AccountProviderUsage(ctx context.Context, source, model string, usage types.Usage) error {
 	a, _ := ctx.Value(accountingKey{}).(*runAccounting)
 	if a == nil {
+		return nil
+	}
+	if native, _ := ctx.Value(durableProviderKey{}).(bool); native {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if prior, seen := a.sources[source]; seen {
+			if !reflect.DeepEqual(prior, usage) {
+				return fmt.Errorf("conflicting usage source %q", source)
+			}
+			return nil
+		}
+		a.sources[source] = usage
+		a.usage.Add(usage)
 		return nil
 	}
 	childID := ""

@@ -116,7 +116,9 @@ func (s *Store) Load(ctx context.Context) (*Loaded, error) {
 	if err != nil {
 		return nil, err
 	}
-	loaded, err := loadContentsWithResults(ctx, s.path, transcript.Bytes(), true, results)
+	loaded, err := loadContentsResolved(ctx, s.path, transcript.Bytes(), true, results, func(ref ArchiveRef) (archiveSegment, error) {
+		return s.readArchive(ctx, ref)
+	})
 	if err != nil {
 		return nil, err
 	}

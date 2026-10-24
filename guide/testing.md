@@ -24,6 +24,11 @@ call, used in order:
   id. The tools really run, through the normal permission gate.
 - After an entry with tool calls, the tool results go back to the model and the
   next entry answers them. An entry without tool calls ends the run.
+- `error` fails that provider call with the supplied message, for example
+  `{"error":"context_length_exceeded"}` exercises overflow recovery.
+- `waitForFile` holds a response until the named file exists. It can accompany
+  `text`, `toolCalls` or `error`; cancelling the provider context releases the
+  wait. These controls only affect the explicit faux provider, not live models.
 - An empty array is a startup error. A model call after the last entry fails
   the run with `No more faux responses queued`.
 

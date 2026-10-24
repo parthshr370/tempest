@@ -17,11 +17,13 @@ func hookSettingsReason(tool string, args json.RawMessage, cwd string) string {
 		return ""
 	}
 	var input struct {
-		Path    string `json:"path"`
-		Input   string `json:"input"`
-		Command string `json:"command"`
-		Code    string `json:"code"`
-		Text    string `json:"text"`
+		Path       string `json:"path"`
+		Input      string `json:"input"`
+		Command    string `json:"command"`
+		Code       string `json:"code"`
+		Text       string `json:"text"`
+		Action     string `json:"action"`
+		Expression string `json:"expression"`
 	}
 	if json.Unmarshal(args, &input) != nil {
 		return ""
@@ -44,6 +46,10 @@ func hookSettingsReason(tool string, args json.RawMessage, cwd string) string {
 		}
 	case "eval":
 		if mentionsHookSettings(input.Code) {
+			return "Interpreter access to hook settings requires per-call approval"
+		}
+	case "debug":
+		if input.Action == "evaluate" && mentionsHookSettings(input.Expression) {
 			return "Interpreter access to hook settings requires per-call approval"
 		}
 	case "write_stdin":

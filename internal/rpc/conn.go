@@ -67,6 +67,9 @@ var errOversize = errors.New("frame too large")
 // ErrClosed reports a disconnected peer, including calls still awaiting replies.
 var ErrClosed = errors.New("rpc connection closed")
 
+// ErrNotSent reports that an outbound call was not admitted to the writer queue.
+var ErrNotSent = errors.New("rpc request not sent")
+
 type message struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
@@ -239,18 +242,22 @@ func (c *Conn) ServeOrdered(handler Handler) error {
 				_ = c.reply(nil, nil, NewError(-32600, "invalid_request", "invalid JSON-RPC response"))
 				continue
 			}
+			id := string(m.ID)
 			c.mu.Lock()
-			ch := c.pending[string(m.ID)]
-			isLate := c.lateIDs[string(m.ID)]
-			c.mu.Unlock()
-			if ch == nil && !isLate && c.rejectProtocol(c.fault("protocol", "unexpected response ID")) {
-				return errors.New("unexpected response ID")
+			ch := c.pending[id]
+			isLate := c.lateIDs[id]
+			if isLate {
+				delete(c.lateIDs, id)
 			}
 			if ch != nil {
 				select {
 				case ch <- m:
 				default:
 				}
+			}
+			c.mu.Unlock()
+			if ch == nil && !isLate && c.rejectProtocol(c.fault("protocol", "unexpected response ID")) {
+				return errors.New("unexpected response ID")
 			}
 			continue
 		}
@@ -428,7 +435,7 @@ func (c *Conn) CallWithID(ctx context.Context, id string, method string, params 
 		return nil, err
 	}
 	if len(b) > c.maxFrame {
-		return nil, NewError(-32000, "frame_too_large", "request exceeds frame cap")
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, NewError(-32000, "frame_too_large", "request exceeds frame cap"))
 	}
 	ch := make(chan message, 1)
 	c.mu.Lock()
@@ -440,16 +447,20 @@ func (c *Conn) CallWithID(ctx context.Context, id string, method string, params 
 	c.mu.Unlock()
 	defer func() { c.mu.Lock(); delete(c.pending, string(rawID)); c.mu.Unlock() }()
 	if err = c.send(ctx, b); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, err)
 	}
 	var response message
 	select {
 	case <-ctx.Done():
 		c.mu.Lock()
-		if c.lateIDs == nil || len(c.lateIDs) >= 128 {
-			c.lateIDs = make(map[string]bool)
+		select {
+		case <-ch:
+		default:
+			if c.lateIDs == nil {
+				c.lateIDs = make(map[string]bool)
+			}
+			c.lateIDs[string(rawID)] = true
 		}
-		c.lateIDs[string(rawID)] = true
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	case <-c.ctx.Done():

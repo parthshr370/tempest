@@ -44,6 +44,7 @@ type snapshot struct {
 	Created      time.Time         `json:"created"`
 	Files        map[string]file   `json:"files"`
 	Conversation string            `json:"conversation"`
+	JournalSeq   uint64            `json:"journal_seq,omitempty"`
 	Automatic    bool              `json:"automatic,omitempty"`
 	Outside      bool              `json:"outside,omitempty"`
 	Gap          string            `json:"gap,omitempty"`
@@ -500,7 +501,7 @@ func (m *Manager) capture(ctx context.Context, goal string, messages []types.Mes
 			return Info{}, err
 		}
 	}
-	cp := snapshot{ID: id, Goal: goal, Created: time.Now().UTC(), Files: files, Conversation: strings.TrimSpace(string(blob)), Ignored: ignored, Skipped: m.skipped, Automatic: len(automatic) > 0 && automatic[0]}
+	cp := snapshot{ID: id, Goal: goal, Created: time.Now().UTC(), Files: files, Conversation: strings.TrimSpace(string(blob)), JournalSeq: m.store.Position().Seq, Ignored: ignored, Skipped: m.skipped, Automatic: len(automatic) > 0 && automatic[0]}
 	m.state.Snapshots = append(m.state.Snapshots, cp)
 	var expired []snapshot
 	count := 0
@@ -738,6 +739,10 @@ func (m *Manager) Rewind(ctx context.Context, id, report string, force bool) (me
 			messages = append(messages, types.UserMessage{Content: types.StringContent("Rewind findings: " + report), Timestamp: time.Now().UnixMilli()})
 		}
 		entry, err := journal.NewRewindEntry(target.ID, report, messages)
+		if err != nil {
+			return err
+		}
+		entry.Documents, err = m.store.RewindDocuments(ctx, target.JournalSeq)
 		if err != nil {
 			return err
 		}

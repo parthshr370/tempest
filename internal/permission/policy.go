@@ -140,11 +140,13 @@ type Outcome struct {
 // ClassifyTool returns the approval tier for toolName.
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
-	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
+	case "ask", "search_history", "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
 		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image", "ast_grep", "gh":
 		return TierRead
 	case "write", "edit", "hashline", "integrate", "todo_write", "checkpoint", "rewind", "ast_edit":
 		return TierWrite
+	case "debug":
+		return TierExec
 	default:
 		// Includes message: it directs other agents' work, so plan mode
 		// denies it like task. Includes write_stdin: input to a running job

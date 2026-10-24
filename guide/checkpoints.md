@@ -44,6 +44,10 @@ The discarded branch remains auditable.
   capture gap.
 - Capture failures never block tools or replace their results. They record a gap
   that older rewinds cannot cross, including after crash and resume.
+- New checkpoints retain the application-state cut. Rewind restores namespaces
+  with `history=rewindable`. It leaves `latest` documents, permission grants,
+  queued submissions and lifetime spend unchanged. It also changes the context
+  epoch so an older background summary cannot replace the rewound context.
 
 ## Bounds
 

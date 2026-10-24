@@ -59,7 +59,7 @@ func TestPlanStackSelectsIntelligenceReadTools(t *testing.T) {
 	}
 	t.Setenv("PATH", bin)
 	names := stackToolNames(t, StackConfig{Cwd: cwd, Plan: true, LSPManager: inertManager(t, cwd)})
-	want := []string{"ast_grep", "find", "gh", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read", "view_image"}
+	want := []string{"ask", "ast_grep", "find", "gh", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read", "view_image"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("plan tools = %v, want %v", names, want)
 	}

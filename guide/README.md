@@ -11,6 +11,8 @@ These pages hold the command, tool, and protocol reference.
 | [Configuration](configuration.md) | Flags, environment variables, settings, precedence, and model roles |
 | [Tools](tools.md) | Hashline patches, atomic edits, reads, search, tool inventory, and internal URLs |
 | [Sessions and durability](sessions-and-durability.md) | Journals, recovery, retries, budgets, stop reasons, structured output, and streaming |
+| [Conversations](conversations.md) | Pinned forks, background compaction, reset, handoff, and archive search |
+| [Execution environments](environments.md) | Local and remote workspaces, capabilities, identity fencing, cancellation, and daemon setup |
 | [Permissions](permissions.md) | Tool tiers, plan mode, destructive-command guard, and cloud policies |
 | [Checkpoints](checkpoints.md) | Captures, rewind, protected paths, retention, and recovery bounds |
 | [Skills and context](skills-and-context.md) | `AGENTS.md`, `RULES.md`, skill format, discovery, and imports |

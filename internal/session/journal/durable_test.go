@@ -336,3 +336,95 @@ func TestLegacyQueuesMigrateIntoUnifiedReceipts(t *testing.T) {
 		store.Close()
 	}
 }
+
+func TestHandoffBatchCrashBoundaries(t *testing.T) {
+	for _, boundary := range []string{"before_write", "torn_batch", "missing_newline", "after_fsync_before_ack"} {
+		t.Run(boundary, func(t *testing.T) {
+			store := newTestStore(t, t.TempDir())
+			run := Meta{RunID: "batch-run"}
+			appendAll(t, store,
+				RunStartedRecord{Meta: run, Model: "m"},
+				MessageEntry{Meta: run, Message: types.AssistantMessage{Content: []types.ContentBlock{types.NewToolCall("one", "first", json.RawMessage(`{}`)), types.NewToolCall("two", "second", json.RawMessage(`{}`))}, StopReason: types.StopToolUse}},
+				UsageRecord{Meta: run, Model: "m", Usage: types.Usage{Cost: types.Cost{Total: .4}}, SourceRef: "paid"},
+			)
+			path := store.Path()
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			results := []MessageEntry{
+				{Meta: run, Message: types.ToolResultMessage{ToolCallID: "one", ToolName: "first", Content: []types.ContentBlock{types.NewText("first complete result")}}},
+				{Meta: run, Message: types.ToolResultMessage{ToolCallID: "two", ToolName: "second", Content: []types.ContentBlock{types.NewText("second complete result")}}},
+			}
+			if err := store.AppendToolBatch(t.Context(), results, &ContextHeadEntry{Meta: run, Reason: "handoff", Note: "next owner"}); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cut := len(after)
+			switch boundary {
+			case "before_write":
+				cut = len(before)
+			case "torn_batch":
+				cut = len(before) + (len(after)-len(before))/2
+			case "missing_newline":
+				cut--
+			}
+			if err := os.Truncate(path, int64(cut)); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				reopened, loaded, err := OpenForResume(t.Context(), path, Options{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				page, err := reopened.Read(t.Context(), durable.Query{Kind: durable.EntryKind, Namespace: "_tempest/journal", Limit: 100})
+				if err != nil {
+					t.Fatal(err)
+				}
+				results, heads, commit := 0, 0, ""
+				for _, record := range page.Records {
+					entry, err := decodeEntry(record.Value)
+					if err != nil {
+						t.Fatal(err)
+					}
+					matches := false
+					switch value := entry.(type) {
+					case MessageEntry:
+						if value.Message.Role() == "toolResult" {
+							results++
+							matches = true
+						}
+					case ContextHeadEntry:
+						heads++
+						matches = true
+					}
+					if matches {
+						if commit != "" && commit != record.CommitID {
+							t.Fatal("results and context head split across commits")
+						}
+						commit = record.CommitID
+					}
+				}
+				wantResults, wantHeads := 0, 0
+				if boundary == "after_fsync_before_ack" {
+					wantResults, wantHeads = 2, 1
+					if len(loaded.Messages) != 0 {
+						t.Fatal("committed handoff retained active context")
+					}
+				}
+				if results != wantResults || heads != wantHeads || loaded.UsageTotal.Cost.Total != .4 {
+					t.Fatalf("partial adoption: results=%d heads=%d usage=%+v", results, heads, loaded.UsageTotal)
+				}
+				if err := reopened.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}

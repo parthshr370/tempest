@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 const (
@@ -72,8 +73,9 @@ type JobEnvironment struct {
 		// CloudRules is additive to v3: absent in older records (no grants).
 		CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 	} `json:"ceiling"`
-	Model    string `json:"model"`
-	Provider string `json:"provider"`
+	Model     string                `json:"model"`
+	Provider  string                `json:"provider"`
+	Workspace environment.Reference `json:"workspace,omitempty"`
 }
 
 // JobWorkspace pins the exact owned worktree intent.

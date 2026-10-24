@@ -223,6 +223,16 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 				run.accounting.sources[source] = usage
 			}
 			run.accounting.mu.Unlock()
+			if run.config.bindings != nil {
+				run.config.bindings.mu.Lock()
+				run.config.bindings.accounting = run.accounting
+				run.config.bindings.mu.Unlock()
+				defer func() {
+					run.config.bindings.mu.Lock()
+					run.config.bindings.accounting = nil
+					run.config.bindings.mu.Unlock()
+				}()
+			}
 		}
 		var cancel context.CancelFunc
 		if run.config.MaxWallTime > 0 && (!state.StartedAt.IsZero() || run.config.Work != nil) {
@@ -467,7 +477,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return err
 				}
 			}
-			prepareResume := firstTurn && config.Resume && config.PrepareNextTurnE != nil
+			prepareResume := config.PrepareNextTurnE != nil
 			firstTurn = false
 			if err := config.Budget.Validate(config.Model); err != nil {
 				return err
@@ -484,6 +494,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 				if update != nil {
 					applyTurnUpdate(config, &current, update)
+					if update.Stop {
+						run.result.StopReason = StopCompleted
+						return nil
+					}
 				}
 				if err := config.Budget.Validate(config.Model); err != nil {
 					return err
@@ -540,12 +554,28 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					}
 					return nil
 				}
+				if config.PrepareNextTurnE != nil && isContextOverflow(message.ErrorCode+" "+message.ErrorMessage) {
+					update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages, Message: message, Overflow: true})
+					if err != nil {
+						return err
+					}
+					if update != nil {
+						applyTurnUpdate(config, &current, update)
+						if update.Stop {
+							run.result.StopReason = StopCompleted
+							return nil
+						}
+						hasMoreToolCalls = true
+						continue
+					}
+				}
 				return providerError(message)
 			}
 
 			toolResults := []types.ToolResultMessage{}
 			hasMoreToolCalls = false
 			var repeatedFailure error
+			var handoff *string
 			if hasToolCalls(message) {
 				run.stopHookContinuations = 0
 				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
@@ -554,6 +584,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 				toolResults = executedToolBatch.Messages
 				repeatedFailure = executedToolBatch.RepeatedFailure
+				handoff = executedToolBatch.Handoff
 				// A batch terminates the turn only when EVERY result sets
 				// Terminate — a single non-terminating result means the model
 				// expects another round.
@@ -567,13 +598,13 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
 				return err
 			}
-			if hooks.Stopped(ctx) {
+			if handoff == nil && hooks.Stopped(ctx) {
 				run.result.StopReason = StopCompleted
 				return nil
 			}
 			// The turn is complete, so the transcript stays resumable; an
 			// abort that raced the tools still wins at the next boundary.
-			if repeatedFailure != nil && ctx.Err() == nil {
+			if handoff == nil && repeatedFailure != nil && ctx.Err() == nil {
 				run.result.StopReason = StopRepeatedFailure
 				run.result.Err = repeatedFailure
 				return nil
@@ -584,6 +615,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				ToolResults: toolResults,
 				Context:     current,
 				NewMessages: run.messages,
+				Handoff:     handoff,
 			}
 			if config.PrepareNextTurnE != nil {
 				update, err := config.PrepareNextTurnE(ctx, turnContext)
@@ -593,6 +625,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				if update != nil {
 					applyTurnUpdate(config, &current, update)
 					turnContext.Context = current
+					if update.Stop {
+						run.result.StopReason = StopCompleted
+						return nil
+					}
 				}
 			} else if config.PrepareNextTurn != nil {
 				if update := config.PrepareNextTurn(turnContext); update != nil {

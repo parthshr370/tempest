@@ -287,7 +287,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 				r.Invocation.OwnerTask = v.OwnerTask
 				r.Invocation.OwnerRevision = v.OwnerRevision
 				if v.Environment != nil {
-					r.Environment = &work.TaskEnvironment{Model: v.Environment.Model, Provider: v.Environment.Provider, Ceiling: work.Ceiling{Mode: v.Environment.Ceiling.Mode, Tools: v.Environment.Ceiling.Tools, Overrides: v.Environment.Ceiling.Overrides, Interactive: v.Environment.Ceiling.Interactive, CloudRules: v.Environment.Ceiling.CloudRules}}
+					r.Environment = &work.TaskEnvironment{Model: v.Environment.Model, Provider: v.Environment.Provider, Workspace: v.Environment.Workspace, Ceiling: work.Ceiling{Mode: v.Environment.Ceiling.Mode, Tools: v.Environment.Ceiling.Tools, Overrides: v.Environment.Ceiling.Overrides, Interactive: v.Environment.Ceiling.Interactive, CloudRules: v.Environment.Ceiling.CloudRules}}
 				}
 				if v.Worktree != nil {
 					w := v.Worktree

@@ -113,6 +113,9 @@ func New(cwd, outputDir string, lost map[string]bool, admit ...func(context.Cont
 
 // Close is safe during a cell and joins every process it owned.
 func (m *Manager) Close() error {
+	if m == nil {
+		return nil
+	}
 	m.mu.Lock()
 	m.closed = true
 	starting := make([]<-chan struct{}, 0, len(m.starting))

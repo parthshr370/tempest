@@ -52,6 +52,11 @@ func (s *Store) appendEnvelope(ctx context.Context, raw []byte, meta Meta, kind 
 		return err
 	}
 	changes = append(changes, native...)
+	contextChanges, err := s.contextChanges(ctx, raw, meta)
+	if err != nil {
+		return err
+	}
+	changes = append(changes, contextChanges...)
 	decision := fmt.Sprintf("journal:%d", meta.Seq)
 	if s.external {
 		decision = s.id + ":" + decision
@@ -113,6 +118,15 @@ func (s *Store) Read(ctx context.Context, q durable.Query) (durable.Page, error)
 	page, err := s.durable.Read(ctx, q)
 	if err != nil {
 		return durable.Page{}, err
+	}
+	if len(page.Records) == 0 && q.Kind == durable.EntryKind && !q.Application && q.ID != "" && q.Cursor == "" && q.CommitID == "" && (q.Namespace == "_tempest/journal" || q.Namespace == "_tempest/requests") {
+		record, err := s.pinnedRecord(ctx, q.Namespace, q.ID, page.Seq)
+		if err != nil {
+			return durable.Page{}, err
+		}
+		if record != nil {
+			page.Records = append(page.Records, *record)
+		}
 	}
 	if q.CommitID == "" && (q.Kind == "" || q.Kind == durable.DocumentKind) && (q.AsOf != 0 || q.History || q.Cursor != "") {
 		definitions := durable.Query{SessionID: s.id, Kind: durable.DocumentKind, Namespace: "_tempest/definitions", Limit: 100}
@@ -703,29 +717,31 @@ type recordedToolResult struct {
 
 func readExtensionResults(ctx context.Context, store durable.Store, sessionID string, cut uint64) (map[string]recordedToolResult, error) {
 	results := make(map[string]recordedToolResult)
-	q := durable.Query{SessionID: sessionID, Kind: durable.EntryKind, Namespace: "_host.extensions", Limit: 100, AsOf: cut}
-	for {
-		page, err := store.Read(ctx, q)
-		if err != nil {
-			return nil, err
-		}
-		for _, record := range page.Records {
-			var fact struct {
-				Kind   string              `json:"kind"`
-				CallID string              `json:"callId"`
-				Result *recordedToolResult `json:"result"`
-			}
-			if err = json.Unmarshal(record.Value, &fact); err != nil {
+	for _, namespace := range []string{"_host.extensions", "_host.environments"} {
+		q := durable.Query{SessionID: sessionID, Kind: durable.EntryKind, Namespace: namespace, Limit: 100, AsOf: cut}
+		for {
+			page, err := store.Read(ctx, q)
+			if err != nil {
 				return nil, err
 			}
-			if fact.Kind == "tool_result" && fact.CallID != "" && fact.Result != nil {
-				results[fact.CallID] = *fact.Result
+			for _, record := range page.Records {
+				var fact struct {
+					Kind   string              `json:"kind"`
+					CallID string              `json:"callId"`
+					Result *recordedToolResult `json:"result"`
+				}
+				if err = json.Unmarshal(record.Value, &fact); err != nil {
+					return nil, err
+				}
+				if fact.Kind == "tool_result" && fact.CallID != "" && fact.Result != nil {
+					results[fact.CallID] = *fact.Result
+				}
 			}
+			if page.NextCursor == "" {
+				break
+			}
+			q.Cursor = page.NextCursor
 		}
-		if page.NextCursor == "" {
-			break
-		}
-		q.Cursor = page.NextCursor
 	}
 	return results, nil
 }

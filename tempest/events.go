@@ -301,7 +301,7 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 		kind = "read"
 	case "write", "edit", "hashline", "integrate", "ast_edit":
 		kind = "edit"
-	case "bash", "eval", "write_stdin", "gh_checkout":
+	case "bash", "eval", "debug", "write_stdin", "gh_checkout":
 		kind = "execute"
 	case "grep", "find", "ls", "lsp_definition", "lsp_references", "ast_grep":
 		kind = "search"

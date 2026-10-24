@@ -13,9 +13,12 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/checkpoint"
+	"go.harness.dev/harness/internal/compaction"
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/dap"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/envlocal"
 	"go.harness.dev/harness/internal/evalkernel"
 	"go.harness.dev/harness/internal/extensionhost"
 	"go.harness.dev/harness/internal/hooks"
@@ -24,6 +27,7 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
+	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
@@ -31,6 +35,7 @@ import (
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 	"go.harness.dev/harness/tempest/extension"
 )
 
@@ -43,12 +48,16 @@ type PermissionModeFunc func() permission.Mode
 // and prompt additions are supplied by the caller without coupling the core to
 // a host integration.
 type StackConfig struct {
-	Cwd          string
-	Model        ptypes.Model
-	PlanModel    ptypes.Model
-	SmolModel    ptypes.Model
-	StreamFn     agent.StreamFn
-	SmolStreamFn agent.StreamFn
+	Cwd string
+	// Environment is resolved before workspace discovery or resource creation.
+	Environment          environment.Lease
+	EnvironmentReference environment.Reference
+	EnvironmentResolver  environment.Resolver
+	Model                ptypes.Model
+	PlanModel            ptypes.Model
+	SmolModel            ptypes.Model
+	StreamFn             agent.StreamFn
+	SmolStreamFn         agent.StreamFn
 	// Reasoning is the default role's reasoning effort ("", "off", minimal,
 	// low, medium, high). PlanReasoning and SmolReasoning override it for
 	// the plan stack and smol (explore) children; empty inherits Reasoning.
@@ -130,62 +139,114 @@ type StackConfig struct {
 	// workspace must read through the same queue; nil selects the tools'
 	// process-wide default queue.
 	MutationQueue *toolio.FileMutationQueue
+	// AskUser is runtime-only and never inherited by children.
+	AskUser       question.Handler
+	DebugAdapters map[string]dap.Adapter
+	// Compaction overrides the model's context maintenance budget.
+	Compaction *compaction.CompactionSettings
 }
 
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
 func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 	lspConfig := cfg.LSP()
 	return StackConfig{
-		Plan:             cfg.Plan(),
-		Reasoning:        cfg.Reasoning(),
-		PlanReasoning:    cfg.PlanReasoning(),
-		SmolReasoning:    cfg.SmolReasoning(),
-		EnableTask:       cfg.EnableTask(),
-		EnableWeb:        cfg.EnableWeb(),
-		WebSearchURL:     cfg.WebSearchURL(),
-		SkillPaths:       cfg.SkillPaths(),
-		BashTimeout:      cfg.BashTimeout(),
-		Hooks:            cfg.Hooks(),
-		LSP:              &lspConfig,
-		PermissionPolicy: permission.Policy{CloudRules: cfg.CloudRules()},
+		EnvironmentReference: configuredEnvironmentReference(cfg),
+		EnvironmentResolver:  configuredEnvironmentResolver(cfg),
+		Plan:                 cfg.Plan(),
+		Reasoning:            cfg.Reasoning(),
+		PlanReasoning:        cfg.PlanReasoning(),
+		SmolReasoning:        cfg.SmolReasoning(),
+		EnableTask:           cfg.EnableTask(),
+		EnableWeb:            cfg.EnableWeb(),
+		WebSearchURL:         cfg.WebSearchURL(),
+		SkillPaths:           cfg.SkillPaths(),
+		BashTimeout:          cfg.BashTimeout(),
+		Hooks:                cfg.Hooks(),
+		LSP:                  &lspConfig,
+		DebugAdapters:        cfg.DebugAdapters(),
+		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 	}
 }
 
 // AgentStack is the assembled result: a configured agent ready for Prompt/
 // Continue calls.
 type AgentStack struct {
-	Agent       *agent.Agent
-	Model       ptypes.Model
-	StreamFn    agent.StreamFn
-	ProjectDir  string
-	Checkpoints *checkpoint.Manager
-	kernels     *evalkernel.Manager
+	Agent            *agent.Agent
+	Model            ptypes.Model
+	StreamFn         agent.StreamFn
+	ProjectDir       string
+	Checkpoints      *checkpoint.Manager
+	Compaction       *CompactionController
+	kernels          *evalkernel.Manager
+	debugger         *dap.Manager
+	ownedEnvironment environment.Lease
 }
 
 // Close stops this stack's kernels and runs its session-end hooks.
 func (s *AgentStack) Close() error {
-	return errors.Join(s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()))
+	var environmentErr error
+	if s.ownedEnvironment != nil {
+		environmentErr = s.ownedEnvironment.Close()
+	}
+	return errors.Join(s.Compaction.Close(), s.debugger.Close(), s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()), environmentErr)
 }
 
 // BuildAgentStack wires a generic coding agent: local tools, permission gating,
 // compaction, and the neutral prompt builder. Callers may extend it through the
 // data seams in StackConfig.
-func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
+func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 	if cfg.StreamFn == nil {
 		return nil, errors.New("agent stack streamFn is nil")
 	}
+	cfg.StreamFn = recordRequestFrames(cfg.Journal, cfg.StreamFn)
 	cwd := cfg.Cwd
-	if strings.TrimSpace(cwd) == "" {
-		var err error
-		cwd, err = os.Getwd()
+	var ownedEnvironment environment.Lease
+	defer func() {
+		if err != nil && ownedEnvironment != nil {
+			err = errors.Join(err, ownedEnvironment.Close())
+		}
+	}()
+	if cfg.Environment == nil && cfg.EnvironmentReference.ID != "" {
+		if cfg.EnvironmentResolver == nil {
+			return nil, errors.New("environment resolver required")
+		}
+		cfg.Environment, err = cfg.EnvironmentResolver(context.Background(), cfg.EnvironmentReference)
 		if err != nil {
 			return nil, err
 		}
+		ownedEnvironment = cfg.Environment
+		if cfg.Environment == nil {
+			return nil, errors.New("environment resolver returned a nil lease")
+		}
+		if err := environment.Match(cfg.EnvironmentReference, cfg.Environment.Reference()); err != nil {
+			return nil, err
+		}
 	}
-	var err error
-	cwd, err = filepath.Abs(cwd)
-	if err != nil {
-		return nil, err
+	local := environment.IsLocal(cfg.Environment)
+	if local {
+		if strings.TrimSpace(cwd) == "" {
+			cwd, err = os.Getwd()
+			if err != nil {
+				return nil, err
+			}
+		}
+		cwd, err = filepath.Abs(cwd)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.Environment == nil {
+			cfg.Environment, err = envlocal.New(cwd)
+			if err != nil {
+				return nil, err
+			}
+			ownedEnvironment = cfg.Environment
+		}
+	} else {
+		cwd = cfg.Environment.Reference().Cwd
+		if !cfg.Hooks.NoHooks && len(cfg.Hooks.Hooks) != 0 {
+			return nil, errors.New("command hooks are unavailable in a remote environment")
+		}
+		cfg.HooksResolved = true
 	}
 	if !cfg.HooksResolved && !cfg.Child {
 		var skipped []string
@@ -196,6 +257,10 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		for _, path := range skipped {
 			slog.Warn("project hooks disabled: explicit trust required", "path", path)
 		}
+	}
+	if cfg.Extensions != nil {
+		cfg.Extensions.Environment = cfg.Environment
+		cfg.Extensions.EnvironmentID = cfg.Environment.Reference().Key()
 	}
 	modeFunc := cfg.PermissionModeFunc
 	if modeFunc == nil {
@@ -212,6 +277,10 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		if err != nil {
 			rawArgs = nil
 		}
+		ctx, err = permission.InspectEnvironment(ctx, cfg.Environment, c.ToolCall.Name, rawArgs)
+		if err != nil {
+			return &agent.BeforeToolCallResult{Block: true, Reason: err.Error()}
+		}
 		outcome := permission.GateDefinition(ctx, modeFunc(), c.ToolCall.Name, c.Definition.Identity, c.Definition.Effect, rawArgs, policy, cwd, c.ToolCall.ID)
 		return &agent.BeforeToolCallResult{Block: !outcome.Allow, Reason: outcome.Reason, Permission: &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}}
 	}
@@ -226,6 +295,9 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if cfg.Journal != nil {
 		sessionDataDir = cfg.Journal.Path() + ".d"
 		sessionID = cfg.Journal.ID()
+		if err := progress.Migrate(sessionDataDir); err != nil {
+			return nil, err
+		}
 	}
 	hookInput := hooks.Input{Cwd: cwd, SessionID: sessionID}
 	if cfg.Journal != nil {
@@ -280,7 +352,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		cfg.MutationQueue = tools.DefaultMutationQueue()
 	}
 	var checkpoints *checkpoint.Manager
-	if cfg.Journal != nil {
+	if cfg.Journal != nil && local {
 		checkpoints, err = checkpoint.New(context.Background(), cwd, cfg.Journal, cfg.MutationQueue)
 		if err != nil {
 			return nil, err
@@ -293,8 +365,28 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if cfg.Loaded != nil {
 		lostKernels = cfg.Loaded.EvalLanguages
 	}
-	kernels := evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels, cfg.AdmitProcess)
+	var kernels *evalkernel.Manager
+	var debugger *dap.Manager
+	if local {
+		kernels = evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels, cfg.AdmitProcess)
+		debugger, err = dap.New(cwd, tools.ToolOutputDir(sessionDataDir), cfg.DebugAdapters, cfg.AdmitProcess)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var historySearch func(context.Context, string, string, int) (json.RawMessage, error)
+	if cfg.Journal != nil {
+		historySearch = func(ctx context.Context, query, cursor string, limit int) (json.RawMessage, error) {
+			page, err := cfg.Journal.SearchHistory(ctx, journal.HistoryOptions{Query: query, Cursor: cursor, Limit: limit})
+			if err != nil {
+				return nil, err
+			}
+			return json.Marshal(page)
+		}
+	}
 	options := tools.ToolsOptions{
+		Environment:        cfg.Environment,
+		HistorySearch:      historySearch,
 		MutationQueue:      cfg.MutationQueue,
 		EnableWeb:          cfg.EnableWeb,
 		BashTimeout:        cfg.BashTimeout,
@@ -313,13 +405,16 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		SessionDataDir:     sessionDataDir,
 		Checkpoints:        checkpoints,
 		Kernels:            kernels,
+		AskUser:            cfg.AskUser,
+		SessionID:          sessionID,
+		Debugger:           debugger,
 		ApproveHookSettings: func(ctx context.Context, tool, callID string, paths []string) error {
 			return approveHookSettings(ctx, tool, callID, paths)
 		},
 	}
 	// Language servers are root-session-only: a child edits another
 	// worktree, whose changes must not reach the parent's documents.
-	if cfg.LSPManager != nil && !cfg.Child {
+	if cfg.LSPManager != nil && !cfg.Child && local {
 		options.LSP = cfg.LSPManager
 		options.OnFileChanged = cfg.LSPManager.Changed
 	}
@@ -370,11 +465,16 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		Personality:        cfg.Personality,
 		Cwd:                cwd,
 		ProgressPath:       progress.Path(sessionDataDir),
+		RemoteEnvironment:  !local,
 		ActiveTools:        active,
 	})
 	var agt *agent.Agent
 	var compact func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error)
-	if runner := newCompactionRunner(model, cfg.StreamFn); runner != nil {
+	runner := newCompactionRunner(model, cfg.StreamFn)
+	if runner != nil {
+		if cfg.Compaction != nil {
+			runner.settings = *cfg.Compaction
+		}
 		runner.hooks = hookRunner
 		if cfg.Extensions != nil {
 			runner.beforeCompaction = cfg.Extensions.BeforeCompactionSource
@@ -398,6 +498,37 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 			}
 			if previous != nil {
 				return previous(ctx, c)
+			}
+			return nil, nil
+		}
+	}
+	if cfg.Journal != nil {
+		previous := compact
+		compact = func(ctx context.Context, turn agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error) {
+			changed := false
+			var err error
+			// A pre-call preparation mustn't reset input already admitted to this turn.
+			if turn.Message.StopReason != "" {
+				changed, err = cfg.Journal.ApplyPendingContext(ctx)
+			}
+			if err != nil {
+				return nil, err
+			}
+			if turn.Handoff != nil {
+				// The recorder committed the batch and context head at turn_end.
+				changed = true
+			}
+			if changed {
+				agt.SetMessages(nil)
+				if cfg.OnMessagesChanged != nil {
+					cfg.OnMessagesChanged(nil)
+				}
+				next := turn.Context
+				next.Messages = nil
+				return &agent.AgentLoopTurnUpdate{Context: &next, Stop: true}, nil
+			}
+			if previous != nil {
+				return previous(ctx, turn)
 			}
 			return nil, nil
 		}
@@ -462,7 +593,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 			checkpoints.Install(messages)
 		}
 	}
-	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, kernels: kernels}, nil
+	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugger: debugger, ownedEnvironment: ownedEnvironment}, nil
 }
 
 // thinkingLevel maps a configured reasoning effort to the agent's level;
@@ -477,7 +608,8 @@ func thinkingLevel(reasoning string) agent.ThinkingLevel {
 // PlanToolNames is the read-only plan stack's selection. Tools that are not
 // registered (web access off, LSP disabled) are skipped by SelectActive.
 func PlanToolNames() []string {
-	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ViewImageTool), string(tools.ManifestDiffTool), string(tools.ASTGrepTool), string(tools.GHTool)}
+	names := []string{"read", "grep", "find", "ls", "search_history", "web_search", "web_fetch", "attachment", string(tools.ViewImageTool), string(tools.ManifestDiffTool), string(tools.ASTGrepTool), string(tools.GHTool)}
+	names = append(names, string(tools.AskTool))
 	for _, name := range tools.LSPToolNames {
 		names = append(names, string(name))
 	}

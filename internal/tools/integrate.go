@@ -181,7 +181,7 @@ func (run integrationRun) write(ctx context.Context) (string, []string, error) {
 		if err != nil {
 			return err
 		}
-		if err := editbatch.New(run.options.SessionDataDir).Apply(run.root, run.origin, changes); err != nil {
+		if err := editbatch.New(editStateDir(run.options)).Apply(run.root, run.origin, changes); err != nil {
 			return err
 		}
 		for index, write := range run.integration.Writes {

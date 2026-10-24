@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/faux"
@@ -11,8 +13,10 @@ import (
 
 // fauxScriptResponse mirrors one scripted provider turn so the CLI can drive hermetic runs without code.
 type fauxScriptResponse struct {
-	Text      string               `json:"text"`
-	ToolCalls []fauxScriptToolCall `json:"toolCalls"`
+	Text        string               `json:"text"`
+	ToolCalls   []fauxScriptToolCall `json:"toolCalls"`
+	Error       string               `json:"error,omitempty"`
+	WaitForFile string               `json:"waitForFile,omitempty"`
 }
 
 // fauxScriptToolCall keeps raw JSON arguments so the script passes them to the faux provider unchanged.
@@ -53,7 +57,31 @@ func loadFauxScript(path string) (*faux.Faux, types.Model, error) {
 			}
 			blocks = append(blocks, faux.ToolCall(call.Name, args, call.ID))
 		}
-		steps = append(steps, faux.Respond(blocks...))
+		respond := faux.Respond(blocks...)
+		steps = append(steps, func(c types.Context, opts *types.StreamOptions, state faux.State, model types.Model) (types.AssistantMessage, error) {
+			if response.WaitForFile != "" {
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					_, err := os.Stat(response.WaitForFile)
+					if err == nil {
+						break
+					}
+					if !os.IsNotExist(err) {
+						return types.AssistantMessage{}, err
+					}
+					select {
+					case <-state.Context.Done():
+						return types.AssistantMessage{}, state.Context.Err()
+					case <-ticker.C:
+					}
+				}
+			}
+			if response.Error != "" {
+				return types.AssistantMessage{}, errors.New(response.Error)
+			}
+			return respond(c, opts, state, model)
+		})
 	}
 	provider.SetResponses(steps...)
 	return provider, provider.Model(), nil

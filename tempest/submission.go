@@ -9,6 +9,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/outputschema"
+	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
 )
@@ -428,36 +429,29 @@ func (s *Session) resumePending(ctx context.Context) (*Run, error) {
 		return nil, err
 	}
 	c := s.core
+	c.admission.Lock()
+	contextErr := s.applyIdleContext(ctx)
+	c.admission.Unlock()
+	if contextErr != nil {
+		return nil, contextErr
+	}
+	c.resumeCompactions()
 	c.mu.Lock()
 	busy, closed := c.active != nil, c.closed
-	if !closed {
-		c.taskWorkers.Add(1)
-	}
 	c.mu.Unlock()
 	if closed {
 		return nil, ErrClosed
 	}
-	defer c.taskWorkers.Done()
-	taskContext, cancelTaskDrain := context.WithCancel(ctx)
-	stopCloseCancel := context.AfterFunc(c.taskContext, cancelTaskDrain)
-	defer func() {
-		stopCloseCancel()
-		cancelTaskDrain()
-	}()
-	var taskErr error
-	if busy {
-		taskErr = c.jobs.Tasks.ResumeBackground(taskContext)
-	} else {
-		taskErr = c.jobs.Tasks.Resume(taskContext)
-	}
-	if taskErr != nil {
-		c.mu.Lock()
-		closing := c.closed
-		c.mu.Unlock()
-		if closing {
-			return nil, ErrClosed
+	if !busy {
+		for _, task := range c.jobs.Tasks.Snapshot() {
+			// Only summaries are speculative. Ordinary task resume keeps its
+			// settled-decision contract for callers and host alarm processing.
+			if task.Owner == "" && task.Definition != session.CompactionTaskName {
+				if err := c.jobs.Tasks.ResumeTask(ctx, task.ID); err != nil {
+					return nil, err
+				}
+			}
 		}
-		return nil, taskErr
 	}
 	c.admission.Lock()
 	defer c.admission.Unlock()

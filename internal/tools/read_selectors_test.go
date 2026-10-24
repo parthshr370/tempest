@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.harness.dev/harness/internal/document"
 )
 
 type archiveFile struct {
@@ -269,5 +271,22 @@ func TestParseReadTarget(t *testing.T) {
 		if got := parseReadTarget(input); got != want {
 			t.Errorf("parseReadTarget(%q) = %+v, want %+v", input, got, want)
 		}
+	}
+}
+func TestReadImageResultsFitRemoteFrameBudget(t *testing.T) {
+	dir := t.TempDir()
+	tool, err := NewTool(ReadTool, dir, ToolsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "too-large.png"), strings.Repeat("x", document.MaxInlineImageBytes+1))
+	if _, err := executeTool(t, tool, map[string]any{"path": filepath.Join(dir, "too-large.png")}); err == nil || !strings.Contains(err.Error(), "inline image reads are limited") {
+		t.Fatalf("oversized image read error = %v", err)
+	}
+	for _, name := range []string{"first.png", "second.png"} {
+		writeFile(t, filepath.Join(dir, name), strings.Repeat("x", 2<<20))
+	}
+	if _, err := executeTool(t, tool, map[string]any{"paths": []string{"first.png", "second.png"}}); err == nil || !strings.Contains(err.Error(), "image output exceeds") {
+		t.Fatalf("multi-image read error = %v", err)
 	}
 }

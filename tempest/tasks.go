@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/taskstate"
 	"go.harness.dev/harness/tempest/durable"
@@ -45,6 +46,28 @@ func (s *Session) configureTasks(ctx context.Context, cfg StackConfig, settings 
 			return cfg.Extensions.InvokeTask(ctx, s.core.jobs.Tasks, definition, task, runID, abort)
 		}
 	}
+	resolve, invoke := options.Resolve, options.Invoke
+	options.Resolve = func(name string) (taskstate.Definition, error) {
+		if name == session.CompactionTaskName {
+			return session.NativeCompactionDefinition(), nil
+		}
+		if resolve == nil {
+			return taskstate.Definition{}, fmt.Errorf("task definition %q unavailable", name)
+		}
+		return resolve(name)
+	}
+	options.Invoke = func(ctx context.Context, definition taskstate.Definition, task extension.Task, abort bool) (extension.TaskDecision, error) {
+		if task.Definition == session.CompactionTaskName {
+			if s.core.compaction == nil {
+				return extension.TaskDecision{}, fmt.Errorf("compaction unavailable for this model")
+			}
+			return s.core.compaction.InvokeTask(ctx, task, abort)
+		}
+		if invoke == nil {
+			return extension.TaskDecision{}, fmt.Errorf("task definition %q unavailable", task.Definition)
+		}
+		return invoke(ctx, definition, task, abort)
+	}
 	runtime, err := taskstate.New(ctx, options)
 	if err != nil {
 		return err
@@ -54,9 +77,23 @@ func (s *Session) configureTasks(ctx context.Context, cfg StackConfig, settings 
 	return nil
 }
 
+func (c *sessionCore) resumeCompactions() {
+	if c.compaction == nil {
+		return
+	}
+	for _, task := range c.jobs.Tasks.Snapshot() {
+		if task.Definition == session.CompactionTaskName {
+			c.compaction.Start(task.ID)
+		}
+	}
+}
+
 // CreateTask admits a phase workflow. Background roots belong to the session;
 // ordinary roots require the current conversational run and its permission tier.
 func (s *Session) CreateTask(ctx context.Context, request TaskRequest) (Task, error) {
+	if request.Definition == session.CompactionTaskName {
+		return Task{}, fmt.Errorf("native compaction is admitted through Compact")
+	}
 	if err := s.authorize(ctx, "create_task", "", request.ID); err != nil {
 		return Task{}, err
 	}

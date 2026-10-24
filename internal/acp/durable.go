@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"time"
 
 	"go.harness.dev/harness/internal/rpc"
@@ -12,16 +13,21 @@ import (
 
 func (c *Client) handleDurable(ctx context.Context, method string, raw json.RawMessage) (any, *rpc.Error) {
 	var p struct {
-		SessionID    string              `json:"sessionId"`
-		RequestID    string              `json:"requestId"`
-		Prompt       []contentBlock      `json:"prompt"`
-		OutputSchema json.RawMessage     `json:"outputSchema"`
-		Placement    tempest.Placement   `json:"placement"`
-		Commit       durable.Commit      `json:"commit"`
-		Query        durable.Query       `json:"query"`
-		Task         tempest.TaskRequest `json:"task"`
-		TaskID       string              `json:"taskId"`
-		TaskQuery    tempest.TaskQuery   `json:"taskQuery"`
+		SessionID      string                 `json:"sessionId"`
+		RequestID      string                 `json:"requestId"`
+		Prompt         []contentBlock         `json:"prompt"`
+		OutputSchema   json.RawMessage        `json:"outputSchema"`
+		Placement      tempest.Placement      `json:"placement"`
+		Commit         durable.Commit         `json:"commit"`
+		Query          durable.Query          `json:"query"`
+		Task           tempest.TaskRequest    `json:"task"`
+		TaskID         string                 `json:"taskId"`
+		TaskQuery      tempest.TaskQuery      `json:"taskQuery"`
+		EntryID        string                 `json:"entryId"`
+		Note           string                 `json:"note"`
+		ForkOptions    tempest.ForkOptions    `json:"forkOptions"`
+		CompactOptions tempest.CompactOptions `json:"compactOptions"`
+		History        tempest.HistoryOptions `json:"history"`
 	}
 	if e := decode(raw, &p); e != nil {
 		return nil, e
@@ -39,6 +45,29 @@ func (c *Client) handleDurable(ctx context.Context, method string, raw json.RawM
 	defer release()
 	var value any
 	switch method {
+	case "_tempest/durable/fork":
+		if p.EntryID == "" {
+			return nil, rpc.NewError(-32602, "invalid_params", "entryId is required")
+		}
+		if p.ForkOptions.Cwd != "" {
+			if !filepath.IsAbs(p.ForkOptions.Cwd) {
+				return nil, rpc.NewError(-32602, "invalid_params", "cwd must be absolute")
+			}
+			if e := checkWorkspace(p.ForkOptions.Cwd); e != nil {
+				return nil, e
+			}
+		}
+		var child *tempest.Session
+		child, err = c.backend.Fork(ctx, p.SessionID, p.EntryID, p.ForkOptions)
+		if err == nil {
+			value = map[string]string{"sessionId": child.ID()}
+		}
+	case "_tempest/durable/reset":
+		value, err = s.Reset(ctx, p.Note, p.RequestID)
+	case "_tempest/durable/compact":
+		value, err = s.Compact(ctx, p.CompactOptions)
+	case "_tempest/durable/search_history":
+		value, err = s.SearchHistory(ctx, p.History)
 	case "_tempest/durable/submit":
 		prompt, e := convertPrompt(p.Prompt)
 		if e != nil {

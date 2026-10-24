@@ -17,6 +17,7 @@ import (
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 const (
@@ -67,6 +68,7 @@ type Loaded struct {
 	// EvalLanguages survives transcript compaction; process state doesn't.
 	EvalLanguages map[string]bool
 	snapshots     map[string][]ptypes.Message
+	prefixes      map[string][]ptypes.Message
 
 	// lastSeq is where a resumed store continues numbering lines.
 	lastSeq uint64
@@ -98,11 +100,60 @@ func Load(ctx context.Context, path string) (*Loaded, error) {
 	return loadContents(ctx, path, contents, true)
 }
 
+// EnvironmentReference reads the committed selection without acquiring a writer.
+func EnvironmentReference(ctx context.Context, path string) (environment.Reference, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return environment.Reference{}, err
+	}
+	headerLine, _, _ := bytes.Cut(contents, []byte{'\n'})
+	var header Header
+	if err := json.Unmarshal(headerLine, &header); err != nil {
+		return environment.Reference{}, err
+	}
+	var reference environment.Reference
+	if header.Version == 4 {
+		_, state, err := expandV4(ctx, path, contents)
+		if err != nil {
+			return reference, err
+		}
+		page, err := state.Read(ctx, durable.Query{SessionID: header.ID, Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Limit: 1})
+		if err != nil {
+			return reference, err
+		}
+		if len(page.Records) != 0 && len(page.Records[0].Value) != 0 && page.Records[0].Value[0] != '"' {
+			var choice struct {
+				Environment environment.Reference `json:"environment"`
+			}
+			if err := json.Unmarshal(page.Records[0].Value, &choice); err != nil {
+				return reference, err
+			}
+			reference = choice.Environment
+			if reference.ID != "" {
+				if err := reference.Validate(); err != nil {
+					return reference, err
+				}
+			}
+		}
+	}
+	if environment.IsLocation(header.Cwd) && (reference.ID == "" || strings.HasPrefix(reference.ID, "local:")) {
+		return reference, fmt.Errorf("%w: remote journal has no persisted environment reference", environment.ErrIdentity)
+	}
+	if reference.ID != "" && !strings.HasPrefix(reference.ID, "local:") && header.Cwd != environment.Location(reference) {
+		return reference, fmt.Errorf("%w: journal location doesn't match its persisted environment", environment.ErrIdentity)
+	}
+	return reference, nil
+}
+
 func loadContents(ctx context.Context, path string, contents []byte, withSnapshots bool) (*Loaded, error) {
 	return loadContentsWithResults(ctx, path, contents, withSnapshots, nil)
 }
 
 func loadContentsWithResults(ctx context.Context, path string, contents []byte, withSnapshots bool, results map[string]recordedToolResult) (*Loaded, error) {
+	return loadContentsResolved(ctx, path, contents, withSnapshots, results, nil)
+}
+
+func loadContentsResolved(ctx context.Context, path string, contents []byte, withSnapshots bool, results map[string]recordedToolResult, archive func(ArchiveRef) (archiveSegment, error)) (*Loaded, error) {
 	lines := bytes.Split(contents, []byte{'\n'})
 	if len(lines) == 0 || len(lines[0]) == 0 {
 		return nil, fmt.Errorf("read journal header: missing header")
@@ -123,7 +174,7 @@ func loadContentsWithResults(ctx context.Context, path string, contents []byte, 
 		if err != nil {
 			return nil, err
 		}
-		loaded, err := loadContentsWithResults(ctx, path, expanded, withSnapshots, results)
+		loaded, err := loadContentsResolved(ctx, path, expanded, withSnapshots, results, archive)
 		if err != nil {
 			return nil, err
 		}
@@ -139,7 +190,7 @@ func loadContentsWithResults(ctx context.Context, path string, contents []byte, 
 		return loaded, nil
 	}
 
-	loaded := &Loaded{Header: header, extensionResults: results}
+	loaded := &Loaded{Header: header, extensionResults: results, prefixes: make(map[string][]ptypes.Message)}
 	entries := make([]Entry, 0, len(lines))
 	lastContent := len(lines) - 1
 	if lastContent > 0 && len(lines[lastContent]) == 0 {
@@ -180,6 +231,25 @@ func loadContentsWithResults(ctx context.Context, path string, contents []byte, 
 		}
 		if meta.ID != "" {
 			loaded.LastID = meta.ID
+		}
+		if head, ok := entry.(ContextHeadEntry); ok && head.Prefix != nil && withSnapshots {
+			var segment archiveSegment
+			var err error
+			if archive != nil {
+				segment, err = archive(*head.Prefix)
+			} else {
+				segment, err = readFileArchive(path, *head.Prefix)
+			}
+			if err != nil {
+				return nil, err
+			}
+			for _, raw := range segment.Messages {
+				message, err := ptypes.UnmarshalMessage(raw)
+				if err != nil {
+					return nil, err
+				}
+				loaded.prefixes[head.ID] = append(loaded.prefixes[head.ID], message)
+			}
 		}
 		entries = append(entries, entry)
 	}
@@ -471,8 +541,8 @@ func validateHeader(header Header) error {
 	if header.Timestamp.IsZero() {
 		return fmt.Errorf("decode journal header: missing timestamp")
 	}
-	if header.Cwd == "" || !filepath.IsAbs(header.Cwd) {
-		return fmt.Errorf("decode journal header: cwd must be absolute")
+	if header.Cwd == "" || !filepath.IsAbs(header.Cwd) && !environment.IsLocation(header.Cwd) {
+		return fmt.Errorf("decode journal header: cwd must be absolute or an identified environment location")
 	}
 	return nil
 }

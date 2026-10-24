@@ -10,6 +10,7 @@ import (
 
 	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 type QueueKind string
@@ -252,9 +253,10 @@ type Ceiling struct {
 	CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 }
 type TaskEnvironment struct {
-	Ceiling  Ceiling
-	Model    string // resolved model identity, fixed for recovery
-	Provider string
+	Ceiling   Ceiling
+	Model     string // resolved model identity, fixed for recovery
+	Provider  string
+	Workspace environment.Reference
 }
 type Workspace struct {
 	Repo        string

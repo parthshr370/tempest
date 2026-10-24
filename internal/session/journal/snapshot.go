@@ -134,3 +134,8 @@ func readSnapshot(journalPath string, e CompactionEntry) ([]types.Message, error
 	}
 	return messages, nil
 }
+
+// ReadSnapshot verifies captured task input or output before using its messages.
+func (s *Store) ReadSnapshot(id, source string, artifact *work.Artifact) ([]types.Message, error) {
+	return readSnapshot(s.path, CompactionEntry{CompactionID: id, SourceHash: source, Snapshot: artifact})
+}

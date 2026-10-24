@@ -60,6 +60,7 @@ type recorder struct {
 	toolStarts map[string]time.Time
 	sources    map[string]ptypes.Usage
 	nextRunID  func() string
+	handoff    *string
 }
 
 func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
@@ -106,6 +107,7 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		}
 		r.runID = state.RunID
 		clear(r.toolStarts)
+		r.handoff = nil
 		meta.RunID = r.runID
 		model := r.agt.State().Model
 		err = r.store.Append(ctx, journal.RunStartedRecord{Meta: meta, Model: model.ID, Provider: model.Provider, PromptSummary: promptSummary(ev.Messages), LogicalRunID: state.LogicalRunID, ContinuationOf: state.ContinuationOf})
@@ -171,6 +173,20 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		err = r.store.Append(ctx, journal.ToolStartedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args), DefinitionID: ev.Definition.Identity, DefinitionRevision: ev.Definition.Revision, Environment: ev.Definition.Environment, Replay: ev.Definition.Replay, SchemaHash: ev.Definition.SchemaHash, ArgumentsHash: ev.Definition.ArgumentsHash})
 	case agent.EventToolExecutionEnd:
 		finished := journal.ToolFinishedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, OK: !ev.IsError}
+		if result, ok := ev.Result.(agent.AgentToolResult); ok && !ev.IsError && result.Control == "handoff" {
+			finished.Control = "handoff"
+			var notes []string
+			for _, block := range result.Content {
+				if block.Type == ptypes.BlockText {
+					notes = append(notes, block.Text)
+				}
+			}
+			finished.ControlNote = strings.Join(notes, "\n")
+			if r.handoff == nil {
+				note := finished.ControlNote
+				r.handoff = &note
+			}
+		}
 		if started, ok := r.toolStarts[callKey]; ok {
 			finished.DurationMS = ev.At.Sub(started).Milliseconds()
 			delete(r.toolStarts, callKey)
@@ -179,7 +195,17 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			finished.Error = toolErrorText(ev.Result)
 		}
 		err = r.store.Append(ctx, finished)
+	case agent.EventTurnEnd:
+		var head *journal.ContextHeadEntry
+		if r.handoff != nil {
+			head = &journal.ContextHeadEntry{Meta: meta, Reason: "handoff", Note: *r.handoff}
+		}
+		err = r.store.AppendToolBatch(ctx, nil, head)
+		if err == nil {
+			r.handoff = nil
+		}
 	case agent.EventAgentEnd:
+		r.handoff = nil
 		if r.queues != nil {
 			r.queues.ReleaseClaims()
 		}

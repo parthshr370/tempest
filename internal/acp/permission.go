@@ -37,6 +37,7 @@ type Broker struct {
 	mu        sync.Mutex
 	approvers map[string]map[*rpc.Conn]int
 	pending   map[string]map[string]*pendingAsk
+	forms     map[*rpc.Conn]bool
 	timeout   time.Duration
 	clock     Clock
 }
@@ -49,7 +50,7 @@ func NewBroker(timeout time.Duration, clock Clock) *Broker {
 	if clock == nil {
 		clock = realClock{}
 	}
-	return &Broker{approvers: make(map[string]map[*rpc.Conn]int), pending: make(map[string]map[string]*pendingAsk), timeout: timeout, clock: clock}
+	return &Broker{approvers: make(map[string]map[*rpc.Conn]int), pending: make(map[string]map[string]*pendingAsk), forms: make(map[*rpc.Conn]bool), timeout: timeout, clock: clock}
 }
 
 func (b *Broker) add(id string, c *rpc.Conn) func() {

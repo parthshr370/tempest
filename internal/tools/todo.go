@@ -84,7 +84,7 @@ func newTodoTool(options ToolsOptions) agent.AgentTool {
 			var text strings.Builder
 			text.WriteString(progress.RenderMarkdown(todos))
 			if path := store.Path(); path != "" {
-				text.WriteString("\nProgress checkpoint: " + path)
+				text.WriteString("\nProgress checkpoint: local://progress.md")
 			}
 			return textResult(text.String(), map[string]any{"todos": todos}), nil
 		},

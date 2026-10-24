@@ -365,7 +365,7 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 		}
 	} else {
 		router := &routingPrompter{conn: s.conn, timeout: s.opts.PermissionTimeout}
-		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Logger: s.opts.Logger, ExtensionProcesses: s.opts.ExtensionProcesses}
+		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Questioner: router.Question, Logger: s.opts.Logger, ExtensionProcesses: s.opts.ExtensionProcesses}
 		if in.SessionID != "" {
 			path, loaded, err := s.lookup(c.ctx, in.SessionID)
 			if err != nil {

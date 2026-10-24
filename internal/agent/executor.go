@@ -25,6 +25,7 @@ type ExecutedToolCallBatch struct {
 	Messages        []types.ToolResultMessage
 	Terminate       bool
 	RepeatedFailure error
+	Handoff         *string
 }
 
 // preparedToolCall is a tool call that passed validation and the BeforeToolCall
@@ -132,7 +133,7 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Handoff: toolBatchHandoff(finalizedCalls)}, nil
 }
 
 // executeToolCallsParallel runs tool calls concurrently. Results are written
@@ -234,7 +235,7 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Handoff: toolBatchHandoff(finalizedCalls)}, nil
 }
 
 // shouldTerminateToolBatch reports whether the batch should end the turn.
@@ -250,6 +251,26 @@ func shouldTerminateToolBatch(finalizedCalls []finalizedOutcome) bool {
 		}
 	}
 	return true
+}
+
+func toolBatchHandoff(outcomes []finalizedOutcome) *string {
+	for _, outcome := range outcomes {
+		if outcome.isError || outcome.result.Control != "handoff" {
+			continue
+		}
+		var note strings.Builder
+		for _, block := range outcome.result.Content {
+			if block.Type == types.BlockText {
+				if note.Len() > 0 {
+					note.WriteByte('\n')
+				}
+				note.WriteString(block.Text)
+			}
+		}
+		text := note.String()
+		return &text
+	}
+	return nil
 }
 
 // prepareToolCallArguments applies the tool's PrepareArguments transform. The
