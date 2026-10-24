@@ -16,6 +16,7 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/cloudcmd"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
 )
@@ -102,6 +103,8 @@ type FlagValues struct {
 	EnableLSP            BoolInput
 	LSPConfig            StringInput
 	CloudPolicy          StringInput
+	NoHooks              BoolInput
+	TrustProjectHooks    BoolInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -168,6 +171,7 @@ type ResolvedConfig struct {
 	mcpServers            []mcpconfig.Server
 	lsp                   lsp.Config
 	cloudRules            []cloudcmd.Rule
+	hooks                 hooks.Settings
 }
 
 // Model returns the default model specification.
@@ -290,43 +294,47 @@ func (e *Error) Unwrap() error { return e.Err }
 // fileSettings keeps scalar values as pointers so an omitted setting won't
 // shadow an environment value or built-in default.
 type fileSettings struct {
-	Model                 *string            `json:"model"`
-	PlanModel             *string            `json:"plan_model"`
-	SmolModel             *string            `json:"smol_model"`
-	Reasoning             *string            `json:"reasoning"`
-	PlanReasoning         *string            `json:"plan_reasoning"`
-	SmolReasoning         *string            `json:"smol_reasoning"`
-	MaxTokens             *int               `json:"max_tokens"`
-	PermissionModeDefault *string            `json:"permission_mode_default"`
-	BashTimeout           *string            `json:"bash_timeout"`
-	LogLevel              *string            `json:"log_level"`
-	LogFile               *string            `json:"log_file"`
-	LogFileMaxBytes       *int64             `json:"log_file_max_bytes"`
-	EnableWeb             *bool              `json:"enable_web"`
-	WebSearchURL          *string            `json:"web_search_url"`
-	AgentDir              *string            `json:"agent_dir"`
-	EnableTask            *bool              `json:"enable_task"`
-	Plan                  *bool              `json:"plan"`
-	Attach                []string           `json:"attach"`
-	SessionDir            *string            `json:"session_dir"`
-	AnthropicBaseURL      *string            `json:"anthropic_base_url"`
-	OpenAIBaseURL         *string            `json:"openai_base_url"`
-	FauxScript            *string            `json:"faux_script"`
-	SkillPaths            []string           `json:"skill_paths"`
-	PermissionAllowTools  []string           `json:"permission_allow_tools"`
-	PermissionDenyTools   []string           `json:"permission_deny_tools"`
-	RetryEnabled          *bool              `json:"retry_enabled"`
-	RetryMaxAttempts      *int               `json:"retry_max_attempts"`
-	RetryBaseDelayMS      *int               `json:"retry_base_delay_ms"`
-	RetryBackoffCapMS     *int               `json:"retry_backoff_cap_ms"`
-	RetryMaxDelayMS       *int               `json:"retry_max_delay_ms"`
-	RetryJitterMin        *float64           `json:"retry_jitter_min"`
-	RetryJitterMax        *float64           `json:"retry_jitter_max"`
-	MCPConfig             *string            `json:"mcp_config"`
-	MCPServers            []mcpconfig.Server `json:"mcp_servers"`
-	EnableLSP             *bool              `json:"enable_lsp"`
-	LSPConfig             *string            `json:"lsp_config"`
-	CloudPolicy           *string            `json:"cloud_policy"`
+	Model                 *string                  `json:"model"`
+	PlanModel             *string                  `json:"plan_model"`
+	SmolModel             *string                  `json:"smol_model"`
+	Reasoning             *string                  `json:"reasoning"`
+	PlanReasoning         *string                  `json:"plan_reasoning"`
+	SmolReasoning         *string                  `json:"smol_reasoning"`
+	MaxTokens             *int                     `json:"max_tokens"`
+	PermissionModeDefault *string                  `json:"permission_mode_default"`
+	BashTimeout           *string                  `json:"bash_timeout"`
+	LogLevel              *string                  `json:"log_level"`
+	LogFile               *string                  `json:"log_file"`
+	LogFileMaxBytes       *int64                   `json:"log_file_max_bytes"`
+	EnableWeb             *bool                    `json:"enable_web"`
+	WebSearchURL          *string                  `json:"web_search_url"`
+	AgentDir              *string                  `json:"agent_dir"`
+	EnableTask            *bool                    `json:"enable_task"`
+	Plan                  *bool                    `json:"plan"`
+	Attach                []string                 `json:"attach"`
+	SessionDir            *string                  `json:"session_dir"`
+	AnthropicBaseURL      *string                  `json:"anthropic_base_url"`
+	OpenAIBaseURL         *string                  `json:"openai_base_url"`
+	FauxScript            *string                  `json:"faux_script"`
+	SkillPaths            []string                 `json:"skill_paths"`
+	PermissionAllowTools  []string                 `json:"permission_allow_tools"`
+	PermissionDenyTools   []string                 `json:"permission_deny_tools"`
+	RetryEnabled          *bool                    `json:"retry_enabled"`
+	RetryMaxAttempts      *int                     `json:"retry_max_attempts"`
+	RetryBaseDelayMS      *int                     `json:"retry_base_delay_ms"`
+	RetryBackoffCapMS     *int                     `json:"retry_backoff_cap_ms"`
+	RetryMaxDelayMS       *int                     `json:"retry_max_delay_ms"`
+	RetryJitterMin        *float64                 `json:"retry_jitter_min"`
+	RetryJitterMax        *float64                 `json:"retry_jitter_max"`
+	MCPConfig             *string                  `json:"mcp_config"`
+	MCPServers            []mcpconfig.Server       `json:"mcp_servers"`
+	EnableLSP             *bool                    `json:"enable_lsp"`
+	LSPConfig             *string                  `json:"lsp_config"`
+	CloudPolicy           *string                  `json:"cloud_policy"`
+	Hooks                 map[string][]hooks.Group `json:"hooks"`
+	NoHooks               *bool                    `json:"no_hooks"`
+	DisableAllHooks       *bool                    `json:"disableAllHooks"`
+	TrustedHookProjects   []string                 `json:"trusted_hook_projects"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -425,6 +433,22 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, &Error{Field: "plan", Err: err}
 	}
+	noHooksSetting := settings.NoHooks
+	if noHooksSetting == nil {
+		noHooksSetting = settings.DisableAllHooks
+	}
+	noHooks, err := resolveBool(c.Flags.NoHooks, lookup("HARNESS_NO_HOOKS"), noHooksSetting, false)
+	if err != nil {
+		return nil, &Error{Field: "no_hooks", Err: err}
+	}
+	trustHooks, err := resolveBool(c.Flags.TrustProjectHooks, lookup("HARNESS_TRUST_PROJECT_HOOKS"), nil, false)
+	if err != nil {
+		return nil, &Error{Field: "trust_project_hooks", Err: err}
+	}
+	hookSettings := hooks.Settings{Hooks: settings.Hooks, NoHooks: noHooks, TrustProjectHooks: trustHooks, TrustedProjects: settings.TrustedHookProjects}
+	if err := hookSettings.Validate(); err != nil {
+		return nil, &Error{Field: "hooks", Err: err}
+	}
 	retryMaxAttempts, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_MAX_ATTEMPTS"), settings.RetryMaxAttempts, 11)
 	if err != nil || retryMaxAttempts < 1 {
 		if err == nil {
@@ -514,6 +538,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		mcpServers:           mcpServers,
 		lsp:                  lspConfig,
 		cloudRules:           cloudRules,
+		hooks:                hookSettings,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,
@@ -566,6 +591,9 @@ func validateResolved(c *ResolvedConfig) error {
 	}
 	return nil
 }
+
+// Hooks returns an owned snapshot of the operator's hook settings.
+func (c *ResolvedConfig) Hooks() hooks.Settings { return c.hooks.Clone() }
 
 // loadSettings treats a missing settings file as no overrides, but keeps real
 // I/O and decode failures tied to the settings field.

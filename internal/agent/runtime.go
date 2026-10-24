@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/work"
 )
@@ -88,6 +89,8 @@ type AgentOptions struct {
 	GetApiKey      func(provider string) string
 	BeforeToolCall func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall  func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
+	Hooks          *hooks.Runner
+	Child          bool
 	// PrepareNextTurn is called after each turn for a stateless config swap.
 	PrepareNextTurn func() *AgentLoopTurnUpdate
 	// PrepareNextTurnWithContext is the stateful variant — preferred when set;
@@ -163,6 +166,8 @@ type Agent struct {
 	GetApiKey                  func(provider string) string
 	BeforeToolCall             func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall              func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
+	Hooks                      *hooks.Runner
+	Child                      bool
 	PrepareNextTurn            func() *AgentLoopTurnUpdate
 	PrepareNextTurnWithContext func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
 	PrepareNextTurnE           func(context.Context, ShouldStopAfterTurnContext) (*AgentLoopTurnUpdate, error)
@@ -250,6 +255,8 @@ func NewAgent(opts AgentOptions) *Agent {
 		GetApiKey:                  opts.GetApiKey,
 		BeforeToolCall:             opts.BeforeToolCall,
 		AfterToolCall:              opts.AfterToolCall,
+		Hooks:                      opts.Hooks,
+		Child:                      opts.Child,
 		PrepareNextTurn:            opts.PrepareNextTurn,
 		PrepareNextTurnWithContext: opts.PrepareNextTurnWithContext,
 		PrepareNextTurnE:           opts.PrepareNextTurnE,
@@ -615,6 +622,8 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		ToolExecution:    toolExecution,
 		BeforeToolCall:   a.BeforeToolCall,
 		AfterToolCall:    a.AfterToolCall,
+		Hooks:            a.Hooks,
+		Child:            a.Child,
 		ConvertToLlm:     convertToLlm,
 		TransformContext: a.TransformContext,
 		GetAPIKey:        a.GetApiKey,

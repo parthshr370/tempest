@@ -112,8 +112,24 @@ func reduce(loaded *Loaded, entries []Entry) {
 			} else {
 				messages = applyCompaction(messages, e)
 			}
+		case RewindEntry:
+			replacement, _ := e.messages()
+			messages = nil
+			clear(calls)
+			clear(unfinished)
+			startOrder = nil
+			for _, message := range replacement {
+				messages = append(messages, replayMessage{message: message})
+			}
 		case PermissionRecord:
-			// A decision isn't an execution intent and changes no reconciliation state.
+			// Effective arguments refine an existing intent; a decision alone never creates one.
+			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
+			if e.CallID != "" {
+				key.toolCallID = e.CallID
+			}
+			if queue := unfinished[key]; len(queue) > 0 && len(e.Args) > 0 {
+				queue[len(queue)-1].started.Args = e.Args
+			}
 		case RunStartedRecord:
 			clear(calls)
 			if _, seen := runIndex[e.RunID]; seen {
@@ -137,6 +153,17 @@ func reduce(loaded *Loaded, entries []Entry) {
 			runs[index].Error = e.Error
 			runs[index].FinishedAt = e.Timestamp
 		case ToolStartedRecord:
+			if e.Tool == "eval" {
+				var request struct {
+					Language string `json:"language"`
+				}
+				if json.Unmarshal(e.Args, &request) == nil && (request.Language == "py" || request.Language == "js") {
+					if loaded.EvalLanguages == nil {
+						loaded.EvalLanguages = make(map[string]bool)
+					}
+					loaded.EvalLanguages[request.Language] = true
+				}
+			}
 			key := toolKey{runID: e.RunID, toolCallID: e.ToolCallID}
 			var state *toolState
 			if queue := calls[key]; len(queue) > 0 {
@@ -282,6 +309,9 @@ func synthesizeResult(call ptypes.ContentBlock, runID string, state *toolState, 
 		text += textSafeToRerun
 	} else {
 		text += textNoRerun
+		if call.Name == "eval" {
+			text += " Eval kernel state was lost; use reset:true and re-run setup explicitly."
+		}
 	}
 	return ptypes.ToolResultMessage{
 		ToolCallID: call.ID,

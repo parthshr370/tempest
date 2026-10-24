@@ -65,6 +65,15 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 	defer m.mu.Unlock()
 	at := ev.At
 	switch ev.Type {
+	case agent.EventHook:
+		if ev.Hook == nil {
+			return nil
+		}
+		out := []Update{update("tempest/hook", map[string]any{"hook": ev.Hook}, at)}
+		if ev.QueueID != "" {
+			out = append(out, update("tempest/queue", map[string]any{"action": "consumed", "item": map[string]any{"id": ev.QueueID}}, at))
+		}
+		return out
 	case agent.EventWork:
 		if ev.Work == nil {
 			return nil
@@ -199,6 +208,13 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 		}
 		return append(out, update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": status, "_meta": map[string]any{"tempest": map[string]any{"permission": map[string]any{"decision": decision, "source": p.Source, "waitMs": p.Wait.Milliseconds()}}}}, at))
 	case agent.EventToolExecutionStart:
+		if ev.Preparing {
+			if !m.announced[ev.ToolCallID] {
+				m.announced[ev.ToolCallID] = true
+				return []Update{m.announce(ev, "pending", at)}
+			}
+			return nil
+		}
 		if m.denied[ev.ToolCallID] {
 			// A denied call never runs; its end update carries the refusal.
 			return nil
@@ -207,7 +223,7 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			m.announced[ev.ToolCallID] = true
 			return []Update{m.announce(ev, "in_progress", at)}
 		}
-		return []Update{update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": "in_progress"}, at)}
+		return []Update{update("tool_call_update", map[string]any{"toolCallId": ev.ToolCallID, "status": "in_progress", "rawInput": ev.Args}, at)}
 	case agent.EventToolExecutionUpdate:
 		p := map[string]any{"toolCallId": ev.ToolCallID}
 		if content := toolContent(ev.PartialResult); len(content) > 0 {
@@ -285,7 +301,7 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 		kind = "read"
 	case "write", "edit", "hashline", "integrate":
 		kind = "edit"
-	case "bash", "write_stdin":
+	case "bash", "eval", "write_stdin":
 		kind = "execute"
 	case "grep", "find", "ls", "lsp_definition", "lsp_references":
 		kind = "search"
@@ -305,6 +321,10 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 		if cmd, ok := args["command"].(string); ok {
 			return "$ " + cmd, kind
 		}
+	}
+	if name == "eval" {
+		language, _ := args["language"].(string)
+		return "eval (" + language + ")", kind
 	}
 	if name == "write_stdin" {
 		target, _ := args["name"].(string)

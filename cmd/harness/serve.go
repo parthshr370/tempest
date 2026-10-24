@@ -96,7 +96,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy":
+		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks":
 			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true

@@ -434,6 +434,25 @@ func Analyze(command, cwd string) Analysis {
 	return a.result()
 }
 
+// AnalyzeInline treats interpreter code as opaque when it names a cloud tool.
+// We can't prove the destination from Python/JS syntax, so deny rules for that
+// tool still apply and allow-write grants can't authorize the code.
+func AnalyzeInline(code string) Analysis {
+	a := analyzer{effect: EffectNone, proven: false}
+	a.inlineInterpreter(code)
+	return a.result()
+}
+
+func (a *analyzer) inlineInterpreter(code string) {
+	normalized := normalizeCloudText(code)
+	for _, tool := range cloudTools {
+		if namesNormalizedCloudTool(normalized, tool) {
+			a.cloud = true
+			a.opaque(Invocation{Tool: tool, Effect: EffectOpaque, cluster: true}, "interpreter code names a cloud tool; target cannot be established")
+		}
+	}
+}
+
 type analyzer struct {
 	effect      Effect
 	cloud       bool
@@ -796,6 +815,16 @@ func (a *analyzer) simple(words []Token, scope invocationContext) {
 		return
 	case shells[name]:
 		a.shell(name, args, scope)
+		return
+	}
+	switch name {
+	case "python", "python3", "node", "bun", "perl", "ruby":
+		for i, arg := range args {
+			if (arg.Text == "-c" || arg.Text == "-e" || arg.Text == "--eval" || arg.Text == "-pe" || arg.Text == "-ne") && i+1 < len(args) {
+				a.inlineInterpreter(args[i+1].Text)
+				return
+			}
+		}
 		return
 	}
 	var inv Invocation

@@ -82,6 +82,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		switch args[0] {
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
+		case "rewind":
+			return runRewind(args[1:], stdout, stderr)
 		case "mcp":
 			return runMCP(args[1:], stdout, stderr)
 		case "doctor":
@@ -468,7 +470,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy":
+		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks":
 			markIntelligenceFlag(f.Name, &values)
 		case "anthropic-base-url":
 			values.AnthropicBaseURL.Set = true
@@ -653,6 +655,7 @@ const topUsage = `Usage:
 Commands:
   serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
   mcp       run as a stdio MCP server that exposes the tempest_run tool
+  rewind    restore a workspace checkpoint and fork its conversation without deleting history
   doctor    check configuration and credentials offline; --ping probes the configured models
   version   print build version
 
@@ -704,7 +707,7 @@ func parseExitCode(err error) int {
 func unexpectedArgument(command, arg string) error {
 	switch command {
 	case "":
-		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, version); see 'tempest -help'", arg)}
+		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, rewind, version); see 'tempest -help'", arg)}
 	case "version":
 		return usageError{message: fmt.Sprintf("tempest version: unexpected argument %q; version takes no arguments", arg)}
 	default:
@@ -724,18 +727,23 @@ func toolPolicy(stderr io.Writer, cfg *config.ResolvedConfig) permission.Policy 
 	return policy
 }
 
-// addIntelligenceFlags registers the language-server and cloud policy
-// flags every session-creating command accepts.
+// addIntelligenceFlags registers operator execution settings on every session-creating command.
 func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.BoolVar(&values.EnableLSP.Value, "enable-lsp", false, "enable the lsp_* tools; language servers are trusted executables started on first use")
 	fs.StringVar(&values.LSPConfig.Value, "lsp-config", "", `operator language-server JSON file {"servers":[...]} (empty selects the built-in gopls, yaml-language-server, terraform-ls and helm_ls definitions)`)
 	fs.StringVar(&values.CloudPolicy.Value, "cloud-policy", "", `operator kube-context policy JSON file {"rules":[{"tool":"kubectl","context":"dev","action":"allow_write"}]}`)
+	fs.BoolVar(&values.NoHooks.Value, "no-hooks", false, "disable all lifecycle command hooks")
+	fs.BoolVar(&values.TrustProjectHooks.Value, "trust-project-hooks", false, "explicitly trust hooks in this session's project settings")
 }
 
 // markIntelligenceFlag records that an intelligence flag was set, so an
 // explicit -enable-lsp=false or empty file outranks the environment.
 func markIntelligenceFlag(name string, values *config.FlagValues) {
 	switch name {
+	case "no-hooks":
+		values.NoHooks.Set = true
+	case "trust-project-hooks":
+		values.TrustProjectHooks.Set = true
 	case "enable-lsp":
 		values.EnableLSP.Set = true
 	case "lsp-config":

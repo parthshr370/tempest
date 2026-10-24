@@ -160,7 +160,7 @@ func (j *Journal) apply(root *os.Root, origin string, changes []Change, interrup
 	if len(changes) == 0 {
 		return nil
 	}
-	if len(changes) == 1 {
+	if len(changes) == 1 && interruptAt < 0 {
 		return applyChange(root, changes[0], "")
 	}
 	current, err := j.begin(root, origin, changes)

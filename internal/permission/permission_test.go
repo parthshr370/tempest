@@ -41,6 +41,7 @@ func TestClassifyToolTiers(t *testing.T) {
 	tests := map[tools.ToolName]Tier{
 		tools.ReadTool:           TierRead,
 		tools.BashTool:           TierExec,
+		tools.EvalTool:           TierExec,
 		tools.EditTool:           TierWrite,
 		tools.HashlineTool:       TierWrite,
 		tools.WriteTool:          TierWrite,
@@ -66,6 +67,8 @@ func TestClassifyToolTiers(t *testing.T) {
 		tools.ManifestDiffTool:   TierRead,
 		tools.ViewImageTool:      TierRead,
 		tools.IntegrateTool:      TierWrite,
+		tools.CheckpointTool:     TierWrite,
+		tools.RewindTool:         TierWrite,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))

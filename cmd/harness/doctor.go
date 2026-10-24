@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -13,8 +14,10 @@ import (
 	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/obs"
 	"go.harness.dev/harness/internal/retry"
+	"go.harness.dev/harness/internal/tools"
 )
 
 // runDoctor stays offline unless --ping explicitly requests billable provider probes.
@@ -94,7 +97,44 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  config: %s\n", opts.Config.SettingsPath())
 	fmt.Fprintf(stdout, "  agent: %s\n", opts.Config.AgentDir())
 	fmt.Fprintf(stdout, "  session: %s\n", opts.Config.SessionDir())
+	if gitPath, err := exec.LookPath("git"); err == nil {
+		fmt.Fprintf(stdout, "PASS checkpoint git: %s\n", gitPath)
+	} else {
+		fmt.Fprintln(stdout, "WARN checkpoint git: unavailable; tool calls still run, but checkpoint capture and rewind need git")
+	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	hookSettings, skippedHooks, err := hooks.ResolveProject(opts.Config.Hooks(), cwd)
+	if err != nil {
+		fmt.Fprintf(stderr, "doctor hooks: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "hooks: disabled=%t\n", hookSettings.NoHooks)
+	for _, event := range hooks.Events {
+		for _, group := range hookSettings.Hooks[event] {
+			for _, command := range group.Hooks {
+				timeout := command.Timeout
+				if timeout == 0 {
+					timeout = hooks.DefaultTimeout(event).Seconds()
+				}
+				fmt.Fprintf(stdout, "  %s matcher=%q timeout=%gs command=%s\n", event, group.Matcher, timeout, command.Command)
+			}
+		}
+	}
+	var toolNames []string
+	for name := range tools.AllToolNames {
+		toolNames = append(toolNames, string(name))
+	}
+	for _, warning := range hookSettings.UnmatchedToolMatchers(toolNames) {
+		fmt.Fprintf(stdout, "  WARN %s (Tempest tool names are case-sensitive; MCP names require discovery)\n", warning)
+	}
+	for _, path := range skippedHooks {
+		fmt.Fprintf(stdout, "  UNTRUSTED %s (hooks not loaded)\n", path)
+	}
 	printPathCheck(stdout, "settings file", opts.Config.SettingsPath())
 	printRoleCredentialCheck(stdout, "default", roles.Default.Model.Provider, opts)
 	printRoleCredentialCheck(stdout, "plan", roles.Plan.Model.Provider, opts)

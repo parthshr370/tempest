@@ -82,6 +82,8 @@ const (
 // entry. Records stay out of the parent chain.
 func isRecord(kind EntryType) bool {
 	switch kind {
+	case KindHook:
+		return true
 	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission,
 		KindQueueEnqueued, KindQueueCancelled, KindJobStarted, KindJobRunning, KindJobAttached,
 		KindJobCancelRequested, KindJobFinished, KindJobCleaned, KindRunStopRequested,
@@ -215,15 +217,17 @@ func (RunFinishedRecord) kind() EntryType            { return KindRunFinished }
 func (e RunFinishedRecord) meta() Meta               { return e.Meta }
 func (e RunFinishedRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 
-// PermissionRecord records the gate's decision before the tool's intent.
+// PermissionRecord records the gate's decision and effective arguments before execution.
 type PermissionRecord struct {
 	Meta       `json:"-"`
-	ToolCallID string `json:"tool_call_id"`
-	Tool       string `json:"tool"`
-	Decision   string `json:"decision"`
-	Source     string `json:"source"`
-	WaitMS     int64  `json:"wait_ms"`
-	AskID      string `json:"ask_id,omitempty"`
+	ToolCallID string          `json:"tool_call_id"`
+	Tool       string          `json:"tool"`
+	CallID     string          `json:"call_id,omitempty"`
+	Args       json.RawMessage `json:"args,omitempty"`
+	Decision   string          `json:"decision"`
+	Source     string          `json:"source"`
+	WaitMS     int64           `json:"wait_ms"`
+	AskID      string          `json:"ask_id,omitempty"`
 }
 
 func (PermissionRecord) kind() EntryType            { return KindPermission }
@@ -300,12 +304,22 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 	case CompactionEntry:
 		wire.Summary, wire.FirstKeptID, wire.TokensBefore = e.Summary, e.FirstKeptID, e.TokensBefore
 		wire.SourceHash, wire.CompactionID, wire.Snapshot = e.SourceHash, e.CompactionID, e.Snapshot
+	case RewindEntry:
+		payload, err := json.Marshal(struct {
+			Checkpoint string            `json:"checkpoint"`
+			Report     string            `json:"report,omitempty"`
+			Messages   []json.RawMessage `json:"messages"`
+		}{e.Checkpoint, e.Report, e.Messages})
+		if err != nil {
+			return nil, err
+		}
+		wire.Payload = payload
 	case WorkRecord:
 		if err := validateWorkRecord(e); err != nil {
 			return nil, err
 		}
 		wire.Payload = e.Payload
-	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord:
+	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord, HookRecord:
 		payload, err := json.Marshal(e)
 		if err != nil {
 			return nil, fmt.Errorf("marshal %s record: %w", wire.Type, err)
@@ -348,6 +362,19 @@ func decodeEntry(raw []byte) (Entry, error) {
 		return nil, fmt.Errorf("decode journal entry: missing id")
 	}
 	switch wire.Type {
+	case KindRewind:
+		var e RewindEntry
+		if err := json.Unmarshal(wire.Payload, &e); err != nil {
+			return nil, err
+		}
+		if e.Checkpoint == "" || wire.ID == "" {
+			return nil, fmt.Errorf("invalid rewind entry")
+		}
+		if _, err := e.messages(); err != nil {
+			return nil, err
+		}
+		e.Meta = meta
+		return e, nil
 	case KindMessage:
 		message, err := ptypes.UnmarshalMessage(wire.Message)
 		if err != nil {
@@ -377,6 +404,17 @@ func decodeRecord(kind EntryType, meta Meta, payload json.RawMessage) (Entry, er
 	if isWorkKind(kind) {
 		record := WorkRecord{Meta: meta, Type: kind, Payload: payload}
 		return record, validateWorkRecord(record)
+	}
+	if kind == KindHook {
+		var record HookRecord
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return nil, err
+		}
+		if record.Event == "" || (record.Status != "started" && record.Status != "finished") {
+			return nil, fmt.Errorf("invalid hook record")
+		}
+		record.Meta = meta
+		return record, nil
 	}
 	if meta.RunID == "" {
 		return nil, fmt.Errorf("decode %s record: missing run_id", kind)

@@ -7,6 +7,7 @@ import (
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/prompt"
 	"go.harness.dev/harness/internal/provider/faux"
+	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
 	"path/filepath"
 	"strings"
@@ -213,5 +214,39 @@ func TestBuildAgentStackPlanModelOverride(t *testing.T) {
 	}
 	if got := stack.Model.ID; got != "plan-model" {
 		t.Fatalf("plan stack model = %q, want %q", got, "plan-model")
+	}
+}
+
+func TestDurablePlanAndSharedChildDoNotExposeRewind(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		plan, shared bool
+	}{
+		{name: "plan", plan: true},
+		{name: "shared child", shared: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			store, err := journal.Create(t.Context(), t.TempDir(), cwd, journal.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			provider := faux.New(faux.Options{})
+			cfg := StackConfig{Cwd: cwd, Journal: store, Model: provider.Model(), StreamFn: provider.StreamSimple, Plan: test.plan}
+			if test.shared {
+				cfg.RewindGuard = func(context.Context) error { return context.Canceled }
+			}
+			stack, err := BuildAgentStack(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer stack.Close()
+			for _, tool := range stack.Agent.State().Tools {
+				if tool.Name == "rewind" || test.plan && tool.Name == "checkpoint" {
+					t.Fatalf("%s exposed %s", test.name, tool.Name)
+				}
+			}
+		})
 	}
 }

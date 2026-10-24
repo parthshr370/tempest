@@ -198,6 +198,85 @@ an intentional on-disk downgrade barrier, not a protocol-version change.
 Back up or move each `.jsonl` together with its `.jsonl.d` directory; committed
 compaction snapshots and child journals are required recovery data, not caches.
 
+#### Checkpoint and rewind
+
+Before the first file-mutating call in each assistant turn, Tempest attempts a
+checkpoint in a session-private Git store. Your index, HEAD, branches and stash
+stay untouched. Git's private index stat cache keeps repeated captures incremental,
+including in non-Git workspaces without creating `.git`. The model can also call
+`checkpoint` with an investigation goal, then `rewind` with findings to retain.
+
+```sh
+tempest rewind -session <id> -list
+tempest rewind -session <id> -checkpoint <checkpoint-id>
+```
+
+Rewind restores files **and** forks the conversation by appending a journal event;
+the discarded branch remains auditable. Outside edits require explicit `-force`.
+Settle running jobs and children first; force never bypasses this guard or a capture
+gap. Capture failures never block tools or replace their results: they record a gap
+that older rewinds cannot cross, including after crash/resume. Ignored files,
+symlinks, nested repositories and files over 8 MiB aren't protected; skipped paths
+get notes and are never overwritten/deleted by rewind. No workspace file-count or
+total-byte limit refuses a large repository. Automatic and explicit checkpoints
+have separate 32-entry retention rings. An omitted id selects the newest explicit
+checkpoint, otherwise the newest automatic one. Only operators can force outside
+edits; neither checkpoint nor rewind is exposed to the model in plan mode.
+
+SDK controls are `CreateCheckpoint`, `Checkpoints` and `Rewind`; ACP exposes
+`tempest/checkpoint`, `tempest/checkpoints` and `tempest/rewind` with `sessionId`.
+See [checkpoint durability and bounds](docs/design/09-checkpoint-and-rewind.md).
+
+#### Lifecycle hooks
+
+Configure shell hooks in `~/.config/harness/settings.json`. The command-hook
+wire format follows [Claude Code hooks](https://code.claude.com/docs/en/hooks):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "^(write|edit|bash)$",
+      "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/check-tool.sh", "timeout": 60}]
+    }]
+  }
+}
+```
+
+Commands receive JSON on stdin. Exit `2` denies a tool with stderr fed back to
+the model; exit `0` can return `hookSpecificOutput.permissionDecision`
+(`allow`, `deny`, `ask`), `updatedInput`, or `additionalContext`. Hook allow
+never bypasses plan mode, explicit policy deny/prompt rules, or approvals required by
+the current mode; it never makes bypass mode stricter.
+Stop hooks can return `{"decision":"block","reason":"finish the checks"}` to
+continue the run. `UserPromptSubmit` stdout or JSON context reaches the model
+before its first request.
+Blocked prompt reasons are shown to the caller, not added to model context.
+An interrupted queued prompt is visibly consumed as “prompt not submitted,”
+without retrying side effects or making the session unusable.
+
+Project hooks in `.harness/settings.json` and `.harness/settings.local.json`
+**never run without explicit operator trust**: use `-trust-project-hooks` for
+the current workspace or add its absolute path to user `trusted_hook_projects`.
+User, trusted project, then local hooks run in file order. `-no-hooks` or user
+`"no_hooks": true` disables all hooks; `tempest doctor` lists commands and skipped
+untrusted sources without executing them.
+Model changes to hook-bearing settings require per-call approval, including
+bash file targets and child patches applied by `integrate`, even in bypass mode.
+
+Supported events are `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, `Stop`, `SubagentStop`, `PreCompact`, `Notification`, and
+`SessionEnd`, shared by CLI, ACP/serve and SDK. SessionStart/SessionEnd are root-only;
+task children use SubagentStop, prompt and tool hooks. Match actual
+snake_case tool names (`read`, `write`, `edit`, `bash`, `web_search`,
+`manifest_diff`, `lsp_definition`, `eval`), not Claude's `Read`/`Bash` names.
+Hooks run in the workspace with `TEMPEST_PROJECT_DIR` and `CLAUDE_PROJECT_DIR`,
+default to 600 seconds (UserPromptSubmit: 30s; SessionEnd: 1.5s total), and have
+process-group cancellation and bounded output.
+Replay never runs shell hooks; interrupted effects aren't retried automatically.
+See [hook semantics, trust and durability](docs/design/10-hooks.md).
+
+
 ### 05 · Tiered permissions with a destructive-command guard
 
 Every tool call passes one chokepoint. Each tool carries a `read`, `write`, or `exec`
@@ -568,8 +647,8 @@ with the reason instead of running.
 
 ## Every tool, in one namespace
 
-Twenty-four built-in tools share one namespace, **14 of them on by default**; pin the
-active set with `-exclude-tools`, and gate the extras behind flags (see Flags below).
+Built-in tools share one namespace; pin the active set with `-exclude-tools`,
+and gate the extras behind flags (see Flags below).
 All file tools are contained to the working directory via `os.Root`, and `grep`/`find`
 fall back to pure Go when `rg`/`fd` are absent. Both search hidden files, honor
 `.gitignore` inside a Git repository, and skip the `.git` directory unless you
@@ -599,6 +678,7 @@ wire methods use camelCase (`jobId`, `jobIds`).
 **Runtime**
 
 - `bash` — workspace shell with a destructive-command guard and a default ten-minute timeout; `skill://` and `local://` words expand to paths; `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds; `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal.
+- `eval` — persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset; requires `python3`, or `node`/`bun` for JS, only when called. See [Persistent code kernels](#persistent-code-kernels).
 - `jobs` — page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
 - `wait` — wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
 - `cancel` — cancel one task or background bash job, by id or name.
@@ -611,6 +691,8 @@ wire methods use camelCase (`jobId`, `jobIds`).
 - `integrate` — three-way merge a finished general task's patch into the live workspace: per file clean, merged or conflict (with markers); writes only when nothing conflicts and the live files still match the snapshot, merged files only with `accept_merged:true` *(behind `-enable-task`; plan mode blocks it)*.
 - `message` — message the parent, a running child, or all peers, optionally awaiting the first reply *(behind `-enable-task`; children get it too)*.
 - `todo_write` — the task list, replaced in full (`todos`) or edited by one op naming todos by content (`init`, `append`, `start`, `done`, `block` with a reason, `drop`), with optional phases; checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace, and the result shows the updated list.
+- `checkpoint` — save workspace bytes, modes and the conversation before an investigation; returns a retained checkpoint id.
+- `rewind` — restore checkpoint files and fork the conversation, retaining findings; defaults to the newest explicit checkpoint. Outside edits need operator force, capture gaps cannot be bypassed, and running jobs must settle first.
 
 **Context**
 
@@ -712,6 +794,62 @@ secret-only change shows `secret_data_changed: true`; pass `redact_secrets: fals
 to see them. Limits per side: 2,048 files, 2 MiB per file, 16 MiB total, 2,000
 resources, 64 nesting levels and 200,000 YAML nodes including aliases. Symlinks in
 the inputs are rejected rather than skipped.
+
+## Persistent code kernels
+
+`eval` executes one cell at a time in each language's session-owned process:
+
+```json
+{"language":"py","code":"answer = 41"}
+{"language":"py","code":"answer + 1"}
+{"language":"js","code":"let answer = 41"}
+{"language":"js","code":"answer + 1"}
+```
+
+Python uses `python3` and the standard library, not IPython. It returns the
+`repr` of a trailing expression; JavaScript uses a synchronous persistent VM
+under `node` (preferred) or `bun`, exposes `require`, and displays the last
+completion value. JS timers and Promise callbacks run between cells; background
+output may appear in a later result. Neither driver rewrites code or supports
+top-level `await`.
+Missing runtimes produce an explicit tool error; Tempest itself still needs
+no interpreter to start or use its other tools.
+
+`timeout` is seconds (default 30, `0` disables it). A timeout interrupts the
+cell, keeping variables and effects that happened before the interruption.
+SIGINT targets only the kernel, not subprocesses started by earlier cells.
+An uncooperative cell or a broken protocol/output stream kills the process group
+after a bounded grace; the result reports unknown outcome and lost state.
+Prefer Node for interruptible JS: Bun versions without VM interruption (including
+1.3.14) require that hard-kill fallback on a CPU-bound timeout and lose state.
+`reset:true` replaces only the selected language's process before running
+the supplied code. Output keeps a bounded tail and spills the full stream
+under `<journal>.d/tool-output/`, like `bash`; a 16 MiB total-output ceiling
+stops runaway writers.
+
+Kernels live across prompts, but not across session close, resume or rewind.
+After resume, previously used languages require `reset:true` and setup again;
+unused languages and SDK-seeded conversations start normally. Rewind stops
+existing kernels before restoring files and requires the same explicit reset.
+An interrupted cell is never replayed automatically: it may already have
+performed side effects.
+CLI, ACP/serve and the Go SDK use the same stack and lifetime; general task
+children have separate kernels. `eval` is exec-tier and unavailable in plan
+mode. Cells are foreground journaled tools, not background `jobs`; idle
+kernels don't prevent a run from completing. Session close kills and joins
+their processes and descendants, and a parent-lifetime pipe prevents orphan
+kernels after a harness crash.
+
+Eval code uses the same destructive-operation scan and cloud policy as inline
+Python/JS in `bash`: matching filesystem operations ask on every call in default
+and acceptEdits mode. Code naming a cloud tool is opaque, so a deny rule for that
+tool wins even in bypass mode; allow-write rules cannot grant opaque code.
+These are heuristic approval guards, not a sandbox for arbitrary interpreter code.
+
+For matplotlib figures or PNG bytes, save an image inside the workspace and
+call `view_image`. This keeps image validation, vision-model gating and
+provider delivery in the existing image tool, without importing matplotlib
+or implicitly inspecting every cell value. See [the kernel design](docs/design/08-eval.md).
 
 ## Runs
 
@@ -1116,6 +1254,8 @@ The example is a separate module with a local `replace`; build it with
 | `-enable-lsp` | Register the `lsp_*` tools; language servers start on first use. See [Language servers](#language-servers). |
 | `-lsp-config <path>` | Operator language-server file; replaces the built-in server list. An empty path selects the built-ins. |
 | `-cloud-policy <path>` | Operator kube-context rules for `kubectl`/`helm` writes. See [Tiered permissions](#05--tiered-permissions-with-a-destructive-command-guard). |
+| `-no-hooks` | Disable all command hooks (`HARNESS_NO_HOOKS`, user `no_hooks`). |
+| `-trust-project-hooks` | Authorize project/local hook commands (`HARNESS_TRUST_PROJECT_HOOKS`); only use for trusted workspaces. |
 | `-skill <path>` | Additional skill directory or `.md` file; repeatable. See [Skills](#skills). |
 | `-permission-mode <mode>` | Tool gate mode: `default`, `plan`, `acceptEdits` or `bypass`. |
 | `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning on one-shot runs, `serve` and `mcp`. |
@@ -1149,10 +1289,11 @@ not read `.env` — export variables before running it.
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
 | `HARNESS_CLOUD_POLICY` | Kube-context rule file (settings `cloud_policy`). |
+| `HARNESS_NO_HOOKS`, `HARNESS_TRUST_PROJECT_HOOKS` | Disable all hooks or explicitly authorize project/local hooks. |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
-Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`
-and `version` subcommands.
+Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`,
+`rewind` and `version` subcommands.
 
 ## Testing without a provider
 

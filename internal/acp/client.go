@@ -204,7 +204,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		return result, nil
 	}
 	switch method {
-	case "session/prompt", "session/cancel", "session/close", "tempest/watch", "tempest/unwatch", "tempest/get_state", "tempest/history", "tempest/continue", "tempest/permission", "tempest/set_budget", "tempest/set_permission_mode":
+	case "session/prompt", "session/cancel", "session/close", "tempest/watch", "tempest/unwatch", "tempest/get_state", "tempest/history", "tempest/continue", "tempest/permission", "tempest/set_budget", "tempest/set_permission_mode", "tempest/checkpoints", "tempest/checkpoint", "tempest/rewind":
 	default:
 		return nil, rpc.NewError(-32601, "method_not_found", "unknown method: "+method)
 	}
@@ -221,6 +221,10 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		MaxCostUSD           *float64 `json:"maxCostUsd"`
 		MaxWallSeconds       *float64 `json:"maxWallSeconds"`
 		Mode                 string   `json:"mode"`
+		Checkpoint           string   `json:"checkpoint"`
+		Goal                 string   `json:"goal"`
+		Report               string   `json:"report"`
+		Force                bool     `json:"force"`
 		Meta                 struct {
 			Tempest struct {
 				// OutputSchema is the session/prompt run's final-answer
@@ -254,6 +258,21 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 	}()
 	switch method {
+	case "tempest/checkpoints":
+		return struct {
+			Checkpoints []tempest.Checkpoint `json:"checkpoints"`
+		}{s.Checkpoints()}, nil
+	case "tempest/checkpoint":
+		info, err := s.CreateCheckpoint(ctx, p.Goal)
+		if err != nil {
+			return nil, failure(err)
+		}
+		return info, nil
+	case "tempest/rewind":
+		if err := s.Rewind(ctx, tempest.RewindOptions{Checkpoint: p.Checkpoint, Report: p.Report, Force: p.Force}); err != nil {
+			return nil, failure(err)
+		}
+		return struct{}{}, nil
 	case "session/prompt", "tempest/continue":
 		var prompt tempest.Prompt
 		if method == "session/prompt" {

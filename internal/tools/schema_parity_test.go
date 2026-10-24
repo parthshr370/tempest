@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 
+	"go.harness.dev/harness/internal/checkpoint"
 	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/skills"
@@ -43,12 +44,14 @@ var originalToolSchemas = map[ToolName]string{
 	WebFetch:  `{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"number"}},"required":["url"]}`,
 	WebSearch: `{"type":"object","properties":{"query":{"type":"string"},"num_results":{"type":"number"}},"required":["query"]}`,
 	// hashline postdates the migration; its fixture freezes the one-argument surface.
-	HashlineTool:  `{"type":"object","properties":{"input":{"type":"string","description":"the hashline patch: [PATH#TAG] sections with PUT/CUT/REM/MV ops"}},"required":["input"]}`,
-	ViewImageTool: `{"type":"object","properties":{"path":{"type":"string","description":"image file path, relative to the working directory or absolute inside it"}},"required":["path"]}`,
+	HashlineTool:   `{"type":"object","properties":{"input":{"type":"string","description":"the hashline patch: [PATH#TAG] sections with PUT/CUT/REM/MV ops"}},"required":["input"]}`,
+	ViewImageTool:  `{"type":"object","properties":{"path":{"type":"string","description":"image file path, relative to the working directory or absolute inside it"}},"required":["path"]}`,
+	CheckpointTool: `{"type":"object","properties":{"goal":{"type":"string"}},"required":["goal"],"additionalProperties":false}`,
+	RewindTool:     `{"type":"object","properties":{"report":{"type":"string"},"checkpoint":{"type":"string"}},"required":["report"],"additionalProperties":false}`,
 }
 
 func TestToolSchemaParity(t *testing.T) {
-	all := AllTools(t.TempDir(), ToolsOptions{EnableWeb: true, Skills: []skills.Skill{{Name: "x"}}})
+	all := AllTools(t.TempDir(), ToolsOptions{EnableWeb: true, Skills: []skills.Skill{{Name: "x"}}, Checkpoints: new(checkpoint.Manager)})
 	for name, want := range originalToolSchemas {
 		tool, ok := all[name]
 		if !ok {
@@ -108,4 +111,9 @@ func TestCoordinationSchemas(t *testing.T) {
 		}
 		assertSchemaParity(t, string(name), tool.Parameters, want)
 	}
+}
+
+func TestEvalSchemaParity(t *testing.T) {
+	tool := newEvalTool(nil)
+	assertSchemaParity(t, "eval", tool.Parameters, `{"type":"object","properties":{"language":{"type":"string","enum":["py","js"]},"code":{"type":"string"},"timeout":{"type":"number","minimum":0,"maximum":2147483,"default":30},"reset":{"type":"boolean"}},"required":["language","code"]}`)
 }

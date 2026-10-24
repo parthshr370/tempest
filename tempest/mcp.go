@@ -13,7 +13,11 @@ func (c *sessionCore) selectedMCPTools() []Tool {
 		registry[tools.ToolName(tool.Name)] = tool
 	}
 	if !c.plan {
-		for _, tool := range c.mcp.Tools() {
+		mcpTools := c.mcp.Tools()
+		if c.checkpoints != nil {
+			mcpTools = c.checkpoints.Wrap(mcpTools, func(string) bool { return true })
+		}
+		for _, tool := range mcpTools {
 			if _, exists := registry[tools.ToolName(tool.Name)]; !exists {
 				registry[tools.ToolName(tool.Name)] = tool
 			}

@@ -13,10 +13,12 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/checkpoint"
 	"go.harness.dev/harness/internal/cloudcmd"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/jobs"
@@ -120,8 +122,10 @@ type sessionCore struct {
 	baseMCPDefaults  map[string]permission.Decision
 	queues           *session.DurableQueues
 	jobs             *jobs.Manager
+	stackClose       func() error
 	// irc is the session tree's message bus; nil without task children.
-	irc *irc.Bus
+	irc         *irc.Bus
+	checkpoints *checkpoint.Manager
 }
 
 func open(ctx context.Context, o Options) (_ *Session, err error) {
@@ -205,6 +209,21 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cwd = loaded.Header.Cwd
 		cfg.Cwd = cwd
 		cfg.InitialMessages = loaded.Messages
+	}
+	if o.Hooks != nil {
+		cfg.Hooks = o.Hooks.Clone()
+		cfg.HooksResolved = false
+	}
+	if !cfg.HooksResolved {
+		var skipped []string
+		cfg.Hooks, skipped, err = hooks.ResolveProject(cfg.Hooks, cwd)
+		if err != nil {
+			return nil, err
+		}
+		cfg.HooksResolved = true
+		for _, path := range skipped {
+			slog.Warn("project hooks disabled: explicit trust required", "path", path)
+		}
 	}
 	modelSpec := ""
 	var budget Budget
@@ -467,6 +486,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		return nil, e
 	}
 	c.agent = stack.Agent
+	c.checkpoints = stack.Checkpoints
+	c.stackClose = stack.Close
 	mcpNames := make(map[string]bool)
 	for _, tool := range c.mcp.Tools() {
 		mcpNames[tool.Name] = true
@@ -694,6 +715,9 @@ func (s *Session) close(ctx context.Context) error {
 func (c *sessionCore) finishClose() {
 	c.closeOnce.Do(func() {
 		c.closeErr = errors.Join(c.closeErr, c.jobs.Close(context.Background()))
+		if c.stackClose != nil {
+			c.closeErr = errors.Join(c.closeErr, c.stackClose())
+		}
 		if c.detachHub != nil {
 			c.detachHub()
 		}

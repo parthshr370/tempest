@@ -138,6 +138,14 @@ func (endpoint *Endpoint) Idle() bool {
 	return false
 }
 
+// Reopen accepts messages again when a stop hook continues the child's run.
+func (endpoint *Endpoint) Reopen() {
+	agent := endpoint.member
+	agent.mu.Lock()
+	agent.open = true
+	agent.mu.Unlock()
+}
+
 // Close seals the mailbox when the agent's run ends.
 func (endpoint *Endpoint) Close() {
 	agent := endpoint.member

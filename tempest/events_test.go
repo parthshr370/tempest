@@ -143,3 +143,25 @@ func TestToolKindAndTitle(t *testing.T) {
 		}
 	}
 }
+
+func TestHookPreparationStatusNeverRegresses(t *testing.T) {
+	m := newMapper("s", types.Model{ID: "m"})
+	preparing := agent.ToolExecutionStart("c", "bash", json.RawMessage(`{"command":"old"}`))
+	preparing.Preparing = true
+	events := []agent.AgentEvent{preparing, {Type: agent.EventToolPermission, ToolCallID: "c", ToolName: "bash", Permission: &agent.PermissionOutcome{Allow: true}}, agent.ToolExecutionStart("c", "bash", json.RawMessage(`{"command":"new"}`))}
+	var statuses []string
+	var last map[string]json.RawMessage
+	for _, event := range events {
+		for _, u := range m.mapEvent(event) {
+			var body map[string]json.RawMessage
+			_ = json.Unmarshal(u.Update, &body)
+			var status string
+			_ = json.Unmarshal(body["status"], &status)
+			statuses = append(statuses, status)
+			last = body
+		}
+	}
+	if !reflect.DeepEqual(statuses, []string{"pending", "pending", "in_progress"}) || string(last["rawInput"]) != `{"command":"new"}` {
+		t.Fatalf("statuses=%v last=%v", statuses, last)
+	}
+}

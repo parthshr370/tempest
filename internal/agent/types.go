@@ -10,6 +10,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/work"
 )
@@ -155,6 +156,8 @@ type AgentLoopConfig struct {
 	Budget
 	Model         types.Model
 	ToolExecution ToolExecutionMode
+	Hooks         *hooks.Runner
+	Child         bool
 
 	ConvertToLlm        func(messages []types.Message) []types.Message
 	TransformContext    func(ctx context.Context, messages []types.Message) []types.Message
@@ -275,6 +278,7 @@ const (
 	// EventUsage reports a delegated model call without adding its transcript.
 	EventUsage AgentEventType = "usage"
 	EventWork  AgentEventType = "work"
+	EventHook  AgentEventType = "hook"
 )
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
@@ -293,11 +297,13 @@ type AgentEvent struct {
 	ToolCallID            string
 	ToolName              string
 	Args                  any
+	Preparing             bool
 	Result                any
 	PartialResult         any
 	IsError               bool
 	Permission            *PermissionOutcome
 	Work                  *work.Event
+	Hook                  *hooks.Report
 	QueueID               string
 	UsageSource           string
 	ChildSessionID        string
