@@ -62,6 +62,7 @@ type Options struct {
 // State is the mutable faux-provider state snapshot passed to response factories.
 type State struct {
 	CallCount int
+	Context   context.Context
 }
 
 // ResponseStep is a queued faux response, resolved when Stream consumes it.
@@ -233,7 +234,7 @@ func (f *Faux) Stream(ctx context.Context, model types.Model, c types.Context, o
 
 	s := stream.NewAssistantStream(f.api, f.provider, model.ID)
 	rng := rand.New(rand.NewSource(f.seed + int64(callIndex)))
-	go f.produce(ctx, s, step, c, opts, State{CallCount: callIndex}, model, rng)
+	go f.produce(ctx, s, step, c, opts, State{CallCount: callIndex, Context: ctx}, model, rng)
 	return s
 }
 

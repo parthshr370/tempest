@@ -253,7 +253,7 @@ func TestCompactorAdmissionPreservesBudgetStopReason(t *testing.T) {
 		}
 	})
 	result, err := a.PromptText(context.Background(), "go")
-	if err != nil || result.StopReason != StopMaxCost || result.Err != nil || f.CallCount() != 1 {
+	if err != nil || result.StopReason != StopMaxCost || result.Err != nil || f.CallCount() != 0 {
 		t.Fatalf("result=%+v err=%v calls=%d", result, err, f.CallCount())
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.harness.dev/harness/tempest/environment"
 )
 
 // ValidateChildPath rejects anything outside the deterministic, non-symlink child chain.
@@ -43,8 +45,8 @@ func CreateChild(ctx context.Context, parentPath, childID, cwd string, opts Opti
 	if _, err := hex.DecodeString(childID); err != nil {
 		return nil, fmt.Errorf("invalid child session id: %w", err)
 	}
-	if !filepath.IsAbs(parentPath) || !filepath.IsAbs(cwd) {
-		return nil, fmt.Errorf("child journal paths must be absolute")
+	if !filepath.IsAbs(parentPath) || !filepath.IsAbs(cwd) && !environment.IsLocation(cwd) {
+		return nil, fmt.Errorf("child journal needs an absolute storage path and a valid workspace location")
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

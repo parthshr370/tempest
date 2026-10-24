@@ -99,3 +99,32 @@ func TestMCPOutputSchemaFailureIsToolError(t *testing.T) {
 		t.Fatalf("schema failure lost content: %#v %v", result, err)
 	}
 }
+func TestMCPSpillUsesReadableLocalHandle(t *testing.T) {
+	dataDir := t.TempDir()
+	localRoot := filepath.Join(dataDir, "local")
+	spillDir := filepath.Join(localRoot, "mcp")
+	raw, err := json.Marshal(map[string]any{"content": []map[string]string{{"type": "text", "text": strings.Repeat("large result ", 30000)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := mapResult(spillDir, "fixture", "large", raw, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var details resultDetails
+	if err := json.Unmarshal(result.Details, &details); err != nil {
+		t.Fatal(err)
+	}
+	handle := details.MCP.OutputPath
+	if !strings.HasPrefix(handle, "local://mcp/") {
+		t.Fatalf("spill path = %q, want local:// handle", handle)
+	}
+	if !strings.Contains(result.Content[len(result.Content)-1].Text, handle) {
+		t.Fatalf("tool output does not advertise spill handle %q: %q", handle, result.Content[len(result.Content)-1].Text)
+	}
+	relative := strings.TrimPrefix(handle, "local://")
+	saved, err := os.ReadFile(filepath.Join(localRoot, filepath.FromSlash(relative)))
+	if err != nil || !bytes.Equal(saved, raw) {
+		t.Fatalf("local handle bytes match: err=%v", err)
+	}
+}

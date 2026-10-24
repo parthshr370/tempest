@@ -6,7 +6,9 @@
 package toolio
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,8 +21,9 @@ import (
 
 // FileMutationQueue serializes file-mutation operations per real path.
 type FileMutationQueue struct {
-	mu    sync.Mutex
-	locks map[string]*fileLock
+	mu         sync.Mutex
+	locks      map[string]*fileLock
+	processDir string
 }
 
 // fileLock keeps a path's mutex alive until every queued caller has released it.
@@ -32,6 +35,16 @@ type fileLock struct {
 // NewFileMutationQueue starts a queue with no file locks.
 func NewFileMutationQueue() *FileMutationQueue {
 	return &FileMutationQueue{locks: map[string]*fileLock{}}
+}
+
+// NewProcessFileMutationQueue shares file locks with other workspace daemons.
+func NewProcessFileMutationQueue(dir string) (*FileMutationQueue, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, err
+	}
+	q := NewFileMutationQueue()
+	q.processDir = dir
+	return q, nil
 }
 
 // Do serializes fn under filePath's mutex, discarding the return value.
@@ -58,6 +71,24 @@ func DoValue[T any](q *FileMutationQueue, filePath string, fn func() (T, error))
 		lock.mu.Unlock()
 		q.release(key, lock)
 	}()
+	if q.processDir != "" {
+		digest := sha256.Sum256([]byte(key))
+		file, err := os.OpenFile(filepath.Join(q.processDir, fmt.Sprintf("%x.lock", digest)), os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return zero, err
+		}
+		defer file.Close()
+		for {
+			err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
+			if !errors.Is(err, syscall.EINTR) {
+				break
+			}
+		}
+		if err != nil {
+			return zero, err
+		}
+		defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	}
 	return fn()
 }
 
@@ -84,7 +115,7 @@ func (q *FileMutationQueue) release(key string, lock *fileLock) {
 	}
 }
 
-// mutationQueueKey resolves existing symlinks so aliases serialize together, but keeps paths for targets that don't exist yet.
+// mutationQueueKey resolves aliases even when the file hasn't been created yet.
 func mutationQueueKey(filePath string) (string, error) {
 	resolved, err := filepath.Abs(filePath)
 	if err != nil {
@@ -93,7 +124,11 @@ func mutationQueueKey(filePath string) (string, error) {
 	real, err := filepath.EvalSymlinks(resolved)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-			return resolved, nil
+			parent, parentErr := mutationQueueKey(filepath.Dir(resolved))
+			if parentErr != nil {
+				return "", parentErr
+			}
+			return filepath.Join(parent, filepath.Base(resolved)), nil
 		}
 		return "", err
 	}

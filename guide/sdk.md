@@ -140,5 +140,11 @@ Passing a backend transfers ownership only after `OpenHost` succeeds. A failed
 constructor leaves that backend open for the caller. A successful host closes it
 only after all sessions join, even when an individual `Close` waiter times out.
 
+`Host.Fork` creates a pinned sibling with policy-selected documents and a fresh
+ledger. `Session.Reset`, `Session.Compact` and `Session.SearchHistory` control the
+active context without deleting audit history. See
+[conversation controls](conversations.md) for safe cuts, background placement,
+overflow receipts and the matching CLI and ACP methods.
+
 
 [Guide index](README.md) · [Tempest](../README.md)

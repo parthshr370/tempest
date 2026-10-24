@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/dap"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/obs"
@@ -149,6 +150,19 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "WARN checkpoint git: unavailable; tool calls still run, but checkpoint capture and rewind need git")
 	}
 	printCodingToolChecks(stdout)
+	fmt.Fprintln(stdout, "debug adapters:")
+	adapters, err := dap.Available(opts.Config.DebugAdapters())
+	if err != nil {
+		fmt.Fprintf(stderr, "doctor debug adapters: %v\n", err)
+		return 1
+	}
+	for _, adapter := range adapters {
+		status := "unavailable"
+		if adapter.Available {
+			status = "available"
+		}
+		fmt.Fprintf(stdout, "  %s: %s (%s)\n", adapter.Name, status, adapter.Command)
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {

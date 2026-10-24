@@ -32,7 +32,7 @@ func TestTodoToolOpsWithPhases(t *testing.T) {
 	for _, want := range []string{
 		"## Build\n- [x] parse input\n- [x] write output\n",
 		"## Verify\n- [-] run tests _(dropped)_\n- [ ] update docs _(blocked: waiting on review)_\n",
-		"Progress checkpoint: " + progress.Path(sessionDataDir),
+		"Progress checkpoint: local://progress.md",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("todo result missing %q:\n%s", want, text)

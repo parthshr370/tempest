@@ -11,6 +11,7 @@ import (
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/cloudcmd"
+	"go.harness.dev/harness/internal/dap"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/hub"
@@ -18,10 +19,12 @@ import (
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/environment"
 	"go.harness.dev/harness/tempest/extension"
 )
 
@@ -29,10 +32,15 @@ import (
 type Options struct {
 	SessionDir string
 	Cwd        string
-	New        *NewSession
-	Resume     *ResumeSession
-	Provider   ProviderConfig
-	Prompter   Prompter
+	// Environment selects a workspace. Launch authority stays in the resolver.
+	Environment         environment.Reference
+	EnvironmentResolver environment.Resolver
+	New                 *NewSession
+	Resume              *ResumeSession
+	Provider            ProviderConfig
+	Prompter            Prompter
+	// Questioner handles non-sensitive ask tool requests; nil returns a headless error.
+	Questioner QuestionHandler
 	Logger     *slog.Logger
 	// FauxScript selects a hermetic JSON response script instead of a network provider.
 	FauxScript string
@@ -68,6 +76,7 @@ type Options struct {
 	admitRun        func(context.Context) (func(), error)
 	admitProcess    func(context.Context) (func(), error)
 	hostCreate      bool
+	forkSeed        *journal.ForkSeed
 }
 
 // NewSession configures a new conversation.
@@ -77,6 +86,8 @@ type NewSession struct {
 	Tools          []Tool
 	Budget         Budget
 	PermissionMode PermissionMode
+	// Environment may select an operator-installed workspace by name.
+	Environment environment.Reference
 	// MCPServers replaces host defaults; a non-nil empty slice disables MCP.
 	MCPServers []MCPServerConfig
 }
@@ -111,6 +122,9 @@ type LSPConfig = lsp.Config
 
 // LSPServerConfig replaces one built-in language-server route.
 type LSPServerConfig = lsp.ServerConfig
+
+// DebugAdapterConfig selects a trusted executable for StackConfig.DebugAdapters.
+type DebugAdapterConfig = dap.Adapter
 
 // CloudRule is one operator kube-context rule for kubectl and helm.
 type CloudRule = cloudcmd.Rule
@@ -185,6 +199,21 @@ type WatchOptions struct {
 type Prompter interface {
 	Approve(context.Context, Ask) (Choice, error)
 }
+
+// QuestionHandler presents a question and stops when its context is cancelled.
+type QuestionHandler = question.Handler
+
+// QuestionRequest binds structured questions to a session tool call.
+type QuestionRequest = question.Request
+
+// Question is a single or multiple-choice prompt with optional free text.
+type Question = question.Question
+
+// QuestionOption is a labeled choice with an optional description.
+type QuestionOption = question.Option
+
+// QuestionAnswer preserves the user's selected labels and optional text.
+type QuestionAnswer = question.Answer
 
 // Choice is a permission option; an empty choice cancels the request.
 type Choice = permission.Choice

@@ -25,11 +25,13 @@ import (
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 // exitAborted is the conventional exit status for a run ended by SIGINT.
@@ -37,19 +39,21 @@ const exitAborted = 130
 
 // commandOptions keeps parsed CLI-only inputs beside the resolved config and secret lookup they feed into the runtime.
 type commandOptions struct {
-	flags           config.FlagValues
-	Config          *config.ResolvedConfig
-	Secrets         config.SecretResolver
-	Prompt          string
-	PrintMode       string
-	OutputFormat    string
-	ExcludeTools    string
-	Resume          string
-	RequestID       string
-	ExtensionConfig string
-	Continue        bool
-	Version         bool
-	Budget          agent.Budget
+	flags             config.FlagValues
+	Config            *config.ResolvedConfig
+	Secrets           config.SecretResolver
+	Prompt            string
+	PrintMode         string
+	OutputFormat      string
+	ExcludeTools      string
+	Resume            string
+	resumeCwd         string
+	resumeEnvironment environment.Reference
+	RequestID         string
+	ExtensionConfig   string
+	Continue          bool
+	Version           bool
+	Budget            agent.Budget
 	// OutputSchemaPath names a JSON Schema file for the run's final answer.
 	OutputSchemaPath string
 	// ImagePaths are image files attached to the prompt.
@@ -82,8 +86,12 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
+		case "env":
+			return runEnvironment(args[1:], stdout, stderr)
 		case "serve":
 			return runServe(args[1:], stdout, stderr)
+		case "fork", "reset", "compact", "history":
+			return runConversation(args[0], args[1:], stdout, stderr)
 		case "rewind":
 			return runRewind(args[1:], stdout, stderr)
 		case "mcp":
@@ -207,10 +215,22 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(stderr, "cwd error: %v\n", err)
-		return 1
+	stack := session.StackConfigFromConfig(opts.Config)
+	if opts.Config.Environment() == "" && opts.resumeEnvironment.ID != "" {
+		stack.EnvironmentReference = opts.resumeEnvironment
+	}
+	var cwd string
+	if opts.Config.Environment() == "" && !environment.IsLocation(opts.resumeCwd) {
+		cwd, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "cwd error: %v\n", err)
+			return 1
+		}
+	} else {
+		cwd = opts.resumeCwd
+		if cwd == "" {
+			cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
+		}
 	}
 	// SIGINT/SIGTERM abort the run cleanly: tools are cancelled and joined and
 	// the journal records the aborted run. The first signal then restores the
@@ -219,18 +239,18 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	runCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	context.AfterFunc(runCtx, stopSignals)
-	inputs, err := discovery.Discover(runCtx, discovery.Options{
-		Cwd:                  cwd,
-		AgentDir:             opts.Config.AgentDir(),
-		SkillPaths:           opts.Config.SkillPaths(),
-		IncludeDefaultSkills: true,
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "context discovery error: %v\n", err)
-		return 1
-	}
-	for _, diagnostic := range inputs.Diagnostics {
-		slog.Warn("discovery diagnostic", "code", diagnostic.Code, "path", diagnostic.Path, "message", diagnostic.Message)
+	var inputs discovery.SessionInputs
+	if !environment.IsLocation(cwd) {
+		inputs, err = discovery.Discover(runCtx, discovery.Options{
+			Cwd: cwd, AgentDir: opts.Config.AgentDir(), SkillPaths: opts.Config.SkillPaths(), IncludeDefaultSkills: true,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "context discovery error: %v\n", err)
+			return 1
+		}
+		for _, diagnostic := range inputs.Diagnostics {
+			slog.Warn("discovery diagnostic", "code", diagnostic.Code, "path", diagnostic.Path, "message", diagnostic.Message)
+		}
 	}
 
 	var attachRegistry *document.AttachmentRegistry
@@ -242,7 +262,6 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 	}
-	stack := session.StackConfigFromConfig(opts.Config)
 	stack.Cwd = cwd
 	stack.Model = stackModel
 	stack.PlanModel = planSelected
@@ -257,6 +276,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.GenericRules = inputs.GenericRules
 	stack.AttachmentRegistry = attachRegistry
 	stack.AttachmentReader = attachReader
+	stack.AskUser = question.Terminal(os.Stdin, stderr)
 	processes, err := loadExtensionProcesses(opts.ExtensionConfig, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -519,7 +539,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
+		case "environment", "environment-command", "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
 			markIntelligenceFlag(f.Name, &values)
 		case "anthropic-base-url":
 			values.AnthropicBaseURL.Set = true
@@ -542,9 +562,43 @@ func resolveCommandConfig(opts *commandOptions) error {
 	if opts.Resume != "" && opts.Continue {
 		return fmt.Errorf("-resume and -continue cannot be used together")
 	}
-	resolved, err := config.Config{Flags: opts.flags}.Resolve()
+	if opts.Resume == "" {
+		resolved, err := (config.Config{Flags: opts.flags}).Resolve()
+		opts.Config = resolved
+		return err
+	}
+	// Resolve storage and operator launch definitions before reading any project files.
+	resolved, err := (config.Config{Flags: opts.flags, SkipProject: true}).Resolve()
 	if err != nil {
 		return err
+	}
+	if opts.Resume != "" {
+		entries, err := journal.Catalog(context.Background(), resolved.SessionDir(), "")
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.Header.ID != opts.Resume && strings.TrimSuffix(filepath.Base(entry.Path), ".jsonl") != strings.TrimSuffix(opts.Resume, ".jsonl") {
+				continue
+			}
+			if opts.resumeCwd != "" {
+				return fmt.Errorf("ambiguous session %q", opts.Resume)
+			}
+			opts.resumeCwd = entry.Header.Cwd
+			opts.resumeEnvironment, err = journal.EnvironmentReference(context.Background(), entry.Path)
+			if err != nil {
+				return err
+			}
+		}
+		if opts.resumeCwd == "" {
+			return fmt.Errorf("resolve journal %q: %w", opts.Resume, journal.ErrSessionNotFound)
+		}
+	}
+	if (opts.resumeEnvironment.ID == "" || strings.HasPrefix(opts.resumeEnvironment.ID, "local:")) && resolved.Environment() == "" {
+		resolved, err = (config.Config{Flags: opts.flags}).Resolve()
+		if err != nil {
+			return err
+		}
 	}
 	opts.Config = resolved
 	return nil
@@ -692,7 +746,12 @@ const topUsage = `Usage:
 
 Commands:
   serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
+  env       serve an identified workspace daemon over dedicated stdio
   mcp       run as a stdio MCP server that exposes the tempest_run tool
+  fork      create a sibling from a safe durable transcript entry
+  reset     start an empty context without deleting audit history or spend
+  compact   summarize context through the durable native task scheduler
+  history   search paged audit history, including text hidden by reset
   rewind    restore a workspace checkpoint and fork its conversation without deleting history
   doctor    check configuration and credentials offline; --ping probes the configured models
   login     sign in with ChatGPT for the openai-chatgpt Responses route
@@ -770,6 +829,8 @@ func toolPolicy(stderr io.Writer, cfg *config.ResolvedConfig) permission.Policy 
 
 // addIntelligenceFlags registers operator execution settings on every session-creating command.
 func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
+	fs.StringVar(&values.Environment.Value, "environment", "", "operator-configured environment name (empty uses the local workspace)")
+	fs.StringVar(&values.EnvironmentCommand.Value, "environment-command", "", "operator daemon argv as a JSON array; requires -environment")
 	fs.BoolVar(&values.EnableLSP.Value, "enable-lsp", false, "enable the lsp_* tools; language servers are trusted executables started on first use")
 	fs.StringVar(&values.LSPConfig.Value, "lsp-config", "", `operator language-server JSON file {"servers":[...]} (empty selects the built-in gopls, yaml-language-server, terraform-ls and helm_ls definitions)`)
 	fs.StringVar(&values.CloudPolicy.Value, "cloud-policy", "", `operator kube-context policy JSON file {"rules":[{"tool":"kubectl","context":"dev","action":"allow_write"}]}`)
@@ -782,6 +843,10 @@ func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
 // explicit -enable-lsp=false or empty file outranks the environment.
 func markIntelligenceFlag(name string, values *config.FlagValues) {
 	switch name {
+	case "environment":
+		values.Environment.Set = true
+	case "environment-command":
+		values.EnvironmentCommand.Set = true
 	case "no-hooks":
 		values.NoHooks.Set = true
 	case "trust-project-hooks":

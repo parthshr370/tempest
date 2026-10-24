@@ -58,6 +58,13 @@ func TestRebuildSystemPrompt(t *testing.T) {
 		}
 	}
 }
+func TestRebuildSystemPromptOmitsLocalBashExpansionForRemoteEnvironment(t *testing.T) {
+	active := tools.CodingTools(t.TempDir(), tools.ToolsOptions{})
+	got := RebuildSystemPrompt(RebuildSystemPromptOptions{ActiveTools: active, RemoteEnvironment: true})
+	if strings.Contains(got, "bash expands skill://") || strings.Contains(got, "bash expands local://") {
+		t.Fatalf("remote prompt advertises local bash expansion: %s", got)
+	}
+}
 
 func TestSessionConcurrency(t *testing.T) {
 	dir := t.TempDir()
@@ -127,7 +134,7 @@ func TestAppendCapabilitiesNamesChildTools(t *testing.T) {
 		{Tool: ptypes.Tool{Name: "read"}, Label: "read"},
 		{Tool: ptypes.Tool{Name: "custom_agent"}, Label: "custom_agent"},
 	}
-	got := AppendCapabilities("Child prompt.", active)
+	got := AppendCapabilities("Child prompt.", active, false)
 	for _, want := range []string{
 		"Child prompt.",
 		"<available_tools>",

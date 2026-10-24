@@ -186,7 +186,7 @@ func commitHashlinePlan(plan *hashline.Plan, root *os.Root, targets map[string]h
 	if err != nil {
 		return "", details, err
 	}
-	if err := editbatch.New(options.SessionDataDir).Apply(root, origin, changes); err != nil {
+	if err := editbatch.New(editStateDir(options)).Apply(root, origin, changes); err != nil {
 		return "", details, err
 	}
 	var sections []string

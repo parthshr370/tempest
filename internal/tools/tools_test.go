@@ -22,6 +22,7 @@ import (
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/progress"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/truncate"
@@ -31,7 +32,7 @@ func TestRegistry(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", t.TempDir())
 	all := AllTools(dir, ToolsOptions{})
-	if len(all) != 13 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil || all[ViewImageTool].Execute == nil {
+	if len(all) != 14 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[AskTool].Execute == nil || all[ManifestDiffTool].Execute == nil || all[ViewImageTool].Execute == nil {
 		t.Fatalf("registry = %v names=%v", all, AllToolNames)
 	}
 	for _, name := range LSPToolNames {
@@ -45,7 +46,7 @@ func TestRegistry(t *testing.T) {
 	if got := CodingTools(dir, ToolsOptions{}); names(got) != "read,bash,edit,write" {
 		t.Fatalf("CodingTools = %s", names(got))
 	}
-	if got := ReadOnlyTools(dir, ToolsOptions{}); names(got) != "read,grep,find,ls,gh" {
+	if got := ReadOnlyTools(dir, ToolsOptions{}); names(got) != "read,grep,find,ls,gh,ask" {
 		t.Fatalf("ReadOnlyTools = %s", names(got))
 	}
 }
@@ -682,8 +683,8 @@ func TestTodoToolCheckpointsOutsideWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	checkpoint := filepath.Join(sessionDataDir, progress.FileName)
-	if got := resultText(result); !strings.Contains(got, "- [ ] `a` implement _(in progress, high priority)_") || !strings.Contains(got, checkpoint) {
+	checkpoint := filepath.Join(sessionDataDir, "local", progress.FileName)
+	if got := resultText(result); !strings.Contains(got, "- [ ] `a` implement _(in progress, high priority)_") || !strings.Contains(got, "local://progress.md") {
 		t.Fatalf("todo result = %q", got)
 	}
 	data, err := os.ReadFile(checkpoint)
@@ -711,7 +712,7 @@ func TestReadSessionArtifacts(t *testing.T) {
 	patch := filepath.Join(sessionDataDir, "jobs", "job_a", "changes.patch")
 	childJournal := filepath.Join(sessionDataDir, "children", "c", "session.jsonl")
 	writeFile(t, patch, "diff --git a/x b/x\n")
-	writeFile(t, filepath.Join(sessionDataDir, progress.FileName), "# Progress\n")
+	writeFile(t, progress.Path(sessionDataDir), "# Progress\n")
 	writeFile(t, childJournal, "secret child transcript\n")
 	if err := os.MkdirAll(filepath.Join(sessionDataDir, "jobs", "job_b"), 0o700); err != nil {
 		t.Fatal(err)
@@ -724,8 +725,12 @@ func TestReadSessionArtifacts(t *testing.T) {
 	outside := filepath.Join(t.TempDir(), "other.txt")
 	writeFile(t, outside, "elsewhere\n")
 
-	read, _ := NewTool(ReadTool, workspace, ToolsOptions{SessionDataDir: sessionDataDir})
-	for path, want := range map[string]string{patch: "diff --git", filepath.Join(sessionDataDir, progress.FileName): "# Progress", spill: `"spilled"`} {
+	resolver, err := refs.New(refs.Config{RootJournal: strings.TrimSuffix(sessionDataDir, ".d")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, _ := NewTool(ReadTool, workspace, ToolsOptions{SessionDataDir: sessionDataDir, Refs: resolver})
+	for path, want := range map[string]string{patch: "diff --git", "local://progress.md": "# Progress", spill: `"spilled"`} {
 		result, err := executeTool(t, read, map[string]any{"path": path})
 		if err != nil || !strings.Contains(resultText(result), want) {
 			t.Fatalf("read %s = %q, %v", path, resultText(result), err)

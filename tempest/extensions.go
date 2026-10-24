@@ -51,7 +51,7 @@ func configureExtensions(ctx context.Context, o Options, cfg *session.StackConfi
 	if err = store.RegisterDocuments(ctx, documents); err != nil {
 		return nil, errors.Join(err, close())
 	}
-	cfg.Extensions = &extensionhost.Runtime{Registry: registry, Selected: selected, Store: store, SessionID: store.ID(), Cwd: cfg.Cwd, EnvironmentID: "local:" + cfg.Cwd}
+	cfg.Extensions = &extensionhost.Runtime{Registry: registry, Selected: selected, Store: store, SessionID: store.ID(), Cwd: cfg.Cwd, EnvironmentID: cfg.Environment.Reference().Key(), Environment: cfg.Environment}
 	cfg.ResolvePreset = cfg.Extensions.ResolvePreset
 	return close, nil
 }

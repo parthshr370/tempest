@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"strings"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/truncate"
 )
 
@@ -74,6 +77,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 	var text strings.Builder
 	details := readBatchDetails{Files: make([]readBatchFile, 0, len(paths))}
 	failures := 0
+	imageBytes, maxImageBytes := 0, base64.StdEncoding.EncodedLen(document.MaxInlineImageBytes)
 	for _, path := range paths {
 		if text.Len() > 0 {
 			text.WriteString("\n\n")
@@ -101,6 +105,12 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 				text.WriteString(block.Text)
 				continue
 			}
+			if block.Type == types.BlockImage {
+				imageBytes += len(block.Data)
+				if imageBytes > maxImageBytes {
+					return agent.AgentToolResult{}, errors.New("read batch image output exceeds the inline image budget; read images in separate calls")
+				}
+			}
 			if text.Len() > 0 {
 				content = append(content, types.NewText(text.String()))
 				text.Reset()
@@ -126,9 +136,13 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	if err := ctx.Err(); err != nil {
 		return agent.AgentToolResult{}, errors.New("Operation aborted")
 	}
-	rootForRead, err := reader.getRoot()
-	if err != nil {
-		return agent.AgentToolResult{}, err
+	var rootForRead *os.Root
+	if !refs.IsURL(request.path) {
+		var err error
+		rootForRead, err = reader.getRoot()
+		if err != nil {
+			return agent.AgentToolResult{}, err
+		}
 	}
 	selector, err := parseReadPathSelector(request.path)
 	if err != nil {

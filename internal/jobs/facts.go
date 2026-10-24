@@ -8,6 +8,7 @@ import (
 	"go.harness.dev/harness/internal/cloudcmd"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 type ceilingPayload struct {
@@ -19,9 +20,10 @@ type ceilingPayload struct {
 	CloudRules []cloudcmd.Rule `json:"cloud_rules,omitempty"`
 }
 type environmentPayload struct {
-	Ceiling  ceilingPayload `json:"ceiling"`
-	Model    string         `json:"model"`
-	Provider string         `json:"provider"`
+	Ceiling   ceilingPayload        `json:"ceiling"`
+	Model     string                `json:"model"`
+	Provider  string                `json:"provider"`
+	Workspace environment.Reference `json:"workspace,omitempty"`
 }
 type workspacePayload struct {
 	Repo        string `json:"repo"`
@@ -95,7 +97,7 @@ func (manager *Manager) commitStart(ctx context.Context, record *entry) error {
 		payload.Spec, err = json.Marshal(recovery.Task)
 		environment := recovery.Environment
 		ceiling := environment.Ceiling
-		payload.Environment = &environmentPayload{Ceiling: ceilingPayload{ceiling.Mode, ceiling.Tools, ceiling.Overrides, ceiling.Interactive, ceiling.CloudRules}, Model: environment.Model, Provider: environment.Provider}
+		payload.Environment = &environmentPayload{Ceiling: ceilingPayload{ceiling.Mode, ceiling.Tools, ceiling.Overrides, ceiling.Interactive, ceiling.CloudRules}, Model: environment.Model, Provider: environment.Provider, Workspace: environment.Workspace}
 	} else {
 		payload.Spec, err = json.Marshal(recovery.Bash)
 		payload.OutputPath = manager.jobPath(recovery.Job.ID, "output.log")

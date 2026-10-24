@@ -109,7 +109,7 @@ func (r *Runtime) InvokeTask(ctx context.Context, scheduler *taskstate.Runtime, 
 			return r.nested(ctx, task.ID+":"+task.Phase, key, name, args)
 		},
 		Environment: func(context.Context) (extension.EnvironmentLease, error) {
-			return localReadEnvironment{cwd: r.Cwd, identity: r.EnvironmentID}, nil
+			return r.readEnvironment()
 		},
 	})
 	defer grant.Revoke()

@@ -141,6 +141,9 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 	}
 	if !target.hasMember && !target.hasQuery {
 		if mimeType := imageMimeType(name); mimeType != "" {
+			if len(src.data) > document.MaxInlineImageBytes {
+				return readSource{}, nil, fmt.Errorf("image %s is %d bytes; inline image reads are limited to %d bytes", src.displayPath, len(src.data), document.MaxInlineImageBytes)
+			}
 			result := agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("Read image file [" + mimeType + "]"), types.NewImage(base64.StdEncoding.EncodeToString(src.data), mimeType)}}
 			return readSource{}, &result, nil
 		}

@@ -115,6 +115,14 @@ func reduce(loaded *Loaded, entries []Entry) {
 			} else {
 				messages = applyCompaction(messages, e)
 			}
+		case ContextHeadEntry:
+			messages = nil
+			clear(calls)
+			clear(unfinished)
+			startOrder = nil
+			for _, message := range loaded.prefixes[e.ID] {
+				messages = append(messages, replayMessage{message: message})
+			}
 		case RewindEntry:
 			replacement, _ := e.messages()
 			messages = nil
@@ -321,6 +329,12 @@ func synthesizeResult(call ptypes.ContentBlock, runID string, state *toolState, 
 		text += textNoRerun
 		if call.Name == "eval" {
 			text += " Eval kernel state was lost; use reset:true and re-run setup explicitly."
+		}
+		if call.Name == "ask" {
+			text += " The interrupted question isn't asked again automatically. Proceed with your best judgment unless the user explicitly asks to answer it."
+		}
+		if call.Name == "debug" {
+			text += " The debug session is gone after resume; explicitly launch or attach a new debug session."
 		}
 	}
 	return ptypes.ToolResultMessage{

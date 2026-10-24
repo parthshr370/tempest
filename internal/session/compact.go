@@ -37,6 +37,7 @@ type compactionRunner struct {
 	hooks            *hooks.Runner
 	hookCache        *hookCache
 	beforeCompaction func(context.Context, string) error
+	background       *compactionState
 }
 
 // newCompactionRunner builds a runner for the given model and provider seam. It
@@ -46,11 +47,13 @@ func newCompactionRunner(model ptypes.Model, streamFn agent.StreamFn) *compactio
 	if streamFn == nil || model.ContextWindow <= 0 {
 		return nil
 	}
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &compactionRunner{
 		contextWindow: model.ContextWindow,
 		model:         model,
 		streamFn:      streamFn,
-		settings:      compaction.DefaultCompactionSettings,
+		settings:      compaction.ModelSettings(model.ContextWindow, model.MaxTokens),
+		background:    &compactionState{ctx: lifetime, cancel: cancel},
 	}
 }
 func (r *compactionRunner) configureJournal(store *journal.Store, loaded *journal.Loaded, agt *agent.Agent) {
@@ -73,7 +76,16 @@ func (r *compactionRunner) hookE(commit func([]ptypes.Message)) func(context.Con
 		return nil
 	}
 	return func(ctx context.Context, c agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error) {
-		compacted, changed, err := r.compact(ctx, c.Context.Messages)
+		var compacted []ptypes.Message
+		var changed bool
+		var err error
+		if c.Overflow {
+			compacted, changed, err = r.recoverOverflow(ctx, c.Context.Messages)
+		} else if r.background.tasks != nil {
+			compacted, changed, err = r.backgroundTurn(ctx, c)
+		} else {
+			compacted, changed, err = r.compact(ctx, c.Context.Messages)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -99,23 +111,49 @@ func stableHash(value any) (string, error) {
 }
 
 func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Message) ([]ptypes.Message, bool, error) {
+	return r.summarize(ctx, messages, false, true)
+}
+
+func (r *compactionRunner) summarize(ctx context.Context, messages []ptypes.Message, force, persist bool) ([]ptypes.Message, bool, error) {
+	if r == nil {
+		return messages, false, nil
+	}
+	return r.summarizeUsing(ctx, messages, force, persist, r.settings)
+}
+
+func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes.Message, force, persist bool, settings compaction.CompactionSettings) ([]ptypes.Message, bool, error) {
 	if r == nil || len(messages) == 0 {
 		return messages, false, nil
 	}
 	tokens := compaction.EstimateContextTokens(messages).Tokens
-	if !compaction.ShouldCompact(tokens, r.contextWindow, r.settings) {
+	if !force && !compaction.ShouldCompact(tokens, r.contextWindow, r.settings) {
 		return messages, false, nil
 	}
 	entries := messagesToEntries(messages)
-	prep := compaction.PrepareCompaction(entries, r.settings)
+	if force && settings.KeepRecentTokens >= tokens {
+		settings.KeepRecentTokens = tokens / 2
+	}
+	prep := compaction.PrepareCompaction(entries, settings)
 	if prep == nil || len(prep.MessagesToSummarize)+len(prep.TurnPrefixMessages) == 0 {
 		return messages, false, nil
 	}
+	epoch := ""
+	if r.store != nil {
+		var err error
+		epoch, err = r.store.ContextEpoch(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		if epoch == "initial" {
+			epoch = ""
+		}
+	}
 	source, err := stableHash(struct {
+		Epoch    string `json:"Epoch,omitempty"`
 		Messages []ptypes.Message
 		Model    string
 		Settings compaction.CompactionSettings
-	}{messages, r.model.ID, r.settings})
+	}{epoch, messages, r.model.ID, settings})
 	if err != nil {
 		return nil, false, err
 	}
@@ -188,7 +226,7 @@ func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Messag
 			}
 		}
 	}
-	if r.store != nil {
+	if persist && r.store != nil {
 		snapshot, err := r.store.WriteSnapshot(id, replacement)
 		if err != nil {
 			return nil, false, err
@@ -243,6 +281,10 @@ func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, p
 		}
 		return part.Finished.Summary, nil
 	}
+	ownerRunID := ""
+	if _, native := ctx.Value(compactionTaskKey{}).(string); native && r.agt != nil {
+		ctx, ownerRunID = r.agt.BackgroundProviderContext(ctx)
+	}
 	release, err := agent.AdmitProvider(ctx, r.model)
 	defer release()
 	if err != nil {
@@ -253,6 +295,12 @@ func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, p
 	runID := ""
 	if r.agt != nil {
 		runID = r.agt.RunState().RunID
+	}
+	if taskID, ok := ctx.Value(compactionTaskKey{}).(string); ok {
+		runID = taskID
+	}
+	if ownerRunID != "" {
+		runID = ownerRunID
 	}
 	appendFact := func(kind journal.EntryType, value journal.CompactionCall) error {
 		if r.store == nil {
@@ -270,12 +318,32 @@ func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, p
 	r.parts[key] = journal.CompactionPart{Started: &start}
 	callCtx, cancel := context.WithTimeout(ctx, compactionSummaryTimeout)
 	result, callErr := call(callCtx)
+	interrupted := callCtx.Err() != nil || errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)
 	cancel()
 	finish := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: r.model.ID, Status: "ok", Summary: result.Text, Usage: result.Usage}
 	if r.store != nil {
 		finish.SourceRef = "compaction:" + r.store.ID() + ":" + id + ":" + phase
 	} else {
 		finish.SourceRef = "compaction:" + source + ":" + phase
+	}
+	if interrupted {
+		// The provider may have spent money, but this cut has no known outcome.
+		// Don't turn session suspension into a reusable failure receipt.
+		if r.store != nil && result.Usage != (ptypes.Usage{}) {
+			if err := r.store.Append(context.WithoutCancel(ctx), journal.UsageRecord{Meta: journal.Meta{RunID: runID}, Model: r.model.ID, SourceRef: finish.SourceRef, Usage: result.Usage}); err != nil {
+				return "", err
+			}
+		}
+		if err := agent.AccountProviderUsage(context.WithoutCancel(ctx), finish.SourceRef, r.model.ID, result.Usage); err != nil {
+			return "", err
+		}
+		if r.background != nil && r.background.notifyUsage != nil {
+			r.background.notifyUsage(finish.SourceRef, r.model.ID, result.Usage)
+		}
+		if callErr != nil {
+			return "", callErr
+		}
+		return "", callCtx.Err()
 	}
 	if callErr != nil {
 		finish.Status = "error"
@@ -288,6 +356,9 @@ func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, p
 	r.parts[key] = journal.CompactionPart{Started: &start, Finished: &finish}
 	if err := agent.AccountProviderUsage(context.WithoutCancel(ctx), finish.SourceRef, r.model.ID, result.Usage); err != nil {
 		return "", err
+	}
+	if r.background != nil && r.background.notifyUsage != nil {
+		r.background.notifyUsage(finish.SourceRef, r.model.ID, result.Usage)
 	}
 	if callErr != nil {
 		return "", callErr

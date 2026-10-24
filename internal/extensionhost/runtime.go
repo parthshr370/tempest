@@ -19,6 +19,7 @@ import (
 	"go.harness.dev/harness/internal/subagent"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/environment"
 	"go.harness.dev/harness/tempest/extension"
 )
 
@@ -40,6 +41,7 @@ type Runtime struct {
 	BasePrompt    string
 	BaseTools     []agent.AgentTool
 	EnvironmentID string
+	Environment   environment.Lease
 	Counter       atomic.Uint64
 	CommandHooks  bool
 	CallTool      func(context.Context, string, string, json.RawMessage) (extension.Result, error)
@@ -108,7 +110,7 @@ func (r *Runtime) grant(ctx context.Context, req *request, d extension.Definitio
 		}
 		return output(ch)
 	}, Environment: func(context.Context) (extension.EnvironmentLease, error) {
-		return localReadEnvironment{cwd: r.Cwd, identity: r.EnvironmentID}, nil
+		return r.readEnvironment()
 	}, CallTool: func(ctx context.Context, key, name string, args json.RawMessage) (extension.Result, error) {
 		if r.CallTool != nil {
 			return r.CallTool(ctx, key, name, args)

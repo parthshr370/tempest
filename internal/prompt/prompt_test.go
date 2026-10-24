@@ -174,16 +174,22 @@ func TestBuildSystemPromptCustomIncludesCapabilities(t *testing.T) {
 		"- task: Delegate a focused task to a child agent",
 		"<runtime>",
 		"Full output:",
-		"/sessions/s.jsonl.d/progress.md",
+		"local://progress.md",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, got)
 		}
 	}
 }
+func TestCapabilitiesSectionDoesNotPromiseRemoteBashExpansion(t *testing.T) {
+	got := CapabilitiesSection([]string{"read", "bash"}, map[string]string{"read": "Read", "bash": "Run commands"}, "", true)
+	if strings.Contains(got, "bash expands skill://") || strings.Contains(got, "bash expands local://") {
+		t.Fatalf("bash expansion guidance = %s", got)
+	}
+}
 
 func TestCapabilitiesSectionOmitsUnavailableRuntimeNotes(t *testing.T) {
-	got := CapabilitiesSection([]string{"write"}, map[string]string{"write": "Create or overwrite files"}, "/sessions/s.jsonl.d/progress.md")
+	got := CapabilitiesSection([]string{"write"}, map[string]string{"write": "Create or overwrite files"}, "/sessions/s.jsonl.d/progress.md", false)
 	if !strings.Contains(got, "<available_tools>") || !strings.Contains(got, "- write: Create or overwrite files") {
 		t.Fatalf("missing tool list: %s", got)
 	}
@@ -205,10 +211,10 @@ func TestCapabilitiesSectionOmitsUnavailableRuntimeNotes(t *testing.T) {
 	if strings.Contains(got, "progress.md") {
 		t.Fatalf("progress note should be absent without todo_write: %s", got)
 	}
-	if got := CapabilitiesSection([]string{"todo_write"}, map[string]string{"todo_write": "Update todos"}, ""); strings.Contains(got, "progress checkpoint") {
+	if got := CapabilitiesSection([]string{"todo_write"}, map[string]string{"todo_write": "Update todos"}, "", false); strings.Contains(got, "progress checkpoint") {
 		t.Fatalf("progress note needs a checkpoint path: %s", got)
 	}
-	if CapabilitiesSection(nil, nil, "") != "" {
+	if CapabilitiesSection(nil, nil, "", false) != "" {
 		t.Fatal("empty tool set should yield empty section")
 	}
 }

@@ -192,3 +192,60 @@ func TestCloseBoundsBlockedWriter(t *testing.T) {
 		t.Fatal("writer survived transport close")
 	}
 }
+func TestLateRepliesAfterManyCancellationsKeepConnectionAlive(t *testing.T) {
+	local, peer := net.Pipe()
+	defer peer.Close()
+	conn := NewStream(local)
+	conn.SetProtocolErrorHandler(func(error) { go conn.Close() })
+	defer conn.Close()
+	go conn.Serve(func(context.Context, string, json.RawMessage) (any, *Error) { return "ok", nil })
+	reader := bufio.NewReader(peer)
+	const cancellations = 130
+	ids := make([]string, cancellations)
+	for i := range cancellations {
+		ctx, cancel := context.WithCancel(context.Background())
+		finished := make(chan error, 1)
+		id := fmt.Sprintf("late-%d", i)
+		go func() {
+			_, err := conn.CallWithID(ctx, id, "work", nil)
+			finished <- err
+		}()
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		var request struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		ids[i] = request.ID
+		cancel()
+		if err := <-finished; !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled call %d = %v", i, err)
+		}
+	}
+	for _, id := range ids {
+		if _, err := fmt.Fprintf(peer, "{\"jsonrpc\":\"2.0\",\"id\":%q,\"result\":null}\n", id); err != nil {
+			t.Fatalf("late reply %q: %v", id, err)
+		}
+	}
+	if _, err := fmt.Fprintln(peer, `{"jsonrpc":"2.0","id":"probe","method":"ping"}`); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("connection closed after late replies: %v", err)
+	}
+	var response struct {
+		ID     string `json:"id"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(line), &response); err != nil || response.ID != "probe" || response.Result != "ok" {
+		t.Fatalf("probe reply = %s, err=%v", line, err)
+	}
+}

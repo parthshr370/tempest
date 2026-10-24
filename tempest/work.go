@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 func (s *Session) checkOpen() error {
@@ -73,13 +74,16 @@ func (c *sessionCore) prepareTask(ctx context.Context, cfg StackConfig, spec wor
 	if cfg.Plan || mode == permission.ModePlan {
 		return work.TaskEnvironment{}, errors.New("plan mode cannot delegate tasks")
 	}
+	if !environment.IsLocal(cfg.Environment) && spec.SubagentType == "general" {
+		return work.TaskEnvironment{}, fmt.Errorf("%w: remote Git isolation", environment.ErrUnsupported)
+	}
 	var err error
 	cfg, err = c.presetConfig(cfg, spec)
 	if err != nil {
 		return work.TaskEnvironment{}, err
 	}
 	model, _ := childModel(cfg, spec)
-	return work.TaskEnvironment{Ceiling: permission.CaptureCeiling(mode, c.selectedToolNames(), c.permissionPolicy), Model: model.ID, Provider: model.Provider}, nil
+	return work.TaskEnvironment{Ceiling: permission.CaptureCeiling(mode, c.selectedToolNames(), c.permissionPolicy), Model: model.ID, Provider: model.Provider, Workspace: cfg.Environment.Reference()}, nil
 }
 func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.TaskLaunch) (result work.TaskResult, err error) {
 	if c.admitRun != nil {
@@ -96,6 +100,11 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	model, stream := childModel(cfg, launch.Spec)
 	if model.ID != launch.Environment.Model || model.Provider != launch.Environment.Provider {
 		return result, errors.New("recorded child model/provider is unavailable")
+	}
+	if launch.Environment.Workspace.ID != "" {
+		if err := environment.Match(launch.Environment.Workspace, cfg.Environment.Reference()); err != nil {
+			return result, err
+		}
 	}
 	childPath := filepath.Join(c.store.Path()+".d", "children", launch.Job.ChildSessionID, "session.jsonl")
 	if launch.JournalPath != childPath {
@@ -138,8 +147,10 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 		}
 		// Undo a batch the crash cut short before the child resumes or its
 		// worktree is exported as a patch.
-		for _, message := range recoverEditBatches(filepath.Dir(childPath), cfg.MutationQueue) {
-			c.logger.Warn("interrupted child edit batch", "job_id", launch.Job.ID, "diagnostic", message)
+		if environment.IsLocal(cfg.Environment) {
+			for _, message := range recoverEditBatches(filepath.Dir(childPath), cfg.MutationQueue) {
+				c.logger.Warn("interrupted child edit batch", "job_id", launch.Job.ID, "diagnostic", message)
+			}
 		}
 		for source, usage := range loaded.UsageSources {
 			if err = c.agent.ImportUsage(ctx, source, loaded.Model, usage); err != nil {
@@ -162,12 +173,17 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	defer cancel()
 	childCfg := cfg
 	childCfg.Cwd = launch.Job.Cwd
+	if environment.IsLocal(cfg.Environment) {
+		childCfg.Environment = nil
+		childCfg.EnvironmentReference = environment.Reference{}
+	}
 	childCfg.Model, childCfg.StreamFn = model, stream
 	if launch.Spec.SubagentType == "explore" && cfg.SmolReasoning != "" {
 		childCfg.Reasoning = cfg.SmolReasoning
 	}
 	childCfg.Plan = false
 	childCfg.Child = true
+	childCfg.AskUser = nil
 	childCfg.HookAgentType = launch.Spec.SubagentType
 	childCfg.EnableTask = false
 	childCfg.Controller, childCfg.Work = nil, nil
@@ -229,6 +245,10 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 		c.mu.Lock()
 		mode := c.mode
 		c.mu.Unlock()
+		callCtx, err = permission.InspectEnvironment(callCtx, cfg.Environment, call.ToolCall.Name, raw)
+		if err != nil {
+			return &agent.BeforeToolCallResult{Block: true, Reason: err.Error()}
+		}
 		outcome := permission.GateChild(callCtx, launch.Environment.Ceiling, mode, c.selectedToolNames(), c.permissionPolicy, call.ToolCall.Name, raw, permission.ChildScope{JobID: launch.Job.ID, SessionID: launch.Job.ChildSessionID, RunID: invocation.RunID, CallID: invocation.CallID, ToolCallID: call.ToolCall.ID, Cwd: launch.Job.Cwd})
 		permissionResult := &agent.PermissionOutcome{Allow: outcome.Allow, Reason: outcome.Reason, Source: string(outcome.Source), Prompted: outcome.Prompted, Wait: outcome.Wait}
 		if outcome.Prompted {
@@ -300,7 +320,7 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 func childToolNames(kind string, parent []string) []string {
 	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message", "checkpoint", "ast_grep", "gh"}
 	if kind == "general" {
-		builtin = append(builtin, "write", "edit", "hashline", "bash", "eval", "todo_write", "rewind", "ast_edit")
+		builtin = append(builtin, "write", "edit", "hashline", "bash", "eval", "debug", "todo_write", "rewind", "ast_edit")
 	}
 	selected := make([]string, 0, len(builtin))
 	for _, name := range builtin {

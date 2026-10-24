@@ -56,6 +56,8 @@ type CompactionSettings struct {
 	Enabled          bool
 	ReserveTokens    int
 	KeepRecentTokens int
+	// SoftThresholdTokens starts speculative work. Zero derives it from the reserve.
+	SoftThresholdTokens int
 }
 
 // DefaultCompactionSettings is the default compaction config: enabled, 16384 reserve tokens, 20000 keep-recent tokens.

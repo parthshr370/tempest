@@ -259,6 +259,12 @@ budget. `historyLen` still counts the full paged history. Frames are limited to
 a smaller page. After compaction, late-attach history shows the compacted view,
 not the full journal transcript.
 
+The active transcript is separate from the audit archive.
+`_tempest/durable/search_history` pages text hidden by reset, compaction or rewind.
+`_tempest/durable/fork`, `_tempest/durable/reset` and `_tempest/durable/compact`
+use the same SDK controls. See [conversation controls](conversations.md) for their
+parameters, document policies and context-epoch rules.
+
 The snapshot's `budget` and the `tempest/set_budget` result use the request shape
 `{maxTurns, maxCostUsd, maxWallSeconds}`. Builds before this one sent Go field names
 (`MaxTurns`, `MaxCostUSD`, and `MaxWallTime` in nanoseconds).

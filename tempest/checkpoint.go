@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.harness.dev/harness/internal/checkpoint"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 // Checkpoint identifies a retained workspace and conversation snapshot.
@@ -24,6 +25,14 @@ func (s *Session) Checkpoints() []Checkpoint { return s.core.checkpoints.List() 
 // CreateCheckpoint saves files and the current idle conversation.
 func (s *Session) CreateCheckpoint(ctx context.Context, goal string) (Checkpoint, error) {
 	c := s.core
+	c.admission.Lock()
+	defer c.admission.Unlock()
+	if !environment.IsLocal(c.environment) {
+		return Checkpoint{}, environment.ErrUnsupported
+	}
+	if err := environment.Require(c.environment, environment.Checkpoint); err != nil {
+		return Checkpoint{}, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -42,6 +51,14 @@ func (s *Session) CreateCheckpoint(ctx context.Context, goal string) (Checkpoint
 // The session must be idle and its jobs and children must have settled.
 func (s *Session) Rewind(ctx context.Context, o RewindOptions) error {
 	c := s.core
+	c.admission.Lock()
+	defer c.admission.Unlock()
+	if !environment.IsLocal(c.environment) {
+		return environment.ErrUnsupported
+	}
+	if err := environment.Require(c.environment, environment.Checkpoint); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {

@@ -26,13 +26,14 @@ type BuildSystemPromptOptions struct {
 	AppendSystemPrompt string
 	Cwd                string
 	// ProgressPath is the todo_write checkpoint, empty when the session has none.
-	ProgressPath string
-	ContextFiles []ContextFile
-	Skills       []skills.Skill
-	Rules        []PromptRule
-	GenericRules []string
-	Personality  string
-	Now          time.Time
+	ProgressPath      string
+	ContextFiles      []ContextFile
+	Skills            []skills.Skill
+	Rules             []PromptRule
+	GenericRules      []string
+	Personality       string
+	RemoteEnvironment bool
+	Now               time.Time
 }
 
 // BuildSystemPrompt renders the embedded system prompt template. Custom prompts
@@ -55,7 +56,7 @@ func BuildSystemPrompt(options BuildSystemPromptOptions) string {
 		ProductName:         defaultProductName(options.ProductName),
 		CustomPrompt:        options.CustomPrompt,
 		HasCustomPrompt:     options.CustomPrompt != "",
-		CapabilitiesSection: CapabilitiesSection(tools, options.ToolSnippets, options.ProgressPath),
+		CapabilitiesSection: CapabilitiesSection(tools, options.ToolSnippets, options.ProgressPath, options.RemoteEnvironment),
 		AppendSystemPrompt:  options.AppendSystemPrompt,
 		Cwd:                 filepath.ToSlash(options.Cwd),
 		Date:                now.Format("2006-01-02"),
@@ -116,7 +117,7 @@ func visiblePromptSkills(all []skills.Skill) []PromptSkill {
 // names preserves order; snippets supplies each tool's one-line purpose. A tool
 // without a snippet is skipped. progressPath is the todo_write checkpoint in
 // the session data directory, empty when the session has none.
-func CapabilitiesSection(names []string, snippets map[string]string, progressPath string) string {
+func CapabilitiesSection(names []string, snippets map[string]string, progressPath string, remoteEnvironment bool) string {
 	lines := make([]string, 0, len(names))
 	for _, name := range names {
 		if snippets == nil || snippets[name] == "" {
@@ -140,10 +141,13 @@ func CapabilitiesSection(names []string, snippets map[string]string, progressPat
 		runtime = append(runtime, `- Tool output is capped. When a result ends with "Full output: <path>", the complete output is saved at that path. Read it back with the read tool instead of re-running the command.`)
 	}
 	if has(names, "todo_write") && progressPath != "" {
-		runtime = append(runtime, "- Your live progress checkpoint is "+progressPath+" (session data, outside the workspace); todo_write rewrites it on every update. Read it with the read tool to recover the plan and current step after an interruption.")
+		runtime = append(runtime, "- Your live progress checkpoint is local://progress.md (session data, outside the workspace); todo_write rewrites it on every update. Read it with the read tool to recover the plan and current step after an interruption.")
 	}
-	if has(names, "read") && progressPath != "" {
-		runtime = append(runtime, "- read and grep take internal URLs: skill://<name>/<file> (skill files), job:// and job://<id>/<artifact> (background jobs, e.g. output.log), history://<id> (a child session's transcript) and local://<path>, a private scratch directory shared by this session tree. To hand a large payload to a child or parent, write it to local://<name> and pass that URL. bash expands skill:// and local:// words to paths.")
+	if has(names, "read") {
+		runtime = append(runtime, "- read and grep take internal URLs: skill://<name>/<file> (skill files), job:// and job://<id>/<artifact> (background jobs, e.g. output.log), history://<id> (a child session's transcript) and local://<path>, a private scratch directory shared by this session tree. To hand a large payload to a child or parent, write it to local://<name> and pass that URL.")
+		if has(names, "bash") && !remoteEnvironment {
+			runtime = append(runtime, "- In local sessions, bash expands skill:// and local:// words to paths.")
+		}
 	}
 	return block + "\n\n<runtime>\n" + strings.Join(runtime, "\n") + "\n</runtime>"
 }

@@ -73,6 +73,9 @@ func TestClassifyToolTiers(t *testing.T) {
 		tools.ASTEditTool:        TierWrite,
 		tools.GHTool:             TierRead,
 		tools.GHCheckoutTool:     TierExec,
+		tools.AskTool:            TierRead,
+		tools.DebugTool:          TierExec,
+		tools.SearchHistoryTool:  TierRead,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))

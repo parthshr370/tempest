@@ -85,7 +85,7 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("server timeouts must be positive")
 	}
 	if opts.SessionDir == "" {
-		cfg, err := (config.Config{}).Resolve()
+		cfg, err := (config.Config{SkipProject: true}).Resolve()
 		if err != nil {
 			return nil, err
 		}
@@ -97,7 +97,7 @@ func New(opts Options) (*Server, error) {
 		cancel()
 		return nil, err
 	}
-	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
+	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
 	if err != nil {
 		cancel()
 		return nil, err
@@ -127,6 +127,9 @@ func (s *Server) New(ctx context.Context, cwd string, n *tempest.NewSession) (*t
 		return nil, err
 	}
 	settings.MCPServers = servers
+	if settings.Environment.ID == "" {
+		settings.Environment = s.opts.DefaultNew.Environment
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -152,6 +155,34 @@ func (s *Server) New(ctx context.Context, cwd string, n *tempest.NewSession) (*t
 	defer closeCancel()
 	_ = s.host.CloseSession(closeCtx, session.ID())
 	return nil, tempest.ErrClosed
+}
+
+// Fork publishes a pinned sibling in the same registry as ordinary sessions.
+func (s *Server) Fork(ctx context.Context, parentID, entryID string, options tempest.ForkOptions) (*tempest.Session, error) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, tempest.ErrClosed
+	}
+	s.openers.Add(1)
+	s.mu.Unlock()
+	defer s.openers.Done()
+	ctx, cancel := s.openContext(ctx)
+	defer cancel()
+	child, err := s.host.Fork(ctx, parentID, entryID, options)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	closed := s.closed
+	if !closed {
+		s.sessions[child.ID()] = &entry{session: child, lastActive: time.Now()}
+	}
+	s.mu.Unlock()
+	if closed {
+		return nil, errors.Join(tempest.ErrClosed, s.host.CloseSession(context.Background(), child.ID()))
+	}
+	return child, nil
 }
 
 // Defaults returns the defaults used when session/new omits Tempest overrides.

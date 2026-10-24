@@ -131,7 +131,7 @@ func (in RunInput) settings(host tempest.NewSession, providers map[string]adapte
 	if strings.TrimSpace(in.Prompt) == "" {
 		return host, fmt.Errorf("prompt must not be blank")
 	}
-	if in.Cwd != "" {
+	if in.Cwd != "" && host.Environment.ID == "" {
 		info, err := os.Stat(in.Cwd)
 		if !filepath.IsAbs(in.Cwd) || err != nil || !info.IsDir() {
 			return host, fmt.Errorf("cwd must be an absolute existing directory")

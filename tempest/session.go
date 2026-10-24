@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,10 +26,12 @@ import (
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/environment"
 )
 
 // Run is an admitted run. Wait may be called more than once.
@@ -145,8 +146,11 @@ type sessionCore struct {
 	taskWorkers      sync.WaitGroup
 	stackClose       func() error
 	// irc is the session tree's message bus; nil without task children.
-	irc         *irc.Bus
-	checkpoints *checkpoint.Manager
+	irc            *irc.Bus
+	checkpoints    *checkpoint.Manager
+	compaction     *session.CompactionController
+	contextChanged func([]types.Message)
+	environment    environment.Lease
 }
 
 func open(ctx context.Context, o Options) (_ *Session, err error) {
@@ -154,17 +158,6 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		return nil, errors.New("exactly one of New or Resume is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	cwd := o.Cwd
-	if cwd == "" {
-		cwd, err = os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-	}
-	cwd, err = filepath.Abs(cwd)
-	if err != nil {
 		return nil, err
 	}
 	var selectedMCP []MCPServerConfig
@@ -177,12 +170,13 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if o.Stack != nil {
 		cfg = *o.Stack
 	}
+	cwd := o.Cwd
 	cfg.Cwd = cwd
 	needsDiscovery := cfg.ContextFiles == nil && cfg.Skills == nil && cfg.GenericRules == nil && cfg.Rules == nil
 	dir := o.SessionDir
 	var defaults *config.ResolvedConfig
 	if dir == "" || o.Stack == nil || needsDiscovery || selectedMCP == nil {
-		defaults, err = (config.Config{WorkingDir: cwd, Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
+		defaults, err = (config.Config{SkipProject: true, Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
 		if err != nil {
 			return nil, err
 		}
@@ -193,6 +187,15 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			cfg = session.StackConfigFromConfig(defaults)
 			cfg.Cwd = cwd
 		}
+	}
+	if o.Environment.ID == "" && o.New != nil {
+		o.Environment = o.New.Environment
+	}
+	if o.Environment.ID == "" {
+		o.Environment = cfg.EnvironmentReference
+	}
+	if o.EnvironmentResolver == nil {
+		o.EnvironmentResolver = cfg.EnvironmentResolver
 	}
 	if selectedMCP == nil && defaults != nil {
 		selectedMCP = defaults.MCPServers()
@@ -213,7 +216,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			if o.Resume.SessionID == "" {
 				return nil, errors.New("resume needs SessionID or Path")
 			}
-			path, err = journal.Resolve(ctx, dir, cwd, o.Resume.SessionID)
+			path, err = resolveSessionPath(ctx, dir, o.Resume.SessionID)
 			if err != nil {
 				return nil, err
 			}
@@ -236,6 +239,51 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cfg.InitialMessages = loaded.Messages
 	}
 	if store != nil {
+		if err = restoreEnvironmentReference(ctx, &o, loaded != nil && environment.IsLocation(loaded.Header.Cwd), store); err != nil {
+			return nil, err
+		}
+	}
+	if loaded != nil && !environment.IsLocation(loaded.Header.Cwd) {
+		if o.Environment.ID != "" && !strings.HasPrefix(o.Environment.ID, "local:") || !environment.IsLocal(cfg.Environment) {
+			return nil, fmt.Errorf("%w: a local journal cannot resume in a remote workspace", environment.ErrIdentity)
+		}
+	}
+	lease, err := resolveEnvironment(ctx, o, &cfg, cwd)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, lease.Close())
+		}
+	}()
+	localEnvironment := environment.IsLocal(lease)
+	if !localEnvironment {
+		cwd = EnvironmentLocation(lease.Reference())
+		cfg.Cwd = lease.Reference().Cwd
+		needsDiscovery = false
+		cfg.ContextFiles, cfg.Skills, cfg.Rules, cfg.GenericRules = nil, nil, nil, nil
+	}
+	if loaded != nil && lease.Capabilities().Has(environment.Lookup) {
+		loaded, err = recoverEnvironmentResults(ctx, lease, store, loaded)
+		if err != nil {
+			return nil, err
+		}
+		cfg.InitialMessages = loaded.Messages
+	}
+	if defaults != nil && localEnvironment {
+		defaults, err = (config.Config{WorkingDir: cwd, Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
+		if err != nil {
+			return nil, err
+		}
+		if o.Stack == nil {
+			currentEnvironment := cfg.Environment
+			cfg = session.StackConfigFromConfig(defaults)
+			cfg.Environment, cfg.Cwd = currentEnvironment, cwd
+		}
+	}
+	if store != nil {
+		cfg.InitialMessages = loaded.Messages
 		if err = restoreAgent(ctx, &o, &cfg, store, &selectedMCP); err != nil {
 			return nil, err
 		}
@@ -243,6 +291,15 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if o.Hooks != nil {
 		cfg.Hooks = o.Hooks.Clone()
 		cfg.HooksResolved = false
+	}
+	if !localEnvironment {
+		if !cfg.Hooks.NoHooks && len(cfg.Hooks.Hooks) != 0 {
+			return nil, errors.New("command hooks are unavailable in a remote environment")
+		}
+		cfg.HooksResolved = true
+	}
+	if !localEnvironment && len(selectedMCP) != 0 {
+		return nil, fmt.Errorf("%w: host MCP servers need a local workspace", environment.ErrUnsupported)
 	}
 	if !cfg.HooksResolved {
 		var skipped []string
@@ -369,6 +426,16 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			}
 		}()
 	}
+	if o.forkSeed != nil {
+		if err = store.InitializeFork(ctx, o.forkSeed); err != nil {
+			return nil, err
+		}
+		loaded, err = store.Load(ctx)
+		if err != nil {
+			return nil, err
+		}
+		cfg.InitialMessages = loaded.Messages
+	}
 	// Explicit model metadata can differ from the plan stack's runtime model.
 	metadataModel := modelSpec
 	if metadataModel == "" {
@@ -380,6 +447,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 	}
 	c := &sessionCore{id: store.ID(), store: store, model: runtimeModel, budget: budget, mode: mode, prompter: o.Prompter, pending: make(map[string]*approval), logger: logger}
+	c.environment = lease
 	c.authorize, c.clientNamespace = o.Authorize, o.ClientNamespace
 	c.providerConfig, c.customStream = providerConfig, customStream
 	c.admitRun = o.admitRun
@@ -405,9 +473,11 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	// A process that died mid-batch may have left a multi-file edit half
 	// applied, in this session or another of the same workspace (a new
 	// session after a crash): restore it before any tool runs.
-	for _, message := range recoverEditBatches(filepath.Dir(store.Path()), cfg.MutationQueue) {
-		seed.Diagnostics = append(seed.Diagnostics, message)
-		logger.Warn("interrupted edit batch", "diagnostic", message)
+	if localEnvironment {
+		for _, message := range recoverEditBatches(filepath.Dir(store.Path()), cfg.MutationQueue) {
+			seed.Diagnostics = append(seed.Diagnostics, message)
+			logger.Warn("interrupted edit batch", "diagnostic", message)
+		}
 	}
 	c.hub = hub.New(seed, mapper.mapEvent)
 	store.ObserveCommit(func() { s.publishDurable(context.Background()) })
@@ -447,6 +517,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			onMessagesChanged(messages)
 		}
 	}
+	c.contextChanged = cfg.OnMessagesChanged
 	cfg.PermissionMode = mode
 	cfg.PermissionModeFunc = func() permission.Mode { c.mu.Lock(); defer c.mu.Unlock(); return c.mode }
 	// Copy caller-owned overrides: always choices belong only to this session.
@@ -466,6 +537,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if o.Prompter != nil {
 		cfg.PermissionPolicy.Prompter = gatePrompter{s}
 	}
+	if o.Questioner != nil {
+		cfg.AskUser = o.Questioner
+	}
 	c.baseMCPDefaults = make(map[string]permission.Decision, len(cfg.PermissionPolicy.MCPDefaults))
 	for name, decision := range cfg.PermissionPolicy.MCPDefaults {
 		c.baseMCPDefaults[name] = decision
@@ -474,7 +548,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	c.permissionPolicy = &cfg.PermissionPolicy
 	// MCP spills sit with the session's other tool output, where read can open them.
 	cfg.AdmitProcess = o.admitProcess
-	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(tools.ToolOutputDir(store.Path()+".d"), "mcp"), selectedMCP, logger, o.admitProcess)
+	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), selectedMCP, logger, o.admitProcess)
 	if err != nil {
 		return nil, err
 	}
@@ -566,6 +640,18 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	c.agent = stack.Agent
 	c.checkpoints = stack.Checkpoints
+	c.compaction = stack.Compaction
+	if c.compaction != nil {
+		c.compaction.BindTasks(c.jobs.Tasks, func(source, model string, usage types.Usage) {
+			// The native phase already persisted this receipt.
+			if err := c.hub.Listener()(context.Background(), agent.AgentEvent{Type: agent.EventUsage, Model: model, UsageSource: source, RunResult: agent.RunResult{Usage: usage}}); err != nil {
+				c.logger.Error("publishing compaction usage", "error", err)
+			}
+		})
+		if err = c.compaction.Recover(ctx); err != nil {
+			return nil, err
+		}
+	}
 	c.stackClose = func() error {
 		var extensionErr error
 		if extensionClose != nil {
@@ -675,6 +761,9 @@ func (s *Session) start(ctx context.Context, p *Prompt, requestID string, releas
 			release()
 		}
 	}()
+	if err := s.applyIdleContext(ctx); err != nil {
+		return nil, err
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -742,12 +831,20 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, schema *outputschem
 		}
 		c.mu.Unlock()
 		s.finishSubmission(r)
+		c.admission.Lock()
 		c.mu.Lock()
 		r.readyOnce.Do(func() { close(r.ready) })
 		c.active = nil
 		delete(c.submissionRuns, r.requestID)
 		closed := c.closed
 		c.mu.Unlock()
+		if !closed {
+			if err := s.applyIdleContext(context.Background()); err != nil {
+				r.err = errors.Join(r.err, err)
+				c.logger.Error("placing pending context change", "error", err)
+			}
+		}
+		c.admission.Unlock()
 		if closed {
 			c.finishClose()
 		}
@@ -839,6 +936,9 @@ func (s *Session) setPermissionMode(m PermissionMode) error {
 	if c.closed {
 		return ErrClosed
 	}
+	if err := c.persistPermissionMode(parsed); err != nil {
+		return err
+	}
 	c.mode = parsed
 	c.hub.Configure(c.budget, string(parsed))
 	return nil
@@ -857,6 +957,9 @@ func (s *Session) close(ctx context.Context) error {
 	c.mu.Unlock()
 	if c.jobs != nil && c.jobs.Tasks != nil {
 		if err := c.jobs.Tasks.Suspend(ctx); err != nil {
+			if !environment.IsLocal(c.environment) {
+				_ = c.environment.Close()
+			}
 			return err
 		}
 	}
@@ -864,6 +967,9 @@ func (s *Session) close(ctx context.Context) error {
 		select {
 		case <-r.done:
 		case <-ctx.Done():
+			if !environment.IsLocal(c.environment) {
+				_ = c.environment.Close()
+			}
 			return ctx.Err()
 		}
 	}
@@ -896,6 +1002,9 @@ func (c *sessionCore) finishClose() {
 			c.closeErr = errors.Join(c.closeErr, c.lsp.Close(closeCtx))
 		}
 		c.closeErr = errors.Join(c.closeErr, c.mcp.Close(closeCtx), c.store.Close())
+		if c.environment != nil {
+			c.closeErr = errors.Join(c.closeErr, c.environment.Close())
+		}
 	})
 }
 
@@ -907,6 +1016,12 @@ func (c *sessionCore) openLSP(cfg *StackConfig, override *LSPConfig, cwd string,
 	selected := cfg.LSP
 	if override != nil {
 		selected = override
+	}
+	if !environment.IsLocal(cfg.Environment) {
+		if cfg.LSPManager != nil || selected != nil && selected.Enabled {
+			return fmt.Errorf("%w: lsp", environment.ErrUnsupported)
+		}
+		return nil
 	}
 	if cfg.LSPManager != nil || selected == nil || !selected.Enabled {
 		return nil

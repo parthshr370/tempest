@@ -261,6 +261,134 @@ use text because those subcommands have no JSON mode.
 Search uses [`gh api --method GET`](https://cli.github.com/manual/gh_api), preserving
 multi-word queries as one field.
 
+## Asking the user
+
+`ask` collects non-sensitive choices and optional free text. It is read-tier and
+available in plan mode. Every question has a unique `id`, `question` text and an
+`options` array. Each option has a `label` and an optional `description`.
+Set `multi:true` for multiple selections. Set `allow_text:true` to accept a written
+answer, including questions with an empty options array.
+
+```json
+{"questions":[{"id":"storage","question":"Which storage should I use?","options":[{"label":"SQLite","description":"One local database file."},{"label":"PostgreSQL","description":"A shared database server."}],"allow_text":true}]}
+```
+
+The result preserves question ids, selected labels and written text. Interactive
+CLI runs prompt only when both stdin and stderr are terminals; prompts go to stderr.
+Enter an option number, comma-separated numbers for multiple selections, or
+`text:your answer`. With no offered options, type the answer directly.
+Enter `cancel` to decline. Redirected/headless runs return a clear error asking the
+model to proceed with its best judgment. A missing UI never stops the session.
+
+ACP uses the standard [`elicitation/create` form method](https://agentclientprotocol.com/protocol/v1/elicitation.md),
+not a permission dialog or a custom extension. The client must explicitly advertise
+`clientCapabilities.elicitation.form:{}`. Requests include `sessionId` and
+`toolCallId` and go only to a connection authorized for that session. MCP uses
+`elicitation/create` when the caller negotiated form support. Both transports
+validate the submitted labels and cardinality. Never use `ask` to collect passwords,
+tokens or other secrets.
+The older MCP 2025-06-18 revision uses one boolean field per choice for multi-select
+questions, since that revision's form schema has no array enums.
+
+SDK callers supply `Options.Questioner` or `HostOptions.Questioner`. It receives a
+`QuestionRequest` and returns `[]QuestionAnswer`. The callback must stop when its
+context is cancelled. Children do not register `ask`: they report questions through
+their parent instead. There is no implicit human-prompt relay from a child.
+
+The existing durable tool boundary records intent before the prompt and journals
+the answer as its tool result. An interrupted question settles as outcome unknown.
+Resume does not ask it again automatically. This avoids repeating a question whose
+answer might have reached the process just before it died. Only an explicit new
+request should ask the user again.
+
+## Debugging programs
+
+`debug` is a session-owned [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/specification)
+client. All actions are exec-tier, including inspection and evaluation. Plan mode
+denies it. General children may inherit it within their parent's tool ceiling, with
+their own adapter and process permit. Remote environments do not use a host-local
+adapter.
+
+Start with `action:"launch"` and `program`, or `action:"attach"` and `pid`.
+`adapter` selects a trusted adapter definition. The default selection is `debugpy`
+for `.py` and `dlv` otherwise. `arguments` passes adapter-specific launch or attach
+fields. `cwd`, `program` and breakpoint `file` paths all resolve against the session
+workspace. Requests default to 30 seconds; `timeout` accepts 1 through 300 seconds.
+Launch and attach always require per-call approval, even in bypass mode; approval
+is never remembered. Evaluation uses the same destructive, cloud and hook-settings
+checks as `eval`.
+
+Actions:
+
+- `set_breakpoint` and `remove_breakpoint`: `file` and a positive `line`.
+- `set_breakpoints`: `file` and `lines`. An empty array clears that file's points.
+- `continue`, `step_over`, `step_in`, `step_out`, `pause`: `thread_id`, or the last
+  stopped thread. Execution waits for a stopped or terminated event; if that wait
+  reaches the timeout after the adapter acknowledged the command, it returns
+  `{"state":"running"}` and retains the session so you can pause it.
+- `threads`, `stack_trace`: list threads or inspect one thread.
+- `scopes`: a `frame_id` from the stack.
+- `variables`: a `variable_ref` from a scope or variable.
+- `evaluate`: `expression` and optional `frame_id`. Evaluation can run target code.
+- `output`: the adapter and target's captured output.
+- `terminate`: disconnect, terminate a launched target (detach an attached target),
+  then join the adapter.
+
+The adapter initializes before launch or attach. Tempest handles adapters that delay
+the launch response until `configurationDone`. Default Go and Python launches stop
+on entry, so you can set breakpoints before continuing. Stack, scope and variable
+results retain DAP field names.
+
+Settings in `~/.config/harness/settings.json` configure trusted executables:
+
+```json
+{
+  "debug_adapters": {
+    "debugpy": {
+      "command": "/path/to/venv/bin/debugpy-adapter",
+      "launch": {"stopOnEntry": true, "justMyCode": false}
+    }
+  }
+}
+```
+
+Built-in definitions use `dlv dap --client-addr={address}` with
+`transport:"reverse_tcp"` and `debugpy-adapter` over stdio. Delve connects to an
+already-open loopback listener, without a port reservation race. Other trusted
+definitions may use stdio or reverse TCP with the `{address}` argument placeholder.
+Overrides retain omitted built-in settings. Launch and attach argument objects
+merge by key. Use `stopOnEntry:false` to run through startup, or `args:[]` to clear
+a built-in argument list.
+
+`vscode-js-debug` (`pwa-node`) isn't supported: it uses the DAP `startDebugging`
+reverse request to create child sessions, while Tempest owns one adapter session.
+Other adapters must work without reverse requests or an external terminal.
+For Python installations without the entry point, configure the venv's Python
+executable with `args:["-m","debugpy.adapter"]`. Tempest does not install adapters.
+`tempest doctor` reports configured commands and their availability.
+SDK callers set `StackConfig.DebugAdapters` with
+`map[string]tempest.DebugAdapterConfig`. Adapter configuration is runtime-only,
+not a command restored from the journal.
+
+On macOS, Delve target launch or attach may require Developer Tools authorization,
+an appropriately signed debugger, or operator setup. Tempest does not change
+`DevToolsSecurity`, signing or sudo settings. The real Delve test checks the DAP
+initialize/disconnect exchange. The optional debugpy test exercises a real target,
+breakpoint, stack, scopes, variables, evaluation, continuation and termination.
+Set `TEMPEST_TEST_DEBUGPY_ADAPTER` to a venv's `debugpy-adapter` to run that optional
+test without adding the venv to `PATH`.
+
+The stack owns the adapter and launched target process groups. It holds its host
+process permit until both are gone. Close and unanswered adapter requests send a
+short bounded disconnect before killing owned groups; attached targets are
+detached with `terminateDebuggee:false` and are never killed by Tempest.
+Output previews are bounded to 32 KiB or 500 lines. Larger output spills beneath
+`<journal>.d/tool-output/`; retained adapter output has a 64 MiB disk cap.
+
+An interrupted debug call settles as outcome unknown and is never replayed.
+Debug adapters are not restored on resume. Subsequent inspection reports that the
+debug session is gone and requires an explicit new launch or attach.
+
 ## Tool reference
 
 ### Files and search
@@ -281,6 +409,7 @@ multi-word queries as one field.
 
 - `bash`: workspace shell with a destructive-command guard and a default ten-minute timeout. `skill://` and `local://` words expand to paths. `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds. `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal. See [Subagents and jobs](subagents.md).
 - `eval`: persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset. Requires `python3`, or `node`/`bun` for JS, only when called. See [Eval](eval.md).
+- `debug`: launch or attach a session-owned debugger, control execution and inspect state. Requires an installed adapter. Plan mode denies all actions.
 - `jobs`: page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
 - `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
 - `cancel`: cancel one task or background bash job, by id or name.
@@ -292,6 +421,7 @@ multi-word queries as one field.
 - `task`: admit asynchronous children and return job handles *(behind `-enable-task`)*.
 - `integrate`: three-way merge a finished general task's patch into the live workspace. Per file the result is clean, merged or conflict (with markers). It writes only when nothing conflicts and the live files still match the snapshot, and merged files only with `accept_merged:true` *(behind `-enable-task`; plan mode blocks it)*.
 - `message`: message the parent, a running child, or all peers, optionally awaiting the first reply *(behind `-enable-task`; children get it too)*.
+- `ask`: collect structured choices and optional free text through terminal, ACP or MCP elicitation. Headless errors instruct the model to use its best judgment.
 - `todo_write`: the task list, replaced in full (`todos`) or edited by one op naming todos by content (`init`, `append`, `start`, `done`, `block` with a reason, `drop`), with optional phases. Checkpointed to `progress.md` in the session's data directory (`<journal>.d/`), never in your workspace. The result shows the updated list.
 - `checkpoint`: save workspace bytes, modes and the conversation before an investigation. Returns a retained checkpoint id.
 - `rewind`: restore checkpoint files and fork the conversation, retaining findings. Defaults to the newest explicit checkpoint. Outside edits need operator force, capture gaps cannot be bypassed, and running jobs must settle first.

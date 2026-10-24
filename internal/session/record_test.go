@@ -513,8 +513,27 @@ func TestAttachJournalRecordsAFullRunInOrder(t *testing.T) {
 		t.Fatal(violations)
 	}
 	var kinds []string
-	for _, line := range readRawLines(t, path) {
-		kinds = append(kinds, line.Type)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range bytes.Split(contents, []byte{'\n'})[1:] {
+		if len(raw) == 0 {
+			continue
+		}
+		envelope, err := durable.DecodeEnvelope(path, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, change := range envelope.Commit.Changes {
+			if change.Kind == durable.EntryKind && change.Namespace == "_tempest/journal" {
+				var line rawLine
+				if err := json.Unmarshal(change.Value, &line); err != nil {
+					t.Fatal(err)
+				}
+				kinds = append(kinds, line.Type)
+			}
+		}
 	}
 	want := []string{
 		"run_started", "message", "message", "usage",

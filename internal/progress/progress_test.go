@@ -2,6 +2,7 @@ package progress
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +131,28 @@ func TestApplyOp(t *testing.T) {
 	} {
 		if _, err := ApplyOp(tc.todos, tc.op); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("ApplyOp(%+v) error = %v, want %q", tc.op, err, tc.want)
+		}
+	}
+}
+func TestMigrateMovesProgressIntoLocalDirectory(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{FileName: "# old checkpoint\n", stateFileName: "[]"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := Migrate(dir); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{FileName: "# old checkpoint\n", stateFileName: "[]"} {
+		oldPath := filepath.Join(dir, name)
+		newPath := filepath.Join(dir, "local", name)
+		got, err := os.ReadFile(newPath)
+		if err != nil || string(got) != want {
+			t.Fatalf("migrated %s = %q, %v", name, got, err)
+		}
+		if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("old %s remains after migration: %v", name, err)
 		}
 	}
 }

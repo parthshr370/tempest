@@ -151,13 +151,14 @@ type RebuildSystemPromptOptions struct {
 	AppendSystemPrompt string
 	Cwd                string
 	// ProgressPath is the todo_write checkpoint, empty when the session has none.
-	ProgressPath string
-	ContextFiles []prompt.ContextFile
-	Skills       []skills.Skill
-	Rules        []prompt.PromptRule
-	GenericRules []string
-	Personality  string
-	ActiveTools  []agent.AgentTool
+	ProgressPath      string
+	ContextFiles      []prompt.ContextFile
+	Skills            []skills.Skill
+	Rules             []prompt.PromptRule
+	GenericRules      []string
+	Personality       string
+	RemoteEnvironment bool
+	ActiveTools       []agent.AgentTool
 }
 
 // RebuildSystemPrompt assembles the full system prompt from the given options,
@@ -178,6 +179,7 @@ func RebuildSystemPrompt(opts RebuildSystemPromptOptions) string {
 		AppendSystemPrompt: opts.AppendSystemPrompt,
 		Cwd:                opts.Cwd,
 		ProgressPath:       opts.ProgressPath,
+		RemoteEnvironment:  opts.RemoteEnvironment,
 		ContextFiles:       opts.ContextFiles,
 		Skills:             opts.Skills,
 		Rules:              opts.Rules,
@@ -190,6 +192,6 @@ func RebuildSystemPrompt(opts RebuildSystemPromptOptions) string {
 // base, so a child agent's prompt names the exact tools it holds. It reuses the
 // same formatter and snippets as the orchestrator prompt, keeping every agent's
 // capability list derived from the real tool registry rather than prose.
-func AppendCapabilities(base string, active []agent.AgentTool) string {
-	return base + prompt.CapabilitiesSection(ToolNames(active), BuildToolSnippets(active), "")
+func AppendCapabilities(base string, active []agent.AgentTool, remoteEnvironment bool) string {
+	return base + prompt.CapabilitiesSection(ToolNames(active), BuildToolSnippets(active), "", remoteEnvironment)
 }

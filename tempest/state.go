@@ -9,6 +9,7 @@ import (
 
 	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/tempest/durable"
+	"go.harness.dev/harness/tempest/environment"
 	"go.harness.dev/harness/tempest/extension"
 )
 
@@ -222,21 +223,25 @@ func (s *Session) publishDurable(ctx context.Context) {
 }
 
 type agentSelection struct {
-	Model        string                `json:"model"`
-	Reasoning    string                `json:"reasoning,omitempty"`
-	Extensions   []extension.Selection `json:"extensions,omitempty"`
-	AllowedTools []string              `json:"allowedTools"`
-	ExcludeTools []string              `json:"excludeTools,omitempty"`
-	Instructions []string              `json:"instructions,omitempty"`
-	CustomPrompt string                `json:"customPrompt,omitempty"`
-	Environment  string                `json:"environment"`
-	HostManaged  bool                  `json:"hostManaged,omitempty"`
-	MCPNames     []string              `json:"mcpNames,omitempty"`
+	Model          string                `json:"model"`
+	Reasoning      string                `json:"reasoning,omitempty"`
+	Extensions     []extension.Selection `json:"extensions,omitempty"`
+	AllowedTools   []string              `json:"allowedTools"`
+	ExcludeTools   []string              `json:"excludeTools,omitempty"`
+	Instructions   []string              `json:"instructions,omitempty"`
+	CustomPrompt   string                `json:"customPrompt,omitempty"`
+	Environment    environment.Reference `json:"environment"`
+	HostManaged    bool                  `json:"hostManaged,omitempty"`
+	MCPNames       []string              `json:"mcpNames,omitempty"`
+	Plan           bool                  `json:"plan,omitempty"`
+	PermissionMode PermissionMode        `json:"permissionMode,omitempty"`
 }
 
 func (s *Session) persistAgent(ctx context.Context, o Options, cfg StackConfig, model string, endpoints []MCPServerConfig) error {
-	choice := agentSelection{Model: model, Reasoning: cfg.Reasoning, Extensions: effectiveExtensions(o), AllowedTools: cfg.AllowedTools, ExcludeTools: cfg.ExcludeTools, Instructions: cfg.PromptAdditions, CustomPrompt: cfg.CustomPrompt, Environment: "local"}
+	choice := agentSelection{Model: model, Reasoning: cfg.Reasoning, Extensions: effectiveExtensions(o), AllowedTools: cfg.AllowedTools, ExcludeTools: cfg.ExcludeTools, Instructions: cfg.PromptAdditions, CustomPrompt: cfg.CustomPrompt, Environment: s.Environment()}
 	choice.HostManaged = o.hostCreate
+	choice.Plan = cfg.Plan
+	choice.PermissionMode = PermissionMode(cfg.PermissionMode)
 	for _, endpoint := range endpoints {
 		choice.MCPNames = append(choice.MCPNames, endpoint.Name)
 	}
@@ -273,12 +278,16 @@ func restoreAgent(ctx context.Context, o *Options, cfg *StackConfig, loadedStore
 	if len(page.Records) == 0 {
 		return nil
 	}
-	var choice agentSelection
-	if err = json.Unmarshal(page.Records[0].Value, &choice); err != nil {
+	choice, err := decodeAgentSelection(page.Records[0].Value)
+	if err != nil {
 		return fmt.Errorf("agent selection: %w", err)
 	}
-	if choice.Environment != "local" {
-		return fmt.Errorf("required environment %q unavailable", choice.Environment)
+	if err := environment.Match(choice.Environment, cfg.Environment.Reference()); err != nil {
+		return err
+	}
+	cfg.Plan = cfg.Plan || choice.Plan
+	if o.Resume != nil && o.Resume.PermissionMode == "" {
+		o.Resume.PermissionMode = choice.PermissionMode
 	}
 	if cfg.Reasoning == "" {
 		cfg.Reasoning = choice.Reasoning
@@ -346,4 +355,49 @@ func restoreAgent(ctx context.Context, o *Options, cfg *StackConfig, loadedStore
 		*endpoints = selected
 	}
 	return nil
+}
+
+func decodeAgentSelection(raw json.RawMessage) (agentSelection, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return agentSelection{}, err
+	}
+	// Earlier agent documents had only the literal local adapter name.
+	if string(fields["environment"]) == `"local"` {
+		delete(fields, "environment")
+		var err error
+		raw, err = json.Marshal(fields)
+		if err != nil {
+			return agentSelection{}, err
+		}
+	}
+	var choice agentSelection
+	err := json.Unmarshal(raw, &choice)
+	return choice, err
+}
+
+func (c *sessionCore) persistPermissionMode(mode PermissionMode) error {
+	ctx := context.Background()
+	page, err := c.store.Read(ctx, durable.Query{Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Limit: 1})
+	if err != nil {
+		return err
+	}
+	if len(page.Records) != 1 {
+		return fmt.Errorf("agent selection unavailable")
+	}
+	choice, err := decodeAgentSelection(page.Records[0].Value)
+	if err != nil {
+		return err
+	}
+	if choice.PermissionMode == mode {
+		return nil
+	}
+	choice.PermissionMode = mode
+	raw, err := json.Marshal(choice)
+	if err != nil {
+		return err
+	}
+	revision := page.Records[0].Revision
+	_, err = c.store.Commit(ctx, durable.Commit{ID: fmt.Sprintf("agent-mode:%d", revision+1), Expected: []durable.RevisionCheck{{SessionID: c.id, Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Revision: revision}}, Changes: []durable.Change{{SessionID: c.id, Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Version: 1, Value: raw}}})
+	return err
 }

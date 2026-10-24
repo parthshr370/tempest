@@ -135,6 +135,7 @@ type CompactionEntry struct {
 	SourceHash   string
 	CompactionID string
 	Snapshot     *work.Artifact
+	TaskID       string
 }
 
 func (CompactionEntry) kind() EntryType            { return KindCompaction }
@@ -182,12 +183,14 @@ func (e ToolStartedRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 // ToolFinishedRecord marks a tool call as returned. The result text lives in
 // the tool-result message entry, not here.
 type ToolFinishedRecord struct {
-	Meta       `json:"-"`
-	ToolCallID string `json:"tool_call_id"`
-	OK         bool   `json:"ok"`
-	Error      string `json:"error,omitempty"`
-	DurationMS int64  `json:"duration_ms"`
-	CallID     string `json:"call_id,omitempty"`
+	Meta        `json:"-"`
+	ToolCallID  string `json:"tool_call_id"`
+	OK          bool   `json:"ok"`
+	Error       string `json:"error,omitempty"`
+	DurationMS  int64  `json:"duration_ms"`
+	CallID      string `json:"call_id,omitempty"`
+	Control     string `json:"control,omitempty"`
+	ControlNote string `json:"control_note,omitempty"`
 }
 
 func (ToolFinishedRecord) kind() EntryType            { return KindToolFinished }
@@ -265,6 +268,7 @@ type wireEntry struct {
 	SourceHash      string          `json:"source_hash,omitempty"`
 	CompactionID    string          `json:"compaction_id,omitempty"`
 	Snapshot        *work.Artifact  `json:"snapshot,omitempty"`
+	CompactionTask  string          `json:"compaction_task,omitempty"`
 }
 
 // unknownEntryError lets [Load] retain a forward-compatible journal tail as a
@@ -311,12 +315,20 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 	case CompactionEntry:
 		wire.Summary, wire.FirstKeptID, wire.TokensBefore = e.Summary, e.FirstKeptID, e.TokensBefore
 		wire.SourceHash, wire.CompactionID, wire.Snapshot = e.SourceHash, e.CompactionID, e.Snapshot
+		wire.CompactionTask = e.TaskID
+	case ContextHeadEntry:
+		payload, err := json.Marshal(e)
+		if err != nil {
+			return nil, err
+		}
+		wire.Payload = payload
 	case RewindEntry:
 		payload, err := json.Marshal(struct {
 			Checkpoint string            `json:"checkpoint"`
 			Report     string            `json:"report,omitempty"`
 			Messages   []json.RawMessage `json:"messages"`
-		}{e.Checkpoint, e.Report, e.Messages})
+			Documents  []durable.Change  `json:"documents,omitempty"`
+		}{e.Checkpoint, e.Report, e.Messages, e.Documents})
 		if err != nil {
 			return nil, err
 		}
@@ -369,6 +381,16 @@ func decodeEntry(raw []byte) (Entry, error) {
 		return nil, fmt.Errorf("decode journal entry: missing id")
 	}
 	switch wire.Type {
+	case KindContextHead:
+		var e ContextHeadEntry
+		if err := json.Unmarshal(wire.Payload, &e); err != nil {
+			return nil, err
+		}
+		if wire.ID == "" || (e.Reason != "reset" && e.Reason != "handoff" && e.Reason != "fork") || (e.Reason == "fork") != (e.Prefix != nil) {
+			return nil, fmt.Errorf("invalid context head")
+		}
+		e.Meta = meta
+		return e, nil
 	case KindRewind:
 		var e RewindEntry
 		if err := json.Unmarshal(wire.Payload, &e); err != nil {
@@ -399,6 +421,7 @@ func decodeEntry(raw []byte) (Entry, error) {
 			SourceHash:   wire.SourceHash,
 			CompactionID: wire.CompactionID,
 			Snapshot:     wire.Snapshot,
+			TaskID:       wire.CompactionTask,
 		}, nil
 	default:
 		return nil, unknownEntryError{typeName: wire.Type, id: wire.ID, seq: wire.Seq}
