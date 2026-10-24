@@ -12,6 +12,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/cloudcmd"
 	types "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/jobs"
 	"go.harness.dev/harness/internal/lsp"
@@ -44,6 +45,8 @@ type Options struct {
 	// CloudRules replaces the host's exact kube-context rules; nil keeps the
 	// host default and a non-nil empty slice selects no scoped rules.
 	CloudRules []CloudRule
+	// Hooks replaces operator hook settings. Project commands still require explicit trust.
+	Hooks *HookSettings
 }
 
 // NewSession configures a new conversation.
@@ -82,6 +85,15 @@ type CloudRule = cloudcmd.Rule
 
 // StackConfig supplies an already resolved agent-stack recipe.
 type StackConfig = session.StackConfig
+
+// HookSettings configures command hooks and explicit project trust.
+type HookSettings = hooks.Settings
+
+// HookGroup matches lifecycle commands against Tempest's snake_case tool names.
+type HookGroup = hooks.Group
+
+// HookCommand is a shell command with an optional timeout in seconds.
+type HookCommand = hooks.Command
 
 // Tool is an embeddable tool implementation.
 type Tool = agent.AgentTool

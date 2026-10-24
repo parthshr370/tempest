@@ -47,6 +47,13 @@ type childMessaging struct{ endpoint *irc.Endpoint }
 func (hooks childMessaging) Pending() bool                             { return false }
 func (hooks childMessaging) Start(context.Context, work.RunInfo) error { return nil }
 func (hooks childMessaging) Idle(context.Context) (bool, error)        { return hooks.endpoint.Idle(), nil }
+func (hooks childMessaging) Reopen(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	hooks.endpoint.Reopen()
+	return nil
+}
 func (hooks childMessaging) Finish(context.Context, string) error {
 	hooks.endpoint.Close()
 	return nil

@@ -69,6 +69,8 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Read files (several in one call with paths), directories, archive members, office documents, JSON queries and internal URLs"
 		case "bash":
 			snippets[tool.Name] = "Execute bash commands (ls, grep, find, etc.)"
+		case "eval":
+			snippets[tool.Name] = "Run Python or JavaScript cells in persistent per-session kernels; reset after resume"
 		case "edit":
 			snippets[tool.Name] = "Make precise file edits with exact text replacement"
 		case "hashline":
@@ -107,6 +109,10 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Plan a symbol rename as anchored edits to apply with edit"
 		case "lsp_diagnostics":
 			snippets[tool.Name] = "Report a file's language-server diagnostics and their freshness"
+		case "checkpoint":
+			snippets[tool.Name] = "Save workspace files and conversation before an investigation"
+		case "rewind":
+			snippets[tool.Name] = "Restore checkpoint files and fork conversation, retaining findings"
 		case "manifest_diff":
 			snippets[tool.Name] = "Compare two rendered Kubernetes manifest snapshots by resource"
 		case "view_image":

@@ -61,7 +61,10 @@ type Loaded struct {
 	UsageSources    map[string]ptypes.Usage
 	CompactionParts map[string]CompactionPart
 	StopRequests    map[string]string
-	snapshots       map[string][]ptypes.Message
+	HookRuns        map[string]HookState
+	// EvalLanguages survives transcript compaction; process state doesn't.
+	EvalLanguages map[string]bool
+	snapshots     map[string][]ptypes.Message
 
 	// lastSeq is where a resumed store continues numbering lines.
 	lastSeq uint64

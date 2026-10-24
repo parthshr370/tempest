@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/editbatch"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/worktree"
 )
@@ -89,7 +90,7 @@ func newIntegrateTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if err != nil {
 				return agent.AgentToolResult{}, err
 			}
-			run := integrationRun{cwd: cwd, root: root, options: options, input: input, integration: integration, origin: "integrate call " + toolCallID}
+			run := integrationRun{cwd: cwd, root: root, options: options, input: input, integration: integration, callID: toolCallID, origin: "integrate call " + toolCallID}
 			text, written, err := run.finish(ctx)
 			if err != nil {
 				return agent.AgentToolResult{}, err
@@ -116,6 +117,7 @@ type integrationRun struct {
 	input       integrateInput
 	integration *worktree.Integration
 	origin      string
+	callID      string
 }
 
 // finish renders the per-file report and writes the merge when allowed. It
@@ -145,6 +147,21 @@ func (run integrationRun) finish(ctx context.Context) (string, []string, error) 
 // write applies the integration's writes to the live files, holding their
 // mutation locks, after proving each still matches the snapshot.
 func (run integrationRun) write(ctx context.Context) (string, []string, error) {
+	var paths []string
+	for _, write := range run.integration.Writes {
+		paths = append(paths, filepath.Join(run.integration.Repo, filepath.FromSlash(write.Path)))
+	}
+	if run.options.ApproveHookSettings != nil {
+		if err := run.options.ApproveHookSettings(ctx, run.callID, paths); err != nil {
+			return "", nil, err
+		}
+	} else {
+		for _, path := range paths {
+			if hooks.HookSettingsPath(path, run.cwd) {
+				return "", nil, errors.New("Changing hook settings requires per-call approval: " + path)
+			}
+		}
+	}
 	targets := map[string]hashlineTarget{}
 	for _, write := range run.integration.Writes {
 		abs := filepath.Join(run.integration.Repo, filepath.FromSlash(write.Path))

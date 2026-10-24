@@ -12,6 +12,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/validate"
+	"go.harness.dev/harness/internal/hooks"
 )
 
 // ExecutedToolCallBatch is the result of executing one assistant message's
@@ -28,10 +29,11 @@ type ExecutedToolCallBatch struct {
 // preparedToolCall is a tool call that passed validation and the BeforeToolCall
 // gate and is ready to execute.
 type preparedToolCall struct {
-	toolCall   types.ContentBlock
-	tool       AgentTool
-	args       json.RawMessage
-	permission *PermissionOutcome
+	toolCall    types.ContentBlock
+	tool        AgentTool
+	args        json.RawMessage
+	permission  *PermissionOutcome
+	hookContext []string
 }
 
 // immediateOutcome is a result produced during prepare (validation error,
@@ -98,8 +100,13 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 
 	for index, toolCall := range toolCalls {
 		ctx := invocationContext(ctx, config, index)
+		if config.Hooks.Has("PreToolUse") {
+			if err := emit(ctx, toolPreparing(toolCall)); err != nil {
+				return ExecutedToolCallBatch{}, err
+			}
+		}
 		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
-		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, emit); err != nil {
+		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, emit, config.Hooks.Has("PreToolUse")); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
 		var finalized finalizedOutcome
@@ -156,8 +163,13 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	for i, toolCall := range toolCalls {
 		ctx := invocationContext(ctx, config, i)
 		callContexts[i] = ctx
+		if config.Hooks.Has("PreToolUse") {
+			if err := safeEmit(ctx, toolPreparing(toolCall)); err != nil {
+				return ExecutedToolCallBatch{}, err
+			}
+		}
 		prepared, immediate := prepareToolCall(ctx, currentContext, assistantMessage, toolCall, config)
-		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, safeEmit); err != nil {
+		if err := emitPreparedStart(ctx, toolCall, prepared, immediate, safeEmit, config.Hooks.Has("PreToolUse")); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
 		if immediate != nil {
@@ -307,11 +319,44 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	if err != nil {
 		return nil, &immediateOutcome{result: createErrorToolResult(err.Error()), isError: true}
 	}
+	hookResult, hookErr := config.Hooks.Run(ctx, hooks.Input{Event: "PreToolUse", ToolName: toolCall.Name, ToolUseID: toolCall.ID, ToolInput: validatedArgs})
+	if hookErr != nil {
+		return nil, &immediateOutcome{result: createErrorToolResult(hookErr.Error()), isError: true}
+	}
+	if hookResult.Decision == "deny" || hookResult.Stop || hooks.Stopped(ctx) {
+		reason := hookResult.Reason
+		if hookResult.Stop {
+			reason = hookResult.StopReason
+		}
+		if reason == "" {
+			reason = "Tool execution blocked by PreToolUse hook"
+		}
+		outcome = &PermissionOutcome{Reason: reason, Source: "hook"}
+		result := createErrorToolResult(reason)
+		for _, text := range hookResult.Context {
+			result.Content = append(result.Content, types.NewText("PreToolUse hook context: "+text))
+		}
+		return nil, &immediateOutcome{result: result, isError: true}
+	}
+	if len(hookResult.UpdatedInput) != 0 {
+		preparedCall.Arguments = hookResult.UpdatedInput
+		validatedArgs, err = validate.ValidateToolArguments(tool.Tool, preparedCall)
+		if err != nil {
+			return nil, &immediateOutcome{result: createErrorToolResult("Hook updatedInput: " + err.Error()), isError: true}
+		}
+	}
+	if config.Hooks != nil {
+		ctx = hooks.WithToolDecision(ctx, hookResult.Decision, hookResult.Reason)
+		ctx = hooks.WithNotification(ctx, func(notifyCtx context.Context, reason string) error {
+			_, err := config.Hooks.Run(notifyCtx, hooks.Input{Event: "Notification", NotificationType: "permission_prompt", Message: reason, ToolName: toolCall.Name, ToolUseID: toolCall.ID, ToolInput: validatedArgs})
+			return err
+		})
+	}
 
 	if config.BeforeToolCall != nil {
 		beforeResult := config.BeforeToolCall(ctx, BeforeToolCallContext{
 			AssistantMessage: assistantMessage,
-			ToolCall:         toolCall,
+			ToolCall:         preparedCall,
 			Args:             validatedArgs,
 			Context:          currentContext,
 		})
@@ -326,7 +371,11 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 			if reason == "" {
 				reason = "Tool execution was blocked"
 			}
-			return nil, &immediateOutcome{result: createErrorToolResult(reason), isError: true}
+			result := createErrorToolResult(reason)
+			for _, text := range hookResult.Context {
+				result.Content = append(result.Content, types.NewText("PreToolUse hook context: "+text))
+			}
+			return nil, &immediateOutcome{result: result, isError: true}
 		}
 	}
 
@@ -334,16 +383,22 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 		return nil, &immediateOutcome{result: createErrorToolResult("Operation aborted"), isError: true}
 	}
 
-	return &preparedToolCall{toolCall: toolCall, tool: tool, args: validatedArgs}, nil
+	return &preparedToolCall{toolCall: preparedCall, tool: tool, args: validatedArgs, hookContext: hookResult.Context}, nil
 }
 
-func emitPreparedStart(ctx context.Context, call types.ContentBlock, prepared *preparedToolCall, immediate *immediateOutcome, emit AgentEventSink) error {
+func emitPreparedStart(ctx context.Context, call types.ContentBlock, prepared *preparedToolCall, immediate *immediateOutcome, emit AgentEventSink, started bool) error {
+	if prepared != nil {
+		call.Arguments = prepared.toolCall.Arguments
+	}
 	var outcome *PermissionOutcome
 	if prepared != nil {
 		outcome = prepared.permission
 	}
 	if immediate != nil {
 		outcome = immediate.permission
+	}
+	if started && outcome == nil && prepared != nil {
+		outcome = &PermissionOutcome{Allow: true, Source: "hook"}
 	}
 	if outcome != nil {
 		if err := emit(ctx, AgentEvent{Type: EventToolPermission, ToolCallID: call.ID, ToolName: call.Name, Args: call.Arguments, Permission: outcome}); err != nil {
@@ -472,6 +527,27 @@ func finalizeExecutedToolCall(ctx context.Context, currentContext AgentContext, 
 			}
 		}()
 	}
+	if !isError && config.Hooks != nil {
+		var response any
+		if len(result.Details) > 0 && json.Valid(result.Details) && !bytes.Equal(bytes.TrimSpace(result.Details), []byte("null")) {
+			response = result.Details
+		} else {
+			response = map[string]any{"content": result.Content, "is_error": isError}
+		}
+		hookResult, err := config.Hooks.Run(ctx, hooks.Input{Event: "PostToolUse", ToolName: prepared.toolCall.Name, ToolUseID: prepared.toolCall.ID, ToolInput: prepared.args, ToolResponse: response})
+		if err != nil {
+			result.Content = append(result.Content, types.NewText("PostToolUse hook error: "+err.Error()))
+		}
+		for _, text := range hookResult.Context {
+			result.Content = append(result.Content, types.NewText("PostToolUse hook context: "+text))
+		}
+		if hookResult.Decision == "deny" {
+			result.Content = append(result.Content, types.NewText("PostToolUse hook feedback: "+hookResult.Reason))
+		}
+	}
+	for _, text := range prepared.hookContext {
+		result.Content = append(result.Content, types.NewText("PreToolUse hook context: "+text))
+	}
 
 	return finalizedOutcome{toolCall: prepared.toolCall, result: result, isError: isError}
 }
@@ -541,4 +617,10 @@ func recoveredMessage(recovered any) string {
 	default:
 		return fmt.Sprint(value)
 	}
+}
+
+func toolPreparing(call types.ContentBlock) AgentEvent {
+	event := ToolExecutionStart(call.ID, call.Name, call.Arguments)
+	event.Preparing = true
+	return event
 }

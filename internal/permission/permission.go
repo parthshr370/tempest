@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"go.harness.dev/harness/internal/cloudcmd"
+	"go.harness.dev/harness/internal/hooks"
 )
 
 // Mode is a tool-gating mode: plan (block mutations, collect plan),
@@ -211,6 +212,10 @@ func Gate(ctx context.Context, mode Mode, toolName string, args json.RawMessage,
 // or destructive/opaque command intent; cloud writes (exact allow_write grant
 // or per-call approval); then the ordinary session/configured/mode policy.
 func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.RawMessage, policy *Policy, cwd string, toolCallID ...string) Outcome {
+	hookDecision, hookReason := hooks.ToolDecision(ctx)
+	if hookDecision == "deny" {
+		return Outcome{Reason: hookReason, Source: "hook"}
+	}
 	if ctx.Err() != nil {
 		return Outcome{Reason: "Operation aborted", Source: SourcePromptCancelled}
 	}
@@ -239,18 +244,29 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 	if verdict.Denied {
 		return Outcome{Reason: verdict.Reason, Source: SourceCloudPolicy}
 	}
-	if mode == ModeBypass {
-		return Outcome{Allow: true, Source: SourceBypass}
-	}
 	req := PromptRequest{Tool: toolName, Tier: tier, Args: args, Cwd: cwd}
 	if len(toolCallID) != 0 {
 		req.ToolCallID = toolCallID[0]
+	}
+	if reason := hookSettingsReason(toolName, args, cwd); reason != "" {
+		req.Reason = reason
+		outcome := resolvePrompt(ctx, policy, req)
+		if !outcome.Allow && outcome.Source == SourceNoPrompter && shell.guardReason != "" {
+			outcome.Source = SourceGuard
+		}
+		return outcome
+	}
+	if mode == ModeBypass && hookDecision != "ask" {
+		return Outcome{Allow: true, Source: SourceBypass}
 	}
 	// Guard and cloud asks are per-call: a nonempty Reason is never
 	// remembered, and no configured or session allow can skip them.
 	if reason, guarded := shell.approvalReason(verdict); reason != "" {
 		req.Reason = reason
 		if policy.Prompter == nil {
+			if err := hooks.Notify(ctx, reason); err != nil {
+				return Outcome{Reason: err.Error(), Source: SourcePromptCancelled}
+			}
 			source := SourceNoPrompter
 			if guarded {
 				source = SourceGuard
@@ -258,6 +274,19 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 			return Outcome{Reason: reason, Source: source}
 		}
 		return resolvePrompt(ctx, policy, req)
+	}
+	if hookDecision == "ask" {
+		req.Reason = hookReason
+		if req.Reason == "" {
+			req.Reason = "A PreToolUse hook requires approval"
+		}
+		return resolvePrompt(ctx, policy, req)
+	}
+	if hookDecision == "allow" && !(overridden && decision == DecidePrompt) && !(sessionOverride && sessionDecision == DecideDeny) {
+		return Outcome{Allow: true, Source: "hook"}
+	}
+	if mode == ModeBypass {
+		return Outcome{Allow: true, Source: SourceBypass}
 	}
 	if verdict.Granted {
 		if overridden && decision == DecidePrompt {
@@ -308,8 +337,7 @@ func toolTier(toolName string, args json.RawMessage) Tier {
 
 const guardReasonPrefix = "Command blocked by destructive-command guard (deletions, existing-file overwrites, in-place edits, and destructive git operations require approval; appends and new-file writes are allowed): "
 
-// shellFacts is the one inspection of a bash command shared by every gate
-// step: the cwd-aware destructive guard and the cloud intent analysis.
+// shellFacts shares the destructive guard and cloud analysis across gate steps.
 type shellFacts struct {
 	bash        bool
 	command     string
@@ -318,10 +346,23 @@ type shellFacts struct {
 }
 
 func inspectShell(toolName string, args json.RawMessage, cwd string) shellFacts {
-	if toolName != "bash" {
-		return shellFacts{analysis: cloudcmd.Analysis{Effect: cloudcmd.EffectNone}}
+	if toolName == "eval" {
+		var request struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(args, &request) != nil {
+			return shellFacts{analysis: cloudcmd.Analysis{Effect: cloudcmd.EffectNone}}
+		}
+		facts := shellFacts{command: request.Code, analysis: cloudcmd.AnalyzeInline(request.Code)}
+		if inlineDestructivePattern.MatchString(request.Code) {
+			facts.guardReason = guardReasonPrefix + request.Code
+		}
+		return facts
 	}
-	return inspectCommand(commandFromArgs(args), cwd)
+	if toolName == "bash" {
+		return inspectCommand(commandFromArgs(args), cwd)
+	}
+	return shellFacts{analysis: cloudcmd.Analysis{Effect: cloudcmd.EffectNone}}
 }
 
 func inspectCommand(command, cwd string) shellFacts {
@@ -387,8 +428,15 @@ func (s shellFacts) approvalReason(verdict cloudcmd.Verdict) (string, bool) {
 }
 
 func resolvePrompt(ctx context.Context, policy *Policy, req PromptRequest) Outcome {
+	if err := hooks.Notify(ctx, req.Reason); err != nil {
+		return Outcome{Reason: err.Error(), Source: SourcePromptCancelled}
+	}
 	if policy.Prompter == nil {
-		return Outcome{Reason: "Tool " + req.Tool + " requires approval but no interactive prompt is available", Source: SourceNoPrompter}
+		reason := "Tool " + req.Tool + " requires approval but no interactive prompt is available"
+		if req.Reason != "" {
+			reason += ": " + req.Reason
+		}
+		return Outcome{Reason: reason, Source: SourceNoPrompter}
 	}
 	started := time.Now()
 	choice, err := policy.Prompter.Approve(ctx, req)

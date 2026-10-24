@@ -118,8 +118,8 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 			}
 		}
 		for _, unfinished := range loaded.Interrupted {
-			if unfinished.Tool == "bash" {
-				return work.TaskResult{Text: childAssistantText(loaded.Messages), Usage: loaded.UsageTotal, StopReason: "unknown", Error: "interrupted child bash has an unknown outcome"}, nil
+			if unfinished.Tool == "bash" || unfinished.Tool == "eval" {
+				return work.TaskResult{Text: childAssistantText(loaded.Messages), Usage: loaded.UsageTotal, StopReason: "unknown", Error: "interrupted child " + unfinished.Tool + " has an unknown outcome; it will not be re-run automatically"}, nil
 			}
 		}
 	}
@@ -133,12 +133,17 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	}
 	childCfg.Plan = false
 	childCfg.Child = true
+	childCfg.HookAgentType = launch.Spec.SubagentType
 	childCfg.EnableTask = false
 	childCfg.Controller, childCfg.Work = nil, nil
+	if launch.Job.Isolation == "shared" {
+		childCfg.RewindGuard = func(context.Context) error {
+			return errors.New("rewind is unsafe inside a shared-workspace child; ask the parent to rewind after every child and job has settled")
+		}
+	}
 	childCfg.Messenger = nil
 	childCfg.ConfiguredTools = nil
 	childCfg.OnMessagesChanged = nil
-	childCfg.PermissionModeFunc = nil
 	childCfg.AttachmentRegistry, childCfg.AttachmentReader = nil, nil
 	// Language servers are root-session-only in M5: a child edits its own
 	// worktree and must neither query nor dirty the parent's documents.
@@ -187,12 +192,22 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	if err != nil {
 		return result, err
 	}
+	defer func() {
+		resultErr := stack.Close()
+		if resultErr != nil {
+			c.logger.Warn("close child stack", "error", resultErr)
+		}
+	}()
 	child = stack.Agent
 	child.SetBudget(Budget{MaxTurns: 32, MaxWallTime: 10 * time.Minute})
 	detach := session.AttachJournalWithOptions(child, store, session.RecordOptions{Queues: queues})
 	defer detach()
 	var lastChildProgress time.Time
 	detachProgress := child.Subscribe(func(progressCtx context.Context, event agent.AgentEvent) error {
+		if event.Type == agent.EventHook && event.Hook != nil {
+			c.hub.Emit(update("tempest/hook", map[string]any{"hook": event.Hook, "childSessionId": launch.Job.ChildSessionID, "jobId": launch.Job.ID}, event.At))
+			return nil
+		}
 		if event.Type == agent.EventAgentStart {
 			if err := c.jobs.TaskRunning(progressCtx, launch.Job.ID, child.RunState().RunID); err != nil {
 				return err
@@ -211,6 +226,7 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 		return c.publishWork(progressCtx, work.Event{Kind: "job", Action: "running", Job: &launch.Job, RunID: c.agent.RunState().RunID, ChildSessionID: launch.Job.ChildSessionID, ChildToolCallID: event.ToolCallID, ChildTitle: event.ToolName})
 	})
 	defer detachProgress()
+	defer func() { _ = child.EndSessionHooks(context.Background()) }()
 	if loaded != nil && len(loaded.Messages) > 0 {
 		tail := loaded.Messages[len(loaded.Messages)-1]
 		if tail.Role() == "assistant" {
@@ -234,9 +250,9 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	return result, runErr
 }
 func childToolNames(kind string, parent []string) []string {
-	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message"}
+	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message", "checkpoint"}
 	if kind == "general" {
-		builtin = append(builtin, "write", "edit", "hashline", "bash", "todo_write")
+		builtin = append(builtin, "write", "edit", "hashline", "bash", "eval", "todo_write", "rewind")
 	}
 	selected := make([]string, 0, len(builtin))
 	for _, name := range builtin {
@@ -312,6 +328,7 @@ func (hooks *sessionWork) Start(ctx context.Context, info work.RunInfo) error {
 	return hooks.core.jobs.Start(ctx, info)
 }
 func (hooks *sessionWork) Idle(ctx context.Context) (bool, error) { return hooks.core.jobs.Idle(ctx) }
+func (hooks *sessionWork) Reopen(ctx context.Context) error       { return hooks.core.jobs.Reopen(ctx) }
 func (hooks *sessionWork) Finish(ctx context.Context, reason string) error {
 	return hooks.core.jobs.Finish(ctx, reason)
 }

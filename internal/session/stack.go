@@ -4,14 +4,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/checkpoint"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/document"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/evalkernel"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/permission"
@@ -76,6 +81,10 @@ type StackConfig struct {
 	ConfiguredTools []agent.AgentTool
 	PromptAdditions []string
 	BashTimeout     time.Duration
+	// Hooks are operator settings. Resolved hooks are inherited by task children.
+	Hooks         hooks.Settings
+	HooksResolved bool
+	HookAgentType string
 	// Work and QueueSource bind the session-owned durable runtime.
 	Work        work.RunHooks
 	Controller  work.Controller
@@ -86,6 +95,8 @@ type StackConfig struct {
 	// (local://, job://, history://) resolve against it. Empty uses Journal.
 	RootJournal string
 	Child       bool
+	// RewindGuard prevents a shared-workspace child from undoing a live parent's files.
+	RewindGuard func(context.Context) error
 	// Messenger is this agent's endpoint on its session tree's message bus;
 	// non-nil registers the message tool.
 	Messenger      *irc.Endpoint
@@ -127,6 +138,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		WebSearchURL:     cfg.WebSearchURL(),
 		SkillPaths:       cfg.SkillPaths(),
 		BashTimeout:      cfg.BashTimeout(),
+		Hooks:            cfg.Hooks(),
 		LSP:              &lspConfig,
 		PermissionPolicy: permission.Policy{CloudRules: cfg.CloudRules()},
 	}
@@ -135,10 +147,17 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 // AgentStack is the assembled result: a configured agent ready for Prompt/
 // Continue calls.
 type AgentStack struct {
-	Agent      *agent.Agent
-	Model      ptypes.Model
-	StreamFn   agent.StreamFn
-	ProjectDir string
+	Agent       *agent.Agent
+	Model       ptypes.Model
+	StreamFn    agent.StreamFn
+	ProjectDir  string
+	Checkpoints *checkpoint.Manager
+	kernels     *evalkernel.Manager
+}
+
+// Close stops this stack's kernels and runs its session-end hooks.
+func (s *AgentStack) Close() error {
+	return errors.Join(s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()))
 }
 
 // BuildAgentStack wires a generic coding agent: local tools, permission gating,
@@ -154,6 +173,21 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		cwd, err = os.Getwd()
 		if err != nil {
 			return nil, err
+		}
+	}
+	var err error
+	cwd, err = filepath.Abs(cwd)
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.HooksResolved && !cfg.Child {
+		var skipped []string
+		cfg.Hooks, skipped, err = hooks.ResolveProject(cfg.Hooks, cwd)
+		if err != nil {
+			return nil, err
+		}
+		for _, path := range skipped {
+			slog.Warn("project hooks disabled: explicit trust required", "path", path)
 		}
 	}
 	modeFunc := cfg.PermissionModeFunc
@@ -186,6 +220,35 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		sessionDataDir = cfg.Journal.Path() + ".d"
 		sessionID = cfg.Journal.ID()
 	}
+	hookInput := hooks.Input{Cwd: cwd, SessionID: sessionID}
+	if cfg.Journal != nil {
+		hookInput.TranscriptPath = cfg.Journal.Path()
+	}
+	if cfg.Child {
+		hookInput.AgentID, hookInput.AgentType = sessionID, cfg.HookAgentType
+		hookInput.AgentTranscriptPath = hookInput.TranscriptPath
+		if cfg.RootJournal != "" {
+			hookInput.TranscriptPath = cfg.RootJournal
+		}
+	}
+	hookRunner, err := hooks.New(cfg.Hooks, hookInput)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Loaded != nil {
+		hookRunner.MarkResumed()
+	}
+	approveHookSettings := func(ctx context.Context, tool, callID string, paths []string) error {
+		ctx = hooks.WithNotification(ctx, func(notifyCtx context.Context, reason string) error {
+			_, err := hookRunner.Run(notifyCtx, hooks.Input{Event: "Notification", NotificationType: "permission_prompt", Message: reason, ToolName: tool, ToolUseID: callID})
+			return err
+		})
+		outcome := permission.ApproveHookSettings(ctx, policy, tool, callID, cwd, paths)
+		if !outcome.Allow {
+			return errors.New(outcome.Reason)
+		}
+		return nil
+	}
 	var taskTool agent.AgentTool
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
 		taskTool = subagent.NewTool(cfg.Controller)
@@ -200,6 +263,24 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.MutationQueue == nil {
+		cfg.MutationQueue = tools.DefaultMutationQueue()
+	}
+	var checkpoints *checkpoint.Manager
+	if cfg.Journal != nil {
+		checkpoints, err = checkpoint.New(context.Background(), cwd, cfg.Journal, cfg.MutationQueue)
+		if err != nil {
+			return nil, err
+		}
+		if messages, recovered := checkpoints.Recovered(); recovered {
+			cfg.InitialMessages = messages
+		}
+	}
+	lostKernels := map[string]bool{}
+	if cfg.Loaded != nil {
+		lostKernels = cfg.Loaded.EvalLanguages
+	}
+	kernels := evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels)
 	options := tools.ToolsOptions{
 		MutationQueue:      cfg.MutationQueue,
 		EnableWeb:          cfg.EnableWeb,
@@ -216,6 +297,11 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		Child:              cfg.Child,
 		Messenger:          cfg.Messenger,
 		SessionDataDir:     sessionDataDir,
+		Checkpoints:        checkpoints,
+		Kernels:            kernels,
+		ApproveHookSettings: func(ctx context.Context, callID string, paths []string) error {
+			return approveHookSettings(ctx, "integrate", callID, paths)
+		},
 	}
 	// Language servers are root-session-only: a child edits another
 	// worktree, whose changes must not reach the parent's documents.
@@ -235,6 +321,13 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	}
 	options.ImageInput = model.SupportsVision()
 	allTools := BuildToolRegistry(cwd, options)
+	if checkpoints == nil {
+		delete(allTools, tools.CheckpointTool)
+		delete(allTools, tools.RewindTool)
+	}
+	if cfg.RewindGuard != nil {
+		delete(allTools, tools.RewindTool)
+	}
 	var active []agent.AgentTool
 	if cfg.Plan {
 		active = SelectActive(allTools, PlanToolNames(), cfg.ExcludeTools, "")
@@ -263,6 +356,7 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 	var agt *agent.Agent
 	var compact func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error)
 	if runner := newCompactionRunner(model, cfg.StreamFn); runner != nil {
+		runner.hooks = hookRunner
 		compact = runner.hookE(func(messages []ptypes.Message) {
 			agt.SetMessages(messages)
 			if cfg.OnMessagesChanged != nil {
@@ -270,6 +364,21 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 			}
 		})
 		defer func() { runner.configureJournal(cfg.Journal, cfg.Loaded, agt) }()
+	}
+	if checkpoints != nil {
+		active = checkpoints.Wrap(active, func(name string) bool {
+			return checkpoint.MutatesFiles(name, permission.ClassifyTool(name) == permission.TierRead)
+		})
+		previous := compact
+		compact = func(ctx context.Context, c agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error) {
+			if update, err := checkpoints.Prepare(ctx, c); update != nil || err != nil {
+				return update, err
+			}
+			if previous != nil {
+				return previous(ctx, c)
+			}
+			return nil, nil
+		}
 	}
 	agt = agent.NewAgent(agent.AgentOptions{
 		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, ThinkingLevel: thinkingLevel(reasoning), Tools: active, Messages: cfg.InitialMessages},
@@ -279,8 +388,42 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		Work:             cfg.Work,
 		BeforeToolCall:   beforeToolCall,
 		SessionID:        sessionID,
+		Hooks:            hookRunner,
+		Child:            cfg.Child,
 	})
-	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd}, nil
+	if hookRunner != nil {
+		hookRunner.PermissionMode = func() string { return string(modeFunc()) }
+		hookRunner.Once = newHookCache(cfg.Journal, cfg.Loaded, agt).run
+	}
+	if checkpoints != nil {
+		checkpoints.Bind(checkpoint.Runtime{
+			Messages: func() []ptypes.Message { return agt.State().Messages },
+			Changed: func(messages []ptypes.Message) {
+				agt.SetMessages(messages)
+				if cfg.OnMessagesChanged != nil {
+					cfg.OnMessagesChanged(messages)
+				}
+			},
+			Jobs:    cfg.Controller,
+			Guard:   cfg.RewindGuard,
+			Rewound: kernels.MarkStateLost,
+			ApproveRestore: func(ctx context.Context, callID string, paths []string) error {
+				return approveHookSettings(ctx, "rewind", callID, paths)
+			},
+		})
+		agt.Subscribe(func(_ context.Context, event agent.AgentEvent) error {
+			if event.Type == agent.EventAgentEnd {
+				checkpoints.DiscardRequest()
+			}
+			return nil
+		})
+	}
+	if checkpoints != nil {
+		if messages, recovered := checkpoints.Recovered(); recovered {
+			checkpoints.Install(messages)
+		}
+	}
+	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, kernels: kernels}, nil
 }
 
 // thinkingLevel maps a configured reasoning effort to the agent's level;

@@ -384,6 +384,16 @@ var cloudTools = []string{ToolKubectl, ToolHelm, ToolTerraform, ToolKustomize}
 // a directory component. It is a deliberate superset; it only decides whether
 // unresolved syntax makes the command opaque.
 func namesCloudTool(text string) bool {
+	normalized := normalizeCloudText(text)
+	for _, tool := range cloudTools {
+		if namesNormalizedCloudTool(normalized, tool) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCloudText(text string) string {
 	folded := make([]byte, 0, len(text))
 	for i := 0; i < len(text); i++ {
 		c := text[i]
@@ -397,21 +407,21 @@ func namesCloudTool(text string) bool {
 			folded = append(folded, c)
 		}
 	}
-	normalized := string(folded)
-	for _, tool := range cloudTools {
-		for from := 0; ; {
-			offset := strings.Index(normalized[from:], tool)
-			if offset < 0 {
-				break
-			}
-			start, end := from+offset, from+offset+len(tool)
-			if (start == 0 || !nameByte(normalized[start-1])) && (end == len(normalized) || !nameByte(normalized[end]) && normalized[end] != '/') {
-				return true
-			}
-			from = start + 1
+	return string(folded)
+}
+
+func namesNormalizedCloudTool(normalized, tool string) bool {
+	for from := 0; ; {
+		offset := strings.Index(normalized[from:], tool)
+		if offset < 0 {
+			return false
 		}
+		start, end := from+offset, from+offset+len(tool)
+		if (start == 0 || !nameByte(normalized[start-1])) && (end == len(normalized) || !nameByte(normalized[end]) && normalized[end] != '/') {
+			return true
+		}
+		from = start + 1
 	}
-	return false
 }
 
 func nameByte(c byte) bool {

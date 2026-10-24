@@ -31,9 +31,11 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/checkpoint"
 	"go.harness.dev/harness/internal/document"
 	"go.harness.dev/harness/internal/editdiff"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/evalkernel"
 	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
@@ -75,6 +77,7 @@ type ToolName string
 const (
 	ReadTool       ToolName = "read"
 	BashTool       ToolName = "bash"
+	EvalTool       ToolName = "eval"
 	EditTool       ToolName = "edit"
 	HashlineTool   ToolName = "hashline"
 	WriteTool      ToolName = "write"
@@ -101,11 +104,13 @@ const (
 	ManifestDiffTool   ToolName = "manifest_diff"
 	ViewImageTool      ToolName = "view_image"
 	IntegrateTool      ToolName = "integrate"
+	CheckpointTool     ToolName = "checkpoint"
+	RewindTool         ToolName = "rewind"
 )
 
 // AllToolNames is the set of every known ToolName. Configured tools can
 // never shadow these names, including the lsp_* names when LSP is disabled.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true}
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EvalTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true, CheckpointTool: true, RewindTool: true}
 
 // LSPToolNames are the language-server tools, all read-tier calculations.
 var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
@@ -113,6 +118,7 @@ var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameToo
 // ToolsOptions configures tool creation with optional overrides for shell,
 // web access, progress tracking, and pre-configured tools.
 type ToolsOptions struct {
+	Checkpoints   *checkpoint.Manager
 	MutationQueue *toolio.FileMutationQueue
 	ShellPath     string
 	CommandPrefix string
@@ -164,6 +170,10 @@ type ToolsOptions struct {
 	// ImageInput reports whether the stack's model accepts image input;
 	// view_image refuses without it.
 	ImageInput bool
+	// Kernels belongs to the session; its owner must close it.
+	Kernels *evalkernel.Manager
+	// ApproveHookSettings gates computed integration targets before any write.
+	ApproveHookSettings func(context.Context, string, []string) error
 }
 
 // These limits keep web responses bounded and prevent impractical command timeouts.
@@ -223,15 +233,28 @@ func (e readSelectorError) Error() string {
 
 var defaultMutationQueue = toolio.NewFileMutationQueue()
 
+// DefaultMutationQueue shares file locks with SDK workspace controls.
+func DefaultMutationQueue() *toolio.FileMutationQueue { return defaultMutationQueue }
+
 // NewTool creates the coding tool named toolName. It returns an error for
 // unknown tool names and for tools whose prerequisites aren't met (e.g.
 // web_search when EnableWeb is false).
 func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTool, error) {
 	switch toolName {
+	case CheckpointTool, RewindTool:
+		if options.Checkpoints == nil {
+			return agent.AgentTool{}, fmt.Errorf("%s requires a durable session", toolName)
+		}
+		return options.Checkpoints.Tool(string(toolName)), nil
 	case ReadTool:
 		return newReadTool(cwd, options), nil
 	case BashTool:
 		return newBashTool(cwd, options), nil
+	case EvalTool:
+		if options.Kernels == nil {
+			return agent.AgentTool{}, errors.New("eval requires a session-owned kernel manager")
+		}
+		return newEvalTool(options.Kernels), nil
 	case EditTool:
 		return newEditTool(cwd, options), nil
 	case WriteTool:
@@ -316,7 +339,7 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	options = withHashlineStore(options)
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool} {
+	for _, name := range []ToolName{ReadTool, BashTool, EvalTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool, CheckpointTool, RewindTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool

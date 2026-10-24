@@ -192,7 +192,8 @@ func (s *Store) AppendAssigned(ctx context.Context, entry Entry) (Meta, error) {
 		s.failed = err
 		return Meta{}, fmt.Errorf("write journal entry: %w", err)
 	}
-	if syncsAfter(kind) {
+	permission, effectiveArgs := entry.(PermissionRecord)
+	if syncsAfter(kind) || effectiveArgs && len(permission.Args) > 0 {
 		if err := s.file.Sync(); err != nil {
 			s.failed = err
 			return Meta{}, fmt.Errorf("sync journal after %s: %w", kind, err)

@@ -111,6 +111,7 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 	l.UsageSources = map[string]types.Usage{}
 	l.CompactionParts = map[string]CompactionPart{}
 	l.StopRequests = map[string]string{}
+	l.HookRuns = map[string]HookState{}
 	l.snapshots = map[string][]types.Message{}
 	queue := map[string]work.QueueItem{}
 	keys := map[string]string{}
@@ -210,6 +211,27 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 			}
 			if err := addUsage(source, e.RunID, e.Usage); err != nil {
 				return err
+			}
+		case HookRecord:
+			if e.QueueID != "" {
+				if _, ok := queue[e.QueueID]; !ok || l.QueueCancelled[e.QueueID] || l.QueueConsumed[e.QueueID] {
+					return fmt.Errorf("invalid or repeated hook queue consumption %q", e.QueueID)
+				}
+				l.QueueConsumed[e.QueueID] = true
+			}
+			if e.Key != "" {
+				state, exists := l.HookRuns[e.Key]
+				if e.Status == "started" {
+					if exists {
+						return fmt.Errorf("duplicate hook intent %q", e.Key)
+					}
+					l.HookRuns[e.Key] = HookState{}
+				} else {
+					if !exists || state.Finished || e.Result == nil {
+						return fmt.Errorf("invalid hook result %q", e.Key)
+					}
+					l.HookRuns[e.Key] = HookState{Finished: true, Result: *e.Result}
+				}
 			}
 		case CompactionEntry:
 			if e.Snapshot != nil && withSnapshots {

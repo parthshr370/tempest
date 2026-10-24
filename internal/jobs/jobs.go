@@ -992,6 +992,28 @@ func (manager *Manager) Idle(ctx context.Context) (bool, error) {
 	}
 }
 
+// Reopen restores admission when completion feedback gives the same run another turn.
+func (manager *Manager) Reopen(ctx context.Context) error {
+	manager.admission.Lock()
+	defer manager.admission.Unlock()
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if manager.fault != nil {
+		return manager.fault
+	}
+	if manager.finished || manager.scope == nil {
+		return errors.New("cannot reopen a finished run")
+	}
+	if err := manager.scope.Err(); err != nil {
+		return err
+	}
+	manager.sealed = false
+	return nil
+}
+
 // Finish seals admission before cancellation and doesn't return until workers join.
 func (manager *Manager) Finish(ctx context.Context, reason string) error {
 	manager.finish.Lock()

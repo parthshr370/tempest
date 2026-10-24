@@ -69,6 +69,13 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 	}
 	var err error
 	switch ev.Type {
+	case agent.EventHook:
+		if ev.Hook != nil {
+			err = r.store.Append(ctx, journal.HookRecord{Meta: meta, Event: ev.Hook.Event, Status: "finished", Report: ev.Hook, QueueID: ev.QueueID})
+			if err == nil && ev.QueueID != "" && r.queues != nil {
+				err = r.queues.Acknowledge(ev.QueueID)
+			}
+		}
 	case agent.EventAgentStart:
 		loaded, loadErr := journal.Load(ctx, r.store.Path())
 		if loadErr != nil {
@@ -139,9 +146,12 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			if ev.Permission.Allow {
 				decision = "allow"
 			}
-			err = r.store.Append(ctx, journal.PermissionRecord{Meta: meta, ToolCallID: ev.ToolCallID, Tool: ev.ToolName, Decision: decision, Source: string(ev.Permission.Source), WaitMS: ev.Permission.Wait.Milliseconds(), AskID: ev.Permission.AskID})
+			err = r.store.Append(ctx, journal.PermissionRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args), Decision: decision, Source: string(ev.Permission.Source), WaitMS: ev.Permission.Wait.Milliseconds(), AskID: ev.Permission.AskID})
 		}
 	case agent.EventToolExecutionStart:
+		if _, already := r.toolStarts[callKey]; already {
+			break
+		}
 		r.toolStarts[callKey] = ev.At
 		err = r.store.Append(ctx, journal.ToolStartedRecord{Meta: meta, ToolCallID: ev.ToolCallID, CallID: invocation.CallID, Tool: ev.ToolName, Args: rawArgs(ev.Args)})
 	case agent.EventToolExecutionEnd:

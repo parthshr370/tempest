@@ -33,6 +33,7 @@ func (h testRunHooks) Idle(ctx context.Context) (bool, error) {
 	}
 	return false, nil
 }
+func (h testRunHooks) Reopen(context.Context) error { return nil }
 func (h testRunHooks) Finish(ctx context.Context, reason string) error {
 	if h.finish != nil {
 		return h.finish(ctx, reason)

@@ -12,6 +12,7 @@ import (
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/compaction"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
 )
@@ -31,6 +32,8 @@ type compactionRunner struct {
 	store         *journal.Store
 	agt           *agent.Agent
 	parts         map[string]journal.CompactionPart
+	hooks         *hooks.Runner
+	hookCache     *hookCache
 }
 
 // newCompactionRunner builds a runner for the given model and provider seam. It
@@ -54,6 +57,7 @@ func (r *compactionRunner) configureJournal(store *journal.Store, loaded *journa
 	r.store = store
 	r.agt = agt
 	r.parts = map[string]journal.CompactionPart{}
+	r.hookCache = newHookCache(store, loaded, agt)
 	if loaded != nil {
 		for key, value := range loaded.CompactionParts {
 			r.parts[key] = value
@@ -117,6 +121,13 @@ func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Messag
 		return nil, false, err
 	}
 	id := "cmp_" + source[:32]
+	hookResult, err := r.preCompactHook(ctx, source)
+	if err != nil {
+		return nil, false, err
+	}
+	if hookResult.Decision == "deny" || hookResult.Stop {
+		return messages, false, nil
+	}
 	history := "No prior history."
 	if len(prep.MessagesToSummarize) > 0 || !prep.IsSplitTurn {
 		history, err = r.phase(ctx, id, source, preparation, "history", func(callCtx context.Context) (compaction.SummaryResult, error) {
@@ -139,6 +150,9 @@ func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Messag
 	read, modified := compaction.ComputeFileLists(prep.FileOps)
 	summary += compaction.FormatFileOperations(read, modified)
 	replacement := compaction.ApplyCompaction(entries, prep, summary)
+	for _, text := range hookResult.Context {
+		replacement = append(replacement, ptypes.UserMessage{Content: ptypes.StringContent("PreCompact hook context: " + text), Timestamp: 1})
+	}
 	// A deterministic timestamp lets an unreferenced pre-crash sidecar be reused.
 	if len(replacement) > 0 {
 		if user, ok := replacement[0].(ptypes.UserMessage); ok {
@@ -177,6 +191,28 @@ func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Messag
 		}
 	}
 	return replacement, true, nil
+}
+
+func (r *compactionRunner) preCompactHook(ctx context.Context, source string) (hooks.Result, error) {
+	if !r.hooks.Has("PreCompact") {
+		return hooks.Result{}, nil
+	}
+	if r.hookCache == nil {
+		r.hookCache = newHookCache(r.store, nil, r.agt)
+	}
+	key := "precompact:" + source
+	// Older journals may already contain a paid phase but no hook intent.
+	if !r.hookCache.contains(key) {
+		if _, ok := r.parts[source+":history"]; ok {
+			return hooks.Result{}, nil
+		}
+		if _, ok := r.parts[source+":prefix"]; ok {
+			return hooks.Result{}, nil
+		}
+	}
+	return r.hookCache.run(ctx, key, "PreCompact", func(callCtx context.Context) (hooks.Result, error) {
+		return r.hooks.Run(callCtx, hooks.Input{Event: "PreCompact", Trigger: "auto"})
+	})
 }
 
 func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, phase string, call func(context.Context) (compaction.SummaryResult, error)) (string, error) {

@@ -318,3 +318,44 @@ func TestRecoverEditBatchesRestoresCrashedHashlineBatch(t *testing.T) {
 		t.Fatal("pre-batch state not restored")
 	}
 }
+
+func TestIntegrateHookSettingsRequireApproval(t *testing.T) {
+	repo := integrateRepo(t)
+	patch := childJob(t, repo, func(tree string) {
+		if err := os.Mkdir(filepath.Join(tree, ".harness"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, filepath.Join(tree, ".harness", "settings.local.json"), `{"hooks":{}}`)
+	})
+	unapproved, err := NewTool(IntegrateTool, repo, withHashlineStore(ToolsOptions{Work: patchController{patch: patch}, TaskTool: subagent.NewTool(patchController{})}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := json.RawMessage(`{"job_id":"job_child"}`)
+	if _, err := unapproved.Execute(context.Background(), "call", args, nil); err == nil || !strings.Contains(err.Error(), "hook settings") {
+		t.Fatalf("settings patch bypassed approval: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".harness", "settings.local.json")); !os.IsNotExist(err) {
+		t.Fatalf("unapproved patch written: %v", err)
+	}
+	calls := 0
+	tool, err := NewTool(IntegrateTool, repo, withHashlineStore(ToolsOptions{Work: patchController{patch: patch}, TaskTool: subagent.NewTool(patchController{}), ApproveHookSettings: func(_ context.Context, callID string, paths []string) error {
+		calls++
+		if callID != "approved" {
+			t.Errorf("approval lost tool call identity: %q", callID)
+		}
+		if len(paths) != 1 || !strings.HasSuffix(paths[0], ".harness/settings.local.json") {
+			t.Errorf("computed targets=%v", paths)
+		}
+		return nil
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool.Execute(context.Background(), "approved", args, nil); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || readString(t, filepath.Join(repo, ".harness", "settings.local.json")) != `{"hooks":{}}` {
+		t.Fatal("approved integration failed")
+	}
+}

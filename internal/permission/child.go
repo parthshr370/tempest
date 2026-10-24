@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -67,6 +68,7 @@ func (p *decisionProbe) Approve(_ context.Context, r PromptRequest) (Choice, err
 	return AllowOnce, nil
 }
 func evaluate(ctx context.Context, mode Mode, tool string, args json.RawMessage, policy *Policy, cwd string) (Outcome, *PromptRequest) {
+	ctx = hooks.WithNotification(ctx, nil)
 	saved := CaptureCeiling(mode, nil, policy)
 	copy := ceilingPolicy(saved)
 	probe := &decisionProbe{}

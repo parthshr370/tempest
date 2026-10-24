@@ -60,6 +60,7 @@ import (
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -145,7 +146,10 @@ func runAgentLoop(ctx context.Context, prompts []types.Message, agentContext Age
 		if err := emit(ctx, TurnStart()); err != nil {
 			return err
 		}
-		if err := run.appendMessages(ctx, &current, prompts); err != nil {
+		if err := run.startHooks(ctx, &current); err != nil {
+			return err
+		}
+		if err := run.appendPrompts(ctx, &current, prompts); err != nil {
 			return err
 		}
 		return run.turns(ctx, current)
@@ -159,6 +163,9 @@ func runAgentLoopContinue(ctx context.Context, agentContext AgentContext, config
 	ctx, run := newLoopRun(ctx, config, emit, streamFn)
 	return run.execute(ctx, nil, func(ctx context.Context) error {
 		if err := emit(ctx, TurnStart()); err != nil {
+			return err
+		}
+		if err := run.startHooks(ctx, &agentContext); err != nil {
 			return err
 		}
 		return run.turns(ctx, agentContext)
@@ -179,7 +186,10 @@ type loopRun struct {
 	initialTurns int
 	enforceFirst bool
 	// outputCorrections counts correction turns spent on the output schema.
-	outputCorrections int
+	outputCorrections     int
+	stopHookContinuations int
+	stopHookActive        bool
+	hookFollowUp          bool
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -188,6 +198,11 @@ type loopRun struct {
 // edge is the one place hooks and providers can take the run down), so
 // agent_end is still emitted.
 func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body func(context.Context) error) ([]types.Message, RunResult) {
+	if run.config.Hooks != nil {
+		ctx = hooks.WithRun(ctx, func(ctx context.Context, report hooks.Report) error {
+			return run.emit(ctx, AgentEvent{Type: EventHook, Hook: &report})
+		})
+	}
 	start := AgentStart(prompts)
 	start.Resume = run.config.Resume
 	err := run.emit(ctx, start)
@@ -227,6 +242,14 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 	var budgetStop *providerBudgetStop
 	switch {
 	case err == nil:
+	case errors.Is(err, errHookPromptConsumed):
+		run.result.StopReason = StopCompleted
+		if ctx.Err() != nil {
+			run.result.StopReason, _ = run.boundaryStop(ctx)
+		}
+	case errors.Is(err, errHookPromptBlocked):
+		run.result.StopReason = StopError
+		run.result.Err = err
 	case errors.As(err, &budgetStop):
 		run.result.StopReason = budgetStop.reason
 		if budgetStop.reason == StopAborted && ctx.Err() != nil {
@@ -312,6 +335,22 @@ func (run *loopRun) take(ctx context.Context, kind work.QueueKind) ([]work.Queue
 
 func (run *loopRun) appendQueued(ctx context.Context, current *AgentContext, messages []work.QueuedMessage) error {
 	for _, queued := range messages {
+		var hookResult hooks.Result
+		if !run.hookFollowUp {
+			run.stopHookActive = false
+			run.stopHookContinuations = 0
+			var err error
+			hookResult, err = run.promptHooks(ctx, queued.Message, queued.ID)
+			if err != nil {
+				if queued.ID == "" || ctx.Err() == nil {
+					return err
+				}
+				hookResult = hooks.Result{Decision: "deny", Interrupted: true, Reason: "UserPromptSubmit hook interrupted; prompt not submitted"}
+			}
+			if hookResult.Decision == "deny" || hookResult.Stop {
+				return run.blockPrompt(ctx, hookResult, queued.ID)
+			}
+		}
 		start := MessageStart(queued.Message)
 		start.QueueID = queued.ID
 		if err := run.emit(ctx, start); err != nil {
@@ -324,7 +363,13 @@ func (run *loopRun) appendQueued(ctx context.Context, current *AgentContext, mes
 		}
 		current.Messages = append(current.Messages, queued.Message)
 		run.messages = append(run.messages, queued.Message)
+		for _, text := range hookResult.Context {
+			if err := run.appendMessages(ctx, current, []types.Message{hookMessage("UserPromptSubmit", text)}); err != nil {
+				return err
+			}
+		}
 	}
+	run.hookFollowUp = false
 	return nil
 }
 
@@ -396,6 +441,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 		hasMoreToolCalls := !firstTurn || !quiescentResume
 
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
+			if hooks.Stopped(ctx) {
+				run.result.StopReason = StopCompleted
+				return nil
+			}
 			if firstTurn && (run.enforceFirst || ctx.Err() != nil) {
 				stop, err := run.boundaryStop(ctx)
 				if stop != "" || err != nil {
@@ -481,6 +530,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			hasMoreToolCalls = false
 			var repeatedFailure error
 			if hasToolCalls(message) {
+				run.stopHookContinuations = 0
 				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
 				if err != nil {
 					return err
@@ -499,6 +549,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 
 			if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
 				return err
+			}
+			if hooks.Stopped(ctx) {
+				run.result.StopReason = StopCompleted
+				return nil
 			}
 			// The turn is complete, so the transcript stays resumable; an
 			// abort that raced the tools still wins at the next boundary.
@@ -529,6 +583,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					turnContext.Context = current
 				}
 			}
+			if hooks.Stopped(ctx) {
+				run.result.StopReason = StopCompleted
+				return nil
+			}
 
 			if config.ShouldStopAfterTurn != nil && config.ShouldStopAfterTurn(turnContext) {
 				run.result.StopReason = StopCompleted
@@ -550,7 +608,11 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				break
 			}
 			if config.Work == nil {
-				if pendingMessages = run.complete(); len(pendingMessages) > 0 {
+				pendingMessages, err = run.completeWithHooks(ctx)
+				if err != nil {
+					return err
+				}
+				if len(pendingMessages) > 0 {
 					break
 				}
 				return nil
@@ -577,7 +639,14 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				return err
 			}
 			if !again {
-				if pendingMessages = run.complete(); len(pendingMessages) > 0 {
+				pendingMessages, err = run.completeWithHooks(ctx)
+				if err != nil {
+					return err
+				}
+				if len(pendingMessages) > 0 {
+					if err := config.Work.Reopen(ctx); err != nil {
+						return err
+					}
 					break
 				}
 				return nil
