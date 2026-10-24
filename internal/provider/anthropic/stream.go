@@ -3,10 +3,9 @@
 // SSE event types (message_start, content_block_*, message_delta, message_stop)
 // into [types.StreamEvent]s, and surfaces them on an [stream.AssistantStream].
 //
-// The idle watchdog (watchIdle) cancels the request context when no SSE event
-// arrives for [streamIdleTimeout] (default 90s, configurable via
-// HARNESS_STREAM_IDLE_SECONDS). This prevents the silent-but-open-stream wedge
-// that would pin 102% CPU on a truncated Anthropic response.
+// The stream watchdog ([base.WatchStream]) cancels the request when no SSE
+// event arrives within [streamTimeouts]. This prevents the silent-but-open-stream
+// wedge that would pin 102% CPU on a truncated Anthropic response.
 //
 // [Stream] handles the full raw request lifecycle. Callers typically use
 // [StreamSimple] which maps a reasoning level to Anthropic thinking config
@@ -22,7 +21,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
@@ -91,11 +89,11 @@ func withMaxTokens(opts types.StreamOptions, maxTokens int) types.StreamOptions 
 // lifecycle: auth checks, header assembly, JSON marshaling, the POST call,
 // SSE iteration/folding, and the idle watchdog.
 //
-// The idle watchdog monitors activity between SSE events and cancels the
-// request context if nothing arrives for [streamIdleTimeout]. This is the
-// fix for the 102%-CPU-wedge: a silently-hung Anthropic stream that never
-// sends data and never errors. The watchdog distinguishes a hung stream
-// (StreamTruncated) from a canceled stream (parent ctx done) via streamError.
+// The stream watchdog cancels the request context if no SSE event arrives
+// within [streamTimeouts]. This is the fix for the 102%-CPU-wedge: a
+// silently-hung Anthropic stream that never sends data and never errors. The
+// watchdog reports a hung stream as a retryable stream interruption and leaves
+// a canceled stream (parent ctx done) as the caller's cancellation.
 func runStream(parent context.Context, s *stream.AssistantStream, model types.Model, c types.Context, opts *Options) {
 	output := newOutputMessage(model)
 	defer func() {
@@ -106,17 +104,11 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	// streamCtx is a child of parent: the watchdog cancels streamCtx, but the
 	// response SSE handler still checks parent so a parent cancel (e.g. /cancel)
-	// is distinguishable from a watchdog cancel (StreamTruncated vs aborted).
+	// is distinguishable from a watchdog cancel (stalled vs aborted).
 	streamCtx, cancel := context.WithCancel(parent)
 	defer cancel()
-	activity := make(chan struct{}, 1)
-	done := make(chan struct{})
-	// idleFired is checked AFTER the cancel: when the watchdog fires, it sets
-	// idleFired=true then calls cancel(). The streamError check after SSE
-	// iteration uses idleFired to decide whether to wrap the error.
-	var idleFired atomic.Bool
-	go watchIdle(done, activity, cancel, &idleFired)
-	defer close(done)
+	watchdog := base.WatchStream(cancel, streamTimeouts)
+	defer watchdog.Stop()
 
 	if opts == nil {
 		opts = &Options{}
@@ -176,7 +168,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -194,19 +186,13 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	s.Push(types.StreamEvent{Type: types.EvStart, Partial: output})
 	state := &foldState{Output: output, IsOAuth: isOAuth, Tools: c.Tools}
-	err = iterateAnthropicEvents(reqCtx, resp.Body, func() {
-		// Non-blocking send: if the watchdog hasn't consumed the previous
-		// activity yet, that's fine — activity is a "recently alive" signal,
-		// not a precise count. Using a buffered-1 channel means the latest
-		// activity is always visible without blocking the SSE reader.
-		select {
-		case activity <- struct{}{}:
-		default:
-		}
-	}, func(event rawAnthropicEvent) error {
+	err = iterateAnthropicEvents(reqCtx, resp.Body, watchdog.Event, func(event rawAnthropicEvent) error {
 		events, err := foldAnthropicEvent(event, state, model)
 		if err != nil {
 			return err
+		}
+		if len(events) > 0 {
+			watchdog.Output()
 		}
 		for _, event := range events {
 			s.Push(event)
@@ -214,7 +200,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		return nil
 	})
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 	if parent.Err() != nil {
@@ -258,54 +244,6 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 	}
 	base.ApplyError(output, err)
 	s.Push(types.StreamEvent{Type: types.EvError, Reason: output.StopReason, Err: output})
-}
-
-// streamError classifies the stream failure. Precedence:
-//  1. parent ctx error (abort/cancel) — returned as-is so callers can
-//     distinguish user cancellation from stream errors
-//  2. idle watchdog fired — wrap as StreamTruncated so the loop knows
-//     the stream died silently (not a real error, but not a clean end)
-//  3. any other error — returned as-is
-func streamError(parentErr error, err error, idle bool) error {
-	if parentErr != nil {
-		return parentErr
-	}
-	if idle {
-		return StreamTruncated(fmt.Errorf("stream idle for %s (no events); aborted to avoid a wedge: %w", streamIdleTimeout, err))
-	}
-	return err
-}
-
-// watchIdle is the goroutine that cancels the stream if no SSE activity arrives
-// within [streamIdleTimeout]. It receives on activity (reset the timer), idle
-// (timer fired → set idleFired → cancel), or done (runStream finished → exit).
-//
-// The timer Stop+Reset dance is the standard Go pattern to safely reset a timer
-// that may have already fired: if Stop returns false, drain the now-stale <-idle.C
-// before Reset to avoid a spurious fire on the next Reset.
-func watchIdle(done <-chan struct{}, activity <-chan struct{}, cancel context.CancelFunc, idleFired *atomic.Bool) {
-	idle := time.NewTimer(streamIdleTimeout)
-	defer idle.Stop()
-	for {
-		select {
-		case <-activity:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(streamIdleTimeout)
-		case <-idle.C:
-			// Timer fired: no activity for streamIdleTimeout.
-			// Set idleFired BEFORE cancel so the streamError check observes it.
-			idleFired.Store(true)
-			cancel()
-			return
-		case <-done:
-			return
-		}
-	}
 }
 
 // messagesURL returns the full Messages API endpoint for the given base URL.

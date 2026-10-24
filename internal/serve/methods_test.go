@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/rpc"
@@ -189,5 +190,24 @@ func TestRunErrorAndBudgetStopReasons(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRepeatedFailureIsARunError: a prompt whose model repeats one failing
+// call fails with repeated_failure, like an output that never validates.
+func TestRepeatedFailureIsARunError(t *testing.T) {
+	f := faux.New(faux.Options{})
+	for range agent.RepeatedFailureLimit {
+		f.AppendResponses(faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"missing"}`), "read-call")))
+	}
+	s := newServer(t, f, nil, permission.ModeBypass, nil)
+	c := connect(t, s)
+	id := newSession(t, c, t.TempDir())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.conn.Call(ctx, "session/prompt", map[string]any{"sessionId": id, "prompt": []any{map[string]string{"type": "text", "text": "go"}}}, nil)
+	var wire *rpc.Error
+	if !errors.As(err, &wire) || wire.Code != -32023 || f.CallCount() != agent.RepeatedFailureLimit {
+		t.Fatalf("repeated failure = %v after %d calls, want -32023 after %d", err, f.CallCount(), agent.RepeatedFailureLimit)
 	}
 }

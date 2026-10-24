@@ -12,9 +12,11 @@
 // Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
 // turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime]), or a
 // failure ([StopError]). A run with an output schema whose final answer still
-// fails it after one correction turn ends with [StopOutputInvalid]. A run that
-// starts emits agent_start first and exactly one agent_end last; agent_end
-// carries the [RunResult].
+// fails it after one correction turn ends with [StopOutputInvalid]. A run
+// whose model sends one tool call unchanged until it has failed the same way
+// [RepeatedFailureLimit] times in a row ends with [StopRepeatedFailure] after
+// that turn (see repeat.go). A run that starts emits agent_start first and
+// exactly one agent_end last; agent_end carries the [RunResult].
 //
 // # Goroutine ownership
 //
@@ -447,7 +449,13 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 
 			message, err := func() (types.AssistantMessage, error) {
 				defer release()
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn)
+				// A discarded attempt is already in the transcript as an errored
+				// message; it is accounted like any finished call.
+				discarded := func(attempt types.AssistantMessage) error {
+					run.messages = append(run.messages, attempt)
+					return run.accountUsage(ctx, attempt)
+				}
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, discarded)
 				return message, errors.Join(err, run.accountUsage(ctx, message))
 			}()
 			if err != nil {
@@ -471,12 +479,14 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 
 			toolResults := []types.ToolResultMessage{}
 			hasMoreToolCalls = false
+			var repeatedFailure error
 			if hasToolCalls(message) {
 				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
 				if err != nil {
 					return err
 				}
 				toolResults = executedToolBatch.Messages
+				repeatedFailure = executedToolBatch.RepeatedFailure
 				// A batch terminates the turn only when EVERY result sets
 				// Terminate — a single non-terminating result means the model
 				// expects another round.
@@ -489,6 +499,13 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 
 			if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
 				return err
+			}
+			// The turn is complete, so the transcript stays resumable; an
+			// abort that raced the tools still wins at the next boundary.
+			if repeatedFailure != nil && ctx.Err() == nil {
+				run.result.StopReason = StopRepeatedFailure
+				run.result.Err = repeatedFailure
+				return nil
 			}
 
 			turnContext := ShouldStopAfterTurnContext{
@@ -691,10 +708,17 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // is appended to the context messages on start and overwritten on each update
 // so a downstream turn sees the live, growing message.
 //
+// When the retry layer re-sends the request ([types.EvRetry]), the attempt
+// streamed so far ends as an errored message: listeners get its message_end,
+// it stays in the transcript (conversion to the provider request skips
+// errored assistant messages, so the re-sent request is unchanged), and
+// discarded accounts for it. The next attempt starts a new message. Tool calls
+// in a discarded attempt never run: they run only after the final message.
+//
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
 // provider's producer stops instead of running on unobserved.
-func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) (types.AssistantMessage, error) {
+func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, discarded func(types.AssistantMessage) error) (types.AssistantMessage, error) {
 	messages := cctx.Messages
 	if config.TransformContext != nil {
 		messages = config.TransformContext(ctx, messages)
@@ -732,7 +756,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 	addedPartial := false
 	logEnd := func(m types.AssistantMessage) {
 		if m.StopReason == types.StopError {
-			slog.Error("assistant stream error", "model", m.Model, "provider", m.Provider, "errorMessage", redactTruncate(m.ErrorMessage, 400), "errorCode", m.ErrorCode)
+			slog.Error("assistant stream error", "model", m.Model, "provider", m.Provider, "errorMessage", redactTruncate(m.ErrorMessage, errorLogRunes), "errorCode", m.ErrorCode)
 			return
 		}
 		slog.Info("assistant stream end", "model", m.Model, "provider", m.Provider, "stopReason", string(m.StopReason), "inputTokens", m.Usage.Input, "outputTokens", m.Usage.Output, "cacheReadTokens", m.Usage.CacheRead)
@@ -766,6 +790,25 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 				eventCopy := event
 				if err := emit(ctx, MessageUpdate(partialMessage, &eventCopy)); err != nil {
 					return partialMessage, err
+				}
+			}
+
+		case types.EvRetry:
+			attempt := types.AssistantMessage{API: config.Model.API, Provider: config.Model.Provider, Model: config.Model.ID, StopReason: types.StopError}
+			if event.Err != nil {
+				attempt = snapshotAssistant(*event.Err)
+			}
+			slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
+			// An attempt that failed before streaming (an HTTP error) opened
+			// no message and reported no usage; the log line is its record.
+			if addedPartial {
+				addedPartial = false
+				cctx.Messages[len(cctx.Messages)-1] = attempt
+				if err := emit(ctx, MessageEnd(attempt)); err != nil {
+					return attempt, err
+				}
+				if err := discarded(attempt); err != nil {
+					return attempt, err
 				}
 			}
 

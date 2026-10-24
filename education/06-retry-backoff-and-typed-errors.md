@@ -66,8 +66,8 @@ Classify a provider failure with twelve possible outcomes (from `CodeRateLimited
 
 1. **Cancel/abort first.** If `ctx.Err() != nil` or stop reason is `StopAborted`, return `CodeCanceled` — terminal, never retry.
 2. **Context overflow before status.** The combined `providerCode + " " + message` is scanned for `context_length_exceeded`, `prompt_too_long`, `maximum context length`, `too many input tokens`, or `context window ... exceeded`. If matched, return `CodeContextOverflow` even if the gateway supplied 429. Overflow is the compaction module's concern, not retry's.
-3. **HTTP status.** 429 → `CodeRateLimited` (retryable). 5xx → `CodeServerFailure` (retryable). Other non-zero statuses: 401/403 → `CodeAuthentication`, 400/404/409/422 → `CodeInvalidRequest`, other 4xx → `CodeInvalidRequest`, everything else → `CodeProviderFailure`. All terminal.
-4. **Structured provider code.** When no HTTP status is available (network errors, stream drops), `classifyProviderCode` matches the normalized `ProviderCode` against known categories before falling through to message patterns. `rate_limit_error` → retryable `CodeRateLimited`; `overloaded_error`/`server_error` → retryable `CodeServerFailure`; `authentication_error`/`invalid_api_key` → terminal `CodeAuthentication`; `invalid_request_error` → terminal `CodeInvalidRequest`. This tier was added as a post-review fix: without it, `ProviderCode: "rate_limit_error"` would fall through message matching and land on terminal `CodeProviderFailure` because `"rate_limit_error"` doesn't contain the substring `"rate limit"`.
+3. **HTTP status.** Only a status of 400 or above classifies the failure. 429 → `CodeRateLimited` (retryable). 5xx → `CodeServerFailure` (retryable). 401/403 → `CodeAuthentication`, 400/404/409/422 → `CodeInvalidRequest`, other 4xx → `CodeInvalidRequest`, other statuses at or above 400 → `CodeProviderFailure`. All terminal. A 2xx status means the provider accepted the request and the stream failed afterwards (a stall, a dropped connection, an in-stream error event), so the status tier is skipped and the code and message tiers below classify it (`internal/retry/error.go:131-147`). Before this change any nonzero status, including 200, fell into a terminal provider-failure branch, so no in-stream failure after a 200 was ever retried.
+4. **Structured provider code.** When the status does not classify the failure (network errors, stream drops, a 2xx that failed afterwards), `classifyProviderCode` matches the normalized `ProviderCode` against known categories before falling through to message patterns. `rate_limit_error` → retryable `CodeRateLimited`; `overloaded_error`/`server_error` → retryable `CodeServerFailure`; `authentication_error`/`invalid_api_key` → terminal `CodeAuthentication`; `invalid_request_error` → terminal `CodeInvalidRequest`. It also maps the codes this package assigns back to themselves: `stream_interrupted`, `network_failure`, `attempt_timeout`, and `server_failure` are retryable, `authentication` and `invalid_request` are terminal, and `canceled` is never mapped because only the caller's context decides cancellation (`error.go:179-198`). This tier was added as a post-review fix: without it, `ProviderCode: "rate_limit_error"` would fall through message matching and land on terminal `CodeProviderFailure` because `"rate_limit_error"` doesn't contain the substring `"rate limit"`.
 5. **Message pattern fallback.** Narrow, bounded patterns only: `i/o timeout`, `tls handshake timeout`, `connection reset`, `broken pipe`, `unexpected eof`, bare `eof`, `socket hang up`, `stream idle`, `stream ended without finish_reason`, `fetch failed`, `upstream ... reset`, `overloaded`, `service unavailable`, `too many requests`, `rate limit`, `provider returned error`. No bare `error`, `closed`, `limit`, or `timeout` matches.
 6. **Terminal fallback.** `CodeProviderFailure`, not retryable.
 
@@ -93,21 +93,21 @@ Four sentinel errors (`ErrRetryable`, `ErrTerminal`, `ErrExhausted`, `ErrCancele
 
 `Unwrap` returns `e.Cause` — the raw provider failure text. So `errors.Is(retryErr, someSentinel)` checks the classified outcome, and `errors.As(retryErr, &providerErr)` digs into the original.
 
-Critically, exhaustion does not unwrap to the retryable classified error. When `retryClassified` exhausts attempts, it constructs an `Error` whose `Cause` is the *original* `classified.Cause` (the provider message), not the retryable `classified` pointer itself. So `errors.Is(exhaustedErr, ErrRetryable)` is false — exhaustion is terminal even though the individual failure that triggered it was retryable.
+Critically, exhaustion does not unwrap to the retryable classified error. When `plan` finds `attempt >= MaxAttempts` (`internal/retry/stream.go:148-150`), it constructs an `Error` whose `Cause` is the *original* `classified.Cause` (the provider message), not the retryable `classified` pointer itself. So `errors.Is(exhaustedErr, ErrRetryable)` is false: exhaustion is terminal even though the individual failure that triggered it was retryable. Its message is `retry attempts exhausted after N attempts: <cause>`.
 
-### Decision 5: the commit-on-observable-output stream decorator
+### Decision 5: retry after output, not only before it
 
 This is the policy's behavioral core, but the concurrency/race story lives in module 07. Here, we cover the *policy*.
 
-Each `Retrier.Stream` call creates one output `AssistantStream` and launches one producer goroutine. The producer loops through attempts:
+Each `Retrier.Stream` call creates one output `AssistantStream` and launches one producer goroutine (`internal/retry/stream.go:45-49`). The producer loops through attempts:
 
 1. Call the inner `Streamer` (which calls the real provider).
-2. Buffer incoming events in a pre-output ring (max 64 events).
-3. The moment an event carries *observable output* — non-empty text delta, non-empty thinking delta, any tool-call event, or a terminal message containing text/thinking/tool blocks — the decorator commits: it flushes the buffer to the output stream and enters a pass-through mode where every subsequent event is forwarded directly. At this point retry is disabled for this logical stream.
-4. If the stream ends with an error before any observable output was committed, classify the failure, apply backoff, and retry (goto 1).
-5. If the stream succeeds (`EvDone`), flush and return.
+2. Forward every non-terminal event of the attempt as it arrives (`forward` at `stream.go:293-302`); the terminal event is either pushed (done) or classified (error).
+3. If the attempt ends with `EvDone`, push it and return.
+4. If the attempt ends with a non-retryable error, push the provider's error event unchanged and return.
+5. If the attempt fails with a retryable error, before or after output, build the record of the discarded attempt (`attemptMessage` at `stream.go:164-180`). That record is the provider's terminal message with its partial content and reported usage when the provider sent one, otherwise the content forwarded so far. Push `EvRetry` carrying that message in `Err`, the attempt ordinal in `Attempt`, and the backoff in `RetryDelay` (`stream.go:89-91`). Fold the event into the logical builder (which resets it), sleep, and re-send the same `types.Context` and freshly cloned options (same cache key).
 
-The pre-output buffer is bounded at 64 events. On the 64th structural event (even one without visible output), the decorator commits and disables retry. This prevents unbounded memory growth during a slow provider startup.
+The content events of every attempt reach the caller on the same output stream; a retryable failure replaces that attempt's terminal error with `EvRetry`. Re-sending after output is safe because nothing acts on a response before its terminal event: the agent loop runs tool calls only after the final message. On `EvRetry` the agent loop closes the partial message it had opened as an errored message, emits its `message_end` (the journal records it as a metered message with its usage record), and appends it to the run's messages through the `discarded` callback (`internal/agent/loop.go:452-458`, `loop.go:796-813`). The next attempt starts a new message. Errored assistant messages are skipped by the transform, the token estimate and compaction, so the re-sent and later requests never include the discarded attempt.
 
 The `Partial` pointer on forwarded events is never the provider's live pointer. The decorator owns a private `AssistantBuilder`; each event is folded into it, and a fresh snapshot is attached as `event.Partial` before pushing. Module 07 explains why the provider's live `Partial` is a race condition waiting to happen.
 
@@ -207,7 +207,7 @@ var (                                               // lines 30-39
 type Error struct {                                 // lines 42-49
     Code       Code         // stable category, never empty
     Message    string       // safe, non-sensitive provider/retry text
-    Retryable  bool         // intrinsic transience; the retrier also checks commit state
+    Retryable  bool         // intrinsic transience; retried before or after output
     RetryAfter time.Duration // largest valid provider hint, or zero
     Attempts   int          // for exhausted/exceeded outcomes; 0 for classified failures
     Cause      error        // raw provider failure; may be nil
@@ -218,7 +218,7 @@ type Error struct {                                 // lines 42-49
 |---|---|
 | `Code` | Stable enum for programmatic matching (`errors.Is`). |
 | `Message` | Human-readable but safe: no request data, no headers. |
-| `Retryable` | Whether the *category* is transient. The retrier may still decline to retry if output was already committed. |
+| `Retryable` | Whether the *category* is transient. The retrier retries it before or after output; only the policy limits (attempts, delay cap) can end the stream. |
 | `RetryAfter` | Parsed from `retry-after-ms` / `Retry-After` / `x-ratelimit-reset*` headers; zero if absent/invalid. |
 | `Attempts` | The retry ordinal where exhaustion or delay-exceeded occurred. |
 | `Cause` | The original failure text (`errors.Unwrap` target). |
@@ -292,34 +292,36 @@ func (r *Retrier) Stream(ctx context.Context, model types.Model, c types.Context
 
 ### The producer loop
 
-`Retrier.Stream` creates an output `AssistantStream` and launches `produce` as a goroutine, then returns the stream immediately ([`stream.go:46-50`](internal/retry/stream.go)). The caller (the agent loop) reads from the returned stream while `produce` manages attempts, backoff, and reconnection behind it.
+`Retrier.Stream` creates an output `AssistantStream` and launches `produce` as a goroutine, then returns the stream immediately ([`stream.go:45-49`](internal/retry/stream.go)). The caller (the agent loop) reads from the returned stream while `produce` manages attempts, backoff, and reconnection behind it.
 
-`produce` ([`stream.go:52-136`](internal/retry/stream.go)):
+`produce` ([`stream.go:59-97`](internal/retry/stream.go)):
 
 1. **Pre-call cancel check.** If `ctx` is already done, push `CodeCanceled` and return.
 2. **Attempt loop.** For `attempt := 1; ; attempt++`:
    a. Cancel check before each attempt.
    b. Clone options with an attempt-local `OnResponse` that captures a copy of the `ProviderResponse` (status + headers), then chains the caller's callback.
-   c. Call `r.next.Stream(ctx, ...)` — the real provider.
-   d. If `nil` stream returned: classify as a provider failure and retry if possible.
-   e. Allocate a pre-output buffer (cap 64). Set `committed = false`.
-   f. **Drain events** in a select loop over `attemptStream.Events()` and `ctx.Done()`.
-      - `EvDone`: flush buffer, push the done event, return. Success.
-      - `EvError`: if committed or the error event itself carries observable output (text/thinking/tool blocks in the terminal message), flush + forward + return. Otherwise, classify the failure and retry if the policy allows.
-      - Any other event: if not yet committed, check whether the event is "observable" (non-empty text/thinking delta, or any tool-call event). If so, commit: flush buffer, set `buffer = nil`. Forward the event (with a fresh `Partial` snapshot from the retrier-owned builder).
-      - On commit trigger via buffer fullness (64th event): flush, commit, disable retry.
-   g. `ctx.Done()` during drain: push `CodeCanceled` and return.
+   c. Call `r.next.Stream(ctx, ...)`, the real provider, and hand the result to `forwardAttempt`.
+   d. `forwardAttempt` ([`stream.go:103-140`](internal/retry/stream.go)) drains events in a select over `attemptStream.Events()` and `ctx.Done()`:
+      - `EvDone`: push it downstream and report success.
+      - `EvError`: record the event and its `Classify` result, and report the failure.
+      - Any other event: `forward` it immediately with a fresh `Partial` snapshot from the retrier-owned builder.
+      - Channel closed without a terminal event: synthesize `CodeStreamInterrupted` with `Retryable: true` ([`stream.go:118-119`](internal/retry/stream.go)).
+   e. If the attempt reported no classification (done or canceled), return.
+   f. Build the discarded attempt message (`attemptMessage`, [`stream.go:164-180`](internal/retry/stream.go)) and ask `plan` for the delay or the terminal error ([`stream.go:144-159`](internal/retry/stream.go)).
+   g. Terminal: push the provider's error event unchanged when the attempt had one, otherwise `pushTerminal` with the discarded message ([`stream.go:190-198`](internal/retry/stream.go)). Return.
+   h. Retryable: push `EvRetry` with the discarded message, attempt ordinal and delay; fold it into the logical builder to reset it; sleep; start the next attempt.
 
 ### Classification → retry decision → backoff
 
-When an attempt fails pre-commit, `retryFailure` calls `Classify` with the captured failure metadata and clock time ([`stream.go:139-146`](internal/retry/stream.go)), then calls `retryClassified` ([`stream.go:152-180`](internal/retry/stream.go)):
+When an attempt produces an `EvError`, `forwardAttempt` builds a `Failure` from the event's stop reason, the captured status and headers, and `ctx.Err()`, then calls `Classify` with the injected clock time ([`stream.go:126-134`](internal/retry/stream.go)). `produce` passes the result to `plan` ([`stream.go:144-159`](internal/retry/stream.go)):
 
-1. **Not retryable?** Flush buffer, push the terminal error, return false (stop).
-2. **Exhausted?** `attempt >= MaxAttempts` → push `CodeAttemptsExhausted` (with `Cause` = raw provider failure, not the retryable `*Error`), return false.
-3. **Compute delay.** `nominalDelay(base, cap, attempt)` doubles until saturating at the cap. Then `jitterDelay(nominal, jitter, random)` multiplies by `Min + (Max-Min)*sample`, defends against NaN/Inf/out-of-range samples, rounds. The final delay is `max(jittered_local, classified.RetryAfter)` — the provider hint can extend but never shorten.
-4. **Fail-fast check.** If `MaxDelay > 0 && delay > MaxDelay`, push `CodeRetryDelayExceeded` and return false.
-5. **Sleep.** `Sleeper.Sleep(ctx, delay)`. If the sleeper returns an error or `ctx` is done, push `CodeCanceled` and return false.
-6. **Return true** (start next attempt).
+1. **Not retryable?** Return the classified error as the terminal outcome. `produce` forwards the provider's error event unchanged when it got one.
+2. **Exhausted?** `attempt >= MaxAttempts` → return `CodeAttemptsExhausted` with the message `retry attempts exhausted after N attempts: <cause>` and `Cause` = the raw provider failure, not the retryable `*Error`.
+3. **Compute delay.** `nominalDelay(base, cap, attempt)` doubles until saturating at the cap. Then `jitterDelay(nominal, jitter, random)` multiplies by `Min + (Max-Min)*sample`, defends against NaN/Inf/out-of-range samples, rounds. The final delay is `max(jittered_local, classified.RetryAfter)`: the provider hint can extend but never shorten.
+4. **Fail-fast check.** If `MaxDelay > 0 && delay > MaxDelay`, return `CodeRetryDelayExceeded` with the message `retry delay <delay> exceeds the configured maximum <max>: <cause>` instead of retrying.
+5. **Return the delay.** `produce` announces the retry with `EvRetry`.
+6. **Sleep.** `Sleeper.Sleep(ctx, delay)`. If the sleeper returns an error or `ctx` is done, push `CodeCanceled` and return.
+7. **Next attempt.** The loop calls the provider again with the same context and freshly cloned options.
 
 ### Backoff math
 
@@ -359,15 +361,15 @@ For reset headers, a magnitude heuristic disambiguates relative vs absolute: `> 
 ### What the code assumes
 
 - **The frozen providers call `OnResponse` before turning a non-2xx into an error.** The decorator installs a per-attempt callback that captures status and headers. If a provider ever skips `OnResponse` on failure, the classifier sees `Status: 0` and `Headers: nil` and falls through to the provider-code and message-pattern tiers. Network errors (TCP resets, TLS failures) reach this path naturally — they have no HTTP status.
-- **The agent loop treats `EvError` as the end of the run.** The decorator hides failed pre-output attempts behind the output stream. If an error arrives after commit, it's forwarded as-is to the agent loop, which treats it as terminal. This is by design: once you've shown the user text, you can't replay it.
+- **The agent loop treats a terminal `EvError` as the end of the run, and `EvRetry` as a boundary inside it.** A retryable failure, before or after output, is announced as `EvRetry`. Events already forwarded remain valid for the attempt that produced them, and the loop discards that attempt at message granularity. Only a non-retryable provider error, or a generated terminal such as exhaustion or cancellation, reaches the loop as `EvError`. Re-sending after output is safe because nothing acts on a response before its terminal event: tool calls run only after the final message.
 - **`Classify` returns a non-nil `*Error` with a populated `Code` and deterministic `Retryable`.** There is no "unknown" or "maybe" outcome. The terminal fallback is `CodeProviderFailure` with `Retryable: false`.
-- **Exhaustion does not unwrap to a retryable error.** `retryClassified` constructs `CodeAttemptsExhausted` with `Cause: classified.Cause` (the raw provider text), not `Cause: classified` (the retryable `*Error`). So `errors.Is(exhaustedErr, ErrRetryable)` is false.
-- **A pre-output stream close without a terminal event is retryable.** The decorator synthesizes a `CodeStreamInterrupted` with `Retryable: true`. The classifier recognizes the exact synthesized message. After commit, the same scenario is terminal (no replay).
+- **Exhaustion does not unwrap to a retryable error.** `plan` constructs `CodeAttemptsExhausted` with `Cause: classified.Cause` (the raw provider text), not `Cause: classified` (the retryable `*Error`). So `errors.Is(exhaustedErr, ErrRetryable)` is false.
+- **A stream close without a terminal event is retryable at any point.** `forwardAttempt` synthesizes `CodeStreamInterrupted` with `Retryable: true` and the message `provider stream ended without terminal event` ([`stream.go:118-119`](internal/retry/stream.go)). Output produced before the close does not change the outcome: the attempt is announced as discarded and the request is re-sent.
 
 ### Edge cases and defenses
 
 - **Context overflow with 429 status.** Checked *before* the 429 check. A 429 with message "context length exceeded" is `CodeContextOverflow` (terminal), not `CodeRateLimited` (retryable). The overflow check combines `providerCode` and `message` so a structured code like `context_length_exceeded` also triggers.
-- **Non-terminal event with content in `Partial`.** The decorator copies the event before checking observability ([`stream.go:103`](internal/retry/stream.go)). The copy clears `Partial`, but the observability check (`eventObservable`, `eventHasObservableOutput`) inspects the owned fields (`Delta`, `Content`, tool-call blocks), not the provider's live pointer. This was a post-review fix: the initial implementation cleared `Partial` before the observability check, so a non-terminal event whose only content was in `Partial` could be buffered and discarded on retry.
+- **Non-terminal event with content only in `Partial`.** `forward` folds owned fields (`Delta`, `Content`, `ToolCall`, `ContentIndex`) into the retrier's builder, then attaches the rebuilt snapshot as `Partial` ([`stream.go:293-302`](internal/retry/stream.go)). Content that exists only in the provider's live `Partial`, such as the `"[Reasoning redacted]"` text of an Anthropic `redacted_thinking` start event, is therefore absent from the forwarded snapshot. It still reaches the caller in the terminal `EvDone.Message`, which `copyEvent` deep-copies. Module 07 covers the ownership reason and the residual trade-off.
 - **Huge positive hints.** `durationCeilMillis` bounds-checks in millisecond units before multiplying into `time.Duration`. A hint that would overflow is rejected as invalid rather than wrapping to negative. `absoluteDelay` applies the same guard: `nanos >= float64(math.MaxInt64)` → invalid.
 - **Config millisecond overflow.** `maxRetryDurationMS` in the config layer rejects any positive millisecond value that can't convert to nanoseconds without overflow. The CLI converts only already-validated values.
 - **Jitter sample defense.** If an injected `Random` returns NaN, negative, or >1, `jitterDelay` clamps to valid bounds. The delay stays within `[Min, Max]` of nominal.
@@ -513,19 +515,19 @@ In TypeScript (single-threaded event loop):
 ```typescript
 async function* retryStream(inner: AsyncGenerator<Event>) {
     for (let attempt = 1; ; attempt++) {
-        const gen = inner()
-        let committed = false
-        for await (const event of gen) {
-            if (event.type === "text_delta" && event.delta) committed = true
-            yield event
+        try {
+            for await (const event of inner()) yield event
+            return
+        } catch (err) {
+            if (attempt >= max) throw err
+            yield { type: "retry", attempt, delay, err }
+            await sleep(delay)
         }
-        if (!committed && attempt < max) { await sleep(delay); continue }
-        return
     }
 }
 ```
 
-Yielding from an async generator is cooperative. The caller pulls events one at a time. There's no concurrent mutation of `event.Partial` because the event loop serializes everything.
+Yielding from an async generator is cooperative. The caller pulls events one at a time. Events are yielded as they arrive; a failed attempt is announced with an explicit `retry` event, and the retry decision does not depend on how much output was already shown. There's no concurrent mutation of `event.Partial` because the event loop serializes everything.
 
 In Go:
 
@@ -537,7 +539,7 @@ func (r *Retrier) Stream(...) *stream.AssistantStream {
 }
 ```
 
-The producer runs in its own goroutine. The caller reads from a channel. Two concurrent goroutines share the event data — so the retrier must *copy* events before forwarding, and must own a private `AssistantBuilder` for the logical snapshot. Module 07 covers why `event.Partial = nil` and the retrier-owned builder are necessary; the policy lesson here is that Go's concurrency forces explicit ownership boundaries where TypeScript's event loop hides them.
+The producer runs in its own goroutine. The caller reads from a channel. Two concurrent goroutines share the event data, so the retrier must *copy* events before forwarding, and must own a private `AssistantBuilder` for the logical snapshot. It also cannot lean on a generator's call stack: once an event is pushed to the output stream it is gone, so a re-sent attempt has to be announced explicitly with `EvRetry` carrying the discarded message (`stream.go:89-91`). Module 07 covers why `event.Partial = nil` and the retrier-owned builder are necessary; the policy lesson here is that Go's concurrency forces explicit ownership boundaries where TypeScript's event loop hides them.
 
 ## Where it lives
 
@@ -546,7 +548,7 @@ The producer runs in its own goroutine. The caller reads from a channel. Two con
 | `Config`, `Clock`, `Sleeper`, `Random`, `Jitter`, `DefaultConfig`, `Validate`, `nominalDelay`, `jitterDelay` | `internal/retry/config.go` |
 | `Error`, `Code`, sentinels (`ErrRetryable` etc.), `Failure`, `Classify`, `classifyProviderCode`, `isContextOverflow` | `internal/retry/error.go` |
 | `RetryAfter`, `durationCeilMillis`, header parsing (`retryAfterSecondsOrDate`, `resetDelay`, `absoluteDelay`, `decimalDuration`) | `internal/retry/hints.go` |
-| `Streamer`, `StreamFunc`, `Retrier`, `New`, `Stream`, `produce`, `retryFailure`, `retryClassified`, `eventObservable`, `forward`, `flush`, `cloneOptions`, defensive copy helpers | `internal/retry/stream.go` |
+| `Streamer`, `StreamFunc`, `Retrier`, `New`, `Stream`, `produce`, `forwardAttempt`, `plan`, `attemptMessage`, `forward`, `copyEvent`, `cloneOptions`, defensive copy helpers | `internal/retry/stream.go` |
 | `RetrySettings`, `maxRetryDurationMS`, config resolution, env/settings/flag precedence | `internal/config/config.go` |
 | Wiring: `NewProviderRouter` decorates `StreamFn` with `retry.New` after credential binding | `internal/adapter/provider.go:105-110` |
 | Wiring: `RoleRoutingConfig.Retry` propagates to each role's router | `internal/adapter/roles.go` |

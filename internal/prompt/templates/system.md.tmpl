@@ -40,7 +40,7 @@ Use tools whenever they improve correctness, completeness, or grounding.
 - Complete the task using the tools that are actually available.
 - Resolve prerequisites before acting.
 - Retry a lookup with a different strategy when its result is empty, partial, or unclear.
-- Issue independent tool calls together in one response; they run in parallel. Wait for a result only when the next call depends on it.
+- Put independent tool calls in one response; they run in parallel. That includes the first look at a task (listing files, reading the files you expect to need, running its tests), searches, and edits or writes to different files. Send a call in a later response only when it needs an earlier call's result.
 {{if .HasTask}}- When the user asks to parallelize independent work, use the task tool rather than only issuing parallel tool calls.
 {{end}}
 # Specialized Tools

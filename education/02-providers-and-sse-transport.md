@@ -31,10 +31,16 @@ Three concrete problems the abstraction solves:
    The registry dispatches by API identifier; the loop only sees
    `stream.AssistantStream`.
 
-3. **Stream health.** A hung SSE connection — where the server accepted the
-   request but never sends another event — pins a goroutine and a CPU core.
-   The idle watchdog in every provider's `runStream` guards against this wedge
-   with a configurable timeout (`HARNESS_STREAM_IDLE_SECONDS`, default 90s).
+3. **Stream health.** A hung SSE connection, where the server accepted the
+   request but never sends another data event, pins a goroutine and a CPU
+   core. Every provider's `runStream` starts the shared watchdog from
+   `internal/provider/base/watchdog.go` (`WatchStream` at
+   `watchdog.go:67-70`) with two configurable bounds: the first-output bound
+   (`HARNESS_STREAM_FIRST_OUTPUT_SECONDS`, default 300s) until the model
+   produces content, then the idle bound (`HARNESS_STREAM_IDLE_SECONDS`,
+   default 90s) between data events. SSE comment keep-alives deliberately do
+   not count (`watchdog.go:15-18`): they prove the socket is open, not that
+   the model is producing.
 
 ## Key decisions and the thinking process
 
@@ -450,8 +456,9 @@ launches `runStream` as a goroutine:
 Stream()
   └─ go runStream(parent, s, model, c, opts)
        ├─ newOutputMessage(model)          // seed the accumulator
-       ├─ context.WithCancel(parent)       // streamCtx = watchdog target
-       ├─ go watchIdle(done, activity, cancel, &idleFired)
+       ├─ context.WithCancel(parent)       // streamCtx = watchdog cancel target
+       ├─ watchdog := base.WatchStream(cancel, streamTimeouts)
+       ├─ defer watchdog.Stop()
        ├─ assertRequestAuth(...)           // fail fast: no key = error event
        ├─ buildRequestHeaders(...) + buildParams(...)
        ├─ OnPayload(payload, model)        // optional transform
@@ -462,20 +469,21 @@ Stream()
        │         └─ retry classifier inspects 429/5xx/4xx
        ├─ check status < 200 || >= 300 → read body, push error
        ├─ s.Push(EvStart, Partial: output)
-       ├─ iterateAnthropicEvents(streamCtx, resp.Body, onActivity, foldFn)
+       ├─ iterateAnthropicEvents(streamCtx, resp.Body, watchdog.Event, foldFn)
        │    └─ sseparse.IterateSSE(ctx, resp.Body, callback)
        │         ├─ read 4096-byte chunks
        │         ├─ drainCompleteLines → decodeSseLine → decodeSseLine → ...
        │         │    └─ blank line → flushSseEvent → callback(event)
        │         └─ callback:
-       │              ├─ onActivity() → non-blocking send to watchdog
+       │              ├─ watchdog.Event() → non-blocking clock reset
        │              ├─ skip non-message events (ping, etc.)
        │              ├─ jsonrepair.ParseJsonWithRepair(event.Data, &raw)
        │              └─ foldAnthropicEvent(raw, state, model)
        │                   └─ foldContentBlockStart / Delta / Stop
+       │                        → watchdog.Output() when content arrived
        │                        → s.Push(EvTextDelta / EvToolCallStart / ...)
        ├─ enforce message_start→message_stop bracketing
-       ├─ streamError(parent.Err(), err, idleFired.Load())
+       ├─ watchdog.Err(parent.Err(), err)
        ├─ check parent.Err() → aborted
        ├─ check output.StopReason → aborted/error
        └─ s.Push(EvDone, Reason, Message)
@@ -498,31 +506,54 @@ trailing bytes unconsumed. They stay in the buffer and are prepended to
 the next chunk. At EOF, any remaining bytes are decoded as a final line
 and the state is flushed.
 
-### 5. The idle watchdog
+### 5. The stream watchdog
 
-All three providers implement the same watchdog pattern. In Anthropic's
+All three providers use the same watchdog implementation from
+`internal/provider/base`, not a per-provider copy. In Anthropic's
 `runStream`:
 
 ```go
 streamCtx, cancel := context.WithCancel(parent)
-activity := make(chan struct{}, 1)
-done := make(chan struct{})
-var idleFired atomic.Bool
-go watchIdle(done, activity, cancel, &idleFired)
-defer close(done)
+watchdog := base.WatchStream(cancel, streamTimeouts)
+defer watchdog.Stop()
 ```
 
-`watchIdle` at `stream.go:292-315` starts a timer for `streamIdleTimeout`
-(90s by default). On each SSE event, the callback sends on `activity` (a
-buffered-1 channel — non-blocking, so a backlogged watchdog does not stall
-the reader). The watchdog resets its timer on activity. If the timer fires,
-it sets `idleFired = true` and calls `cancel()`.
+`streamTimeouts` is a package variable in each provider's `options.go`
+(`anthropic/options.go:58`, `openai/options.go:28`, `google/options.go:34`)
+initialized once with `base.StreamTimeoutsFromEnv()` (`watchdog.go:37-44`).
+That function reads `HARNESS_STREAM_FIRST_OUTPUT_SECONDS` (default 300) and
+`HARNESS_STREAM_IDLE_SECONDS` (default 90) through `envSeconds`
+(`watchdog.go:46-51`), and forces the first-output bound to be at least the
+idle bound.
 
-After SSE iteration ends, `streamError` checks `idleFired.Load()`: if true,
-the error is wrapped as `StreamTruncated` rather than treated as a real
-transport failure. This distinction matters for the agent loop's retry
-decision — a truncated stream from a hung connection might be retryable,
-while a genuine HTTP error might not.
+`StreamTimeouts` (`watchdog.go:19-27`) therefore has two bounds.
+`FirstOutput` applies until the model produces content: text, thinking, or a
+tool call. It covers provider queueing and the silent reasoning phase of
+models that do not stream their reasoning. `Idle` applies after that, when a
+generating model should be streaming tokens continuously.
+`Watchdog.bound()` (`watchdog.go:132-137`) picks between them by reading an
+atomic flag.
+
+The reader calls `watchdog.Event()` on every SSE data event
+(`watchdog.go:75-82`). It sends on a buffered-1 channel with a non-blocking
+select, so one pending signal is enough to restart the clock and a
+backlogged watchdog never stalls the parser. SSE comment keep-alives are
+dropped by the SSE parser before the callback runs, so they never reach
+`Event()`. That is deliberate: a proxy keeps sending keep-alives for an
+upstream that has hung. The provider calls `watchdog.Output()`
+(`watchdog.go:84-88`) once a fold produced content events, which switches
+the allowed silence from `FirstOutput` to `Idle`.
+
+If the timer fires, `run` (`watchdog.go:111-130`) stores a
+`*retry.Error{Code: stream_interrupted, Retryable: true}` and calls
+`cancel()`. The message names the bound that expired: `stream idle for 1m30s
+(no events)` or `stream idle for 5m0s before the first output (no events)`.
+`watchdog.Err` (`watchdog.go:101-109`) then decides what the provider
+reports: the caller's cancellation as is when the parent context is done,
+the stored stall error when the watchdog fired, and the transport error
+unchanged otherwise. The watchdog cancels through its own child context, so
+the transport error after a stall is a bare `context.Canceled` that would
+otherwise read as a user abort; `Err` turns it back into a retryable stall.
 
 ### 6. Role routing
 
@@ -587,37 +618,43 @@ present.
 `iterateAnthropicEvents` tracks `sawMessageStart` and `sawMessageEnd`. If
 the stream delivers `message_start` but never `message_stop` (the connection
 closed or the SSE stream ended prematurely), the function returns an error:
-`"Anthropic stream ended before message_stop"`. This is distinct from the
-idle watchdog — the watchdog fires when no bytes arrive; the bracketing
-check fires when bytes arrived but the protocol sequence is incomplete.
+`"Anthropic stream ended before message_stop"` (`events.go:145-146`). This is
+distinct from the watchdog: the watchdog fires when no data events arrive,
+while the bracketing check fires when data arrived but the protocol sequence
+is incomplete.
 
 OpenAI has a parallel check: if the stream ends without any chunk carrying
-a `finish_reason`, the response is treated as truncated
-(`"stream ended without finish_reason"` at `openai/stream.go:168-170`).
+a `finish_reason`, and the watchdog did not fire, the provider pushes a
+`*retry.Error{Code: stream_interrupted, Retryable: true}` with the message
+`"stream ended without finish_reason"` (`openai/stream.go:171-175`).
 
-### Idle watchdog → StreamTruncated, not a transport error
+### Watchdog stall → retryable stream interruption, not a transport error
 
-The watchdog goroutine sets `idleFired = true` before calling `cancel()`,
-and `streamError` checks `idleFired.Load()` after SSE iteration. If the
-watchdog fired, the error is wrapped:
+The watchdog stores its stall error before calling `cancel()`, and
+`watchdog.Err` checks the stored value after the request fails:
 
 ```go
-// anthropic/stream.go:275-283
-func streamError(parentErr error, err error, idle bool) error {
+// internal/provider/base/watchdog.go:101-109
+func (watchdog *Watchdog) Err(parentErr, err error) error {
     if parentErr != nil {
         return parentErr  // real cancellation: user typed /cancel
     }
-    if idle {
-        return StreamTruncated(errors.New("response stream was truncated"))
+    if stall := watchdog.stall.Load(); stall != nil {
+        return stall
     }
     return err
 }
 ```
 
-This lets the agent loop distinguish:
-- Parent context cancelled → user abort (not an error).
-- Watchdog fired → stream hung (StreamTruncated, potentially retryable).
-- Real transport error → network/protocol failure (not retryable by default).
+This lets the retry layer and the agent loop distinguish three outcomes:
+- Parent context cancelled → user abort, reported as the caller's error.
+- Watchdog fired → stream stalled, reported as
+  `*retry.Error{Code: stream_interrupted, Retryable: true}`.
+- Real transport error → network/protocol failure, passed through unchanged.
+
+A stall therefore no longer wraps `context.Canceled` and is no longer recorded
+with error code `canceled`. It is a retryable `stream_interrupted`, so the
+retry decorator in module 06 can re-send the request (`watchdog.go:111-130`).
 
 ### Panic recovery
 
@@ -718,7 +755,8 @@ not need two error paths (return value + stream event). All errors — auth,
 network, parse, idle timeout, protocol bracketing — arrive through the
 same channel as `EvError`. The `pushError` helper in each provider sets
 the `StopReason` to either `StopAborted` (parent context done) or
-`StopError` (genuine failure), and the agent loop switches on that.
+`StopError` (genuine failure, including a watchdog stall), and the agent
+loop switches on that.
 
 ### Interface-based injection: `agent.StreamFn`
 
@@ -750,15 +788,16 @@ package.
 | `internal/adapter/roles.go` | `RoleRoutingConfig`, `RoleRouters`, `ResolveRoles`, `roleCredentials` |
 | `internal/transport/sseparse/sse.go` | `ServerSentEvent`, `IterateSSE`, `decodeSseLine`, `flushSseEvent`, `drainCompleteLines`, `decoderState` |
 | `internal/transport/sseparse/sse_test.go` | SSE round-trip and edge-case tests |
-| `internal/provider/anthropic/stream.go` | `Stream`, `StreamSimple`, `runStream`, `watchIdle`, `streamError`, `pushError` |
+| `internal/provider/base/watchdog.go` | `StreamTimeouts`, `StreamTimeoutsFromEnv`, `envSeconds`, `Watchdog`, `WatchStream`, `Event`, `Output`, `Stop`, `Stalled`, `Err`, `run`, `bound` |
+| `internal/provider/anthropic/stream.go` | `Stream`, `StreamSimple`, `runStream`, `pushError` |
 | `internal/provider/anthropic/events.go` | `rawAnthropicEvent`, `foldState`, `foldBlock`, `iterateAnthropicEvents`, `foldAnthropicEvent`, `foldContentBlockStart`, `foldContentBlockDelta`, `foldContentBlockStop` |
-| `internal/provider/anthropic/options.go` | `Options`, `Effort`, `StreamIdleTimeoutFromEnv`, `buildBaseOptions`, `mapThinkingLevelToEffort` |
-| `internal/provider/openai/stream.go` | `Stream`, `StreamSimple`, `runStream`, `watchIdle` |
+| `internal/provider/anthropic/options.go` | `Options`, `Effort`, `streamTimeouts`, `buildBaseOptions`, `mapThinkingLevelToEffort` |
+| `internal/provider/openai/stream.go` | `Stream`, `StreamSimple`, `runStream`, `pushError` |
 | `internal/provider/openai/events.go` | `openAIStreamChunk`, `openAIFoldState`, `iterateOpenAIEvents`, `foldOpenAIChunk`, `foldOpenAIToolCallDelta` |
-| `internal/provider/openai/options.go` | `Options`, `StreamIdleTimeoutFromEnv` |
-| `internal/provider/google/stream.go` | `Stream`, `StreamSimple`, `runStream`, `watchIdle` |
+| `internal/provider/openai/options.go` | `Options`, `streamTimeouts` |
+| `internal/provider/google/stream.go` | `Stream`, `StreamSimple`, `runStream`, `pushError` |
 | `internal/provider/google/events.go` | `googleStreamChunk`, `googleFoldState`, `iterateGoogleEvents`, `foldGoogleChunk`, `foldGoogleFuncCall` |
-| `internal/provider/google/options.go` | `Options`, `thinkingConfig`, `StreamIdleTimeoutFromEnv` |
+| `internal/provider/google/options.go` | `Options`, `thinkingConfig`, `streamTimeouts` |
 | `internal/provider/faux/faux.go` | `Faux`, `ResponseStep`, `State`, `New`, `SetResponses`, `AppendResponses`, `Stream`, `StreamSimple`, `Provider`, `Respond`, `RespondMessage`, `Text`, `Thinking`, `ToolCall` |
 | `internal/engine/types/options.go` | `ProviderResponse`, `StreamOptions`, `SimpleStreamOptions` (with `OnResponse`, `OnPayload`) |
 | `internal/engine/types/model.go` | `Model` (with `API`, `Provider`, `BaseURL`, `ContextWindow`, `MaxTokens`, `Compat`) |

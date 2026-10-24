@@ -1,5 +1,7 @@
 package types
 
+import "time"
+
 // StreamEventType is the discriminant of a streaming event. Consumers switch on
 // it, so a tagged struct (below) is used rather than an interface sum.
 type StreamEventType string
@@ -17,13 +19,20 @@ const (
 	EvToolCallEnd   StreamEventType = "toolcall_end"
 	EvDone          StreamEventType = "done"
 	EvError         StreamEventType = "error"
+	// EvRetry reports that the attempt streamed so far failed with a transient
+	// error and the same request is being sent again. Everything streamed since
+	// the request started is discarded; the events that follow belong to the
+	// next attempt.
+	EvRetry StreamEventType = "retry"
 )
 
-// StreamEvent is one streaming event. Every non-terminal arm carries Partial (a
-// live pointer to the builder's message — read-only until the next event).
+// StreamEvent is one streaming event. Content arms carry Partial (a live
+// pointer to the builder's message — read-only until the next event).
 // Terminal arms carry either a final message and stop reason or a final error
 // message. `*_end` text/thinking events carry the full Content, while
-// toolcall_end carries the assembled ToolCall.
+// toolcall_end carries the assembled ToolCall. A retry carries the discarded
+// attempt in Err (its partial content, usage and error), its ordinal in
+// Attempt and the wait before the next attempt in RetryDelay.
 type StreamEvent struct {
 	Type         StreamEventType
 	ContentIndex int
@@ -31,9 +40,11 @@ type StreamEvent struct {
 	Content      string            // text_end / thinking_end (full content)
 	ToolCall     *ContentBlock     // toolcall_end (assembled tool call)
 	Reason       StopReason        // done / error
-	Partial      *AssistantMessage // non-terminal arms
+	Partial      *AssistantMessage // content arms
 	Message      *AssistantMessage // done
-	Err          *AssistantMessage // error
+	Err          *AssistantMessage // error / retry (the discarded attempt)
+	Attempt      int               // retry: 1-based ordinal of the failed attempt
+	RetryDelay   time.Duration     // retry: wait before the next attempt
 }
 
 // AssistantBuilder folds a stream of StreamEvents into an AssistantMessage. The
@@ -100,6 +111,8 @@ func (b *AssistantBuilder) Fold(ev StreamEvent) {
 				b.msg.ErrorDetails = ev.Err.ErrorDetails
 			}
 		}
+	case EvRetry:
+		b.msg = AssistantMessage{API: b.msg.API, Provider: b.msg.Provider, Model: b.msg.Model}
 	}
 }
 

@@ -31,6 +31,8 @@ const (
 	// collects output when it does not go quiet first.
 	DefaultStdinWaitMS = 2000
 	MaxStdinWaitMS     = 30000
+	// MaxJobPage is the largest page Controller.Jobs serves.
+	MaxJobPage = 50
 )
 
 type QueueInput struct {

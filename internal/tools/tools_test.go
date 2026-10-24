@@ -561,21 +561,19 @@ func TestBashTool(t *testing.T) {
 		t.Fatalf("bash result = %q", got)
 	}
 
-	_, err = executeTool(t, bash, map[string]any{"command": "printf fail; exit 7"})
-	if err == nil || !strings.Contains(err.Error(), "Command exited with code 7") || !strings.Contains(err.Error(), "fail") {
-		t.Fatalf("nonzero err = %v", err)
+	// stderr reaches the model in the order the command wrote it, ahead of the exit status.
+	_, err = executeTool(t, bash, map[string]any{"command": "echo out1; echo err1 >&2; echo out2; exit 7"})
+	if err == nil || !strings.Contains(err.Error(), "out1\nerr1\nout2\n") || !strings.HasSuffix(err.Error(), "Command exited with code 7") {
+		t.Fatalf("nonzero err = %q", err)
 	}
 }
 
-func TestBashToolLargeOutputKeepsTail(t *testing.T) {
+func TestBashToolLargeOutputKeepsTailError(t *testing.T) {
 	dir := t.TempDir()
 	bash, _ := NewTool(BashTool, dir, ToolsOptions{})
-	result, err := executeTool(t, bash, map[string]any{"command": "for ((i=1;i<=50000;i++)); do printf '%06d\\n' \"$i\"; done"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := resultText(result); !strings.Contains(got, "050000") {
-		t.Fatalf("large output tail missing final line: %q", got)
+	_, err := executeTool(t, bash, map[string]any{"command": "for ((i=1;i<=50000;i++)); do printf '%06d\\n' \"$i\"; done; echo 'fatal: tail error' >&2; exit 3"})
+	if err == nil || !strings.Contains(err.Error(), "050000\nfatal: tail error\n") || !strings.HasSuffix(err.Error(), "Command exited with code 3") {
+		t.Fatalf("truncated output lost its final stderr line: %q", err)
 	}
 }
 

@@ -249,7 +249,12 @@ func TestWriteStdinRefusesRecoveredAndNonBashJobs(t *testing.T) {
 	if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "never reattaches") || !strings.Contains(err.Error(), "unknown") {
 		t.Fatalf("recovered pty job = %v", err)
 	}
-	if _, err = host.manager.WriteStdin(context.Background(), "job_missing", work.StdinRequest{}); !errors.Is(err, ErrJobNotFound) {
+	// A missing job is reported with what to do next: with no jobs, how to
+	// start one that takes input; otherwise, the jobs that exist.
+	if _, err = host.manager.WriteStdin(context.Background(), "job_missing", work.StdinRequest{}); !errors.Is(err, ErrJobNotFound) || !strings.Contains(err.Error(), "stdin:true") {
+		t.Fatal(err)
+	}
+	if _, err = manager.WriteStdin(context.Background(), "job_missing", work.StdinRequest{}); !errors.Is(err, ErrJobNotFound) || !strings.Contains(err.Error(), jobID) {
 		t.Fatal(err)
 	}
 	if _, err = host.manager.WriteStdin(context.Background(), jobID, work.StdinRequest{Wait: (work.MaxStdinWaitMS + 1) * time.Millisecond}); !errors.Is(err, ErrInvalidInput) {

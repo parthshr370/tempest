@@ -227,7 +227,8 @@ func TestExecuteToolCallsUnknownToolImmediateError(t *testing.T) {
 	if len(batch.Messages) != 1 || !batch.Messages[0].IsError {
 		t.Fatalf("messages = %#v, want one error result", batch.Messages)
 	}
-	if got := resultText(t, batch.Messages[0].Content); got != "Tool missing not found" {
+	// The error names the tools that do exist, so the model can redirect.
+	if got := resultText(t, batch.Messages[0].Content); !strings.HasPrefix(got, "Tool missing not found") || !strings.Contains(got, "other") {
 		t.Fatalf("error text = %q", got)
 	}
 }

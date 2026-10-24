@@ -3,7 +3,6 @@ package google
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,10 +12,12 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/provider/base"
+	"go.harness.dev/harness/internal/retry"
 )
 
 func TestMain(m *testing.M) {
-	streamIdleTimeout = 50 * time.Millisecond
+	streamTimeouts = base.StreamTimeouts{FirstOutput: 50 * time.Millisecond, Idle: 50 * time.Millisecond}
 	os.Exit(m.Run())
 }
 
@@ -257,11 +258,8 @@ func TestStreamHTTPAndIdleWatchdog(t *testing.T) {
 	idleModel.BaseURL = idleServer.URL
 	idleStream := Stream(context.Background(), idleModel, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &Options{StreamOptions: types.StreamOptions{APIKey: "sk-test"}})
 	idleMessage := drainAssistantStream(t, idleStream)
-	if idleMessage.StopReason != types.StopError || !strings.Contains(idleMessage.ErrorMessage, "stream idle") {
+	if idleMessage.StopReason != types.StopError || !strings.Contains(idleMessage.ErrorMessage, "stream idle") || idleMessage.ErrorCode != string(retry.CodeStreamInterrupted) {
 		t.Fatalf("idle message = %+v", idleMessage)
-	}
-	if !IsStreamTruncated(streamError(nil, errors.New("context canceled"), true)) {
-		t.Fatal("idle streamError should be StreamTruncated")
 	}
 }
 

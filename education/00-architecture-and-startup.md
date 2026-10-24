@@ -314,7 +314,7 @@ If context files or skills are re-scanned after the agent starts, the system pro
 
 ### What breaks without the `Partial` nil in `copyEvent`
 
-Streaming events can contain a mutable partial assistant message. The retry decorator makes a forwarding copy before it buffers or re-emits an event; `copyEvent` explicitly clears `Partial` and deep-copies the message, error, and tool call fields (`internal/retry/stream.go:253-276`). Removing that clearing step would let retry bookkeeping retain a pointer whose producer may still mutate. The invariant is simple: a copied event must not share the live partial message.
+Streaming events can contain a mutable partial assistant message. The retry decorator makes a forwarding copy before it forwards an event; `copyEvent` explicitly clears `Partial` and deep-copies the message, error, and tool call fields (`internal/retry/stream.go:248-257`). Removing that clearing step would let retry bookkeeping retain a pointer whose producer may still mutate. The invariant is simple: a copied event must not share the live partial message.
 
 ### What breaks if config resolution is mutable
 

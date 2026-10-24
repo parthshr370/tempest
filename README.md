@@ -439,7 +439,17 @@ finish. `jobs` lists `name` and `readiness`; `cancel` and `logs` take
 `name` in place of `job_id`, and `wait` takes `names` besides `job_ids`. A name
 resolves to its running job, else the one started last. Starting a name that is
 already running fails with the job holding it; restart a service with `cancel
-{"name":…}` and start it again.
+{"name":…}` and start it again. A job call that names no job, or an id or name the
+session doesn't have, fails with the session's jobs (id, name, kind, state, newest
+first) or, when there are none, with how to start one. `ready_timeout_ms` without
+`ready_log` or `ready_port` is rejected rather than ignored: it bounds a readiness
+wait, and to wait for a job to finish you call `wait`.
+
+Like the foreground command, a background job writes stdout and stderr to one
+pipe, as under `2>&1`, so `logs` and `write_stdin` show them interleaved in the
+order the command wrote them. A bash job's `result_text` (in `wait`, `jobs` and
+the completion notice) is the end of its output, where a failing command prints
+its error; `logs` pages the whole of it.
 
 #### Interactive jobs: stdin and pseudo-terminals
 
@@ -459,8 +469,8 @@ polls any background job; `close_stdin:true` ends the input after the text.
 `pty:true` starts the job on a pseudo-terminal (stdlib ioctls on darwin and Linux,
 no dependency): the process is a session leader whose controlling terminal is
 24x80, with `TERM=dumb`, `NO_COLOR=1` and `cat` as pager so REPLs and prompting
-tools run as they do for a person without painting the log. Its stdout and stderr
-are one stream, the terminal echoes input and ends lines with `\r\n`, and nothing
+tools run as they do for a person without painting the log. The terminal echoes
+input and ends lines with `\r\n`, and nothing
 is stripped. Ctrl-C reaches the foreground program through the line discipline;
 on a pipe job, with or without `stdin:true`, text that is exactly `\u0003` sends
 SIGINT to the job's process group instead. `close_stdin` closes a pipe job's stdin
@@ -498,8 +508,9 @@ budget cuts short ends with the `path:START-END` that continues it, and a file i
 leaves no room for is named, not read. A failing entry reports its error in place
 of its section. `offset`/`limit` page a single `path` only. `grep` takes `paths`
 the same way, with one shared match `limit`. The system prompt tells the model to
-batch known reads this way and to issue independent tool calls in one response,
-which the agent loop already runs concurrently.
+batch known reads this way and to put independent tool calls in one response (the
+opening look at a task, searches, edits or writes to different files), which the
+agent loop already runs concurrently.
 
 `read` takes more than files. Every text output below starts with the
 `[path#TAG]` header and accepts the same `path:START-END` / `path:START+COUNT`
@@ -591,7 +602,7 @@ wire methods use camelCase (`jobId`, `jobIds`).
 - `jobs` — page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
 - `wait` — wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
 - `cancel` — cancel one task or background bash job, by id or name.
-- `logs` — page a background command's bounded stdout/stderr by byte offset, by id or name.
+- `logs` — page a background command's bounded output (stdout and stderr in write order) by byte offset, by id or name.
 - `write_stdin` — type into a running background job (text, Ctrl-C, end of input) and get back the output it printed since the last call, by id or name.
 
 **Coordination**
@@ -718,6 +729,7 @@ ends with a stop reason:
 | `max_turns`, `max_cost`, `max_wall_time` | A budget tripped. | 0 |
 | `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
 | `error` | The provider failed, or the session journal could not be written. | 1 |
+| `repeated_failure` | The model sent the same tool call, with the same arguments, until it had failed with the same error five times in a row. | 1 |
 
 Budgets are checked at turn boundaries: after a turn's tools finish and before
 the next model call. A budget-stopped run therefore ends on a complete turn, and
@@ -733,12 +745,42 @@ the next model call. A budget-stopped run therefore ends on a complete turn, and
   route, a call that comes back without a cost stops the run with that error.
 - `-max-wall-time D` caps elapsed time, as a Go duration such as `10m`.
 
+A failed tool call sent again unchanged fails the same way, so the loop watches for
+it. A failed result that repeats the failure just before it (same tool, same
+arguments after JSON canonicalization, same error) gets a host notice appended,
+from the second time on, saying how many times in a row the call has failed and
+that the arguments or the approach must change. The fifth identical failure in a
+row ends the run with `repeated_failure` after that turn; `error` in the report
+names the call and its error, and over ACP `session/prompt` fails with `-32023
+repeated_failure`. Any other tool result or a user message (a new prompt included)
+resets the count, and a successful result is never changed. The count is read from
+the transcript, so continuing a resumed session (`Session.Continue`,
+`tempest/continue`) carries it on.
+
 Background bash and the four management tools ship with ordinary bash; task
 remains opt-in. Cancellation, `Session.Close`, CLI signals and server shutdown
 cancel and join owned jobs before the root terminal event. This isn't a detached
 process service: no background command is intentionally kept alive after clean
 shutdown. SIGKILL can leave OS descendants running; recovery reports their outcome
 as unknown, never reruns the command and never signals a stale PID.
+
+A model call that fails transiently is sent again, unchanged, after an
+exponential backoff (`HARNESS_RETRY_*`; 11 attempts by default): HTTP 429 and
+5xx, dropped connections, error events inside a stream, and stalled streams. A
+stream has stalled when no SSE event arrives for 5 minutes before the model's
+first output (queueing, or reasoning the model doesn't stream) or for 90
+seconds once output has started. Keep-alive comments don't count, so a proxy
+holding a hung upstream open is still caught. Sending the call again after part
+of a reply was streamed is safe because tool calls run only once a reply is
+complete. The abandoned attempt ends as an errored assistant message, in the
+transcript and the journal, carrying whatever usage the provider reported for it
+(OpenAI-compatible routes report usage only at the end of a stream, so a stalled
+attempt there records none, and its `responseId` is kept for looking up the
+bill). It is never sent back to the model; the next attempt starts a new
+message, and stderr logs `assistant stream retry` with the attempt, the delay and
+the cause. Cancellation and other 4xx failures (authentication, invalid request,
+context overflow) are not retried. When the attempts run out, the run stops with
+`error` naming the attempt count and the last cause.
 
 `-output-format json` prints a run report:
 
@@ -748,7 +790,7 @@ as unknown, never reruns the command and never signals a stale PID.
 ```
 
 `cost_usd` is `null` when any call's price was unknown, and `error` appears on
-`error` and `output_invalid` stops.
+`error`, `output_invalid` and `repeated_failure` stops.
 
 `-output-schema FILE` makes the run's final answer one JSON value that satisfies
 the JSON Schema in FILE. The provider is asked for native structured output
@@ -1103,6 +1145,7 @@ not read `.env` — export variables before running it.
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |
 | `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
+| `HARNESS_STREAM_IDLE_SECONDS`, `HARNESS_STREAM_FIRST_OUTPUT_SECONDS` | Stream stall bounds: seconds without an SSE event once output has started (default 90), and before the first output (default 300, never below the idle bound). |
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
 | `HARNESS_CLOUD_POLICY` | Kube-context rule file (settings `cloud_policy`). |

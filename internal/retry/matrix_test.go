@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,12 +191,12 @@ func TestExactBackoffSequence(t *testing.T) {
 			}
 			source.attempts = append(source.attempts, matrixAttempt{events: []types.StreamEvent{matrixDone()}})
 			events := collect(matrixRetrier(t, source, matrixConfig(sleeper, fixedRandom(tc.random))).Stream(context.Background(), testModel(), types.Context{}, nil))
-			if len(events) != 1 || events[0].Type != types.EvDone || len(sleeper.delays) != len(tc.want) {
+			if len(events) != len(tc.want)+1 || events[len(tc.want)].Type != types.EvDone || len(sleeper.delays) != len(tc.want) {
 				t.Fatalf("events=%+v delays=%v", events, sleeper.delays)
 			}
 			for i := range tc.want {
-				if sleeper.delays[i] != tc.want[i] {
-					t.Fatalf("delay[%d]=%v want %v", i, sleeper.delays[i], tc.want[i])
+				if sleeper.delays[i] != tc.want[i] || events[i].Type != types.EvRetry || events[i].Attempt != i+1 || events[i].RetryDelay != tc.want[i] {
+					t.Fatalf("delay[%d]=%v event=%+v want %v", i, sleeper.delays[i], events[i], tc.want[i])
 				}
 			}
 		})
@@ -257,7 +258,7 @@ func TestCancelDuringSleep(t *testing.T) {
 		t.Fatal("sleeper was not entered")
 	}
 	events := collect(out)
-	if source.calls != 1 || len(events) != 1 || terminalCode(t, events) != CodeCanceled || events[0].Reason != types.StopAborted {
+	if source.calls != 1 || eventTypes(events) != "retry error" || terminalCode(t, events) != CodeCanceled || events[1].Reason != types.StopAborted {
 		t.Fatalf("calls=%d events=%+v", source.calls, events)
 	}
 }
@@ -448,7 +449,7 @@ func TestTypedErrorsAndRealExhaustedChain(t *testing.T) {
 	cfg := matrixConfig(&recordedSleeper{}, fixedRandom(1))
 	cfg.MaxAttempts = 2
 	events := collect(matrixRetrier(t, source, cfg).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if terminalCode(t, events) != CodeAttemptsExhausted || len(events) != 1 {
+	if terminalCode(t, events) != CodeAttemptsExhausted || eventTypes(events) != "retry error" || !strings.Contains(events[1].Err.ErrorMessage, "2 attempts") || !strings.Contains(events[1].Err.ErrorMessage, "connection reset") {
 		t.Fatalf("real-exhausted-chain events=%+v", events)
 	}
 	// The generated terminal frame is intentionally not the retryable provider cause.
@@ -503,15 +504,15 @@ func TestAttemptsAndReplaySafety(t *testing.T) {
 	if events[2].Partial.Content[0].Text != "ok" {
 		t.Fatal("forwarded partial aliases provider")
 	}
-	// An empty first attempt must be hidden, then a coherent second attempt forwarded.
+	// A failed attempt is discarded by a retry event, then a coherent second attempt forwarded.
 	replay := &matrixStreamer{attempts: source.attempts[1:]}
 	events = collect(matrixRetrier(t, replay, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if replay.calls != 2 || len(events) != 3 || events[0].Type != types.EvStart || events[1].Partial.Content[0].Text != "again" || events[0].Partial == providerPartial {
+	if replay.calls != 2 || eventTypes(events) != "start text_start retry start text_delta done" || len(events[4].Partial.Content) != 1 || events[4].Partial.Content[0].Text != "again" {
 		t.Fatalf("replay events=%+v", events)
 	}
 }
 
-func TestObservableOutputVariantsAndNonTerminalPartialContent(t *testing.T) {
+func TestEveryOutputKindIsRetriedWithOwnedPartials(t *testing.T) {
 	variants := []struct {
 		name  string
 		event types.StreamEvent
@@ -521,56 +522,60 @@ func TestObservableOutputVariantsAndNonTerminalPartialContent(t *testing.T) {
 		{"tool-start", types.StreamEvent{Type: types.EvToolCallStart, ContentIndex: 0}},
 		{"tool-delta", types.StreamEvent{Type: types.EvToolCallDelta, ContentIndex: 0, Delta: "{}"}},
 		{"tool-end", types.StreamEvent{Type: types.EvToolCallEnd, ContentIndex: 0, ToolCall: &types.ContentBlock{Type: types.BlockToolCall, ID: "id", Name: "tool", Arguments: []byte(`{}`)}}},
-		{"non-terminal-owned-content", types.StreamEvent{Type: types.EvTextEnd, ContentIndex: 0, Content: "partial"}},
+		{"text-end", types.StreamEvent{Type: types.EvTextEnd, ContentIndex: 0, Content: "partial"}},
 	}
 	for _, tc := range variants {
 		t.Run(tc.name, func(t *testing.T) {
 			downstreamPartial := &types.AssistantMessage{API: "downstream"}
 			tc.event.Partial = downstreamPartial
-			source := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{tc.event, matrixRetryEvent("connection reset")}}}}
+			source := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{tc.event, matrixRetryEvent("connection reset")}}, {events: []types.StreamEvent{matrixDone()}}}}
 			events := collect(matrixRetrier(t, source, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-			if source.calls != 1 || len(events) != 2 || events[1].Type != types.EvError {
-				t.Fatalf("calls=%d events=%+v", source.calls, events)
+			if source.calls != 2 || eventTypes(events) != string(tc.event.Type)+" retry done" {
+				t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 			}
 			if events[0].Partial == nil || events[0].Partial.API != "test" || events[0].Partial.Provider != "test" || events[0].Partial.Model != "test" || events[0].Partial == downstreamPartial {
 				t.Fatalf("forwarded event has an unowned logical partial: %+v", events[0])
 			}
 		})
 	}
-	terminalContent := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{ErrorMessage: "connection reset", Content: []types.ContentBlock{{Type: types.BlockText, Text: "visible"}}}}}}}}
-	if events := collect(matrixRetrier(t, terminalContent, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil)); terminalContent.calls != 1 || len(events) != 1 || events[0].Err.Content[0].Text != "visible" {
+	terminalContent := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{ErrorMessage: "connection reset", Content: []types.ContentBlock{{Type: types.BlockText, Text: "visible"}}}}}}, {events: []types.StreamEvent{matrixDone()}}}}
+	if events := collect(matrixRetrier(t, terminalContent, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil)); terminalContent.calls != 2 || eventTypes(events) != "retry done" || events[0].Err.Content[0].Text != "visible" {
 		t.Fatalf("terminal content events=%+v calls=%d", events, terminalContent.calls)
 	}
 }
 
-func TestStructuralLimitAndStreamClose(t *testing.T) {
-	structural := make([]types.StreamEvent, 64)
-	for i := range structural {
-		structural[i] = types.StreamEvent{Type: types.EvStart}
+// A provider that accepted the request (2xx) and then failed in the stream is
+// classified by the failure's code, not by the accepted status.
+func TestFailureAfterAcceptedResponseIsClassifiedByCode(t *testing.T) {
+	stalled := matrixRetryEvent("stream idle for 1m30s (no events)")
+	stalled.Err.ErrorCode = string(CodeStreamInterrupted)
+	invalid := matrixRetryEvent("unsupported parameter")
+	invalid.Err.ErrorCode = "invalid_request_error"
+	accepted := types.ProviderResponse{Status: 200}
+	source := &matrixStreamer{attempts: []matrixAttempt{
+		{response: accepted, events: []types.StreamEvent{{Type: types.EvStart}, {Type: types.EvTextDelta, ContentIndex: 0, Delta: "partial"}, stalled}},
+		{response: accepted, events: []types.StreamEvent{{Type: types.EvStart}, invalid}},
+	}}
+	events := collect(matrixRetrier(t, source, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
+	if source.calls != 2 || eventTypes(events) != "start text_delta retry start error" || events[2].Err.ErrorCode != string(CodeStreamInterrupted) || events[4].Err.ErrorCode != "invalid_request_error" {
+		t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 	}
-	capSource := &matrixStreamer{attempts: []matrixAttempt{{events: append(structural, matrixRetryEvent("connection reset"))}}}
-	events := collect(matrixRetrier(t, capSource, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if capSource.calls != 1 || len(events) != 65 || events[64].Type != types.EvError {
-		t.Fatalf("64-cap events=%d calls=%d", len(events), capSource.calls)
-	}
-	for i := range structural {
-		if events[i].Type != types.EvStart {
-			t.Fatalf("event[%d]=%s", i, events[i].Type)
-		}
-	}
+}
+
+func TestStreamClose(t *testing.T) {
 	before := &matrixStreamer{attempts: []matrixAttempt{{events: nil}, {events: []types.StreamEvent{matrixDone()}}}}
-	events = collect(matrixRetrier(t, before, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if before.calls != 2 || len(events) != 1 || events[0].Type != types.EvDone {
-		t.Fatalf("stream-close-before-commit calls=%d events=%+v", before.calls, events)
+	events := collect(matrixRetrier(t, before, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
+	if before.calls != 2 || eventTypes(events) != "retry done" {
+		t.Fatalf("stream-close-before-output calls=%d events=%+v", before.calls, events)
 	}
-	after := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvTextDelta, ContentIndex: 0, Delta: "visible"}}}}}
+	after := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvTextDelta, ContentIndex: 0, Delta: "visible"}}}, {events: []types.StreamEvent{matrixDone()}}}}
 	events = collect(matrixRetrier(t, after, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if after.calls != 1 || len(events) != 2 || terminalCode(t, events) != CodeStreamInterrupted {
-		t.Fatalf("stream-close-after-commit calls=%d events=%+v", after.calls, events)
+	if after.calls != 2 || eventTypes(events) != "text_delta retry done" || events[1].Err.ErrorCode != string(CodeStreamInterrupted) || events[1].Err.Content[0].Text != "visible" {
+		t.Fatalf("stream-close-after-output calls=%d events=%+v", after.calls, events)
 	}
 	empty := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvStart}, matrixDone()}}}}
 	events = collect(matrixRetrier(t, empty, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if len(events) != 2 || events[0].Type != types.EvStart || events[1].Type != types.EvDone {
+	if eventTypes(events) != "start done" {
 		t.Fatalf("empty success events=%+v", events)
 	}
 }
@@ -593,7 +598,7 @@ func TestConcurrentRNG(t *testing.T) {
 				return
 			}
 			events := collect(r.Stream(context.Background(), testModel(), types.Context{}, nil))
-			if source.calls != 2 || len(events) != 1 || events[0].Type != types.EvDone {
+			if source.calls != 2 || eventTypes(events) != "retry done" {
 				errCh <- errors.New("incoherent concurrent stream")
 			}
 		}()

@@ -40,12 +40,13 @@ const (
 	maxRetained        = 16
 	maxResultBytes     = 1 << 20
 	maxPreviewBytes    = 4 << 10
+	maxListPreview     = 512
 	maxCompletionBytes = 8 << 10
 	maxLogBytes        = 16 << 20
 	maxTimeoutSeconds  = 2147483
 	maxPromptBytes     = 32 << 10
 	maxDescription     = 512
-	maxJobPage         = 50
+	maxJobPage         = work.MaxJobPage
 	maxLogPage         = 64 << 10
 	maxWait            = 300 * time.Second
 )
@@ -1070,9 +1071,19 @@ func (manager *Manager) find(jobID string) (*entry, error) {
 	defer manager.mu.Unlock()
 	record := manager.entries[jobID]
 	if record == nil {
-		return nil, ErrJobNotFound
+		return nil, manager.notFoundLocked(fmt.Sprintf("no job %q", jobID))
 	}
 	return record, nil
+}
+
+// notFoundLocked is the job_not_found error for missing: it names the jobs
+// that do exist, or how to start one, so the caller can address a real job.
+func (manager *Manager) notFoundLocked(missing string) error {
+	jobs := make([]work.Job, 0, len(manager.entries))
+	for _, record := range manager.entries {
+		jobs = append(jobs, record.recovery.Job)
+	}
+	return fmt.Errorf("%w: %s in this session. %s", ErrJobNotFound, missing, work.DescribeJobs(jobs))
 }
 
 // Cancel acknowledges its durable request, not the worker's final join.
@@ -1175,7 +1186,11 @@ func (manager *Manager) Jobs(ctx context.Context, cursor string, limit int) (wor
 		job.Result = nil
 		job.Patch = nil
 		job.Output = nil
-		job.ResultText = preview(job.ResultText, 512)
+		if job.Kind == "bash" {
+			job.ResultText = tailPreview(job.ResultText, maxListPreview)
+		} else {
+			job.ResultText = preview(job.ResultText, maxListPreview)
+		}
 		page.Jobs = append(page.Jobs, job)
 	}
 	return page, nil

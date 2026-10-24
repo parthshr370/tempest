@@ -70,7 +70,7 @@ This matters because tool-calling loops in other Go agent frameworks use callbac
 ### StreamEvent — the event union
 
 ```go
-// internal/engine/types/stream.go:7-37
+// internal/engine/types/stream.go:7-48
 type StreamEventType string
 
 const (
@@ -86,6 +86,9 @@ const (
     EvToolCallEnd   StreamEventType = "toolcall_end"
     EvDone          StreamEventType = "done"
     EvError         StreamEventType = "error"
+    // EvRetry: the attempt so far failed transiently; the same request is
+    // sent again and later events belong to the next attempt.
+    EvRetry         StreamEventType = "retry"
 )
 
 type StreamEvent struct {
@@ -97,16 +100,20 @@ type StreamEvent struct {
     Reason       StopReason         // done / error stop reason
     Partial      *AssistantMessage  // non-terminal arms — live pointer to builder's message
     Message      *AssistantMessage  // done — the final message
-    Err          *AssistantMessage  // error — the error-bearing message
+    Err          *AssistantMessage  // error: the error-bearing message; retry: the discarded attempt
+    Attempt      int                // retry: 1-based ordinal of the failed attempt
+    RetryDelay   time.Duration      // retry: wait before the next attempt
 }
 ```
 
 Every non-terminal event (`*_start`, `*_delta`) carries `Partial`, a pointer to the builder's live message buffer. Terminal events (`EvDone`, `EvError`) carry the final message. The `*_end` events are authoritative: `TextEnd.Content` overwrites whatever deltas accumulated, because the provider sometimes emits a final assembled string that differs from the sum of deltas.
 
+`EvRetry` is not terminal. It reports that the attempt streamed so far failed with a transient error and the same request is being sent again. It carries the discarded attempt in `Err` (partial content, usage, error), its ordinal in `Attempt`, and the wait before the next attempt in `RetryDelay` (`internal/engine/types/stream.go:22-26,45-47`). Folding it resets the builder, so the stream's `Final()` reflects only the last attempt (`stream.go:114-115`).
+
 ### AssistantBuilder — the fold
 
 ```go
-// internal/engine/types/stream.go:42-108
+// internal/engine/types/stream.go:50-121
 type AssistantBuilder struct {
     msg AssistantMessage   // mutated in place by Fold
 }
@@ -121,13 +128,14 @@ func (b *AssistantBuilder) Fold(ev StreamEvent)
     //   *_end    → overwrites the block with ev.Content / ev.ToolCall (authoritative)
     //   EvDone   → records ev.Reason as StopReason
     //   EvError  → records ev.Reason + copies ErrorMessage/ErrorCode/ErrorDetails from ev.Err
+    //   EvRetry  → resets the accumulated message to the provenance header
 
 func (b *AssistantBuilder) Message() AssistantMessage
     // Returns the accumulated message. Content slice is shared — callers that
-    // need independence must copy (see snapshotAssistant in agent/loop.go:290-308).
+    // need independence must copy (see snapshotAssistant in agent/loop.go:685-702).
 ```
 
-The `block(i, typ)` helper (`stream.go:53-58`) grows `b.msg.Content` with zero-value blocks of the right type so folds can arrive by content index. The model may interleave text and tool-call blocks; the builder tracks each by its index.
+The `block(i, typ)` helper (`stream.go:64-70`) grows `b.msg.Content` with zero-value blocks of the right type so folds can arrive by content index. The model may interleave text and tool-call blocks; the builder tracks each by its index.
 
 ### Stream[T,R] — the generic channel
 

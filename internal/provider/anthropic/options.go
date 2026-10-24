@@ -1,13 +1,9 @@
 package anthropic
 
 import (
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
 	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/provider/base"
 )
 
 // Effort is the Anthropic thinking-effort level for adaptive-thinking models.
@@ -58,19 +54,8 @@ const (
 	minMaxTokens        = 1
 )
 
-// StreamIdleTimeoutFromEnv reads HARNESS_STREAM_IDLE_SECONDS, defaulting to 90s.
-// The result is assigned to [streamIdleTimeout] at init time so the watchdog
-// uses a consistent value for the process lifetime.
-func StreamIdleTimeoutFromEnv() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("HARNESS_STREAM_IDLE_SECONDS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 90 * time.Second
-}
-
-var streamIdleTimeout = StreamIdleTimeoutFromEnv()
+// streamTimeouts bounds stream silence for the process lifetime.
+var streamTimeouts = base.StreamTimeoutsFromEnv()
 
 // clampMaxTokensToContext caps maxTokens to what the model's context window
 // can accommodate after subtracting estimated prompt tokens and a safety margin.

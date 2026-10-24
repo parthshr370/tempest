@@ -427,7 +427,7 @@ func TestCLIRunLifecycle(t *testing.T) {
 		loaded := loadOnlyJournal(t, sessionDir)
 		for _, message := range loaded.Messages {
 			if result, ok := message.(ptypes.ToolResultMessage); ok {
-				if !result.IsError || len(result.Content) != 1 || result.Content[0].Text != "Tool "+result.ToolName+" not found" {
+				if !result.IsError || len(result.Content) != 1 || !strings.HasPrefix(result.Content[0].Text, "Tool "+result.ToolName+" not found") {
 					t.Fatalf("plan tool result = %#v, want tool unavailable", result)
 				}
 			}

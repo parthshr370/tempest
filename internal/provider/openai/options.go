@@ -1,13 +1,9 @@
 package openai
 
 import (
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
 	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/provider/base"
 )
 
 // Options configures an OpenAI stream request, embedding the shared StreamOptions.
@@ -28,18 +24,8 @@ const (
 	cacheRetentionNone = "none"
 )
 
-// StreamIdleTimeoutFromEnv returns the stream idle timeout from
-// HARNESS_STREAM_IDLE_SECONDS, defaulting to 90 seconds when unset or invalid.
-func StreamIdleTimeoutFromEnv() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("HARNESS_STREAM_IDLE_SECONDS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 90 * time.Second
-}
-
-var streamIdleTimeout = StreamIdleTimeoutFromEnv()
+// streamTimeouts bounds stream silence for the process lifetime.
+var streamTimeouts = base.StreamTimeoutsFromEnv()
 
 // clampMaxTokensToContext lowers maxTokens so it fits within the model's context
 // window after the estimated prompt and a safety margin, never below minMaxTokens.

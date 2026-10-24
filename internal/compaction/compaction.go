@@ -936,7 +936,12 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 	}
 	stop := context.AfterFunc(ctx, cancel)
 	defer func() { stop(); cancel() }()
-	for range response.Events() {
+	// Attempts the retry layer abandoned can still be billed; count the usage they reported.
+	var discarded ptypes.Usage
+	for event := range response.Events() {
+		if event.Type == ptypes.EvRetry && event.Err != nil {
+			discarded.Add(event.Err.Usage)
+		}
 	}
 	final, err := response.Result(context.WithoutCancel(ctx))
 	if err != nil {
@@ -945,7 +950,8 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 	if final == nil {
 		return SummaryResult{}, errors.New("compaction: nil summarization result")
 	}
-	result := SummaryResult{Usage: final.Usage}
+	result := SummaryResult{Usage: discarded}
+	result.Usage.Add(final.Usage)
 	if final.StopReason == ptypes.StopError || final.StopReason == ptypes.StopAborted {
 		msg := final.ErrorMessage
 		if msg == "" {

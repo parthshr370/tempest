@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -139,7 +140,7 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 				ids = append(ids, job.ID)
 			}
 			if len(ids) == 0 {
-				return agent.AgentToolResult{}, errors.New("wait needs job_ids or names")
+				return agent.AgentToolResult{}, missingJobTarget(ctx, controller, "wait needs job_ids or names")
 			}
 			jobs, callErr := controller.Wait(ctx, ids, timeout)
 			if callErr != nil {
@@ -200,5 +201,24 @@ func jobTarget(ctx context.Context, controller work.Controller, jobID, name stri
 		}
 		return job.ID, nil
 	}
-	return "", errors.New("job_id or name is required")
+	return "", missingJobTarget(ctx, controller, "pass job_id or name")
+}
+
+// missingJobTarget is the error for a job call that names no job: need says
+// what to pass, and the session's jobs (or how to start one) say what to pass
+// it.
+func missingJobTarget(ctx context.Context, controller work.Controller, need string) error {
+	var jobs []work.Job
+	cursor := ""
+	for {
+		page, err := controller.Jobs(ctx, cursor, work.MaxJobPage)
+		if err != nil {
+			return fmt.Errorf("%s; listing this session's jobs failed: %w", need, err)
+		}
+		jobs = append(jobs, page.Jobs...)
+		if page.NextCursor == "" {
+			return fmt.Errorf("%s. %s", need, work.DescribeJobs(jobs))
+		}
+		cursor = page.NextCursor
+	}
 }
