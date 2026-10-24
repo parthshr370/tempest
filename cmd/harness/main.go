@@ -152,6 +152,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		MaxTokens:        opts.Config.MaxTokens(),
 		Retry:            retryConfig,
 		SecretLookup:     opts.Secrets.Resolve,
+		Providers:        opts.Config.Providers(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "provider config error: %v\n", err)
@@ -173,8 +174,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
 		stackStreamFn = streamFn
-	} else if !providerCredentialPresent(selectedModel.Provider, opts.Secrets) {
-		fmt.Fprintf(stderr, "warning: no %s credential resolved; model calls will fail until one is present\n", selectedModel.Provider)
+	} else if provider := configuredProvider(selectedModel.Provider, opts); !provider.CredentialPresent(opts.Secrets.Resolve) && !provider.UsesCredentialChain() {
+		fmt.Fprintf(stderr, "warning: no %s credential resolved; set %s or providers.%s.api_key\n", selectedModel.Provider, provider.APIKeyEnv, selectedModel.Provider)
 	}
 	if opts.Config.Plan() && opts.Config.FauxScript() == "" {
 		// The plan flag routes the whole run through the read-only stack on the
@@ -470,7 +471,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks":
+		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
 			markIntelligenceFlag(f.Name, &values)
 		case "anthropic-base-url":
 			values.AnthropicBaseURL.Set = true
@@ -527,33 +528,22 @@ func secretResolver(values config.FlagValues) config.SecretResolver {
 			value = os.Getenv("GEMINI_API_KEY")
 		case "GOOGLE_API_KEY":
 			value = os.Getenv("GOOGLE_API_KEY")
+		default:
+			value = os.Getenv(name)
 		}
 		value = strings.TrimSpace(value)
 		return value, value != ""
 	})
 }
 
-// providerCredentialPresent reports whether the selected provider can find one of its supported credentials.
-func providerCredentialPresent(provider string, secrets config.SecretResolver) bool {
-	if secrets == nil {
-		return false
+// configuredProvider returns the same endpoint definition used by role routing.
+func configuredProvider(name string, opts commandOptions) adapter.ProviderConfig {
+	var overrides map[string]adapter.ProviderConfig
+	if opts.Config != nil {
+		overrides = opts.Config.Providers()
 	}
-	switch provider {
-	case "openai":
-		_, present := secrets.Resolve("OPENAI_API_KEY")
-		return present
-	case "openrouter":
-		_, present := secrets.Resolve("OPENROUTER_API_KEY")
-		return present
-	case "google":
-		_, gemini := secrets.Resolve("GEMINI_API_KEY")
-		_, googleKey := secrets.Resolve("GOOGLE_API_KEY")
-		return gemini || googleKey
-	default:
-		_, apiKey := secrets.Resolve("ANTHROPIC_API_KEY")
-		_, authToken := secrets.Resolve("ANTHROPIC_AUTH_TOKEN")
-		return apiKey || authToken
-	}
+	providers, _ := adapter.Providers(overrides)
+	return providers[name]
 }
 
 // resolveOutputFormat preserves -print as a fallback while letting -output-format win.
@@ -734,6 +724,7 @@ func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.StringVar(&values.CloudPolicy.Value, "cloud-policy", "", `operator kube-context policy JSON file {"rules":[{"tool":"kubectl","context":"dev","action":"allow_write"}]}`)
 	fs.BoolVar(&values.NoHooks.Value, "no-hooks", false, "disable all lifecycle command hooks")
 	fs.BoolVar(&values.TrustProjectHooks.Value, "trust-project-hooks", false, "explicitly trust hooks in this session's project settings")
+	fs.BoolVar(&values.TrustProjectProviders.Value, "trust-project-providers", false, "trust project endpoints with credentials and any environment variable named by api_key_env")
 }
 
 // markIntelligenceFlag records that an intelligence flag was set, so an
@@ -744,6 +735,8 @@ func markIntelligenceFlag(name string, values *config.FlagValues) {
 		values.NoHooks.Set = true
 	case "trust-project-hooks":
 		values.TrustProjectHooks.Set = true
+	case "trust-project-providers":
+		values.TrustProjectProviders.Set = true
 	case "enable-lsp":
 		values.EnableLSP.Set = true
 	case "lsp-config":

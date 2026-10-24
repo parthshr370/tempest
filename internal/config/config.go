@@ -72,39 +72,40 @@ type BoolInput struct {
 
 // FlagValues is the typed collection of configuration-bearing command flags.
 type FlagValues struct {
-	Model                StringInput
-	PlanModel            StringInput
-	SmolModel            StringInput
-	Reasoning            StringInput
-	PlanReasoning        StringInput
-	SmolReasoning        StringInput
-	MaxTokens            IntInput
-	PermissionMode       StringInput
-	BashTimeout          StringInput
-	LogLevel             StringInput
-	LogFile              StringInput
-	LogFileMaxBytes      IntInput
-	EnableTask           BoolInput
-	Plan                 BoolInput
-	Attach               StringsInput
-	EnableWeb            BoolInput
-	WebSearchURL         StringInput
-	AgentDir             StringInput
-	SessionDir           StringInput
-	AnthropicBaseURL     StringInput
-	OpenAIBaseURL        StringInput
-	AnthropicAPIKey      StringInput
-	AnthropicAuthToken   StringInput
-	FauxScript           StringInput
-	SkillPaths           StringsInput
-	PermissionAllowTools StringsInput
-	PermissionDenyTools  StringsInput
-	MCPConfig            StringInput
-	EnableLSP            BoolInput
-	LSPConfig            StringInput
-	CloudPolicy          StringInput
-	NoHooks              BoolInput
-	TrustProjectHooks    BoolInput
+	Model                 StringInput
+	PlanModel             StringInput
+	SmolModel             StringInput
+	Reasoning             StringInput
+	PlanReasoning         StringInput
+	SmolReasoning         StringInput
+	MaxTokens             IntInput
+	PermissionMode        StringInput
+	BashTimeout           StringInput
+	LogLevel              StringInput
+	LogFile               StringInput
+	LogFileMaxBytes       IntInput
+	EnableTask            BoolInput
+	Plan                  BoolInput
+	Attach                StringsInput
+	EnableWeb             BoolInput
+	WebSearchURL          StringInput
+	AgentDir              StringInput
+	SessionDir            StringInput
+	AnthropicBaseURL      StringInput
+	OpenAIBaseURL         StringInput
+	AnthropicAPIKey       StringInput
+	AnthropicAuthToken    StringInput
+	FauxScript            StringInput
+	SkillPaths            StringsInput
+	PermissionAllowTools  StringsInput
+	PermissionDenyTools   StringsInput
+	MCPConfig             StringInput
+	EnableLSP             BoolInput
+	LSPConfig             StringInput
+	CloudPolicy           StringInput
+	NoHooks               BoolInput
+	TrustProjectHooks     BoolInput
+	TrustProjectProviders BoolInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -136,42 +137,45 @@ type Config struct {
 	Flags        FlagValues
 	LookupEnv    func(string) string
 	SettingsPath string
+	WorkingDir   string
 }
 
 // ResolvedConfig is the immutable runtime configuration used after startup.
 // MCP endpoint credentials stay in memory; callers must not log its private fields.
 type ResolvedConfig struct {
-	model                 string
-	planModel             string
-	smolModel             string
-	reasoning             string
-	planReasoning         string
-	smolReasoning         string
-	maxTokens             int
-	permissionModeDefault string
-	bashTimeout           time.Duration
-	logLevel              string
-	logFile               string
-	enableTask            bool
-	plan                  bool
-	attachPaths           []string
-	logFileMaxBytes       int64
-	enableWeb             bool
-	webSearchURL          string
-	agentDir              string
-	sessionDir            string
-	anthropicBaseURL      string
-	openAIBaseURL         string
-	fauxScript            string
-	settingsPath          string
-	skillPaths            []string
-	permissionAllowTools  []string
-	permissionDenyTools   []string
-	retry                 RetrySettings
-	mcpServers            []mcpconfig.Server
-	lsp                   lsp.Config
-	cloudRules            []cloudcmd.Rule
-	hooks                 hooks.Settings
+	model                  string
+	planModel              string
+	smolModel              string
+	reasoning              string
+	planReasoning          string
+	smolReasoning          string
+	maxTokens              int
+	permissionModeDefault  string
+	bashTimeout            time.Duration
+	logLevel               string
+	logFile                string
+	enableTask             bool
+	plan                   bool
+	attachPaths            []string
+	logFileMaxBytes        int64
+	enableWeb              bool
+	webSearchURL           string
+	agentDir               string
+	sessionDir             string
+	anthropicBaseURL       string
+	openAIBaseURL          string
+	fauxScript             string
+	settingsPath           string
+	skillPaths             []string
+	permissionAllowTools   []string
+	permissionDenyTools    []string
+	retry                  RetrySettings
+	mcpServers             []mcpconfig.Server
+	lsp                    lsp.Config
+	cloudRules             []cloudcmd.Rule
+	hooks                  hooks.Settings
+	providers              map[string]adapter.ProviderConfig
+	untrustedProviderFiles []string
 }
 
 // Model returns the default model specification.
@@ -294,47 +298,49 @@ func (e *Error) Unwrap() error { return e.Err }
 // fileSettings keeps scalar values as pointers so an omitted setting won't
 // shadow an environment value or built-in default.
 type fileSettings struct {
-	Model                 *string                  `json:"model"`
-	PlanModel             *string                  `json:"plan_model"`
-	SmolModel             *string                  `json:"smol_model"`
-	Reasoning             *string                  `json:"reasoning"`
-	PlanReasoning         *string                  `json:"plan_reasoning"`
-	SmolReasoning         *string                  `json:"smol_reasoning"`
-	MaxTokens             *int                     `json:"max_tokens"`
-	PermissionModeDefault *string                  `json:"permission_mode_default"`
-	BashTimeout           *string                  `json:"bash_timeout"`
-	LogLevel              *string                  `json:"log_level"`
-	LogFile               *string                  `json:"log_file"`
-	LogFileMaxBytes       *int64                   `json:"log_file_max_bytes"`
-	EnableWeb             *bool                    `json:"enable_web"`
-	WebSearchURL          *string                  `json:"web_search_url"`
-	AgentDir              *string                  `json:"agent_dir"`
-	EnableTask            *bool                    `json:"enable_task"`
-	Plan                  *bool                    `json:"plan"`
-	Attach                []string                 `json:"attach"`
-	SessionDir            *string                  `json:"session_dir"`
-	AnthropicBaseURL      *string                  `json:"anthropic_base_url"`
-	OpenAIBaseURL         *string                  `json:"openai_base_url"`
-	FauxScript            *string                  `json:"faux_script"`
-	SkillPaths            []string                 `json:"skill_paths"`
-	PermissionAllowTools  []string                 `json:"permission_allow_tools"`
-	PermissionDenyTools   []string                 `json:"permission_deny_tools"`
-	RetryEnabled          *bool                    `json:"retry_enabled"`
-	RetryMaxAttempts      *int                     `json:"retry_max_attempts"`
-	RetryBaseDelayMS      *int                     `json:"retry_base_delay_ms"`
-	RetryBackoffCapMS     *int                     `json:"retry_backoff_cap_ms"`
-	RetryMaxDelayMS       *int                     `json:"retry_max_delay_ms"`
-	RetryJitterMin        *float64                 `json:"retry_jitter_min"`
-	RetryJitterMax        *float64                 `json:"retry_jitter_max"`
-	MCPConfig             *string                  `json:"mcp_config"`
-	MCPServers            []mcpconfig.Server       `json:"mcp_servers"`
-	EnableLSP             *bool                    `json:"enable_lsp"`
-	LSPConfig             *string                  `json:"lsp_config"`
-	CloudPolicy           *string                  `json:"cloud_policy"`
-	Hooks                 map[string][]hooks.Group `json:"hooks"`
-	NoHooks               *bool                    `json:"no_hooks"`
-	DisableAllHooks       *bool                    `json:"disableAllHooks"`
-	TrustedHookProjects   []string                 `json:"trusted_hook_projects"`
+	Model                   *string                           `json:"model"`
+	PlanModel               *string                           `json:"plan_model"`
+	SmolModel               *string                           `json:"smol_model"`
+	Reasoning               *string                           `json:"reasoning"`
+	PlanReasoning           *string                           `json:"plan_reasoning"`
+	SmolReasoning           *string                           `json:"smol_reasoning"`
+	MaxTokens               *int                              `json:"max_tokens"`
+	PermissionModeDefault   *string                           `json:"permission_mode_default"`
+	BashTimeout             *string                           `json:"bash_timeout"`
+	LogLevel                *string                           `json:"log_level"`
+	LogFile                 *string                           `json:"log_file"`
+	LogFileMaxBytes         *int64                            `json:"log_file_max_bytes"`
+	EnableWeb               *bool                             `json:"enable_web"`
+	WebSearchURL            *string                           `json:"web_search_url"`
+	AgentDir                *string                           `json:"agent_dir"`
+	EnableTask              *bool                             `json:"enable_task"`
+	Plan                    *bool                             `json:"plan"`
+	Attach                  []string                          `json:"attach"`
+	SessionDir              *string                           `json:"session_dir"`
+	AnthropicBaseURL        *string                           `json:"anthropic_base_url"`
+	OpenAIBaseURL           *string                           `json:"openai_base_url"`
+	FauxScript              *string                           `json:"faux_script"`
+	SkillPaths              []string                          `json:"skill_paths"`
+	PermissionAllowTools    []string                          `json:"permission_allow_tools"`
+	PermissionDenyTools     []string                          `json:"permission_deny_tools"`
+	RetryEnabled            *bool                             `json:"retry_enabled"`
+	RetryMaxAttempts        *int                              `json:"retry_max_attempts"`
+	RetryBaseDelayMS        *int                              `json:"retry_base_delay_ms"`
+	RetryBackoffCapMS       *int                              `json:"retry_backoff_cap_ms"`
+	RetryMaxDelayMS         *int                              `json:"retry_max_delay_ms"`
+	RetryJitterMin          *float64                          `json:"retry_jitter_min"`
+	RetryJitterMax          *float64                          `json:"retry_jitter_max"`
+	MCPConfig               *string                           `json:"mcp_config"`
+	MCPServers              []mcpconfig.Server                `json:"mcp_servers"`
+	EnableLSP               *bool                             `json:"enable_lsp"`
+	LSPConfig               *string                           `json:"lsp_config"`
+	CloudPolicy             *string                           `json:"cloud_policy"`
+	Hooks                   map[string][]hooks.Group          `json:"hooks"`
+	NoHooks                 *bool                             `json:"no_hooks"`
+	DisableAllHooks         *bool                             `json:"disableAllHooks"`
+	TrustedHookProjects     []string                          `json:"trusted_hook_projects"`
+	Providers               map[string]adapter.ProviderConfig `json:"providers"`
+	TrustedProviderProjects []string                          `json:"trusted_provider_projects"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -377,6 +383,27 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	settings, err := loadSettings(settingsPath)
 	if err != nil {
 		return nil, err
+	}
+	trustProviders, err := resolveBool(c.Flags.TrustProjectProviders, lookup("HARNESS_TRUST_PROJECT_PROVIDERS"), nil, false)
+	if err != nil {
+		return nil, &Error{Field: "trust_project_providers", Err: err}
+	}
+	providers, untrustedProviderFiles, err := resolveProviders(settings, c.WorkingDir, trustProviders)
+	if err != nil {
+		return nil, &Error{Field: "providers", Err: err}
+	}
+	if endpoint := strings.TrimSpace(lookup("AZURE_OPENAI_ENDPOINT")); endpoint != "" {
+		p := providers["azure"]
+		p.BaseURL = endpoint
+		providers["azure"] = p
+	}
+	if version := strings.TrimSpace(lookup("AZURE_OPENAI_API_VERSION")); version != "" {
+		p := providers["azure"]
+		if p.Query == nil {
+			p.Query = map[string]string{}
+		}
+		p.Query["api-version"] = version
+		providers["azure"] = p
 	}
 	mcpServers, err := resolveMCP(c.Flags.MCPConfig, lookup("HARNESS_MCP_CONFIG"), settings)
 	if err != nil {
@@ -528,17 +555,19 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		// The vendor variables (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) are the
 		// lowest-priority source: tempest's own flag, HARNESS_* variable and
 		// settings key all override them.
-		anthropicBaseURL:     resolveString(c.Flags.AnthropicBaseURL, lookup("HARNESS_ANTHROPIC_BASE_URL"), settings.AnthropicBaseURL, strings.TrimSpace(lookup("ANTHROPIC_BASE_URL"))),
-		openAIBaseURL:        resolveString(c.Flags.OpenAIBaseURL, lookup("HARNESS_OPENAI_BASE_URL"), settings.OpenAIBaseURL, strings.TrimSpace(lookup("OPENAI_BASE_URL"))),
-		fauxScript:           resolveString(c.Flags.FauxScript, lookup("HARNESS_FAUX_SCRIPT"), settings.FauxScript, ""),
-		settingsPath:         settingsPath,
-		skillPaths:           skillPaths,
-		permissionAllowTools: permissionAllowTools,
-		permissionDenyTools:  permissionDenyTools,
-		mcpServers:           mcpServers,
-		lsp:                  lspConfig,
-		cloudRules:           cloudRules,
-		hooks:                hookSettings,
+		anthropicBaseURL:       resolveString(c.Flags.AnthropicBaseURL, lookup("HARNESS_ANTHROPIC_BASE_URL"), settings.AnthropicBaseURL, strings.TrimSpace(lookup("ANTHROPIC_BASE_URL"))),
+		openAIBaseURL:          resolveString(c.Flags.OpenAIBaseURL, lookup("HARNESS_OPENAI_BASE_URL"), settings.OpenAIBaseURL, strings.TrimSpace(lookup("OPENAI_BASE_URL"))),
+		fauxScript:             resolveString(c.Flags.FauxScript, lookup("HARNESS_FAUX_SCRIPT"), settings.FauxScript, ""),
+		settingsPath:           settingsPath,
+		skillPaths:             skillPaths,
+		permissionAllowTools:   permissionAllowTools,
+		permissionDenyTools:    permissionDenyTools,
+		mcpServers:             mcpServers,
+		lsp:                    lspConfig,
+		cloudRules:             cloudRules,
+		hooks:                  hookSettings,
+		providers:              providers,
+		untrustedProviderFiles: untrustedProviderFiles,
 		retry: RetrySettings{
 			Enabled:      retryEnabled,
 			MaxAttempts:  retryMaxAttempts,
@@ -562,7 +591,7 @@ func validateResolved(c *ResolvedConfig) error {
 		if strings.TrimSpace(model) == "" && field != "model" {
 			continue
 		}
-		if err := adapter.ValidateModelSpec(model); err != nil {
+		if err := adapter.ValidateModelSpecWithProviders(model, c.providers); err != nil {
 			return &Error{Field: field, Err: err}
 		}
 	}

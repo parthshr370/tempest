@@ -72,7 +72,7 @@ The harness uses three model roles, not one. The default role handles the main a
 
 Each role maps to a model specification (a string like `"openai:gpt-5.1"` or `"anthropic:claude-sonnet-4-5"`). The plan and smol roles default to the default model if not explicitly set — `ResolveRoles` uses `firstNonEmpty(planModel, defaultModel)` and `firstNonEmpty(smolModel, defaultModel)` (`roles.go:33-34`).
 
-Each role resolves to a fully routed `ProviderRouter` with its own `StreamFn`, credentials, base URL, and retry policy. If the default model is Anthropic and the smol model is OpenAI, the two routers have different API keys and base URLs even though they share the same `SecretLookup` function. This is handled by `newRoleRouter` (`roles.go:51-63`), which calls `roleCredentials` to pick the correct credential based on the model's provider prefix.
+Each role resolves to a fully routed `ProviderRouter` with its own `StreamFn`, credentials, base URL, and retry policy. If the default model is Anthropic and the smol model is OpenAI, the two routers have different API keys and base URLs even though they share the same `SecretLookup` function. `newRoleRouter` looks up the model's provider in the endpoint registry and calls `ProviderConfig.Credential` to resolve its key.
 
 ## Signatures and types
 
@@ -222,7 +222,7 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error)
 ```
 
 - `cfg.PlanModel` and `cfg.SmolModel` fall back to `cfg.DefaultModel` when empty.
-- Each role model is routed through `newRoleRouter`, which calls `roleCredentials` to pick the correct API key/auth token based on the model's provider prefix (OpenAI vs Anthropic).
+- Each role model is routed through `newRoleRouter`, which resolves the endpoint registry entry and its API key or auth token based on the model's provider prefix.
 - Returns `RoleRouters{Default, Plan, Smol}`, each a `ProviderRouter` with a `StreamFn` ready to make streaming provider calls.
 
 ```go
@@ -383,9 +383,9 @@ FlagValues              LookupEnv              fileSettings
 
 Every accessor on `*ResolvedConfig` dereferences `c`. If called on a nil pointer, it panics — the same behavior as any Go method on a nil value receiver. The convention is that `Resolve()` never returns `nil` without an error, and callers only dereference the config after a nil-error check.
 
-### SecretResolver is never nil during role resolution
+### Missing credential resolver
 
-`roleCredentials` (`roles.go:65-77`) checks `if lookup == nil` and returns empty credentials. The caller (`ResolveRoles`) still proceeds — it builds a `ProviderRouter` with empty API key and auth token. The provider will fail at request time with an authentication error, which is surfaced as a clear error message rather than a nil-pointer panic.
+`ProviderConfig.Credential` accepts a nil lookup and falls back to the provider's configured key. `ResolveRoles` can therefore build a router without an environment resolver. If neither a key nor a native credential chain nor `no_auth` is available, the router returns a missing-credential error on the first request.
 
 ### Retry configuration disabled path
 
@@ -508,7 +508,7 @@ This is the "accept interfaces, return structs" principle applied to configurati
 |---|---|
 | `internal/config/config.go` | `Config`, `ResolvedConfig`, `FlagValues`, `StringInput`, `IntInput`, `BoolInput`, `StringsInput`, `RetrySettings`, `SecretResolver`, `SecretResolverFunc`, `Error`, `fileSettings`, `Resolve()`, `validateResolved()`, `loadSettings()`, `resolveString()`, `resolveInt()`, `resolveInt64()`, `resolveBool()`, `resolveFloat()`, `resolveLogLevel()`, `GetAgentDir()`, `GetSettingsPath()`, `ExpandTildePath()`, `defaultModel`, `defaultPermissionMode`, `defaultLogLevel`, `defaultLogFileMax`, `maxRetryDurationMS` |
 | `internal/config/config_test.go` | precedence table tests, cross-field validation tests, tilde-expansion tests, model spec validation, retry range tests |
-| `internal/adapter/roles.go` | `ResolveRoles()`, `RoleRoutingConfig`, `RoleRouters`, `ProviderRouter`, `newRoleRouter()`, `roleCredentials()` |
+| `internal/adapter/roles.go` | `ResolveRoles()`, `RoleRoutingConfig`, `RoleRouters`, `ProviderRouter`, `newRoleRouter()` |
 | `cmd/harness/main.go:200-281` | `parseCommandOptions()` (flag parsing and `Set` tracking), `resolveCommandConfig()` (Resolve call), `secretResolver()` (credential lookup closure), `skillPathsFlag` |
 | `cmd/harness/main.go:63-198` | `runOneShot()` (config consumption: retry wiring, ResolveRoles call, agent stack construction) |
 | `12-idiomatic-go-vs-typescript.md` | design rules: resolve-once, immutable config, no hidden env reads, no global registries |

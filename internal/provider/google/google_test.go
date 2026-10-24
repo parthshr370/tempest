@@ -366,3 +366,31 @@ func streamEventTypes(in []types.StreamEventType) []string {
 	}
 	return out
 }
+
+func TestBlockedPromptIsTerminal(t *testing.T) {
+	for _, transport := range []string{"sse", "http"} {
+		t.Run(transport, func(t *testing.T) {
+			endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				const blocked = `{"promptFeedback":{"blockReason":"SAFETY"}}`
+				if transport == "http" {
+					fmt.Fprint(w, blocked)
+				} else {
+					fmt.Fprint(w, "data: "+blocked+"\n\n")
+				}
+			}))
+			defer endpoint.Close()
+			model := baseModel()
+			model.BaseURL = endpoint.URL
+			if transport == "http" {
+				model.BaseURL += "/models/gemini-test:generateContent"
+			}
+			got, err := StreamSimple(context.Background(), model, types.Context{}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{NoAuth: true}}).Result(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.StopReason != types.StopError || got.ErrorCode != string(retry.CodeInvalidRequest) || !strings.Contains(got.ErrorMessage, "content filter: SAFETY") {
+				t.Fatalf("blocked prompt became retryable: %+v", got)
+			}
+		})
+	}
+}

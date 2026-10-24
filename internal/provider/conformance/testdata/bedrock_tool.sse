@@ -1,0 +1,21 @@
+event: messageStart
+data: {"role":"assistant"}
+
+event: contentBlockStart
+data: {"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"tool_1","name":"lookup"}}}
+
+event: contentBlockDelta
+data: {"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"path\":"}}}
+
+event: contentBlockDelta
+data: {"contentBlockIndex":0,"delta":{"toolUse":{"input":"\"file.txt\"}"}}}
+
+event: contentBlockStop
+data: {"contentBlockIndex":0}
+
+event: messageStop
+data: {"stopReason":"tool_use"}
+
+event: metadata
+data: {"usage":{"inputTokens":10,"outputTokens":4,"totalTokens":14}}
+

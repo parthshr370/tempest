@@ -12,6 +12,7 @@ import (
 	"go.harness.dev/harness/internal/engine/transform"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
+	"go.harness.dev/harness/internal/provider/base"
 )
 
 // buildParams assembles the OpenAI chat-completions request body from the model,
@@ -30,9 +31,16 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 			"include_usage": true,
 		},
 	}
+	if model.OpenAICompat != nil && model.OpenAICompat.SupportsUsageInStreaming != nil && !*model.OpenAICompat.SupportsUsageInStreaming {
+		delete(params, "stream_options")
+	}
 
 	if maxTokens > 0 {
-		params["max_completion_tokens"] = maxTokens
+		field := "max_completion_tokens"
+		if model.OpenAICompat != nil && model.OpenAICompat.MaxTokensField != "" {
+			field = model.OpenAICompat.MaxTokensField
+		}
+		params[field] = maxTokens
 	}
 
 	if opts != nil && opts.Temperature != nil {
@@ -41,19 +49,30 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 
 	if len(c.Tools) > 0 {
 		params["tools"] = convertTools(c.Tools)
+		if opts == nil || opts.ToolChoice == nil {
+			if model.OpenAICompat == nil || model.OpenAICompat.SupportsToolChoice == nil || *model.OpenAICompat.SupportsToolChoice {
+				params["tool_choice"] = "auto"
+			}
+		}
 	} else if hasToolHistory(c.Messages) {
 		params["tools"] = []map[string]any{}
 	}
 
-	if opts != nil && opts.ToolChoice != nil {
+	if opts != nil && opts.ToolChoice != nil && (model.OpenAICompat == nil || model.OpenAICompat.SupportsToolChoice == nil || *model.OpenAICompat.SupportsToolChoice) {
 		params["tool_choice"] = opts.ToolChoice
 	}
 
 	if opts != nil && opts.ReasoningEffort != "" {
-		if model.Provider == "openrouter" {
-			// OpenRouter's canonical form; reasoning_effort is its alias.
+		format := "openai"
+		if model.OpenAICompat != nil && model.OpenAICompat.ReasoningFormat != "" {
+			format = model.OpenAICompat.ReasoningFormat
+		} else if model.Provider == "openrouter" {
+			format = "openrouter"
+		}
+		switch format {
+		case "openrouter":
 			params["reasoning"] = map[string]any{"effort": opts.ReasoningEffort}
-		} else {
+		case "openai":
 			params["reasoning_effort"] = opts.ReasoningEffort
 		}
 	}
@@ -97,18 +116,34 @@ func applyPromptCache(params map[string]any, model types.Model, opts *Options) {
 		return
 	}
 	isOpenRouter := model.Provider == "openrouter"
-	if !isOpenRouter && !(model.Provider == "openai" && isOpenAIEndpoint(model.BaseURL)) {
+	supportsKey := isOpenRouter || model.Provider == "openai" && isOpenAIEndpoint(model.BaseURL)
+	supportsSession := isOpenRouter
+	cacheControl := isOpenRouter
+	if compat := model.OpenAICompat; compat != nil {
+		if compat.SupportsPromptCacheKey != nil {
+			supportsKey = *compat.SupportsPromptCacheKey
+		}
+		if compat.SupportsSessionID != nil {
+			supportsSession = *compat.SupportsSessionID
+		}
+		if compat.CacheControlFormat != "" {
+			cacheControl = compat.CacheControlFormat == "anthropic"
+		}
+	}
+	if !supportsKey && !supportsSession && !cacheControl {
 		return
 	}
-	if isOpenRouter && isAnthropicSlug(model.ID) {
+	if cacheControl && isAnthropicSlug(model.ID) {
 		params["cache_control"] = map[string]string{"type": "ephemeral"}
 	}
 	if opts == nil || opts.SessionID == "" {
 		return
 	}
 	key := promptCacheKey(opts.SessionID)
-	params["prompt_cache_key"] = key
-	if isOpenRouter {
+	if supportsKey {
+		params["prompt_cache_key"] = key
+	}
+	if supportsSession {
 		params["session_id"] = key
 	}
 }
@@ -116,11 +151,7 @@ func applyPromptCache(params map[string]any, model types.Model, opts *Options) {
 // promptCacheKey returns the session id, or its SHA-256 hex digest when the id
 // is longer than OpenAI accepts. Either way the key is stable for the session.
 func promptCacheKey(sessionID string) string {
-	if len(sessionID) <= maxPromptCacheKeyLength {
-		return sessionID
-	}
-	sum := sha256.Sum256([]byte(sessionID))
-	return hex.EncodeToString(sum[:])
+	return base.PromptCacheKey(sessionID)
 }
 
 // isOpenAIEndpoint reports whether baseURL is OpenAI's own API; an empty base
@@ -163,6 +194,10 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 	params := []map[string]any{}
 
 	normalizeID := func(id string, _ types.Model, _ types.AssistantMessage) string {
+		if model.OpenAICompat != nil && model.OpenAICompat.RequiresMistralToolIDs != nil && *model.OpenAICompat.RequiresMistralToolIDs {
+			sum := sha256.Sum256([]byte(id))
+			return hex.EncodeToString(sum[:])[:9]
+		}
 		return id
 	}
 	transformedMessages := transform.TransformMessages(c.Messages, model, normalizeID)
@@ -210,6 +245,15 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 				}
 			}
 			assistantText := strings.Join(textParts, "")
+			if model.OpenAICompat != nil && model.OpenAICompat.ReasoningContentField != "" {
+				var reasoning strings.Builder
+				for _, block := range assistant.Content {
+					if block.Type == types.BlockThinking {
+						reasoning.WriteString(block.Thinking)
+					}
+				}
+				assistantMsg[model.OpenAICompat.ReasoningContentField] = reasoning.String()
+			}
 
 			toolCalls := []map[string]any{}
 			for _, block := range assistant.Content {
@@ -225,7 +269,8 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 				}
 			}
 
-			if len(assistantText) > 0 || len(toolCalls) > 0 {
+			hasReasoningField := model.OpenAICompat != nil && model.OpenAICompat.ReasoningContentField != ""
+			if len(assistantText) > 0 || len(toolCalls) > 0 || hasReasoningField {
 				if len(assistantText) > 0 {
 					assistantMsg["content"] = assistantText
 				} else {

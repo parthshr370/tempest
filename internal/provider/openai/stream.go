@@ -83,7 +83,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		}
 	}
 
-	if err := assertRequestAuth(model.Provider, opts.APIKey, opts.Headers); err != nil {
+	if err := assertRequestAuth(model.Provider, opts.APIKey, opts.Headers); err != nil && !opts.NoAuth {
 		pushError(s, output, err, parent.Err() != nil)
 		return
 	}
@@ -111,15 +111,17 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		defer timeoutCancel()
 	}
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, chatCompletionsURL(model.BaseURL), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, base.RequestURL(chatCompletionsURL(model.BaseURL), opts.Query), bytes.NewReader(body))
 	if err != nil {
 		pushError(s, output, err, parent.Err() != nil)
 		return
 	}
 	headers := map[string]string{
-		"accept":        "application/json",
-		"content-type":  "application/json",
-		"authorization": "Bearer " + opts.APIKey,
+		"accept":       "application/json",
+		"content-type": "application/json",
+	}
+	if opts.APIKey != "" {
+		headers["authorization"] = "Bearer " + opts.APIKey
 	}
 	for key, value := range mergeHeaders(headers, model.Headers, opts.Headers) {
 		req.Header.Set(key, value)
@@ -234,6 +236,11 @@ func mergeHeaders(headerSources ...map[string]string) map[string]string {
 	merged := map[string]string{}
 	for _, headers := range headerSources {
 		for key, value := range headers {
+			for existing := range merged {
+				if strings.EqualFold(existing, key) {
+					delete(merged, existing)
+				}
+			}
 			merged[key] = value
 		}
 	}

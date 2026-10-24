@@ -48,7 +48,17 @@ const (
 
 // OpenAICompat holds per-model OpenAI compatibility flags.
 type OpenAICompat struct {
-	ReasoningDisableMode string `json:"reasoningDisableMode,omitempty"`
+	ReasoningDisableMode       string `json:"reasoningDisableMode,omitempty"`
+	MaxTokensField             string `json:"maxTokensField,omitempty"`
+	ReasoningFormat            string `json:"reasoningFormat,omitempty"`
+	ReasoningContentField      string `json:"reasoningContentField,omitempty"`
+	SupportsPromptCacheKey     *bool  `json:"supportsPromptCacheKey,omitempty"`
+	SupportsEncryptedReasoning *bool  `json:"supportsEncryptedReasoning,omitempty"`
+	SupportsSessionID          *bool  `json:"supportsSessionId,omitempty"`
+	SupportsUsageInStreaming   *bool  `json:"supportsUsageInStreaming,omitempty"`
+	SupportsToolChoice         *bool  `json:"supportsToolChoice,omitempty"`
+	CacheControlFormat         string `json:"cacheControlFormat,omitempty"`
+	RequiresMistralToolIDs     *bool  `json:"requiresMistralToolIds,omitempty"`
 }
 
 // SupportsVision reports whether the model accepts image input.

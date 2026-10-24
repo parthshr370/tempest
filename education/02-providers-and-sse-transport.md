@@ -783,9 +783,9 @@ package.
 | `internal/provider/base/provider_test.go` | `TestRegistryResolve`, `TestWithEnvAPIKey`, `TestWithEnvAPIKeyDerivedVar`, `TestStreamFuncSeam` |
 | `internal/adapter/modelspec.go` | `modelSpec`, `parseModelSpec`, `ModelIDFromSpec`, `ValidateModelSpec`, `ValidateBaseURL`, `route`, `resolveRoute` |
 | `internal/adapter/modelspec_test.go` | `TestParseModelSpec`, `TestModelIDFromSpec`, `TestResolveRouteDefaultsToAnthropic`, `TestResolveRouteUnknownProviderErrors` |
-| `internal/adapter/provider.go` | `AnthropicMessagesAPI`, `OpenAICompletionsAPI`, `GoogleGenerativeAPI`, `RoutingConfig`, `ProviderRouter`, `NewProviderRouter`, `withStream`, `erroredStream`, `ResolveProviderForModel` |
+| `internal/adapter/provider.go` | `AnthropicMessagesAPI`, `OpenAICompletionsAPI`, `GoogleGenerativeAPI`, `RoutingConfig`, `ProviderRouter`, `NewProviderRouter`, `withStream`, `erroredStream` |
 | `internal/adapter/provider_test.go` | `TestProviderRouterUnsupportedProviderErrors`, `TestProviderRouterOpenAIRouteUsesOwnCredentials`, `TestProviderRouterBaseURLAndAuthTokenAreHonored`, `TestProviderRouterRetriesRateLimitedResponse` |
-| `internal/adapter/roles.go` | `RoleRoutingConfig`, `RoleRouters`, `ResolveRoles`, `roleCredentials` |
+| `internal/adapter/roles.go` | `RoleRoutingConfig`, `RoleRouters`, `ResolveRoles`, `newRoleRouter` |
 | `internal/transport/sseparse/sse.go` | `ServerSentEvent`, `IterateSSE`, `decodeSseLine`, `flushSseEvent`, `drainCompleteLines`, `decoderState` |
 | `internal/transport/sseparse/sse_test.go` | SSE round-trip and edge-case tests |
 | `internal/provider/base/watchdog.go` | `StreamTimeouts`, `StreamTimeoutsFromEnv`, `envSeconds`, `Watchdog`, `WatchStream`, `Event`, `Output`, `Stop`, `Stalled`, `Err`, `run`, `bound` |

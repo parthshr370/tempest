@@ -126,14 +126,6 @@ func TestProviderRouterResolvesProxyConfigFromEnv(t *testing.T) {
 	}
 }
 
-func TestResolveProviderForModelRoutesThroughAnthropicProxy(t *testing.T) {
-	for _, model := range []string{"claude-sonnet-4", "anthropic/claude-opus-4-8", "openai/gpt-4o", "google/gemini-2.5-pro"} {
-		if got := ResolveProviderForModel(model); got != "anthropic" {
-			t.Fatalf("ResolveProviderForModel(%q) = %q", model, got)
-		}
-	}
-}
-
 func TestProviderRouterMaxTokensDefaultAndOverride(t *testing.T) {
 	router := mustRouter(t, RoutingConfig{Env: func(string) string { return "" }})
 	// The default model id hits the catalog, so the catalog output cap (128000

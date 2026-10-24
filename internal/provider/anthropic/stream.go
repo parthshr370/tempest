@@ -113,9 +113,11 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	if opts == nil {
 		opts = &Options{}
 	}
-	if err := assertRequestAuth(model.Provider, opts.APIKey, opts.Headers); err != nil {
-		pushError(s, output, err, parent.Err() != nil)
-		return
+	if !opts.NoAuth {
+		if err := assertRequestAuth(model.Provider, opts.APIKey, opts.Headers); err != nil {
+			pushError(s, output, err, parent.Err() != nil)
+			return
+		}
 	}
 	interleavedThinking := true
 	if opts.InterleavedThinking != nil {
@@ -127,6 +129,10 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		cacheSessionID = ""
 	}
 	headers, isOAuth := buildRequestHeaders(model, opts.APIKey, interleavedThinking, shouldUseFineGrainedToolStreamingBeta(model, c), opts.Headers, cacheSessionID)
+	if strings.Contains(model.BaseURL, ":streamRawPredict") || strings.Contains(model.BaseURL, ":rawPredict") {
+		delete(headers, "anthropic-version")
+		delete(headers, "x-api-key")
+	}
 	params, err := buildParams(streamCtx, model, c, isOAuth, opts)
 	if err != nil {
 		pushError(s, output, err, parent.Err() != nil)
@@ -157,7 +163,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		reqCtx, timeoutCancel = context.WithTimeout(streamCtx, time.Duration(opts.TimeoutMs)*time.Millisecond)
 		defer timeoutCancel()
 	}
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, messagesURL(model.BaseURL), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, base.RequestURL(messagesURL(model.BaseURL), opts.Query), bytes.NewReader(body))
 	if err != nil {
 		pushError(s, output, err, parent.Err() != nil)
 		return
@@ -186,7 +192,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	s.Push(types.StreamEvent{Type: types.EvStart, Partial: output})
 	state := &foldState{Output: output, IsOAuth: isOAuth, Tools: c.Tools}
-	err = iterateAnthropicEvents(reqCtx, resp.Body, watchdog.Event, func(event rawAnthropicEvent) error {
+	foldEvent := func(event rawAnthropicEvent) error {
 		events, err := foldAnthropicEvent(event, state, model)
 		if err != nil {
 			return err
@@ -198,7 +204,12 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 			s.Push(event)
 		}
 		return nil
-	})
+	}
+	if strings.Contains(model.BaseURL, ":rawPredict") {
+		err = iterateMessage(resp.Body, watchdog.Event, foldEvent)
+	} else {
+		err = iterateAnthropicEvents(reqCtx, resp.Body, watchdog.Event, foldEvent)
+	}
 	if err != nil {
 		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
@@ -250,6 +261,9 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 func messagesURL(baseURL string) string {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultAnthropicBaseURL
+	}
+	if strings.Contains(baseURL, ":streamRawPredict") || strings.Contains(baseURL, ":rawPredict") {
+		return baseURL
 	}
 	return strings.TrimRight(baseURL, "/") + "/v1/messages"
 }

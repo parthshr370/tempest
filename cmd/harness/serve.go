@@ -96,7 +96,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks":
+		case "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
 			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true
@@ -155,7 +155,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers()}
-	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL()}
+	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers()}
 	if command == "mcp" {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()

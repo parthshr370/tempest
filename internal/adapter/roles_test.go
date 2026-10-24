@@ -52,20 +52,13 @@ func TestRoleCredentialsPerProvider(t *testing.T) {
 		}
 		return "", false
 	}
-	tests := map[string][2]string{
-		"google:gemini-2.5-flash": {"gem-key", ""},
-		"gemini-2.5-flash":        {"gem-key", ""},
-		"openai:gpt-5":            {"oai-key", ""},
-		"claude-opus-4-8":         {"ant-key", ""},
-	}
-	for model, want := range tests {
-		got, _ := roleCredentials(model, lookup)
-		if got != want[0] {
-			t.Fatalf("roleCredentials(%q) key = %q, want %q", model, got, want[0])
+	for provider, want := range map[string]string{"google": "gem-key", "openai": "oai-key", "anthropic": "ant-key"} {
+		got := BuiltinProviders()[provider].Credential(lookup)
+		if got != want {
+			t.Fatalf("%s key = %q, want %q", provider, got, want)
 		}
 	}
-	// GOOGLE_API_KEY is the google fallback when GEMINI_API_KEY is absent.
-	fallback, _ := roleCredentials("google:gemini-2.5-flash", func(k string) (string, bool) {
+	fallback := BuiltinProviders()["google"].Credential(func(k string) (string, bool) {
 		if k == "GOOGLE_API_KEY" {
 			return "gcp-key", true
 		}

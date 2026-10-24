@@ -122,7 +122,7 @@ func decodeStrict(raw json.RawMessage, dst any) error {
 	return nil
 }
 
-func (in RunInput) settings(host tempest.NewSession) (tempest.NewSession, error) {
+func (in RunInput) settings(host tempest.NewSession, providers map[string]adapter.ProviderConfig) (tempest.NewSession, error) {
 	if strings.TrimSpace(in.Prompt) == "" {
 		return host, fmt.Errorf("prompt must not be blank")
 	}
@@ -136,10 +136,10 @@ func (in RunInput) settings(host tempest.NewSession) (tempest.NewSession, error)
 		return host, fmt.Errorf("sessionId must be an id, not a path")
 	}
 	if in.Model != "" {
-		if strings.Contains(in.Model, "@") {
+		if adapter.HasModelBaseURL(in.Model) {
 			return host, fmt.Errorf("model must not override the host provider URL")
 		}
-		if err := adapter.ValidateModelSpec(in.Model); err != nil {
+		if err := adapter.ValidateModelSpecWithProviders(in.Model, providers); err != nil {
 			return host, err
 		}
 		host.Model = in.Model

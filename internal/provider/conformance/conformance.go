@@ -23,6 +23,7 @@ import (
 type Factory struct {
 	Dialect string
 	Stream  func(context.Context, types.Model, types.Context, *types.SimpleStreamOptions) *stream.AssistantStream
+	Encode  func(string) string
 }
 
 //go:embed testdata/*.sse
@@ -38,6 +39,7 @@ func Run(t *testing.T, factory Factory) {
 		{"text_and_cache_usage", textAndUsage},
 		{"unknown_cost", unknownCost},
 		{"tool_round_trip", toolRoundTrip},
+		{"retry_history_cleanup", retryHistoryCleanup},
 		{"thinking_controls", thinkingControls},
 		{"cancel_preserves_partial", cancellation},
 		{"retry_classes", retryClasses},
@@ -68,8 +70,11 @@ func fixture(t *testing.T, factory Factory, kind string) string {
 	return string(contents)
 }
 
-func server(t *testing.T, replay string, requests chan<- json.RawMessage) *httptest.Server {
+func server(t *testing.T, factory Factory, replay string, requests chan<- json.RawMessage) *httptest.Server {
 	t.Helper()
+	if factory.Encode != nil {
+		replay = factory.Encode(replay)
+	}
 	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		body, err := io.ReadAll(request.Body)
 		if err != nil {
@@ -100,7 +105,7 @@ func result(t *testing.T, factory Factory, routed types.Model, history types.Con
 }
 
 func textAndUsage(t *testing.T, factory Factory) {
-	endpoint := server(t, fixture(t, factory, "text"), nil)
+	endpoint := server(t, factory, fixture(t, factory, "text"), nil)
 	message := result(t, factory, model(factory, endpoint.URL), conversation(), options())
 	if message.StopReason != types.StopStop || len(message.Content) != 1 || message.Content[0].Text != "hello" {
 		t.Fatalf("text result: %+v", message)
@@ -114,7 +119,7 @@ func textAndUsage(t *testing.T, factory Factory) {
 	if factory.Dialect == "anthropic" {
 		wantCost = (20.0 + 40 + 1.5 + 3 + 4) / 1e6
 	}
-	if factory.Dialect == "google" {
+	if factory.Dialect == "google" || factory.Dialect == "responses" {
 		wantWrite = 0
 		wantCost = (20.0 + 40 + 1.5) / 1e6
 	}
@@ -124,7 +129,7 @@ func textAndUsage(t *testing.T, factory Factory) {
 }
 
 func unknownCost(t *testing.T, factory Factory) {
-	endpoint := server(t, fixture(t, factory, "text"), nil)
+	endpoint := server(t, factory, fixture(t, factory, "text"), nil)
 	routed := model(factory, endpoint.URL)
 	routed.Cost.Unknown = true
 	message := result(t, factory, routed, conversation(), options())
@@ -142,7 +147,7 @@ func unknownCost(t *testing.T, factory Factory) {
 
 func toolRoundTrip(t *testing.T, factory Factory) {
 	requests := make(chan json.RawMessage, 2)
-	endpoint := server(t, fixture(t, factory, "tool"), requests)
+	endpoint := server(t, factory, fixture(t, factory, "tool"), requests)
 	routed := model(factory, endpoint.URL)
 	history := conversation()
 	history.Tools = []types.Tool{{Name: "lookup", Description: "Read a file", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`)}}
@@ -184,6 +189,44 @@ func assertToolResult(t *testing.T, dialect string, body json.RawMessage, callID
 				} `json:"functionResponse"`
 			} `json:"parts"`
 		} `json:"contents"`
+	}
+	if dialect == "responses" {
+		var response struct {
+			Input []struct {
+				Type   string          `json:"type"`
+				ID     string          `json:"call_id"`
+				Output json.RawMessage `json:"output"`
+			} `json:"input"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatal(err)
+		}
+		last := response.Input[len(response.Input)-1]
+		if last.Type != "function_call_output" || last.ID != callID || !strings.Contains(string(last.Output), "file contents") {
+			t.Fatalf("tool wire: %s", body)
+		}
+		return
+	}
+	if dialect == "bedrock" {
+		var response struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content []struct {
+					Result struct {
+						ID      string          `json:"toolUseId"`
+						Content json.RawMessage `json:"content"`
+					} `json:"toolResult"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil {
+			t.Fatal(err)
+		}
+		last := response.Messages[len(response.Messages)-1]
+		if last.Role != "user" || len(last.Content) == 0 || last.Content[0].Result.ID != callID || !strings.Contains(string(last.Content[0].Result.Content), "file contents") {
+			t.Fatalf("tool wire: %s", body)
+		}
+		return
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		t.Fatal(err)
@@ -227,7 +270,7 @@ func thinkingControls(t *testing.T, factory Factory) {
 	for _, mode := range []string{"unsupported", "enabled", "disabled", "adaptive", "none-effort"} {
 		t.Run(mode, func(t *testing.T) {
 			requests := make(chan json.RawMessage, 1)
-			endpoint := server(t, fixture(t, factory, "text"), requests)
+			endpoint := server(t, factory, fixture(t, factory, "text"), requests)
 			routed := model(factory, endpoint.URL)
 			routed.Reasoning = mode != "unsupported"
 			opts := options()
@@ -255,7 +298,10 @@ func thinkingControls(t *testing.T, factory Factory) {
 				OutputConfig struct {
 					Effort string `json:"effort"`
 				} `json:"output_config"`
-				Effort     string `json:"reasoning_effort"`
+				Effort    string `json:"reasoning_effort"`
+				Reasoning struct {
+					Effort string `json:"effort"`
+				} `json:"reasoning"`
 				Generation struct {
 					Thinking *struct {
 						Level  string `json:"thinkingLevel"`
@@ -300,6 +346,14 @@ func thinkingControls(t *testing.T, factory Factory) {
 				if request.Effort != want {
 					t.Fatalf("effort want %q: %s", want, body)
 				}
+			case "responses":
+				want := opts.Reasoning
+				if mode == "unsupported" {
+					want = ""
+				}
+				if request.Reasoning.Effort != want {
+					t.Fatalf("effort want %q: %s", want, body)
+				}
 			case "google":
 				if len(request.MisplacedThinking) > 0 {
 					t.Fatalf("thinkingConfig outside generationConfig: %s", body)
@@ -333,7 +387,11 @@ func cancellation(t *testing.T, factory Factory) {
 	closed := make(chan struct{})
 	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
-		if _, err := io.WriteString(writer, replay[:cut]); err != nil {
+		partial := replay[:cut]
+		if factory.Encode != nil {
+			partial = factory.Encode(partial)
+		}
+		if _, err := io.WriteString(writer, partial); err != nil {
 			t.Error(err)
 			return
 		}
@@ -387,6 +445,9 @@ func retryClasses(t *testing.T, factory Factory) {
 					} else {
 						body = "data: " + body + "\n\n"
 					}
+				}
+				if status == 200 && factory.Encode != nil {
+					body = factory.Encode(body)
 				}
 				if _, err := io.WriteString(writer, body); err != nil {
 					t.Error(err)

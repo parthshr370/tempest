@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
+	"go.harness.dev/harness/internal/obs"
 	"go.harness.dev/harness/internal/retry"
 )
 
@@ -22,7 +25,17 @@ func ApplyError(output *types.AssistantMessage, err error) {
 	if err == nil {
 		return
 	}
-	output.ErrorMessage = err.Error()
+	message := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if endpoint, parseErr := url.Parse(urlErr.URL); parseErr == nil {
+			endpoint.RawQuery, endpoint.Fragment, endpoint.User = "", "", nil
+			message = strings.ReplaceAll(message, urlErr.URL, endpoint.String())
+		} else {
+			message = strings.ReplaceAll(message, urlErr.URL, "[REDACTED URL]")
+		}
+	}
+	output.ErrorMessage = obs.Redact(message)
 	var structured types.StructuredError
 	if errors.As(err, &structured) {
 		output.ErrorCode = structured.ErrorCode()

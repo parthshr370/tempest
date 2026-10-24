@@ -24,6 +24,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
+	"go.harness.dev/harness/internal/retry"
 )
 
 // Stream starts a Gemini generation and returns an AssistantStream whose events
@@ -68,15 +69,17 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	if opts == nil {
 		opts = &Options{}
 	}
-	if strings.TrimSpace(opts.APIKey) == "" {
+	if strings.TrimSpace(opts.APIKey) == "" && !opts.DisableEnvAuth && !opts.NoAuth {
 		if filled := base.WithEnvAPIKey(&opts.StreamOptions, model.Provider); filled != &opts.StreamOptions {
 			opts.APIKey = filled.APIKey
 		}
 	}
 
-	if err := assertRequestAuth(model.Provider, opts.APIKey, opts.Headers); err != nil {
-		pushError(s, output, err, parent.Err() != nil)
-		return
+	if !opts.NoAuth {
+		if err := assertRequestAuth(model.Provider, opts.APIKey, mergeHeaders(model.Headers, opts.Headers)); err != nil {
+			pushError(s, output, err, parent.Err() != nil)
+			return
+		}
 	}
 
 	payload := any(buildParams(model, c, opts))
@@ -103,15 +106,17 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	}
 
 	url := generateContentURL(model.BaseURL, model.ID)
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, base.RequestURL(url, opts.Query), bytes.NewReader(body))
 	if err != nil {
 		pushError(s, output, err, parent.Err() != nil)
 		return
 	}
 	headers := map[string]string{
-		"accept":         "application/json",
-		"content-type":   "application/json",
-		"x-goog-api-key": opts.APIKey,
+		"accept":       "application/json",
+		"content-type": "application/json",
+	}
+	if opts.APIKey != "" && !opts.NoAuth {
+		headers["x-goog-api-key"] = opts.APIKey
 	}
 	for key, value := range mergeHeaders(headers, model.Headers, opts.Headers) {
 		req.Header.Set(key, value)
@@ -137,8 +142,17 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	s.Push(types.StreamEvent{Type: types.EvStart, Partial: output})
 	state := &googleFoldState{Output: output}
+	hasFinishReason := false
 
-	err = iterateGoogleEvents(reqCtx, resp.Body, watchdog.Event, func(chunk *googleStreamChunk) error {
+	foldChunk := func(chunk *googleStreamChunk) error {
+		if reason := chunk.PromptFeedback.BlockReason; reason != "" && reason != "BLOCK_REASON_UNSPECIFIED" {
+			return &retry.Error{Code: retry.CodeInvalidRequest, Message: "Gemini prompt blocked by content filter: " + reason}
+		}
+		for _, candidate := range chunk.Candidates {
+			if candidate.FinishReason != "" {
+				hasFinishReason = true
+			}
+		}
 		events, err := foldGoogleChunk(chunk, state, model)
 		if err != nil {
 			return err
@@ -150,9 +164,26 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 			s.Push(ev)
 		}
 		return nil
-	})
+	}
+	if strings.Contains(model.BaseURL, ":generateContent") {
+		var chunk googleStreamChunk
+		err = json.NewDecoder(resp.Body).Decode(&chunk)
+		watchdog.Event()
+		if err == nil && len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			err = googleAPIError(chunk.Error)
+		}
+		if err == nil {
+			err = foldChunk(&chunk)
+		}
+	} else {
+		err = iterateGoogleEvents(reqCtx, resp.Body, watchdog.Event, foldChunk)
+	}
 	if err != nil {
 		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
+		return
+	}
+	if !hasFinishReason && parent.Err() == nil {
+		pushError(s, output, &retry.Error{Code: retry.CodeStreamInterrupted, Message: "Gemini stream ended without finishReason", Retryable: true}, false)
 		return
 	}
 
@@ -208,6 +239,9 @@ func generateContentURL(baseURL string, modelID string) string {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultGoogleBaseURL
 	}
+	if strings.Contains(baseURL, ":streamGenerateContent") || strings.Contains(baseURL, ":generateContent") {
+		return baseURL
+	}
 	return strings.TrimRight(baseURL, "/") + "/v1beta/models/" + modelID + ":streamGenerateContent?alt=sse"
 }
 
@@ -223,9 +257,14 @@ func mergeHeaders(headerSources ...map[string]string) map[string]string {
 }
 
 // assertRequestAuth fails fast when no API key is available for the request.
-func assertRequestAuth(_ string, apiKey string, _ map[string]string) error {
+func assertRequestAuth(_ string, apiKey string, headers map[string]string) error {
 	if apiKey != "" {
 		return nil
+	}
+	for key, value := range headers {
+		if strings.EqualFold(key, "authorization") && strings.TrimSpace(value) != "" {
+			return nil
+		}
 	}
 	return errors.New("no API key for provider: google")
 }
