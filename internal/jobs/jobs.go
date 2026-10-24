@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/outputschema"
+	"go.harness.dev/harness/internal/taskstate"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/internal/worktree"
 )
@@ -94,6 +95,8 @@ type Manager struct {
 	finished  bool
 	accepted  map[string]int
 	workers   sync.WaitGroup
+	// Tasks shares this supervisor's run and session lifetime.
+	Tasks *taskstate.Runtime
 }
 
 var _ work.Controller = (*Manager)(nil)
@@ -581,6 +584,7 @@ func (manager *Manager) StartTask(ctx context.Context, spec work.TaskSpec) (work
 	run := manager.run
 	manager.mu.Unlock()
 	job := work.Job{ID: jobID, Kind: "task", State: "starting", RunID: invocation.RunID, LogicalRunID: run.LogicalRunID, ToolCallID: invocation.ToolCallID, ChildSessionID: childID, Description: spec.Description, StartedAt: time.Now().UTC(), Cwd: cwd, Isolation: isolation, Cleanup: "none"}
+	job.OwnerTask = invocation.OwnerTask
 	if workspace != nil {
 		job.BaseCommit = workspace.BaseCommit
 		job.Cleanup = "retained"
@@ -673,6 +677,7 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 	run := manager.run
 	manager.mu.Unlock()
 	job := work.Job{ID: jobID, Kind: "bash", State: "starting", RunID: invocation.RunID, LogicalRunID: run.LogicalRunID, ToolCallID: invocation.ToolCallID, StartedAt: time.Now().UTC(), Cwd: manager.host.Cwd, Cleanup: "none", Name: spec.Name}
+	job.OwnerTask = invocation.OwnerTask
 	if readiness != nil {
 		job.Readiness = "waiting"
 	}
@@ -1045,6 +1050,7 @@ func (manager *Manager) Finish(ctx context.Context, reason string) error {
 	manager.finished = true
 	manager.sealed = true
 	runID := manager.run.RunID
+	taskRunID := manager.run.LogicalRunID
 	records := make([]*entry, 0)
 	for _, record := range manager.entries {
 		if record.live {
@@ -1054,6 +1060,10 @@ func (manager *Manager) Finish(ctx context.Context, reason string) error {
 	manager.mu.Unlock()
 	manager.admission.Unlock()
 	persistCtx := context.WithoutCancel(ctx)
+	var taskErr error
+	if manager.Tasks != nil && reason != "completed" {
+		taskErr = manager.Tasks.StopRun(persistCtx, taskRunID)
+	}
 	if reason != "completed" && runID != "" {
 		payload, err := json.Marshal(stopPayload{Reason: reason})
 		if err != nil {
@@ -1080,7 +1090,7 @@ func (manager *Manager) Finish(ctx context.Context, reason string) error {
 	manager.scope = nil
 	manager.cancel = nil
 	manager.mu.Unlock()
-	return manager.error()
+	return errors.Join(manager.error(), taskErr)
 }
 
 // Close also discards recoverable children while idle, without opening a child journal.
@@ -1098,6 +1108,11 @@ func (manager *Manager) Close(ctx context.Context) error {
 	manager.mu.Unlock()
 	for _, record := range records {
 		if _, err := manager.cancelRecord(context.WithoutCancel(ctx), record, "session_closed"); err != nil {
+			return err
+		}
+	}
+	if manager.Tasks != nil {
+		if err := manager.Tasks.Close(ctx); err != nil {
 			return err
 		}
 	}

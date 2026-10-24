@@ -1,6 +1,6 @@
 # Tools
 
-Tempest ships **17 built-in tools**, **12 on by default**, in one namespace. Pin the
+Tempest ships built-in coding tools in one namespace. Pin the
 active set with `-exclude-tools` and enable the optional groups with flags:
 `-enable-task`, `-enable-web`, `-enable-lsp`, `-attach`. All file tools are contained
 to the working directory through `os.Root`. `grep` and `find` fall back to pure Go
@@ -129,18 +129,31 @@ header and accepts the same `path:START-END` / `path:START+COUNT` line ranges an
 | `bundle.zip:dir/file.txt` | One member, read in memory (16 MiB cap, nothing extracted to disk). `bundle.zip:dir` lists a folder. |
 | `report.docx`, `.xlsx`, `.pptx` | The document's extracted text. |
 | `package.json?q=.scripts \| keys` | A JSON query, printed as indented JSON. |
+| `paper.pdf` | PDF text through `pdftotext -layout`. Install Poppler if the command is absent. |
+| `app.db`, `.db3`, `.sqlite`, `.sqlite3` | SQLite tables and their definitions. |
+| `app.db:items` | The table's schema and first 20 rows. `?limit=20&offset=20` selects a page. |
+| `app.db?q=SELECT name FROM items` | A read-only SQL query, capped at 1000 rows. Put optional paging before `q`: `?limit=20&offset=20&q=SELECT...`. |
 
 The JSON query is a small jq subset implemented in-house: `.` (identity), `.a.b`,
 `."any key"` and `.["any key"]`, `.[0]` and `.[-1]`, `.[]` (array elements or object
 values), `?` after any step to skip values of the wrong type instead of failing
 (`.items[]?.name?`), `keys`, `length`, and `|` pipes. Object keys print sorted.
-Queries combine with members (`bundle.zip:data.json?q=.a`). PDFs and SQLite databases
-are refused with a pointer to `pdftotext` or `sqlite3` through `bash`.
+Queries combine with members (`bundle.zip:data.json?q=.a`).
+
+SQLite reads use a private copy of the contained database and its WAL, so reading
+cannot create sidecars or change the source. Do not write the database while taking
+the copy. Queries must be a single `SELECT` or read-only `WITH ... SELECT`.
+Write statements, shell commands and external file functions are refused.
+The CLI also runs with `-readonly`, `-safe`, `query_only` and `trusted_schema=OFF`.
+Everything after `q=` is raw SQL: `+`, `&` and `%` keep their SQL meaning.
+PDF, database and WAL inputs are capped at 32 MiB each before conversion/copying.
+PDF text and SQLite results use ordinary line selectors and `offset`/`limit` paging.
+Missing readers report the required executable instead of showing binary data.
 
 ## Internal URLs
 
-`read` and `grep` resolve four schemes, so the agent can name things that do not live
-in the workspace:
+`read` resolves the following schemes. The four file and session schemes also work
+with `grep`:
 
 | URL | Resolves to |
 |---|---|
@@ -151,12 +164,15 @@ in the workspace:
 | `history://` | The child sessions, with their job ids. |
 | `history://<id>` | A child's transcript rendered as text, by task job id or child session id. |
 | `local://<path>` | A private scratch directory, `<journal>.d/local/`, shared by the root session and its children. |
+| `issue://<number>`, `pr://<number>` | A GitHub issue or pull request in the caller's workspace repository. `owner/repo/number` selects another repository. |
+| `issue://`, `pr://owner/repo` | Recent GitHub items. Listings accept `state`, `limit` (1 to 100), `author` and `label` query parameters. |
+| `pr://<number>/diff` | Changed files, numbered from one. Append `/1` for that file's diff or `/all` for the full diff. Line selectors page each result. |
 
 `local://` is the one writable scheme: `write` and `edit` accept it, so an agent hands
 a large payload to a child (or back to its parent) by writing `local://plan.md` and
 passing the URL instead of pasting the text.
 
-Every scheme is rooted. `..` is refused, file access goes through an `os.Root` on the
+Every file-backed scheme is rooted. `..` is refused, file access goes through an `os.Root` on the
 scheme's directory, and a symlink that leads outside it is refused. A child resolves
 `local://`, `job://` and `history://` against its root session, so a session tree
 shares one namespace and other sessions stay out of reach. `job://`, `history://` and
@@ -172,17 +188,94 @@ before the permission gate, so the destructive-command guard and the cloud tiers
 the real paths. A word that cannot resolve fails the call with the reason instead of
 running.
 
+## Structural search and rewrites
+
+`ast_grep` and `ast_edit` register only when `ast-grep` or its `sg` alias is on PATH.
+`tempest doctor` reports why they are absent. There is no text-search fallback.
+
+```json
+{"pat":"oldApi($$$ARGS)","path":"src/**/*.ts"}
+```
+
+`ast_grep` returns 50 matches per call. Use `skip` to continue. File extensions
+select the language; `lang` overrides it. Paths may name files, directories or globs.
+Search scopes can be separated by semicolons.
+
+```json
+{"ops":[{"pat":"oldApi($$$ARGS)","out":"newApi($$$ARGS)"}],"paths":["src/**/*.ts"]}
+```
+
+The first `ast_edit` call writes nothing. It shows a unified diff and a `preview`
+token. Repeat the request with `"apply":true` and that token to commit. Changed
+source or arguments invalidate it. Operations run in order. Empty `out` deletes
+matches. Overlapping matches are refused. Narrow the pattern before retrying.
+Rewrite scopes are bounded to 256 files and 16 MiB of source per call.
+Search scans files independently and retains only the requested 50-match page;
+it does not inherit the rewrite snapshot limits. Gitignored directories are pruned.
+
+The binary reads source through stdin in a private directory. It never receives
+workspace paths or loads workspace parser configuration. Symlinks discovered
+during directory walks are skipped; explicitly named scopes follow links only
+inside the workspace.
+Writes use the same mutation locks, atomic writes, multi-file rollback journal,
+hook-settings approval and checkpoint path as ordinary edits.
+General children inherit these tools only when their parent allows them.
+Plan and scout sessions get structural search, not structural edits.
+Previews are read-tier calls and do not capture checkpoints. Large structural
+results and GitHub output are bounded like bash, with full text spilled into the
+session's `tool-output` artifacts (the path is returned for `read`).
+
+The JSON byte ranges and replacement offsets follow the
+[ast-grep JSON protocol](https://ast-grep.github.io/guide/tools/json.html).
+
+## GitHub
+
+`gh` is a read-tier tool. Operations are `issue_view`, `pr_view`, `pr_diff`,
+`repo_view`, `file_read`, `search_issues`, `search_prs`, `search_code`,
+`search_commits`, `search_repos`, `run_watch` and `run_logs`.
+Pass `repo:"owner/repo"` or use the workspace repository. `number` and `run` are
+positive decimal strings. Search takes `query` and an optional `limit` (1 to 100).
+Repository search is global. Other searches use the workspace repository when no
+explicit `repo` or query scope (`repo:`, `org:`, `user:`, `owner:`) is given.
+`file_read` takes a repository-relative `path` and optional `branch`.
+`run_watch` polls until completion, up to `timeout` seconds (1 to 300, default 30).
+`run_logs` returns failed-job logs.
+
+`gh_checkout` requires exec permission and is absent from all child, plan and scout sessions.
+Pass `number`, a new workspace `path`, and optional `repo`. It fetches the numbered
+PR head, verifies its SHA, and creates a detached Git worktree. It does not switch
+or overwrite the caller's checkout. Git hooks are disabled for worktree creation.
+Existing destinations, paths outside the workspace, and paths inside Git metadata
+directories (including filesystem aliases) are refused. The fetched tree's
+would-be paths pass through hook-settings approval before checkout. Fetching uses
+the repository's actual host and `gh auth git-credential`, with terminal prompts
+disabled and a separate five-minute budget. A failed checkout removes partial
+worktrees, their registrations, and parents created by the call.
+Git worktree metadata is not checkpointed: successful checkout invalidates older
+rewind targets rather than pretending rewind can remove the registration. Use
+`git worktree remove` to remove the worktree.
+
+These tools require the GitHub CLI. Authentication failures say to run
+`gh auth login`. JSON flags are used where the CLI supports them. Diffs and logs
+use text because those subcommands have no JSON mode.
+Search uses [`gh api --method GET`](https://cli.github.com/manual/gh_api), preserving
+multi-word queries as one field.
+
 ## Tool reference
 
 ### Files and search
 
-- `read`: files, directories, archives and their members, office documents, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`). Numbered content when the file fits one read, a structural outline for a Go file that does not. `paths` reads up to 20 files in one call, each with its own selector.
+- `read`: files, directories, archives and their members, office documents, PDF text, SQLite, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`, `issue://`, `pr://`). Numbered content when the file fits one read, a structural outline for a Go file that does not. `paths` reads up to 20 files in one call, each with its own selector.
 - `write`: create or overwrite a file, or a `local://` scratch file.
 - `edit`: exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor). Also edits `local://` files.
 - `hashline`: line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers. See [Hashline edits](#hashline-edits).
 - `grep`: regex search across the tree, under up to 20 `paths` at once, or under an internal URL.
 - `find`: glob-based path lookup.
 - `ls`: directory listing.
+- `ast_grep`: structural workspace search, when ast-grep is installed.
+- `ast_edit`: preview and apply structural rewrites, when ast-grep is installed.
+- `gh`: read GitHub issues, PRs, files, search and Actions output.
+- `gh_checkout`: check out a PR in a new workspace worktree.
 
 ### Runtime
 

@@ -2,6 +2,7 @@ package base
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,7 +18,13 @@ import (
 
 // ResponseError retains HTTP status and retry hints instead of classifying body text alone.
 func ResponseError(resp *http.Response, body []byte) *retry.Error {
-	return retry.Classify(retry.Failure{Status: resp.StatusCode, Headers: util.HeadersToRecord(resp.Header), Message: fmt.Sprintf("provider HTTP %d: %s", resp.StatusCode, body)}, time.Now())
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	return retry.Classify(retry.Failure{Status: resp.StatusCode, ProviderCode: payload.Error.Code, Headers: util.HeadersToRecord(resp.Header), Message: fmt.Sprintf("provider HTTP %d: %s", resp.StatusCode, body)}, time.Now())
 }
 
 // ApplyError preserves structured converter errors and classifies transport/provider failures.

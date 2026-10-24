@@ -313,8 +313,8 @@ func BuildAgentStack(cfg StackConfig) (*AgentStack, error) {
 		SessionDataDir:     sessionDataDir,
 		Checkpoints:        checkpoints,
 		Kernels:            kernels,
-		ApproveHookSettings: func(ctx context.Context, callID string, paths []string) error {
-			return approveHookSettings(ctx, "integrate", callID, paths)
+		ApproveHookSettings: func(ctx context.Context, tool, callID string, paths []string) error {
+			return approveHookSettings(ctx, tool, callID, paths)
 		},
 	}
 	// Language servers are root-session-only: a child edits another
@@ -477,7 +477,7 @@ func thinkingLevel(reasoning string) agent.ThinkingLevel {
 // PlanToolNames is the read-only plan stack's selection. Tools that are not
 // registered (web access off, LSP disabled) are skipped by SelectActive.
 func PlanToolNames() []string {
-	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ViewImageTool), string(tools.ManifestDiffTool)}
+	names := []string{"read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", string(tools.ViewImageTool), string(tools.ManifestDiffTool), string(tools.ASTGrepTool), string(tools.GHTool)}
 	for _, name := range tools.LSPToolNames {
 		names = append(names, string(name))
 	}

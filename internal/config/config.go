@@ -150,6 +150,7 @@ type ResolvedConfig struct {
 	planReasoning          string
 	smolReasoning          string
 	maxTokens              int
+	maxTokensConfigured    bool
 	permissionModeDefault  string
 	bashTimeout            time.Duration
 	logLevel               string
@@ -214,6 +215,9 @@ func firstSet(values ...string) string {
 
 // MaxTokens returns the maximum model output tokens.
 func (c *ResolvedConfig) MaxTokens() int { return c.maxTokens }
+
+// MaxTokensConfigured reports whether the user set an output-token cap.
+func (c *ResolvedConfig) MaxTokensConfigured() bool { return c.maxTokensConfigured }
 
 // PermissionModeDefault returns the configured default tool permission mode.
 func (c *ResolvedConfig) PermissionModeDefault() string { return c.permissionModeDefault }
@@ -540,6 +544,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		planReasoning:         strings.ToLower(resolveString(c.Flags.PlanReasoning, lookup("HARNESS_PLAN_REASONING"), settings.PlanReasoning, "")),
 		smolReasoning:         strings.ToLower(resolveString(c.Flags.SmolReasoning, lookup("HARNESS_SMOL_REASONING"), settings.SmolReasoning, "")),
 		maxTokens:             maxTokens,
+		maxTokensConfigured:   c.Flags.MaxTokens.Set || strings.TrimSpace(lookup("HARNESS_MAX_TOKENS")) != "" || settings.MaxTokens != nil,
 		permissionModeDefault: resolveString(c.Flags.PermissionMode, lookup("HARNESS_PERMISSION_MODE"), settings.PermissionModeDefault, defaultPermissionMode),
 		bashTimeout:           bashTimeout,
 		logLevel:              resolveLogLevel(c.Flags.LogLevel, lookup("HARNESS_LOG_LEVEL"), lookup("HARNESS_DEBUG"), settings.LogLevel),
@@ -593,6 +598,9 @@ func validateResolved(c *ResolvedConfig) error {
 		}
 		if err := adapter.ValidateModelSpecWithProviders(model, c.providers); err != nil {
 			return &Error{Field: field, Err: err}
+		}
+		if c.maxTokensConfigured && strings.HasPrefix(strings.TrimSpace(model), "openai-chatgpt:") {
+			return &Error{Field: "max_tokens", Err: errors.New("ChatGPT plan usage does not support explicit output-token caps; use turn or wall-time limits")}
 		}
 	}
 	for field, baseURL := range map[string]string{"anthropic_base_url": c.anthropicBaseURL, "openai_base_url": c.openAIBaseURL} {

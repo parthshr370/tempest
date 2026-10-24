@@ -2,6 +2,7 @@ package serve
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 
@@ -78,6 +79,7 @@ func TestDurableACPWithdrawAndDocumentRead(t *testing.T) {
 				Tempest struct {
 					Durable struct {
 						Version       int      `json:"version"`
+						Tasks         bool     `json:"tasks"`
 						Methods       []string `json:"methods"`
 						Notifications []string `json:"notifications"`
 					} `json:"durable"`
@@ -87,8 +89,17 @@ func TestDurableACPWithdrawAndDocumentRead(t *testing.T) {
 	}
 	call(t, wire, "initialize", map[string]any{"protocolVersion": 1}, &capability)
 	durable := capability.AgentCapabilities.Meta.Tempest.Durable
-	if durable.Version != 1 || len(durable.Methods) != 5 || len(durable.Notifications) != 1 || durable.Notifications[0] != "_tempest/durable/update" {
+	if durable.Version != 1 || !durable.Tasks || !slices.Contains(durable.Notifications, "_tempest/durable/update") {
 		t.Fatalf("durable capabilities=%+v", durable)
+	}
+	for _, method := range []string{
+		"submit", "get_submission", "withdraw", "commit", "read",
+		"create_task", "get_task", "tasks", "cancel_task", "retry_task",
+		"cancel_all", "resume_pending", "next_wake",
+	} {
+		if !slices.Contains(durable.Methods, "_tempest/durable/"+method) {
+			t.Errorf("durable capabilities missing method %q: %+v", method, durable)
+		}
 	}
 }
 

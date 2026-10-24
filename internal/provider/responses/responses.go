@@ -57,12 +57,14 @@ func params(model types.Model, c types.Context, opts *types.SimpleStreamOptions)
 	if c.SystemPrompt != "" {
 		p["instructions"] = c.SystemPrompt
 	}
-	maxTokens := base.ClampMaxTokens(model, c, opts.MaxTokens)
-	if maxTokens > 0 {
-		p["max_output_tokens"] = maxTokens
-	}
-	if opts.Temperature != nil {
-		p["temperature"] = *opts.Temperature
+	if model.Provider != "openai-chatgpt" {
+		maxTokens := base.ClampMaxTokens(model, c, opts.MaxTokens)
+		if maxTokens > 0 {
+			p["max_output_tokens"] = maxTokens
+		}
+		if opts.Temperature != nil {
+			p["temperature"] = *opts.Temperature
+		}
 	}
 	if opts.SessionID != "" && opts.CacheRetention != "none" && (model.OpenAICompat == nil || model.OpenAICompat.SupportsPromptCacheKey == nil || *model.OpenAICompat.SupportsPromptCacheKey) {
 		p["prompt_cache_key"] = base.PromptCacheKey(opts.SessionID)
@@ -75,7 +77,11 @@ func params(model types.Model, c types.Context, opts *types.SimpleStreamOptions)
 		tools = append(tools, map[string]any{"type": "function", "name": tool.Name, "description": tool.Description, "parameters": tool.Parameters, "strict": false})
 	}
 	if len(tools) > 0 {
-		p["tools"] = tools
+		if model.Provider == "openai-chatgpt" {
+			p["tools"] = []any{map[string]any{"type": "namespace", "name": "tempest", "description": "Tempest local tools", "tools": tools}}
+		} else {
+			p["tools"] = tools
+		}
 	}
 	if len(opts.OutputSchema) > 0 {
 		p["text"] = map[string]any{"format": map[string]any{"type": "json_schema", "name": "response", "schema": opts.OutputSchema, "strict": true}}
@@ -115,7 +121,11 @@ func assistantItems(m types.AssistantMessage, model types.Model) []any {
 			if args == "" {
 				args = "{}"
 			}
-			out = append(out, map[string]any{"type": "function_call", "call_id": b.ID, "name": b.Name, "arguments": args})
+			call := map[string]any{"type": "function_call", "call_id": b.ID, "name": b.Name, "arguments": args}
+			if model.Provider == "openai-chatgpt" {
+				call["namespace"] = "tempest"
+			}
+			out = append(out, call)
 		case types.BlockThinking:
 			if supportsEncryptedReasoning(model) && m.API == model.API && m.Provider == model.Provider && m.Model == model.ID && b.ThinkingSignature != "" {
 				var item map[string]any
@@ -135,6 +145,7 @@ type item struct {
 	CallID    string `json:"call_id"`
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
+	Namespace string `json:"namespace"`
 	Summary   []struct {
 		Text string `json:"text"`
 	} `json:"summary"`
@@ -235,7 +246,11 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 		fail(fmt.Errorf("no API key for provider: %s", model.Provider))
 		return
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := *http.DefaultClient
+	if model.Provider == "openai-chatgpt" {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		fail(err)
 		return
@@ -249,7 +264,11 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		fail(base.ResponseError(resp, raw))
+		failure := base.ResponseError(resp, raw)
+		if model.Provider == "openai-chatgpt" && resp.StatusCode == http.StatusUnauthorized {
+			failure.Message += "; OpenAI sign-in may be expired or revoked; run tempest login openai"
+		}
+		fail(failure)
 		return
 	}
 	s.Push(types.StreamEvent{Type: types.EvStart, Partial: output})
@@ -301,6 +320,9 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 			key := fmt.Sprintf("item:%d", e.OutputIndex)
 			switch it.Type {
 			case "function_call":
+				if model.Provider == "openai-chatgpt" && it.Namespace != "tempest" {
+					return fmt.Errorf("ChatGPT returned a function outside the Tempest namespace")
+				}
 				index := open(key, types.NewToolCall(it.CallID, it.Name, json.RawMessage(`{}`)))
 				if e.Type == "response.output_item.done" {
 					if !json.Valid([]byte(it.Arguments)) {
@@ -348,6 +370,9 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 			output.Usage = types.Usage{Input: max(0, u.Input-u.InputDetails.Cached), CacheRead: u.InputDetails.Cached, Output: u.Output, TotalTokens: u.Total, Reasoning: u.OutputDetails.Reasoning}
 			types.CalculateCost(model.Cost, &output.Usage)
 			if e.Type == "response.incomplete" {
+				if model.Provider == "openai-chatgpt" {
+					return fmt.Errorf("ChatGPT response incomplete; no tools were executed")
+				}
 				if e.Response.Incomplete.Reason != "max_output_tokens" {
 					return fmt.Errorf("Responses incomplete: %s", e.Response.Incomplete.Reason)
 				}

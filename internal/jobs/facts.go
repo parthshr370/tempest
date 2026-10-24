@@ -33,6 +33,8 @@ type workspacePayload struct {
 }
 type startedPayload struct {
 	JobID          string              `json:"job_id"`
+	OwnerTask      string              `json:"owner_task,omitempty"`
+	OwnerRevision  uint64              `json:"owner_revision,omitempty"`
 	IdentityDigest string              `json:"identity_digest"`
 	CallID         string              `json:"call_id"`
 	ToolCallID     string              `json:"tool_call_id"`
@@ -86,7 +88,8 @@ type stopPayload struct {
 
 func (manager *Manager) commitStart(ctx context.Context, record *entry) error {
 	recovery := record.recovery
-	payload := startedPayload{JobID: recovery.Job.ID, IdentityDigest: recovery.IdentityDigest, CallID: recovery.Invocation.CallID, ToolCallID: recovery.Invocation.ToolCallID, LogicalRunID: recovery.Job.LogicalRunID, StartedAt: recovery.Job.StartedAt, Kind: recovery.Job.Kind, ChildSessionID: recovery.Job.ChildSessionID, ChildJournal: recovery.ChildJournal, Cwd: recovery.Job.Cwd}
+	payload := startedPayload{JobID: recovery.Job.ID, OwnerTask: recovery.Job.OwnerTask, IdentityDigest: recovery.IdentityDigest, CallID: recovery.Invocation.CallID, ToolCallID: recovery.Invocation.ToolCallID, LogicalRunID: recovery.Job.LogicalRunID, StartedAt: recovery.Job.StartedAt, Kind: recovery.Job.Kind, ChildSessionID: recovery.Job.ChildSessionID, ChildJournal: recovery.ChildJournal, Cwd: recovery.Job.Cwd}
+	payload.OwnerRevision = recovery.Invocation.OwnerRevision
 	var err error
 	if recovery.Task != nil {
 		payload.Spec, err = json.Marshal(recovery.Task)

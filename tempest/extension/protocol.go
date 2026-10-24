@@ -19,6 +19,8 @@ type handlerRequest struct {
 	Arguments    json.RawMessage    `json:"arguments,omitempty"`
 	Input        *HookInput         `json:"input,omitempty"`
 	Call         *Call              `json:"call,omitempty"`
+	Task         *Task              `json:"task,omitempty"`
+	Abort        bool               `json:"abort,omitempty"`
 	Continuation string             `json:"continuation,omitempty"`
 }
 type memoResponse struct {

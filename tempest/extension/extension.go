@@ -31,7 +31,7 @@ type Selection struct {
 	Required bool   `json:"required,omitempty"`
 }
 
-// Definition is a complete replacement of one bundle. Tasks are not supported yet.
+// Definition is a complete replacement of one operator-installed bundle.
 type Definition struct {
 	ID            string                       `json:"id"`
 	Revision      string                       `json:"revision"`
@@ -46,16 +46,6 @@ type Definition struct {
 	Tasks         []TaskDefinition             `json:"tasks,omitempty"`
 	Close         func(context.Context) error  `json:"-"`
 	available     func() bool
-}
-
-// TaskDefinition decodes unsupported manifest descriptors so installation can
-// reject them explicitly. No task capability or phase handler is advertised.
-type TaskDefinition struct {
-	Name        string          `json:"name"`
-	Version     uint32          `json:"version"`
-	InputSchema json.RawMessage `json:"inputSchema"`
-	StateSchema json.RawMessage `json:"stateSchema"`
-	Initial     json.RawMessage `json:"initial"`
 }
 
 // Tool is a namespaced definition. Never is the conservative replay default.

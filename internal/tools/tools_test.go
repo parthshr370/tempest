@@ -29,8 +29,9 @@ import (
 
 func TestRegistry(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
 	all := AllTools(dir, ToolsOptions{})
-	if len(all) != 11 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil || all[ViewImageTool].Execute == nil {
+	if len(all) != 13 || !AllToolNames[ReadTool] || !AllToolNames[BashTool] || !AllToolNames[TodoTool] || all[ManifestDiffTool].Execute == nil || all[ViewImageTool].Execute == nil {
 		t.Fatalf("registry = %v names=%v", all, AllToolNames)
 	}
 	for _, name := range LSPToolNames {
@@ -44,7 +45,7 @@ func TestRegistry(t *testing.T) {
 	if got := CodingTools(dir, ToolsOptions{}); names(got) != "read,bash,edit,write" {
 		t.Fatalf("CodingTools = %s", names(got))
 	}
-	if got := ReadOnlyTools(dir, ToolsOptions{}); names(got) != "read,grep,find,ls" {
+	if got := ReadOnlyTools(dir, ToolsOptions{}); names(got) != "read,grep,find,ls,gh" {
 		t.Fatalf("ReadOnlyTools = %s", names(got))
 	}
 }

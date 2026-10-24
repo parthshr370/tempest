@@ -140,6 +140,9 @@ type sessionCore struct {
 	baseMCPDefaults  map[string]permission.Decision
 	queues           *session.DurableQueues
 	jobs             *jobs.Manager
+	taskContext      context.Context
+	cancelTasks      context.CancelFunc
+	taskWorkers      sync.WaitGroup
 	stackClose       func() error
 	// irc is the session tree's message bus; nil without task children.
 	irc         *irc.Bus
@@ -303,15 +306,16 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			if provider.OpenAIBaseURL == "" {
 				provider.OpenAIBaseURL = defaults.OpenAIBaseURL()
 			}
-			if provider.MaxTokens == 0 {
-				provider.MaxTokens = defaults.MaxTokens()
-			}
 			if provider.Providers == nil {
 				provider.Providers = defaults.Providers()
 			}
 		}
 		if modelSpec != "" {
 			provider.ModelID = modelSpec
+		}
+		if provider.MaxTokens == 0 && defaults != nil {
+			provider.MaxTokens = defaults.MaxTokens()
+			provider.MaxTokensDefaulted = !defaults.MaxTokensConfigured()
 		}
 		providerConfig = provider
 		router, e := adapter.NewProviderRouter(provider)
@@ -549,6 +553,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		},
 	}, jobs.Options{BashTimeout: cfg.BashTimeout, OnError: func(error) { s.Cancel() }, AdmitProcess: o.admitProcess}, recoveries)
 	if err != nil {
+		return nil, err
+	}
+	if err = s.configureTasks(ctx, cfg, o.Tasks); err != nil {
 		return nil, err
 	}
 	cfg.Work = &sessionWork{core: c, recoveries: recoveries}
@@ -840,11 +847,19 @@ func (s *Session) close(ctx context.Context) error {
 	c := s.core
 	c.mu.Lock()
 	c.closed = true
+	if c.cancelTasks != nil {
+		c.cancelTasks()
+	}
 	r := c.active
 	if r != nil {
 		r.cancel()
 	}
 	c.mu.Unlock()
+	if c.jobs != nil && c.jobs.Tasks != nil {
+		if err := c.jobs.Tasks.Suspend(ctx); err != nil {
+			return err
+		}
+	}
 	if r != nil {
 		select {
 		case <-r.done:
@@ -852,6 +867,11 @@ func (s *Session) close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	// Drain owners may still be adopting phase replies after their handlers join.
+	// Don't close their store until both admission and task drains have returned.
+	c.admission.Lock()
+	c.admission.Unlock()
+	c.taskWorkers.Wait()
 	c.finishClose()
 	return c.closeErr
 }

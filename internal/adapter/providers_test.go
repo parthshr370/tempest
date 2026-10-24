@@ -69,19 +69,27 @@ func TestProviderPresetsWireShape(t *testing.T) {
 					}
 					io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
 				} else {
-					if body["input"] == nil || string(body["max_output_tokens"]) != "64" {
+					if body["input"] == nil || name != "openai-chatgpt" && string(body["max_output_tokens"]) != "64" || name == "openai-chatgpt" && body["max_output_tokens"] != nil {
 						t.Errorf("Responses body = %s", body)
 					}
 					io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-test\"}}\n\n")
 				}
 			}))
 			defer server.Close()
-			router, err := NewProviderRouter(RoutingConfig{ModelID: name + ":test-model", MaxTokens: 64, Providers: map[string]ProviderConfig{name: {BaseURL: server.URL + "/v1"}}, Env: func(key string) string {
+			routing := RoutingConfig{ModelID: name + ":test-model", MaxTokens: 64, Providers: map[string]ProviderConfig{name: {BaseURL: server.URL + "/v1"}}, Env: func(key string) string {
 				if key == preset.APIKeyEnv && key != "" {
 					return "fixture-key"
 				}
 				return ""
-			}})
+			}}
+			if name == "openai-chatgpt" {
+				routing.MaxTokens = 0
+				routing.Providers = nil
+				routing.ChatGPTCredentials = func(context.Context) (RequestCredential, error) {
+					return RequestCredential{AccessToken: "fixture-key", BaseURL: server.URL + "/v1"}, nil
+				}
+			}
+			router, err := NewProviderRouter(routing)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -281,6 +289,7 @@ func TestProviderPresetEndpoints(t *testing.T) {
 		"llamacpp":         "http://localhost:8080/v1",
 		"azure":            "",
 		"openai-responses": "https://api.openai.com/v1",
+		"openai-chatgpt":   "https://api.openai.com/v1",
 		"bedrock":          "",
 		"vertex":           "",
 	}

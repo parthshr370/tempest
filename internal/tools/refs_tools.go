@@ -35,7 +35,8 @@ const (
 	readSelectorsHelp = "Also reads directories (entries), archives (bundle.zip, .tar, .tar.gz, .tgz list members; bundle.zip:dir/file reads one), .docx/.xlsx/.pptx (extracted text), " +
 		"JSON queries (file.json?q=.items[0].name; a jq subset: .a.b, .[n], .[], ? after a step, keys, length, |) and internal URLs: skill://<name>[/<file>] (skill://<name>/ lists it), " +
 		"job:// (jobs), job://<id> (record), job://<id>/<artifact> (output.log, result.txt, changes.patch), history:// and history://<id> (child transcripts), local://<path> (scratch shared with child sessions). " +
-		"PDF and SQLite are not rendered; use bash. Line ranges apply to every text output."
+		"PDF text uses pdftotext. SQLite file.db lists tables; file.db:table shows schema and rows; ?limit=20&offset=0 pages rows. ?q=SELECT... takes raw SQL (including +, %, &); put limit/offset before q, e.g. ?limit=20&q=SELECT a+b FROM t. Queries use sqlite3 -safe -readonly. PDF, database and WAL inputs are capped at 32 MiB each. " +
+		"issue://<number> and pr://<number> read GitHub items (owner/repo/number selects another repo); pr://<number>/diff lists files, /diff/<index> reads one, /diff/all reads the full diff. These require authenticated gh. Line ranges apply to every text output."
 	localWriteHelp = "A local://<path> URL targets the session tree's private scratch directory instead of the workspace, for handing large payloads between agents; other internal URLs are read-only."
 	bashURLHelp    = "skill://<name>/<file> and local://<path> words expand to quoted absolute paths before the command is checked and run (percent-encode spaces in names)."
 )
@@ -44,8 +45,17 @@ const (
 // os.Root with the pure-Go matcher, or rendered text (job listings,
 // transcripts) line by line. Results name files by URL and are not
 // recorded in the edit snapshot store.
-func grepRefs(ctx context.Context, options ToolsOptions, input grepToolInput) (agent.AgentToolResult, error) {
-	target, err := options.Refs.Search(ctx, input.Path)
+func grepRefs(ctx context.Context, cwd string, options ToolsOptions, input grepToolInput) (agent.AgentToolResult, error) {
+	var target refs.SearchTarget
+	var err error
+	if refs.GitHubURL(input.Path) {
+		var resource refs.Resource
+		resource, err = refs.ReadGitHub(refs.WithProcessAdmission(ctx, options.AdmitProcess), cwd, input.Path)
+		err = codingToolError(err, options)
+		target.URI, target.Text = resource.URI, string(resource.Data)
+	} else {
+		target, err = options.Refs.Search(ctx, input.Path)
+	}
 	if err != nil {
 		return agent.AgentToolResult{}, err
 	}

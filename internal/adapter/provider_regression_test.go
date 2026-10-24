@@ -18,7 +18,14 @@ import (
 func TestProviderProtocolFallbackLimits(t *testing.T) {
 	for name := range BuiltinProviders() {
 		t.Run(name, func(t *testing.T) {
-			rt, err := resolveRoute(RoutingConfig{ModelID: name + ":unlisted", Providers: map[string]ProviderConfig{name: {BaseURL: "https://example.test"}}}, func(string) string { return "" })
+			routing := RoutingConfig{ModelID: name + ":unlisted", Providers: map[string]ProviderConfig{name: {BaseURL: "https://example.test"}}}
+			if name == "openai-chatgpt" {
+				routing.Providers = nil
+				routing.ChatGPTCredentials = func(context.Context) (RequestCredential, error) {
+					return RequestCredential{AccessToken: "fixture-key", BaseURL: "https://api.openai.com/v1"}, nil
+				}
+			}
+			rt, err := resolveRoute(routing, func(string) string { return "" })
 			if err != nil {
 				t.Fatal(err)
 			}

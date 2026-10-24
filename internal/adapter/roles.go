@@ -11,6 +11,7 @@
 package adapter
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -20,15 +21,16 @@ import (
 // RoleRoutingConfig contains the resolved model settings shared by the three
 // agent roles. SecretLookup keeps credential material out of durable config.
 type RoleRoutingConfig struct {
-	DefaultModel     string
-	PlanModel        string
-	SmolModel        string
-	AnthropicBaseURL string
-	OpenAIBaseURL    string
-	MaxTokens        int
-	SecretLookup     func(string) (string, bool)
-	Retry            *retry.Config
-	Providers        map[string]ProviderConfig
+	DefaultModel       string
+	PlanModel          string
+	SmolModel          string
+	AnthropicBaseURL   string
+	OpenAIBaseURL      string
+	MaxTokens          int
+	SecretLookup       func(string) (string, bool)
+	Retry              *retry.Config
+	Providers          map[string]ProviderConfig
+	ChatGPTCredentials func(context.Context) (RequestCredential, error)
 }
 
 // RoleRouters contains a fully routed provider for each agent role.
@@ -80,14 +82,19 @@ func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) 
 	if provider == "anthropic" && cfg.SecretLookup != nil {
 		authToken, _ = cfg.SecretLookup("ANTHROPIC_AUTH_TOKEN")
 	}
+	maxTokens := cfg.MaxTokens
+	if provider == "openai-chatgpt" {
+		maxTokens = 0
+	}
 	return NewProviderRouter(RoutingConfig{
-		ModelID:          model,
-		AnthropicBaseURL: cfg.AnthropicBaseURL,
-		OpenAIBaseURL:    cfg.OpenAIBaseURL,
-		APIKey:           apiKey,
-		AuthToken:        authToken,
-		MaxTokens:        cfg.MaxTokens,
-		Providers:        cfg.Providers,
+		ModelID:            model,
+		AnthropicBaseURL:   cfg.AnthropicBaseURL,
+		OpenAIBaseURL:      cfg.OpenAIBaseURL,
+		APIKey:             apiKey,
+		AuthToken:          authToken,
+		MaxTokens:          maxTokens,
+		Providers:          cfg.Providers,
+		ChatGPTCredentials: cfg.ChatGPTCredentials,
 		// Environment sources are resolved upstream: config folds
 		// HARNESS_* and the vendor base-URL variables into cfg in
 		// precedence order, and SecretLookup supplies credentials. The

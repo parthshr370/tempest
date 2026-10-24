@@ -169,13 +169,29 @@ func (m *Manager) Wrap(tools []agent.AgentTool, mutates func(string) bool) []age
 		}
 		execute := tool.Execute
 		out[i].Execute = func(ctx context.Context, id string, args json.RawMessage, update agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+			if tool.Name == "ast_edit" {
+				var request struct {
+					Apply bool `json:"apply"`
+				}
+				if json.Unmarshal(args, &request) == nil && !request.Apply {
+					return execute(ctx, id, args, update)
+				}
+			}
 			m.beforeCall(ctx, tool.Name, id)
 			// A panic still runs afterCall. Keep Uncertain durable until we know
 			// the tool returned; the executor owns panic-to-result conversion.
-			returned := false
-			defer func() { m.afterCall(ctx, returned) }()
+			returned, createdWorktree := false, false
+			defer func() {
+				m.afterCall(ctx, returned)
+				if createdWorktree {
+					m.mu.Lock()
+					defer m.mu.Unlock()
+					m.gap("gh_checkout created Git worktree metadata outside checkpoint snapshots; remove it with git worktree remove")
+				}
+			}()
 			result, err := execute(ctx, id, args, update)
 			returned = true
+			createdWorktree = tool.Name == "gh_checkout" && err == nil && !result.IsError
 			return result, err
 		}
 	}

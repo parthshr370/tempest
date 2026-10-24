@@ -51,10 +51,7 @@ func validateDefinition(d Definition) error {
 	if !identifier.MatchString(d.ID) || strings.TrimSpace(d.Revision) == "" || len(d.Revision) > 256 {
 		return errors.New("extension ID or revision invalid")
 	}
-	if len(d.Tasks) > 0 {
-		return errors.New("extension tasks are unsupported")
-	}
-	if len(d.Tools)+len(d.Sections)+len(d.Hooks)+len(d.Wraps)+len(d.Presets) > MaxHandlers {
+	if len(d.Tasks)+len(d.Tools)+len(d.Sections)+len(d.Hooks)+len(d.Wraps)+len(d.Presets) > MaxHandlers {
 		return errors.New("extension handler limit exceeded")
 	}
 	seen := map[string]bool{}
@@ -65,6 +62,38 @@ func validateDefinition(d Definition) error {
 		}
 		seen[key] = true
 		return nil
+	}
+	for _, t := range d.Tasks {
+		if err := check("task", t.Name); err != nil {
+			return err
+		}
+		if t.Version == 0 || t.Run == nil || len(t.InputSchema) == 0 || len(t.StateSchema) == 0 {
+			return errors.New("task version, schemas and run handler required")
+		}
+		versions := make(map[uint32]bool)
+		for _, version := range t.Migrations {
+			if version == 0 || version >= t.Version || versions[version] || t.Migrate == nil {
+				return errors.New("invalid task migration versions")
+			}
+			versions[version] = true
+		}
+		inputSchema, err := outputschema.Compile(t.InputSchema)
+		if err != nil {
+			return err
+		}
+		if inputSchema == nil {
+			return errors.New("task input schema required")
+		}
+		schema, err := outputschema.Compile(t.StateSchema)
+		if err != nil {
+			return err
+		}
+		if schema == nil {
+			return errors.New("task state schema required")
+		}
+		if _, err = schema.Validate(string(t.Initial)); err != nil {
+			return err
+		}
 	}
 	for _, t := range d.Tools {
 		if err := check("tool", t.Name); err != nil {
@@ -159,6 +188,13 @@ func validateDefinition(d Definition) error {
 	return nil
 }
 func cloneDefinition(d Definition) Definition {
+	d.Tasks = append([]TaskDefinition(nil), d.Tasks...)
+	for i := range d.Tasks {
+		d.Tasks[i].InputSchema = slices.Clone(d.Tasks[i].InputSchema)
+		d.Tasks[i].StateSchema = slices.Clone(d.Tasks[i].StateSchema)
+		d.Tasks[i].Initial = slices.Clone(d.Tasks[i].Initial)
+		d.Tasks[i].Migrations = slices.Clone(d.Tasks[i].Migrations)
+	}
 	d.Tools = append([]Tool(nil), d.Tools...)
 	for i := range d.Tools {
 		d.Tools[i].InputSchema = append(json.RawMessage(nil), d.Tools[i].InputSchema...)

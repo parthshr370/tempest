@@ -339,8 +339,11 @@ func TestIntegrateHookSettingsRequireApproval(t *testing.T) {
 		t.Fatalf("unapproved patch written: %v", err)
 	}
 	calls := 0
-	tool, err := NewTool(IntegrateTool, repo, withHashlineStore(ToolsOptions{Work: patchController{patch: patch}, TaskTool: subagent.NewTool(patchController{}), ApproveHookSettings: func(_ context.Context, callID string, paths []string) error {
+	tool, err := NewTool(IntegrateTool, repo, withHashlineStore(ToolsOptions{Work: patchController{patch: patch}, TaskTool: subagent.NewTool(patchController{}), ApproveHookSettings: func(_ context.Context, tool, callID string, paths []string) error {
 		calls++
+		if tool != "integrate" {
+			t.Errorf("approval lost tool identity: %q", tool)
+		}
 		if callID != "approved" {
 			t.Errorf("approval lost tool call identity: %q", callID)
 		}

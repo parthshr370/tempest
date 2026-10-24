@@ -118,7 +118,8 @@ its own MCP selection.
 
 Opening and listing do not run accepted input. Call `ResumePending(ctx)` explicitly
 to schedule durable pending work in currently open sessions. It attempts every
-open session and joins errors rather than stopping at the first busy session.
+open session and joins errors (including `ErrRunActive`) rather than stopping at the
+first busy session.
 A CLI history read must not make that lifecycle decision. Provider credentials and
 executable configuration remain runtime inputs, not journaled secrets.
 

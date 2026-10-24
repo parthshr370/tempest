@@ -272,3 +272,33 @@ func TestSkillPathsResolutionAndDefensiveCopy(t *testing.T) {
 		t.Fatal("empty -skill equivalent succeeded")
 	}
 }
+
+func TestChatGPTRejectsOnlyExplicitUserOutputCaps(t *testing.T) {
+	for _, role := range []string{"HARNESS_MODEL", "HARNESS_PLAN_MODEL", "HARNESS_SMOL_MODEL"} {
+		for _, source := range []string{"default", "flag", "environment", "settings"} {
+			t.Run(role+"/"+source, func(t *testing.T) {
+				settingsPath := filepath.Join(t.TempDir(), "settings.json")
+				environment := map[string]string{role: "openai-chatgpt:test"}
+				var flags FlagValues
+				switch source {
+				case "flag":
+					flags.MaxTokens = IntInput{Value: 100, Set: true}
+				case "environment":
+					environment["HARNESS_MAX_TOKENS"] = "100"
+				case "settings":
+					if err := os.WriteFile(settingsPath, []byte(`{"max_tokens":100}`), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				resolved, err := (Config{Flags: flags, SettingsPath: settingsPath, LookupEnv: func(name string) string { return environment[name] }}).Resolve()
+				if source == "default" {
+					if err != nil || resolved.MaxTokensConfigured() {
+						t.Fatalf("implicit internal cap rejected: %v", err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), "explicit output-token caps") {
+					t.Fatalf("explicit %s cap accepted: %v", source, err)
+				}
+			})
+		}
+	}
+}

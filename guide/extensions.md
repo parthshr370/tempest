@@ -1,9 +1,9 @@
 # Extensions
 
 Extensions are named, operator-installed bundles. A bundle can supply prompt
-sections, tools, typed hooks, result wrappers, document definitions, and agent
-presets. Go implementations and subprocess implementations use the same handler
-contract. General extension task phases are not supported.
+sections, tools, typed hooks, result wrappers, document definitions, agent
+presets, and [durable task phases](tasks.md). Go implementations and subprocess
+implementations use the same handler contract.
 
 ## Go bundles
 

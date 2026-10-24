@@ -179,7 +179,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		c.initialized = true
 		c.notices = p.ClientCapabilities.Session.Notices
 		c.mu.Unlock()
-		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"_meta": map[string]any{"tempest": map[string]any{"durable": map[string]any{"version": 1, "methods": []string{"_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read"}, "notifications": []string{"_tempest/durable/update"}}}}, "loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
+		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"_meta": map[string]any{"tempest": map[string]any{"durable": map[string]any{"version": 1, "tasks": true, "methods": []string{"_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read", "_tempest/durable/create_task", "_tempest/durable/get_task", "_tempest/durable/tasks", "_tempest/durable/cancel_task", "_tempest/durable/retry_task", "_tempest/durable/cancel_all", "_tempest/durable/resume_pending", "_tempest/durable/next_wake"}, "notifications": []string{"_tempest/durable/update"}}}}, "loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
 	}
 	c.mu.Lock()
 	initialized := c.initialized
@@ -188,7 +188,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		return nil, rpc.NewError(-32002, "not_initialized", "initialize must come first")
 	}
 	switch method {
-	case "_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read":
+	case "_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read", "_tempest/durable/create_task", "_tempest/durable/get_task", "_tempest/durable/tasks", "_tempest/durable/cancel_task", "_tempest/durable/retry_task", "_tempest/durable/cancel_all", "_tempest/durable/resume_pending", "_tempest/durable/next_wake":
 		return c.handleDurable(ctx, method, raw)
 	case "tempest/steer", "tempest/follow_up", "tempest/cancel_queued", "tempest/jobs", "tempest/wait", "tempest/cancel_job", "tempest/logs", "tempest/cleanup_job":
 		return c.handleWork(ctx, method, raw)

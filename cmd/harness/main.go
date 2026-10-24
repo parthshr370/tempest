@@ -90,6 +90,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return runMCP(args[1:], stdout, stderr)
 		case "doctor":
 			return runDoctor(args[1:], stdout, stderr)
+		case "login":
+			return runLogin(args[1:], stdout, stderr)
+		case "logout":
+			return runLogout(args[1:], stdout, stderr)
+		case "auth":
+			return runAuth(args[1:], stdout, stderr)
 		case "version":
 			if len(args) > 1 {
 				fmt.Fprintln(stderr, unexpectedArgument("version", args[1]))
@@ -150,15 +156,16 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		retryConfig = &resolvedRetry
 	}
 	roles, err := adapter.ResolveRoles(adapter.RoleRoutingConfig{
-		DefaultModel:     opts.Config.Model(),
-		PlanModel:        opts.Config.PlanModel(),
-		SmolModel:        opts.Config.SmolModel(),
-		AnthropicBaseURL: opts.Config.AnthropicBaseURL(),
-		OpenAIBaseURL:    opts.Config.OpenAIBaseURL(),
-		MaxTokens:        opts.Config.MaxTokens(),
-		Retry:            retryConfig,
-		SecretLookup:     opts.Secrets.Resolve,
-		Providers:        opts.Config.Providers(),
+		DefaultModel:       opts.Config.Model(),
+		PlanModel:          opts.Config.PlanModel(),
+		SmolModel:          opts.Config.SmolModel(),
+		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
+		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
+		MaxTokens:          opts.Config.MaxTokens(),
+		Retry:              retryConfig,
+		SecretLookup:       opts.Secrets.Resolve,
+		Providers:          opts.Config.Providers(),
+		ChatGPTCredentials: adapter.OpenAIChatGPTCredentials(""),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "provider config error: %v\n", err)
@@ -180,7 +187,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
 		stackStreamFn = streamFn
-	} else if provider := configuredProvider(selectedModel.Provider, opts); !provider.CredentialPresent(opts.Secrets.Resolve) && !provider.UsesCredentialChain() {
+	} else if provider := configuredProvider(selectedModel.Provider, opts); selectedModel.Provider != "openai-chatgpt" && !provider.CredentialPresent(opts.Secrets.Resolve) && !provider.UsesCredentialChain() {
 		fmt.Fprintf(stderr, "warning: no %s credential resolved; set %s or providers.%s.api_key\n", selectedModel.Provider, provider.APIKeyEnv, selectedModel.Provider)
 	}
 	if opts.Config.Plan() && opts.Config.FauxScript() == "" {
@@ -688,6 +695,9 @@ Commands:
   mcp       run as a stdio MCP server that exposes the tempest_run tool
   rewind    restore a workspace checkpoint and fork its conversation without deleting history
   doctor    check configuration and credentials offline; --ping probes the configured models
+  login     sign in with ChatGPT for the openai-chatgpt Responses route
+  logout    revoke and clear a saved ChatGPT session
+  auth      show signed-in account metadata with status or list
   version   print build version
 
 Run 'tempest <command> -help' for that command's flags.
@@ -738,7 +748,7 @@ func parseExitCode(err error) int {
 func unexpectedArgument(command, arg string) error {
 	switch command {
 	case "":
-		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, rewind, version); see 'tempest -help'", arg)}
+		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, rewind, login, logout, auth, version); see 'tempest -help'", arg)}
 	case "version":
 		return usageError{message: fmt.Sprintf("tempest version: unexpected argument %q; version takes no arguments", arg)}
 	default:

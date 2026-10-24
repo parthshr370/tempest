@@ -37,6 +37,8 @@ const (
 	SchemeJob     = "job"
 	SchemeHistory = "history"
 	SchemeLocal   = "local"
+	SchemeIssue   = "issue"
+	SchemePR      = "pr"
 )
 
 // LocalDirName is the local:// directory inside the root session's data
@@ -127,7 +129,7 @@ func IsURL(s string) bool {
 		return false
 	}
 	switch scheme {
-	case SchemeSkill, SchemeJob, SchemeHistory, SchemeLocal:
+	case SchemeSkill, SchemeJob, SchemeHistory, SchemeLocal, SchemeIssue, SchemePR:
 		return true
 	}
 	return false
@@ -137,7 +139,13 @@ func IsURL(s string) bool {
 func Parse(raw string) (Ref, error) {
 	scheme, rest, ok := strings.Cut(raw, "://")
 	if !ok || !IsURL(raw) {
-		return Ref{}, newError(CodeInvalid, raw, "not an internal URL; supported schemes are skill://, job://, history:// and local://", nil)
+		return Ref{}, newError(CodeInvalid, raw, "not an internal URL; supported schemes are skill://, job://, history://, local://, issue:// and pr://", nil)
+	}
+	if GitHubURL(raw) {
+		if _, err := parseGitHub(raw); err != nil {
+			return Ref{}, newError(CodeInvalid, raw, err.Error(), err)
+		}
+		return Ref{Scheme: scheme, Name: rest}, nil
 	}
 	if strings.ContainsAny(rest, "?#") {
 		return Ref{}, newError(CodeInvalid, raw, "internal URLs take no query or fragment; percent-encode ? and # in names", nil)
@@ -290,6 +298,8 @@ func (r *Resolver) Locate(ref Ref) (Location, error) {
 			return Location{}, newError(CodeTarget, uri, "the job list is rendered, not a directory; name a job", nil)
 		}
 		return Location{URI: uri, Root: filepath.Join(dir, work.JobArtifactsDir, ref.Name), Name: osName(ref.Path)}, nil
+	case SchemeIssue, SchemePR:
+		return Location{}, newError(CodeTarget, uri, "GitHub references are rendered, not workspace paths; use read for issue:// and pr://", nil)
 	default:
 		return Location{}, newError(CodeTarget, uri, "history:// is rendered from a journal and has no file path", nil)
 	}

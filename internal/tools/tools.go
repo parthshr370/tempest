@@ -106,11 +106,16 @@ const (
 	IntegrateTool      ToolName = "integrate"
 	CheckpointTool     ToolName = "checkpoint"
 	RewindTool         ToolName = "rewind"
+	ASTGrepTool        ToolName = "ast_grep"
+	ASTEditTool        ToolName = "ast_edit"
+	GHTool             ToolName = "gh"
+	GHCheckoutTool     ToolName = "gh_checkout"
 )
 
 // AllToolNames is the set of every known ToolName. Configured tools can
 // never shadow these names, including the lsp_* names when LSP is disabled.
-var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EvalTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true, CheckpointTool: true, RewindTool: true}
+var AllToolNames = map[ToolName]bool{ReadTool: true, BashTool: true, EvalTool: true, EditTool: true, HashlineTool: true, WriteTool: true, GrepTool: true, FindTool: true, LsTool: true, TodoTool: true, TaskTool: true, SkillTool: true, WebSearch: true, WebFetch: true, AttachmentTool: true, JobsTool: true, WaitTool: true, CancelTool: true, LogsTool: true, WriteStdinTool: true, MessageTool: true, LSPDefinitionTool: true, LSPReferencesTool: true, LSPRenameTool: true, LSPDiagnosticsTool: true, ManifestDiffTool: true, ViewImageTool: true, IntegrateTool: true, CheckpointTool: true, RewindTool: true,
+	ASTGrepTool: true, ASTEditTool: true, GHTool: true, GHCheckoutTool: true}
 
 // LSPToolNames are the language-server tools, all read-tier calculations.
 var LSPToolNames = []ToolName{LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool}
@@ -173,8 +178,8 @@ type ToolsOptions struct {
 	ImageInput bool
 	// Kernels belongs to the session; its owner must close it.
 	Kernels *evalkernel.Manager
-	// ApproveHookSettings gates computed integration targets before any write.
-	ApproveHookSettings func(context.Context, string, []string) error
+	// ApproveHookSettings gates computed mutation targets before any write.
+	ApproveHookSettings func(ctx context.Context, tool, callID string, paths []string) error
 }
 
 // These limits keep web responses bounded and prevent impractical command timeouts.
@@ -320,6 +325,13 @@ func NewTool(toolName ToolName, cwd string, options ToolsOptions) (agent.AgentTo
 		return newIntegrateTool(cwd, options), nil
 	case ViewImageTool:
 		return newViewImageTool(cwd, options), nil
+	case ASTGrepTool, ASTEditTool:
+		return newASTTool(toolName, cwd, options)
+	case GHTool, GHCheckoutTool:
+		if toolName == GHCheckoutTool && options.Child {
+			return agent.AgentTool{}, errors.New("gh_checkout is unavailable in children: nested Git worktrees cannot be exported")
+		}
+		return newGitHubTool(toolName, cwd, options), nil
 	default:
 		return agent.AgentTool{}, fmt.Errorf("Unknown tool name: %s", toolName)
 	}
@@ -330,9 +342,13 @@ func CodingTools(cwd string, options ToolsOptions) []agent.AgentTool {
 	return mustTools(cwd, options, ReadTool, BashTool, EditTool, WriteTool)
 }
 
-// ReadOnlyTools returns the read-only tools: read, grep, find, and ls.
+// ReadOnlyTools returns workspace search/read tools and authenticated GitHub reads.
 func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
-	return mustTools(cwd, options, ReadTool, GrepTool, FindTool, LsTool)
+	result := mustTools(cwd, options, ReadTool, GrepTool, FindTool, LsTool, GHTool)
+	if tool, err := NewTool(ASTGrepTool, cwd, options); err == nil {
+		result = append(result, tool)
+	}
+	return result
 }
 
 // AllTools creates every known tool plus any pre-configured tools from
@@ -340,7 +356,8 @@ func ReadOnlyTools(cwd string, options ToolsOptions) []agent.AgentTool {
 func AllTools(cwd string, options ToolsOptions) map[ToolName]agent.AgentTool {
 	options = withHashlineStore(options)
 	out := map[ToolName]agent.AgentTool{}
-	for _, name := range []ToolName{ReadTool, BashTool, EvalTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool, CheckpointTool, RewindTool} {
+	for _, name := range []ToolName{ReadTool, BashTool, EvalTool, EditTool, HashlineTool, WriteTool, GrepTool, FindTool, LsTool, TodoTool, TaskTool, SkillTool, WebSearch, WebFetch, JobsTool, WaitTool, CancelTool, LogsTool, WriteStdinTool, MessageTool, LSPDefinitionTool, LSPReferencesTool, LSPRenameTool, LSPDiagnosticsTool, ManifestDiffTool, ViewImageTool, IntegrateTool, CheckpointTool, RewindTool,
+		ASTGrepTool, ASTEditTool, GHTool, GHCheckoutTool} {
 		tool, err := NewTool(name, cwd, options)
 		if err == nil {
 			out[name] = tool
@@ -952,7 +969,7 @@ func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 				if len(input.Paths) > 0 {
 					return agent.AgentToolResult{}, errors.New("pass path or paths, not both")
 				}
-				return grepRefs(ctx, options, input)
+				return grepRefs(ctx, cwd, options, input)
 			}
 			rootForGrep, err := rootOnce(cwd)()
 			if err != nil {

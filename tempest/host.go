@@ -107,6 +107,7 @@ type Host struct {
 	options         HostOptions
 	sessions        map[string]*Session
 	opening         map[string]chan struct{}
+	alarmRetry      map[string]time.Time
 	openers         sync.WaitGroup
 	ctx             context.Context
 	cancel          context.CancelFunc
@@ -142,7 +143,7 @@ func OpenHost(ctx context.Context, options HostOptions) (*Host, error) {
 		options.SessionDir = resolved.SessionDir()
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	host := &Host{options: options, sessions: make(map[string]*Session), opening: make(map[string]chan struct{}), ctx: lifetime, cancel: cancel, closeDone: make(chan struct{})}
+	host := &Host{options: options, sessions: make(map[string]*Session), opening: make(map[string]chan struct{}), alarmRetry: make(map[string]time.Time), ctx: lifetime, cancel: cancel, closeDone: make(chan struct{})}
 	if options.Limits.MaxConcurrentRuns > 0 {
 		host.runs = make(chan struct{}, options.Limits.MaxConcurrentRuns)
 	}
@@ -225,7 +226,7 @@ func (host *Host) sessionOptions() Options {
 	if host.options.FauxScript != "" {
 		options.FauxScript = host.options.FauxScript
 	}
-	if host.options.Provider.ModelID != "" || host.options.Provider.Providers != nil || host.options.Provider.OpenAIBaseURL != "" || host.options.Provider.AnthropicBaseURL != "" {
+	if host.options.Provider.ModelID != "" || host.options.Provider.Providers != nil || host.options.Provider.OpenAIBaseURL != "" || host.options.Provider.AnthropicBaseURL != "" || host.options.Provider.ChatGPTCredentials != nil {
 		options.Provider = host.options.Provider
 	}
 	return options
@@ -688,7 +689,7 @@ func (host *Host) CloseSession(ctx context.Context, id string) error {
 	return err
 }
 
-// ResumePending explicitly schedules accepted input in currently open sessions.
+// ResumePending schedules accepted input and reopens archived tasks whose alarm is due.
 func (host *Host) ResumePending(ctx context.Context) error {
 	host.mu.Lock()
 	if host.closed {
@@ -700,17 +701,99 @@ func (host *Host) ResumePending(ctx context.Context) error {
 		sessions = append(sessions, session)
 	}
 	host.mu.Unlock()
-	var joined error
+	alarms, scanErr := host.archivedTaskAlarms(ctx)
+	joined := scanErr
 	for _, session := range sessions {
 		if err := session.ResumePending(ctx); err != nil {
 			joined = errors.Join(joined, fmt.Errorf("session %s: %w", session.ID(), err))
 		}
 	}
+	now := time.Now()
+	if host.options.Options.Tasks.Now != nil {
+		now = host.options.Options.Tasks.Now()
+	}
+	for id, wake := range alarms {
+		host.mu.Lock()
+		open := host.sessions[id] != nil
+		retryAt := host.alarmRetry[id]
+		host.mu.Unlock()
+		if open || now.Before(wake) || now.Before(retryAt) {
+			continue
+		}
+		err := host.resumeAlarmSession(ctx, id)
+		host.mu.Lock()
+		if err != nil {
+			host.alarmRetry[id] = now.Add(taskAlarmRetryDelay)
+		} else {
+			delete(host.alarmRetry, id)
+		}
+		host.mu.Unlock()
+		if err != nil {
+			joined = errors.Join(joined, fmt.Errorf("session %s: %w", id, err))
+		}
+	}
 	return joined
 }
 
-// NextWake reports no persisted timer until the task scheduler is installed.
-func (host *Host) NextWake() (time.Time, bool) { return time.Time{}, false }
+const taskAlarmRetryDelay = time.Minute
+
+func (host *Host) resumeAlarmSession(ctx context.Context, id string) (drainErr error) {
+	session, err := host.Open(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		drainErr = errors.Join(drainErr, host.CloseSession(ctx, id))
+	}()
+	run, err := session.resumePending(ctx)
+	if err != nil {
+		return err
+	}
+	if run != nil {
+		select {
+		case <-run.done:
+			_, err = run.Wait()
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	}
+	return err
+}
+
+// NextWake reports the earliest persisted alarm, including archived sessions.
+func (host *Host) NextWake() (time.Time, bool) {
+	host.mu.Lock()
+	sessions := make([]*Session, 0, len(host.sessions))
+	for _, session := range host.sessions {
+		sessions = append(sessions, session)
+	}
+	host.mu.Unlock()
+	var earliest time.Time
+	for _, session := range sessions {
+		if deadline, ok := session.NextWake(); ok && (earliest.IsZero() || deadline.Before(earliest)) {
+			earliest = deadline
+		}
+	}
+	alarms, err := host.archivedTaskAlarms(context.Background())
+	if err != nil {
+		slog.Warn("host task alarm scan failed", "error", err)
+	}
+	for id, deadline := range alarms {
+		host.mu.Lock()
+		if retryAt := host.alarmRetry[id]; deadline.Before(retryAt) {
+			deadline = retryAt
+		}
+		host.mu.Unlock()
+		open := false
+		for _, session := range sessions {
+			open = open || session.ID() == id
+		}
+		if !open && (earliest.IsZero() || deadline.Before(earliest)) {
+			earliest = deadline
+		}
+	}
+	return earliest, !earliest.IsZero()
+}
 
 // Close joins sessions before closing the host-owned backend. A cancelled wait
 // doesn't release a backend that still has live users.

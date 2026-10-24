@@ -54,6 +54,7 @@ func BuiltinProviders() map[string]ProviderConfig {
 		"llamacpp":         chat("http://localhost:8080/v1", ""),
 		"azure":            {Protocol: "openai-chat", APIKeyEnv: "AZURE_OPENAI_API_KEY", AuthHeader: "api-key", AuthPrefix: new(""), Query: map[string]string{"api-version": "2025-04-01-preview"}, Compatibility: &types.OpenAICompat{SupportsPromptCacheKey: new(false)}},
 		"openai-responses": {Protocol: "openai-responses", BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY"},
+		"openai-chatgpt":   {Protocol: "openai-responses", BaseURL: "https://api.openai.com/v1"},
 		"bedrock":          {Protocol: "bedrock", APIKeyEnv: "AWS_BEARER_TOKEN_BEDROCK"},
 		"vertex":           {Protocol: "vertex", APIKeyEnv: "GOOGLE_CLOUD_API_KEY"},
 	}
@@ -79,6 +80,9 @@ func BuiltinProviders() map[string]ProviderConfig {
 func Providers(overrides map[string]ProviderConfig) (map[string]ProviderConfig, error) {
 	providers := BuiltinProviders()
 	for name, override := range overrides {
+		if name == "openai-chatgpt" {
+			return nil, fmt.Errorf("openai-chatgpt uses its signed-in credential and public Responses endpoint; provider overrides are not allowed")
+		}
 		if name == "" || name != strings.ToLower(name) || strings.ContainsAny(name, ":@/ \t\r\n") {
 			return nil, fmt.Errorf("invalid provider name %q", name)
 		}

@@ -57,6 +57,8 @@ type Options struct {
 	ExtensionProcesses []extension.ProcessOptions
 	// Documents grants application namespaces and their validation policies.
 	Documents []durable.DocumentDefinition
+	// Tasks supplies the phase clock and bounded crash-recovery policy.
+	Tasks TaskOptions
 	// Store injects a caller-owned transaction domain; Host owns its close.
 	Store durable.Store
 	// Authorize checks host authority before accessing session state.
@@ -95,6 +97,14 @@ type ProviderConfig = adapter.RoutingConfig
 
 // ProviderDefinition describes one named provider in ProviderConfig.Providers.
 type ProviderDefinition = adapter.ProviderConfig
+
+// RequestCredential carries a request-local bearer and its bound API origin.
+type RequestCredential = adapter.RequestCredential
+
+// OpenAIChatGPTCredentials explicitly opts an SDK session into a saved local profile.
+func OpenAIChatGPTCredentials(profile string) func(context.Context) (RequestCredential, error) {
+	return adapter.OpenAIChatGPTCredentials(profile)
+}
 
 // LSPConfig selects trusted language-server definitions for a session.
 type LSPConfig = lsp.Config

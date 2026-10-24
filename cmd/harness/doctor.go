@@ -46,14 +46,15 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	roles, err := adapter.ResolveRoles(adapter.RoleRoutingConfig{
-		DefaultModel:     opts.Config.Model(),
-		PlanModel:        opts.Config.PlanModel(),
-		SmolModel:        opts.Config.SmolModel(),
-		AnthropicBaseURL: opts.Config.AnthropicBaseURL(),
-		OpenAIBaseURL:    opts.Config.OpenAIBaseURL(),
-		MaxTokens:        opts.Config.MaxTokens(),
-		SecretLookup:     opts.Secrets.Resolve,
-		Providers:        opts.Config.Providers(),
+		DefaultModel:       opts.Config.Model(),
+		PlanModel:          opts.Config.PlanModel(),
+		SmolModel:          opts.Config.SmolModel(),
+		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
+		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
+		MaxTokens:          opts.Config.MaxTokens(),
+		SecretLookup:       opts.Secrets.Resolve,
+		Providers:          opts.Config.Providers(),
+		ChatGPTCredentials: adapter.OpenAIChatGPTCredentials(""),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "doctor configuration error: %v\n", err)
@@ -114,6 +115,10 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, name := range slices.Sorted(maps.Keys(providers)) {
 		p := providers[name]
+		if name == "openai-chatgpt" {
+			printChatGPTDoctor(stdout)
+			continue
+		}
 		noAuth := p.NoAuth != nil && *p.NoAuth
 		p.NoAuth = nil
 		fmt.Fprintf(stdout, "  %s: api=%s protocol=%s key=%s present=%s auth_required=%s base_url=%s\n", name, p.API(), p.Protocol, p.APIKeyEnv, yesNo(p.CredentialPresent(opts.Secrets.Resolve)), yesNo(!noAuth), redactedURL(p.BaseURL))
@@ -143,6 +148,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	} else {
 		fmt.Fprintln(stdout, "WARN checkpoint git: unavailable; tool calls still run, but checkpoint capture and rewind need git")
 	}
+	printCodingToolChecks(stdout)
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -260,6 +266,10 @@ func yesNo(b bool) string {
 }
 
 func printRoleCredentialCheck(w io.Writer, role, provider string, opts commandOptions) {
+	if provider == "openai-chatgpt" {
+		printChatGPTDoctor(w)
+		return
+	}
 	providerConfig := configuredProvider(provider, opts)
 	if providerConfig.UsesCredentialChain() && !providerConfig.CredentialPresent(opts.Secrets.Resolve) {
 		fmt.Fprintf(w, "INFO %s provider credential: %s uses a native credential chain; --ping verifies it\n", role, provider)
@@ -309,14 +319,15 @@ func sameModel(a, b types.Model) bool {
 // model used, plus the provider's HTTP status and message on failure.
 func pingModels(stdout io.Writer, opts commandOptions) int {
 	roles, err := adapter.ResolveRoles(adapter.RoleRoutingConfig{
-		DefaultModel:     opts.Config.Model(),
-		PlanModel:        opts.Config.PlanModel(),
-		SmolModel:        opts.Config.SmolModel(),
-		AnthropicBaseURL: opts.Config.AnthropicBaseURL(),
-		OpenAIBaseURL:    opts.Config.OpenAIBaseURL(),
-		MaxTokens:        16,
-		SecretLookup:     opts.Secrets.Resolve,
-		Providers:        opts.Config.Providers(),
+		DefaultModel:       opts.Config.Model(),
+		PlanModel:          opts.Config.PlanModel(),
+		SmolModel:          opts.Config.SmolModel(),
+		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
+		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
+		MaxTokens:          16,
+		SecretLookup:       opts.Secrets.Resolve,
+		Providers:          opts.Config.Providers(),
+		ChatGPTCredentials: adapter.OpenAIChatGPTCredentials(""),
 	})
 	fmt.Fprintln(stdout, "ping:")
 	if err != nil {
@@ -328,16 +339,20 @@ func pingModels(stdout io.Writer, opts commandOptions) int {
 		model := target.router.Model
 		label := fmt.Sprintf("  %s (%s:%s)", strings.Join(target.roles, "+"), model.Provider, model.ID)
 		p := configuredProvider(model.Provider, opts)
-		if !p.CredentialPresent(opts.Secrets.Resolve) && !p.UsesCredentialChain() {
+		if model.Provider != "openai-chatgpt" && !p.CredentialPresent(opts.Secrets.Resolve) && !p.UsesCredentialChain() {
 			fmt.Fprintf(stdout, "%s: error no %s credential; set %s or providers.%s.api_key\n", label, model.Provider, p.APIKeyEnv, model.Provider)
 			exitCode = 1
 			continue
 		}
 		started := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		probeOptions := &types.SimpleStreamOptions{}
+		if model.Provider != "openai-chatgpt" {
+			probeOptions.MaxTokens = 16
+		}
 		probe := target.router.StreamFn(ctx, model, types.Context{
 			Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}},
-		}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{MaxTokens: 16}})
+		}, probeOptions)
 		message, err := probe.Result(ctx)
 		cancel()
 		switch {

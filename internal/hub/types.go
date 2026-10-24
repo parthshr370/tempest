@@ -123,6 +123,7 @@ type Snapshot struct {
 	DurableSeq        uint64                    `json:"durableSeq"`
 	Documents         []durable.Record          `json:"documents"`
 	Submissions       []durable.Record          `json:"submissions"`
+	Tasks             []durable.Record          `json:"tasks"`
 	DocumentsCursor   string                    `json:"documentsCursor,omitempty"`
 	SubmissionsCursor string                    `json:"submissionsCursor,omitempty"`
 }

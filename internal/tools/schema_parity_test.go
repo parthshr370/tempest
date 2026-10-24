@@ -117,3 +117,19 @@ func TestEvalSchemaParity(t *testing.T) {
 	tool := newEvalTool(nil)
 	assertSchemaParity(t, "eval", tool.Parameters, `{"type":"object","properties":{"language":{"type":"string","enum":["py","js"]},"code":{"type":"string"},"timeout":{"type":"number","minimum":0,"maximum":2147483,"default":30},"reset":{"type":"boolean"}},"required":["language","code"]}`)
 }
+
+func TestCodingExtensionSchemaParity(t *testing.T) {
+	bin := t.TempDir()
+	codingFakeBinary(t, bin, "ast-grep", "printf '[]'\n")
+	t.Setenv("PATH", bin)
+	all := AllTools(t.TempDir(), ToolsOptions{})
+	fixtures := map[ToolName]string{
+		ASTGrepTool:    `{"type":"object","additionalProperties":false,"properties":{"pat":{"type":"string"},"path":{"type":"string"},"skip":{"type":"integer","minimum":0},"lang":{"type":"string"}},"required":["pat"]}`,
+		ASTEditTool:    `{"type":"object","additionalProperties":false,"properties":{"ops":{"type":"array","minItems":1,"items":{"type":"object","additionalProperties":false,"properties":{"pat":{"type":"string"},"out":{"type":"string"}},"required":["pat","out"]}},"paths":{"type":"array","minItems":1,"items":{"type":"string"}},"lang":{"type":"string"},"apply":{"type":"boolean","default":false},"preview":{"type":"string"}},"required":["ops","paths"]}`,
+		GHTool:         `{"type":"object","additionalProperties":false,"properties":{"op":{"type":"string","enum":["issue_view","pr_view","pr_diff","repo_view","file_read","search_issues","search_prs","search_code","search_commits","search_repos","run_watch","run_logs"]},"repo":{"type":"string"},"number":{"type":"string"},"query":{"type":"string"},"path":{"type":"string"},"branch":{"type":"string"},"run":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100},"timeout":{"type":"integer","minimum":1,"maximum":300}},"required":["op"]}`,
+		GHCheckoutTool: `{"type":"object","additionalProperties":false,"properties":{"repo":{"type":"string"},"number":{"type":"string"},"path":{"type":"string"}},"required":["number","path"]}`,
+	}
+	for name, want := range fixtures {
+		assertSchemaParity(t, string(name), all[name].Parameters, want)
+	}
+}

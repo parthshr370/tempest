@@ -65,10 +65,14 @@ type RoutingConfig struct {
 	APIKey           string
 	AuthToken        string
 	MaxTokens        int
-	Env              func(string) string
-	BlobReader       types.BlobReader
-	Retry            *retry.Config
-	Providers        map[string]ProviderConfig
+	// MaxTokensDefaulted keeps inherited harness defaults distinct from user caps.
+	MaxTokensDefaulted bool
+	Env                func(string) string
+	BlobReader         types.BlobReader
+	Retry              *retry.Config
+	Providers          map[string]ProviderConfig
+	// ChatGPTCredentials is explicit so SDK users never inherit ambient sign-in.
+	ChatGPTCredentials func(context.Context) (RequestCredential, error)
 }
 
 // ProviderRouter bundles the resolved provider registry, the default model,
@@ -133,11 +137,31 @@ func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route,
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
-		requested := model.MaxTokens
-		if resolved.MaxTokens > 0 {
-			requested = resolved.MaxTokens
+		if rt.CredentialSource != nil {
+			if model.Provider != "openai-chatgpt" || model.API != rt.Model.API || model.BaseURL != rt.Model.BaseURL || len(model.Headers) != 0 || resolved.APIKey != "" || len(resolved.Headers) != 0 || len(resolved.Query) != 0 || resolved.NoAuth {
+				return erroredStream(model, fmt.Errorf("openai-chatgpt does not allow credential, endpoint or header overrides"))
+			}
+			credential, err := rt.CredentialSource(ctx)
+			if err != nil {
+				return erroredStream(model, err)
+			}
+			if err := validateChatGPTCredential(credential); err != nil {
+				return erroredStream(model, err)
+			}
+			model.BaseURL = credential.BaseURL
+			resolved.APIKey = credential.AccessToken
 		}
-		resolved.MaxTokens = base.ClampMaxTokens(model, c, requested)
+		if rt.CredentialSource != nil {
+			// Internal caps drive compaction and overflow recovery, not plan requests.
+			resolved.MaxTokens = 0
+			resolved.Temperature = nil
+		} else {
+			requested := model.MaxTokens
+			if resolved.MaxTokens > 0 {
+				requested = resolved.MaxTokens
+			}
+			resolved.MaxTokens = base.ClampMaxTokens(model, c, requested)
+		}
 		resolved.DisableEnvAuth = !rt.Provider.UsesCredentialChain()
 		resolved.NoAuth = rt.Provider.NoAuth != nil && *rt.Provider.NoAuth
 		if resolved.Headers == nil && (len(rt.Provider.Headers) > 0 || rt.AuthToken != "" || rt.Provider.AuthHeader != "") {

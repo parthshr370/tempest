@@ -53,8 +53,13 @@ func stackToolNames(t *testing.T, cfg StackConfig) []string {
 
 func TestPlanStackSelectsIntelligenceReadTools(t *testing.T) {
 	cwd := t.TempDir()
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ast-grep"), []byte("#!/bin/sh\nprintf '[]'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
 	names := stackToolNames(t, StackConfig{Cwd: cwd, Plan: true, LSPManager: inertManager(t, cwd)})
-	want := []string{"find", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read", "view_image"}
+	want := []string{"ast_grep", "find", "gh", "grep", "ls", "lsp_definition", "lsp_diagnostics", "lsp_references", "lsp_rename", "manifest_diff", "read", "view_image"}
 	if !slices.Equal(names, want) {
 		t.Fatalf("plan tools = %v, want %v", names, want)
 	}
@@ -63,11 +68,14 @@ func TestPlanStackSelectsIntelligenceReadTools(t *testing.T) {
 	if slices.Contains(names, "lsp_definition") || !slices.Contains(names, "manifest_diff") {
 		t.Fatalf("plan tools without LSP = %v", names)
 	}
+	if slices.Contains(names, "ast_edit") || slices.Contains(names, "gh_checkout") {
+		t.Fatalf("plan stack exposes mutation tools: %v", names)
+	}
 }
 
 func TestChildStackNeverGetsLanguageServerTools(t *testing.T) {
 	cwd := t.TempDir()
-	names := stackToolNames(t, StackConfig{Cwd: cwd, Child: true, LSPManager: inertManager(t, cwd), AllowedTools: []string{"read", "edit", "lsp_definition", "lsp_rename"}})
+	names := stackToolNames(t, StackConfig{Cwd: cwd, Child: true, LSPManager: inertManager(t, cwd), AllowedTools: []string{"read", "edit", "lsp_definition", "lsp_rename", "gh_checkout"}})
 	if !slices.Equal(names, []string{"edit", "read"}) {
 		t.Fatalf("child tools = %v, want read and edit only", names)
 	}

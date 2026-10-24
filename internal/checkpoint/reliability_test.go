@@ -155,7 +155,7 @@ func TestOnlyFileMutatorsAreWrapped(t *testing.T) {
 			t.Fatalf("orchestration tool %s wrapped", name)
 		}
 	}
-	for _, name := range []string{"read", "wait", "logs", "lsp_rename"} {
+	for _, name := range []string{"read", "wait", "logs", "lsp_rename", "ast_grep", "gh"} {
 		if MutatesFiles(name, true) {
 			t.Fatalf("read tool %s wrapped", name)
 		}
@@ -762,5 +762,63 @@ func TestCommittedRewindSurvivesMetadataWriteFailure(t *testing.T) {
 	loaded, err := journal.Load(t.Context(), store.Path())
 	if err != nil || len(loaded.Messages) != 2 {
 		t.Fatalf("metadata recovery discarded later input: %+v %v", loaded, err)
+	}
+}
+
+func TestASTPreviewSkipsCaptureButApplyIsRewindable(t *testing.T) {
+	manager, _ := testManager(t)
+	bindEmpty(manager)
+	writeWorkspace(t, manager, "source.js", "before\n")
+	saved, err := manager.Create(t.Context(), "before AST", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := agent.AgentTool{Tool: types.Tool{Name: "ast_edit"}, Execute: func(_ context.Context, _ string, args json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+		var input struct {
+			Apply bool `json:"apply"`
+		}
+		if err := json.Unmarshal(args, &input); err != nil {
+			return agent.AgentToolResult{}, err
+		}
+		if input.Apply {
+			writeWorkspace(t, manager, "source.js", "after\n")
+		}
+		return agent.AgentToolResult{}, nil
+	}}
+	wrapped := manager.Wrap([]agent.AgentTool{tool}, func(string) bool { return true })[0]
+	before := len(manager.List())
+	if _, err := wrapped.Execute(t.Context(), "preview", json.RawMessage(`{}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.List()) != before || manager.state.Uncertain {
+		t.Fatal("preview captured a mutating call")
+	}
+	if _, err := wrapped.Execute(t.Context(), "apply", json.RawMessage(`{"apply":true}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Rewind(t.Context(), saved.ID, "", true); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(manager.cwd, "source.js"))
+	if err != nil || string(content) != "before\n" {
+		t.Fatalf("AST apply was not rewindable: %q %v", content, err)
+	}
+}
+
+func TestGitHubCheckoutInvalidatesUnrestorableCheckpoint(t *testing.T) {
+	manager, _ := testManager(t)
+	bindEmpty(manager)
+	saved, err := manager.Create(t.Context(), "before worktree", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := agent.AgentTool{Tool: types.Tool{Name: "gh_checkout"}, Execute: func(context.Context, string, json.RawMessage, agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+		return agent.AgentToolResult{}, nil
+	}}
+	if _, err := manager.Wrap([]agent.AgentTool{tool}, func(string) bool { return true })[0].Execute(t.Context(), "checkout", json.RawMessage(`{}`), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Rewind(t.Context(), saved.ID, "", true); err == nil || !strings.Contains(err.Error(), "capture gap") {
+		t.Fatalf("rewind pretends to restore Git metadata: %v", err)
 	}
 }

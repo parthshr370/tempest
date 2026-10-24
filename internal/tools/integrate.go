@@ -152,7 +152,7 @@ func (run integrationRun) write(ctx context.Context) (string, []string, error) {
 		paths = append(paths, filepath.Join(run.integration.Repo, filepath.FromSlash(write.Path)))
 	}
 	if run.options.ApproveHookSettings != nil {
-		if err := run.options.ApproveHookSettings(ctx, run.callID, paths); err != nil {
+		if err := run.options.ApproveHookSettings(ctx, string(IntegrateTool), run.callID, paths); err != nil {
 			return "", nil, err
 		}
 	} else {

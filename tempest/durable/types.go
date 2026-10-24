@@ -165,6 +165,9 @@ const (
 	ResetInitial ResetPolicy = "initial"
 )
 
+// ErrInvalidCommit rejects a batch before any durable write is attempted.
+var ErrInvalidCommit = errors.New("invalid durable commit")
+
 // ErrConflict means the decision changed or a compared revision lost its race.
 var ErrConflict = errors.New("durable conflict")
 
