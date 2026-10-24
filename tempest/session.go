@@ -161,7 +161,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	dir := o.SessionDir
 	var defaults *config.ResolvedConfig
 	if dir == "" || o.Stack == nil || needsDiscovery || selectedMCP == nil {
-		defaults, err = (config.Config{Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
+		defaults, err = (config.Config{WorkingDir: cwd, Flags: config.FlagValues{MCPConfig: config.StringInput{Set: selectedMCP != nil, Value: ""}}}).Resolve()
 		if err != nil {
 			return nil, err
 		}
@@ -276,6 +276,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			}
 			if provider.MaxTokens == 0 {
 				provider.MaxTokens = defaults.MaxTokens()
+			}
+			if provider.Providers == nil {
+				provider.Providers = defaults.Providers()
 			}
 		}
 		if modelSpec != "" {

@@ -11,6 +11,7 @@
 package adapter
 
 import (
+	"fmt"
 	"strings"
 
 	"go.harness.dev/harness/internal/retry"
@@ -27,6 +28,7 @@ type RoleRoutingConfig struct {
 	MaxTokens        int
 	SecretLookup     func(string) (string, bool)
 	Retry            *retry.Config
+	Providers        map[string]ProviderConfig
 }
 
 // RoleRouters contains a fully routed provider for each agent role.
@@ -60,7 +62,24 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error) {
 
 // newRoleRouter resolves one role with the credentials that match its provider prefix.
 func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) {
-	apiKey, authToken := roleCredentials(model, cfg.SecretLookup)
+	providers, err := Providers(cfg.Providers)
+	if err != nil {
+		return ProviderRouter{}, err
+	}
+	spec := parseModelSpec(model)
+	provider := spec.Provider
+	if provider == "" {
+		provider = "anthropic"
+	}
+	p, ok := providers[provider]
+	if !ok {
+		return ProviderRouter{}, fmt.Errorf("unsupported model provider %q", provider)
+	}
+	apiKey := p.Credential(cfg.SecretLookup)
+	authToken := ""
+	if provider == "anthropic" && cfg.SecretLookup != nil {
+		authToken, _ = cfg.SecretLookup("ANTHROPIC_AUTH_TOKEN")
+	}
 	return NewProviderRouter(RoutingConfig{
 		ModelID:          model,
 		AnthropicBaseURL: cfg.AnthropicBaseURL,
@@ -68,6 +87,7 @@ func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) 
 		APIKey:           apiKey,
 		AuthToken:        authToken,
 		MaxTokens:        cfg.MaxTokens,
+		Providers:        cfg.Providers,
 		// Environment sources are resolved upstream: config folds
 		// HARNESS_* and the vendor base-URL variables into cfg in
 		// precedence order, and SecretLookup supplies credentials. The
@@ -75,38 +95,4 @@ func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) 
 		Env:   func(string) string { return "" },
 		Retry: cfg.Retry,
 	})
-}
-
-// roleCredentials keeps each provider's key route separate: OpenAI takes an
-// API key, Anthropic a key-or-token pair, Google a Gemini key with the
-// Google Cloud key as fallback. Resolution goes through
-// ResolveProviderForModel so bare model ids ("gemini-2.5-flash") route like
-// prefixed ones ("google:gemini-2.5-flash").
-func roleCredentials(model string, lookup func(string) (string, bool)) (string, string) {
-	if lookup == nil {
-		return "", ""
-	}
-	spec := parseModelSpec(model)
-	provider := spec.Provider
-	if provider == "" {
-		provider = ResolveProviderForModel(spec.ModelID)
-	}
-	switch provider {
-	case "openai":
-		key, _ := lookup("OPENAI_API_KEY")
-		return key, ""
-	case "openrouter":
-		key, _ := lookup("OPENROUTER_API_KEY")
-		return key, ""
-	case "google":
-		if key, _ := lookup("GEMINI_API_KEY"); key != "" {
-			return key, ""
-		}
-		key, _ := lookup("GOOGLE_API_KEY")
-		return key, ""
-	default:
-		apiKey, _ := lookup("ANTHROPIC_API_KEY")
-		authToken, _ := lookup("ANTHROPIC_AUTH_TOKEN")
-		return apiKey, authToken
-	}
 }

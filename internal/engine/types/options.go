@@ -23,7 +23,11 @@ type StreamOptions struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 	MaxTokens   int      `json:"maxTokens,omitempty"`
 	APIKey      string   `json:"-"`
-	Transport   string   `json:"transport,omitempty"`
+	// Query carries endpoint parameters without persisting credentials.
+	Query          map[string]string `json:"-"`
+	NoAuth         bool              `json:"-"`
+	DisableEnvAuth bool              `json:"-"`
+	Transport      string            `json:"transport,omitempty"`
 	// The Go seam uses a plain string map; header suppression can be added when a
 	// caller needs it.
 	Headers  map[string]string `json:"headers,omitempty"`

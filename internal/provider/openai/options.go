@@ -1,7 +1,6 @@
 package openai
 
 import (
-	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/base"
 )
@@ -30,11 +29,7 @@ var streamTimeouts = base.StreamTimeoutsFromEnv()
 // clampMaxTokensToContext lowers maxTokens so it fits within the model's context
 // window after the estimated prompt and a safety margin, never below minMaxTokens.
 func clampMaxTokensToContext(model types.Model, c types.Context, maxTokens int) int {
-	if model.ContextWindow <= 0 {
-		return maxInt(minMaxTokens, maxTokens)
-	}
-	available := model.ContextWindow - estimate.EstimateContextTokens(c).Tokens - contextSafetyTokens
-	return minInt(maxTokens, maxInt(minMaxTokens, available))
+	return base.ClampMaxTokens(model, c, maxTokens)
 }
 
 // buildBaseOptions derives StreamOptions from the simple options, clamping max

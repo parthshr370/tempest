@@ -4,13 +4,16 @@ import (
 	"context"
 	"fmt"
 	"go.harness.dev/harness/internal/agent"
-	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/obs"
 	"go.harness.dev/harness/internal/provider/anthropic"
 	"go.harness.dev/harness/internal/provider/base"
+	"go.harness.dev/harness/internal/provider/bedrock"
 	"go.harness.dev/harness/internal/provider/google"
 	"go.harness.dev/harness/internal/provider/openai"
+	"go.harness.dev/harness/internal/provider/responses"
+	"go.harness.dev/harness/internal/provider/vertex"
 	"go.harness.dev/harness/internal/retry"
 	"log/slog"
 	"os"
@@ -65,6 +68,7 @@ type RoutingConfig struct {
 	Env              func(string) string
 	BlobReader       types.BlobReader
 	Retry            *retry.Config
+	Providers        map[string]ProviderConfig
 }
 
 // ProviderRouter bundles the resolved provider registry, the default model,
@@ -87,7 +91,7 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 	if env == nil {
 		env = os.Getenv
 	}
-	if err := ValidateModelSpec(firstNonEmpty(cfg.ModelID, env("ANTHROPIC_DEFAULT_SONNET_MODEL"), "claude-opus-4-8")); err != nil {
+	if err := ValidateModelSpecWithProviders(firstNonEmpty(cfg.ModelID, env("ANTHROPIC_DEFAULT_SONNET_MODEL"), "claude-opus-4-8"), cfg.Providers); err != nil {
 		return ProviderRouter{}, err
 	}
 	rt, err := resolveRoute(cfg, env)
@@ -98,12 +102,15 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 	registry.Register(AnthropicMessagesAPI, base.Provider{ID: "anthropic", Models: []types.Model{rt.Model}, StreamSimple: anthropic.StreamSimple})
 	registry.Register(OpenAICompletionsAPI, base.Provider{ID: "openai", Models: []types.Model{rt.Model}, StreamSimple: openai.StreamSimple})
 	registry.Register(GoogleGenerativeAPI, base.Provider{ID: "google", Models: []types.Model{rt.Model}, StreamSimple: google.StreamSimple})
+	registry.Register("openai-responses", base.Provider{ID: "openai-responses", StreamSimple: responses.StreamSimple})
+	registry.Register("bedrock-converse-stream", base.Provider{ID: "bedrock", StreamSimple: bedrock.StreamSimple})
+	registry.Register("google-vertex", base.Provider{ID: "vertex", StreamSimple: vertex.StreamSimple})
 	p, ok := registry.Resolve(rt.API)
 	if !ok || p.StreamSimple == nil {
 		return ProviderRouter{}, fmt.Errorf("no provider registered for model API %q", rt.API)
 	}
 	r := ProviderRouter{Registry: registry, Model: rt.Model}
-	r = r.withStream(p.StreamSimple, rt.APIKey, rt.AuthToken, cfg.BlobReader)
+	r = r.withStream(p.StreamSimple, rt, cfg.BlobReader)
 	if cfg.Retry != nil {
 		retrier, err := retry.New(retry.StreamFunc(r.StreamFn), *cfg.Retry)
 		if err != nil {
@@ -119,13 +126,36 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 // that the caller left unset. A nil streamSimple can only arise from programmer
 // error since NewProviderRouter validates it, so it surfaces as a terminal error
 // event rather than a panic.
-func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, apiKey, authToken string, blobReader types.BlobReader) ProviderRouter {
+func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route, blobReader types.BlobReader) ProviderRouter {
 	var reasoningWarning sync.Once
 	r.StreamFn = func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 		if streamSimple == nil {
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
+		requested := model.MaxTokens
+		if resolved.MaxTokens > 0 {
+			requested = resolved.MaxTokens
+		}
+		resolved.MaxTokens = base.ClampMaxTokens(model, c, requested)
+		resolved.DisableEnvAuth = !rt.Provider.UsesCredentialChain()
+		resolved.NoAuth = rt.Provider.NoAuth != nil && *rt.Provider.NoAuth
+		if resolved.Headers == nil && (len(rt.Provider.Headers) > 0 || rt.AuthToken != "" || rt.Provider.AuthHeader != "") {
+			resolved.Headers = map[string]string{}
+		}
+		for key, value := range rt.Provider.Headers {
+			if !hasHeader(resolved.Headers, key) {
+				putHeader(resolved.Headers, key, value)
+			}
+		}
+		if resolved.Query == nil && (len(rt.Provider.Query) > 0 || rt.Provider.AuthQuery != "") {
+			resolved.Query = map[string]string{}
+		}
+		for key, value := range rt.Provider.Query {
+			if _, ok := resolved.Query[key]; !ok {
+				resolved.Query[key] = value
+			}
+		}
 		if resolved.Reasoning != "" && !model.Reasoning {
 			// A reasoning field the model doesn't support is rejected by
 			// strict endpoints, so it never reaches the wire.
@@ -137,16 +167,73 @@ func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, apiKey, a
 		if blobReader != nil {
 			resolved.BlobReader = blobReader
 		}
-		if strings.TrimSpace(resolved.APIKey) == "" && apiKey != "" {
-			resolved.APIKey = apiKey
+		if strings.TrimSpace(resolved.APIKey) == "" {
+			resolved.APIKey = rt.APIKey
 		}
-		if strings.TrimSpace(resolved.APIKey) == "" && authToken != "" && !hasHeader(resolved.Headers, "authorization") {
-			if resolved.Headers == nil {
-				resolved.Headers = map[string]string{}
+		if resolved.APIKey == "" && rt.AuthToken != "" && !hasHeader(resolved.Headers, "authorization") {
+			putHeader(resolved.Headers, "authorization", "Bearer "+rt.AuthToken)
+		}
+		auth := rt.Provider
+		requestKey := resolved.APIKey
+		auth.APIKey = resolved.APIKey
+		auth.Headers = resolved.Headers
+		auth.Query = resolved.Query
+		auth.NoAuth = new(resolved.NoAuth)
+		if !auth.CredentialPresent(nil) && !rt.Provider.UsesCredentialChain() {
+			return erroredStream(model, rt.Provider.credentialError())
+		}
+		if rt.Provider.AuthQuery != "" && resolved.APIKey != "" {
+			resolved.Query[rt.Provider.AuthQuery] = resolved.APIKey
+			resolved.APIKey = ""
+		}
+		if rt.Provider.AuthHeader != "" && resolved.APIKey != "" {
+			prefix := "Bearer "
+			if rt.Provider.AuthPrefix != nil {
+				prefix = *rt.Provider.AuthPrefix
 			}
-			resolved.Headers["authorization"] = "Bearer " + authToken
+			putHeader(resolved.Headers, rt.Provider.AuthHeader, prefix+resolved.APIKey)
+			resolved.APIKey = ""
 		}
-		return streamSimple(ctx, model, c, resolved)
+		if rt.Provider.AuthHeader != "" || rt.Provider.AuthQuery != "" || resolved.Query["key"] != "" || resolved.Query["api-key"] != "" {
+			resolved.NoAuth = true
+		}
+		values := []string{rt.APIKey, rt.AuthToken, rt.Provider.APIKey, requestKey}
+		for key, value := range resolved.Headers {
+			values = append(values, value)
+			if strings.EqualFold(key, "authorization") || strings.EqualFold(key, rt.Provider.AuthHeader) {
+				prefix := "Bearer "
+				if rt.Provider.AuthPrefix != nil {
+					prefix = *rt.Provider.AuthPrefix
+				}
+				if prefix != "" {
+					values = append(values, strings.TrimPrefix(value, prefix))
+				}
+			}
+		}
+		for _, value := range resolved.Query {
+			values = append(values, value)
+		}
+		source := streamSimple(ctx, model, c, resolved)
+		clean := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+		go func() {
+			defer clean.End()
+			for event := range source.Events() {
+				if event.Err != nil {
+					message := *event.Err
+					message.ErrorMessage = obs.RedactValues(message.ErrorMessage, values...)
+					message.ErrorDetails = redactErrorDetails(message.ErrorDetails, values)
+					event.Err = &message
+				}
+				if event.Message != nil && event.Message.ErrorMessage != "" {
+					message := *event.Message
+					message.ErrorMessage = obs.RedactValues(message.ErrorMessage, values...)
+					message.ErrorDetails = redactErrorDetails(message.ErrorDetails, values)
+					event.Message = &message
+				}
+				clean.Push(event)
+			}
+		}()
+		return clean
 	}
 	return r
 }
@@ -169,28 +256,32 @@ func erroredStream(model types.Model, err error) *stream.AssistantStream {
 	return s
 }
 
-// ResolveProviderForModel returns the provider for a bare model name. The
-// embedded catalog decides by exact id; id-shape prefixes cover unknown ids;
-// slash-prefixed ids ("openai/gpt-4o") keep the Anthropic proxy route the
-// router has always given them, as does anything unrecognized.
-func ResolveProviderForModel(modelID string) string {
-	trimmed := strings.TrimSpace(modelID)
-	// Exact-id lookup first, so aggregator slugs ("z-ai/glm-latest") hit
-	// OpenRouter before the id-shape fallbacks run.
-	for _, prov := range []string{"anthropic", "openai", "google", "openrouter"} {
-		if _, ok := catalog.Lookup(prov, trimmed); ok {
-			return prov
+func redactErrorDetails(details map[string]any, values []string) map[string]any {
+	if details == nil {
+		return nil
+	}
+	out := make(map[string]any, len(details))
+	for key, value := range details {
+		out[obs.RedactValues(key, values...)] = redactErrorValue(value, values)
+	}
+	return out
+}
+
+func redactErrorValue(value any, values []string) any {
+	switch v := value.(type) {
+	case string:
+		return obs.RedactValues(v, values...)
+	case map[string]any:
+		return redactErrorDetails(v, values)
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = redactErrorValue(item, values)
 		}
+		return out
+	default:
+		return value
 	}
-	switch {
-	case strings.HasPrefix(trimmed, "gemini-"):
-		return "google"
-	case strings.HasPrefix(trimmed, "gpt-"), strings.HasPrefix(trimmed, "o1"), strings.HasPrefix(trimmed, "o3"), strings.HasPrefix(trimmed, "o4"):
-		return "openai"
-	case strings.HasPrefix(trimmed, "claude-"):
-		return "anthropic"
-	}
-	return "anthropic"
 }
 
 func firstNonEmpty(values ...string) string {
@@ -208,6 +299,12 @@ func cloneSimpleOptions(opts *types.SimpleStreamOptions) *types.SimpleStreamOpti
 		return &types.SimpleStreamOptions{}
 	}
 	clone := *opts
+	if opts.Query != nil {
+		clone.Query = make(map[string]string, len(opts.Query))
+		for key, value := range opts.Query {
+			clone.Query[key] = value
+		}
+	}
 	if opts.Headers != nil {
 		clone.Headers = map[string]string{}
 		for key, value := range opts.Headers {

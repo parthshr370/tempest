@@ -24,7 +24,7 @@ func TestRouterDropsReasoningForNonReasoningModelWithOneWarning(t *testing.T) {
 		seen = append(seen, opts.Reasoning)
 		return erroredStream(model, context.Canceled)
 	}
-	router := ProviderRouter{}.withStream(streamSimple, "key", "", nil)
+	router := ProviderRouter{}.withStream(streamSimple, route{APIKey: "key"}, nil)
 	plain := ptypes.Model{ID: "plain", Provider: "openrouter"}
 	thinking := ptypes.Model{ID: "thinker", Provider: "openrouter", Reasoning: true}
 	for _, model := range []ptypes.Model{plain, plain, thinking} {

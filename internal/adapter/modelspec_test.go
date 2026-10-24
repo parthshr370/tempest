@@ -17,6 +17,9 @@ func TestParseModelSpec(t *testing.T) {
 		{"slash model no provider", "anthropic/claude-opus-4-8", "", "anthropic/claude-opus-4-8", ""},
 		{"provider prefix", "anthropic:claude-sonnet-4", "anthropic", "claude-sonnet-4", ""},
 		{"openai with base url", "openai:gpt-4o@https://api.openai.com/v1", "openai", "gpt-4o", "https://api.openai.com/v1"},
+		{"vertex version", "vertex:claude-haiku-4-5@20251001", "vertex", "claude-haiku-4-5@20251001", ""},
+		{"version with endpoint", "vertex:claude-haiku-4-5@20251001@https://example.com", "vertex", "claude-haiku-4-5@20251001", "https://example.com"},
+		{"bare model with base url", "claude-haiku-4-5@https://example.com", "", "claude-haiku-4-5", "https://example.com"},
 		{"empty", "", "", "", ""},
 	}
 	for _, tc := range tests {
@@ -53,19 +56,19 @@ func TestResolveRouteDefaultsToAnthropic(t *testing.T) {
 }
 
 func TestResolveRouteUnknownProviderErrors(t *testing.T) {
-	if _, err := resolveRoute(RoutingConfig{ModelID: "mistral:large"}, func(string) string { return "" }); err == nil {
+	if _, err := resolveRoute(RoutingConfig{ModelID: "unknown-provider:large"}, func(string) string { return "" }); err == nil {
 		t.Fatal("expected error for unknown provider")
 	}
 }
 
 func TestValidateModelSpecAcceptsGoogle(t *testing.T) {
-	for _, raw := range []string{"google:gemini-3.8-flash", "google:gemini-3.1-pro-preview@https://ex/", "openrouter:anthropic/claude-opus-5"} {
+	for _, raw := range []string{"google:gemini-3.8-flash", "google:gemini-3.1-pro-preview@https://ex/", "openrouter:anthropic/claude-opus-5", "mistral:large"} {
 		if err := ValidateModelSpec(raw); err != nil {
 			t.Fatalf("ValidateModelSpec(%q) = %v", raw, err)
 		}
 	}
-	err := ValidateModelSpec("mistral:large")
-	if err == nil || err.Error() != "unsupported model provider; use anthropic, openai, google, or openrouter" {
+	err := ValidateModelSpec("unknown-provider:large")
+	if err == nil || err.Error() != `unsupported model provider "unknown-provider"; configure it in providers` {
 		t.Fatalf("unknown provider error = %v", err)
 	}
 }
@@ -118,10 +121,6 @@ func TestResolveRouteOpenRouter(t *testing.T) {
 	if custom.Model.BaseURL != "http://127.0.0.1:9/v1" {
 		t.Fatalf("custom base URL = %q", custom.Model.BaseURL)
 	}
-	// Bare aggregator slugs resolve through the catalog, not the Anthropic proxy.
-	if got := ResolveProviderForModel("~deepseek/deepseek-v4-flash-latest"); got != "openrouter" {
-		t.Fatalf("ResolveProviderForModel deepseek slug = %q, want openrouter", got)
-	}
 }
 
 func TestResolveRouteCatalogDefaults(t *testing.T) {
@@ -153,23 +152,6 @@ func TestResolveRouteCatalogDefaults(t *testing.T) {
 	}
 	if fallback.Model.MaxTokens != DefaultMaxTokens || !fallback.Model.Cost.Unknown {
 		t.Fatalf("default max tokens = %d", fallback.Model.MaxTokens)
-	}
-}
-
-func TestResolveProviderForModel(t *testing.T) {
-	tests := map[string]string{
-		"claude-opus-4-8":       "anthropic",
-		"gpt-5":                 "openai",
-		"o3":                    "openai",
-		"gemini-2.5-flash":      "google",
-		"google/gemini-2.5-pro": "anthropic",
-		"openai/gpt-4o":         "anthropic",
-		"totally-unknown":       "anthropic",
-	}
-	for raw, want := range tests {
-		if got := ResolveProviderForModel(raw); got != want {
-			t.Fatalf("ResolveProviderForModel(%q) = %q, want %q", raw, got, want)
-		}
 	}
 }
 

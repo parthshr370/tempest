@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -97,5 +99,41 @@ func TestDoctorPingProbesConfiguredModelAndReportsProviderStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDoctorCustomProviderRedactsConfiguredCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Gateway-Key") != "settings-secret" || r.URL.Query().Get("key") != "query-secret" {
+			t.Error("custom credentials not sent")
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, "settings-secret query-secret")
+	}))
+	defer endpoint.Close()
+	settings := filepath.Join(home, ".config", "harness", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settings), 0700); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(map[string]any{"model": "custom:test", "providers": map[string]any{"custom": map[string]any{"protocol": "openai-chat", "base_url": endpoint.URL, "api_key": "settings-secret", "auth_header": "X-Gateway-Key", "auth_prefix": "", "query": map[string]string{"key": "query-secret"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settings, encoded, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var output, diagnostics bytes.Buffer
+	if code := runDoctor([]string{"--ping"}, &output, &diagnostics); code != 1 {
+		t.Fatalf("exit=%d output=%s", code, &output)
+	}
+	for _, secret := range []string{"settings-secret", "query-secret"} {
+		if strings.Contains(output.String()+diagnostics.String(), secret) {
+			t.Fatalf("doctor leaked configured credential %q", secret)
+		}
+	}
+	if !strings.Contains(output.String(), "custom: api=openai-completions") || !strings.Contains(output.String(), "provider HTTP 401") {
+		t.Fatalf("doctor custom provider=%s", &output)
 	}
 }

@@ -7,9 +7,11 @@ import (
 	"io"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/jsonrepair"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/transport/sseparse"
 )
 
@@ -19,10 +21,13 @@ var toolCallIDCounter atomic.Int64
 
 // googleStreamChunk is one decoded Gemini SSE chunk.
 type googleStreamChunk struct {
-	ResponseID    string               `json:"responseId"`
-	Candidates    []googleCandidate    `json:"candidates"`
-	UsageMetadata *googleUsageMetadata `json:"usageMetadata"`
-	Error         json.RawMessage      `json:"error"`
+	ResponseID     string               `json:"responseId"`
+	Candidates     []googleCandidate    `json:"candidates"`
+	UsageMetadata  *googleUsageMetadata `json:"usageMetadata"`
+	Error          json.RawMessage      `json:"error"`
+	PromptFeedback struct {
+		BlockReason string `json:"blockReason"`
+	} `json:"promptFeedback"`
 }
 
 // googleCandidate is a single generation candidate within a chunk.
@@ -92,7 +97,7 @@ func iterateGoogleEvents(ctx context.Context, r io.Reader, onActivity func(), fn
 			return fmt.Errorf("could not parse Gemini SSE chunk: %s; data=%s", err.Error(), data)
 		}
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
-			return fmt.Errorf("Gemini stream error: %s", chunk.Error)
+			return googleAPIError(chunk.Error)
 		}
 		return fn(&chunk)
 	})
@@ -284,4 +289,21 @@ func firstNonEmptyStr(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func googleAPIError(raw json.RawMessage) error {
+	var details struct {
+		Code    int    `json:"code"`
+		Status  string `json:"status"`
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &details); err != nil {
+		return fmt.Errorf("invalid Gemini error: %w", err)
+	}
+	status := details.Code
+	if status == 0 {
+		status = map[string]int{"RESOURCE_EXHAUSTED": 429, "UNAVAILABLE": 503, "INTERNAL": 500, "UNAUTHENTICATED": 401, "PERMISSION_DENIED": 403, "INVALID_ARGUMENT": 400}[details.Status]
+	}
+	return retry.Classify(retry.Failure{Status: status, ProviderCode: details.Type, Message: details.Message}, time.Now())
 }

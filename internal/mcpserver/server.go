@@ -213,7 +213,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 	if err := decodeRunInput(p.Arguments, &in); err != nil {
 		return nil, invalid(err)
 	}
-	settings, err := in.settings(s.opts.DefaultNew)
+	settings, err := in.settings(s.opts.DefaultNew, s.opts.Provider.Providers)
 	if err != nil {
 		return nil, invalid(err)
 	}

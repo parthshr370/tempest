@@ -74,6 +74,9 @@ type ResumeSession struct {
 // ProviderConfig configures provider credentials and endpoint routing.
 type ProviderConfig = adapter.RoutingConfig
 
+// ProviderDefinition describes one named provider in ProviderConfig.Providers.
+type ProviderDefinition = adapter.ProviderConfig
+
 // LSPConfig selects trusted language-server definitions for a session.
 type LSPConfig = lsp.Config
 

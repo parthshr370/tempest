@@ -5,6 +5,7 @@ package base
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"strings"
 
@@ -98,6 +99,9 @@ func WithEnvAPIKey(opts *types.StreamOptions, provider string) *types.StreamOpti
 	if opts == nil {
 		opts = &types.StreamOptions{}
 	}
+	if opts.DisableEnvAuth || opts.NoAuth {
+		return opts
+	}
 	if strings.TrimSpace(opts.APIKey) != "" {
 		return opts // explicit key: untouched
 	}
@@ -108,4 +112,21 @@ func WithEnvAPIKey(opts *types.StreamOptions, provider string) *types.StreamOpti
 	clone := *opts // shallow copy
 	clone.APIKey = key
 	return &clone
+}
+
+// RequestURL adds configured query parameters after protocol endpoint expansion.
+func RequestURL(raw string, query map[string]string) string {
+	if len(query) == 0 {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	values := u.Query()
+	for key, value := range query {
+		values.Set(key, value)
+	}
+	u.RawQuery = values.Encode()
+	return u.String()
 }

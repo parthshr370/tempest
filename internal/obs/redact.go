@@ -3,6 +3,9 @@
 package obs
 
 import (
+	"encoding/json"
+	"io"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -12,7 +15,7 @@ import (
 // masked while the key stays for context. Runs before the plainer matchers
 // because "api_key":"x" has a quote between key and colon that kvSecret cannot
 // span.
-var jsonSecret = regexp.MustCompile(`(?i)("[\w.-]*(?:api[_-]?key|apikey|token|secret|password|authorization|auth[_-]?token)[\w.-]*"\s*:\s*)"[^"]*"`)
+var jsonSecret = regexp.MustCompile(`(?i)("(?:key|[\w.-]*(?:api[_-]?key|apikey|token|secret|password|authorization|auth[_-]?token)[\w.-]*)"\s*:\s*)"[^"]*"`)
 
 // bareSecret matches standalone credential-looking tokens (bearer values and
 // sk-style keys) anywhere in the text. It runs before kvSecret so that
@@ -25,7 +28,7 @@ var urlSecret = regexp.MustCompile(`(?i)(https?://)[^:/?#@\s]+:[^@/?#\s]+@`)
 
 // kvSecret matches "key: value" / "key=value" pairs whose key names a
 // credential, so the value can be masked while the key name is kept for context.
-var kvSecret = regexp.MustCompile(`(?i)([\w.-]*(?:api[_-]?key|apikey|token|secret|password|authorization|auth[_-]?token)[\w.-]*\s*[:=]\s*)(\S+)`)
+var kvSecret = regexp.MustCompile(`(?i)((?:\bkey|[\w.-]*(?:api[_-]?key|apikey|token|secret|password|authorization|auth[_-]?token)[\w.-]*)\s*[:=]\s*)(\S+)`)
 
 // Redact masks common credential patterns so a diagnostic log line cannot
 // persist API keys, bearer tokens, or key=value secrets. It is best-effort, not
@@ -50,4 +53,32 @@ func RedactTruncate(s string, max int) string {
 		return string(r[:max]) + "…[truncated]"
 	}
 	return s
+}
+
+// RedactValues also masks credentials with arbitrary header or query names.
+func RedactValues(s string, values ...string) string {
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		encodedJSON, _ := json.Marshal(value)
+		for _, encoded := range []string{value, url.QueryEscape(value), url.PathEscape(value), string(encodedJSON[1 : len(encodedJSON)-1])} {
+			s = strings.ReplaceAll(s, encoded, "[REDACTED]")
+		}
+	}
+	return Redact(s)
+}
+
+// RedactingWriter scrubs diagnostics before they reach their output destination.
+type RedactingWriter struct {
+	io.Writer
+	Values []string
+}
+
+func (w RedactingWriter) Write(p []byte) (int, error) {
+	_, err := io.WriteString(w.Writer, RedactValues(string(p), w.Values...))
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

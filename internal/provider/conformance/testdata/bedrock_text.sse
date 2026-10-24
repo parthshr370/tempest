@@ -1,0 +1,15 @@
+event: messageStart
+data: {"role":"assistant"}
+
+event: contentBlockDelta
+data: {"contentBlockIndex":0,"delta":{"text":"hello"}}
+
+event: contentBlockStop
+data: {"contentBlockIndex":0}
+
+event: messageStop
+data: {"stopReason":"end_turn"}
+
+event: metadata
+data: {"usage":{"inputTokens":10,"outputTokens":4,"totalTokens":19,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}}
+

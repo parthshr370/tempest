@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,11 +53,39 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		OpenAIBaseURL:    opts.Config.OpenAIBaseURL(),
 		MaxTokens:        opts.Config.MaxTokens(),
 		SecretLookup:     opts.Secrets.Resolve,
+		Providers:        opts.Config.Providers(),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "doctor configuration error: %v\n", err)
 		return 1
 	}
+	providerRegistry, _ := adapter.Providers(opts.Config.Providers())
+	var credentials []string
+	for _, provider := range providerRegistry {
+		credentials = append(credentials, provider.APIKey, provider.Credential(opts.Secrets.Resolve))
+		for key, value := range provider.Headers {
+			credentials = append(credentials, value)
+			if strings.EqualFold(key, "authorization") || strings.EqualFold(key, provider.AuthHeader) {
+				prefix := "Bearer "
+				if provider.AuthPrefix != nil {
+					prefix = *provider.AuthPrefix
+				}
+				if prefix != "" {
+					credentials = append(credentials, strings.TrimPrefix(value, prefix))
+				}
+			}
+		}
+		for _, value := range provider.Query {
+			credentials = append(credentials, value)
+		}
+	}
+	for _, name := range []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN"} {
+		if value, ok := opts.Secrets.Resolve(name); ok {
+			credentials = append(credentials, value)
+		}
+	}
+	stdout = obs.RedactingWriter{Writer: stdout, Values: credentials}
+	stderr = obs.RedactingWriter{Writer: stderr, Values: credentials}
 	fmt.Fprintln(stdout, "resolved config:")
 	fmt.Fprintf(stdout, "  model: %s\n", opts.Config.Model())
 	fmt.Fprintf(stdout, "  plan_model: %s\n", roleSpec(opts.Config.PlanModel(), opts.Config.Model()))
@@ -69,16 +99,27 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  log_file: %s\n", opts.Config.LogFile())
 	fmt.Fprintf(stdout, "  enable_web: %t\n", opts.Config.EnableWeb())
 	fmt.Fprintf(stdout, "  web_search_url: %s\n", redactedURL(opts.Config.WebSearchURL()))
-	fmt.Fprintf(stdout, "  anthropic_base_url: %s\n", opts.Config.AnthropicBaseURL())
-	fmt.Fprintf(stdout, "  openai_base_url: %s\n", opts.Config.OpenAIBaseURL())
+	fmt.Fprintf(stdout, "  anthropic_base_url: %s\n", redactedURL(opts.Config.AnthropicBaseURL()))
+	fmt.Fprintf(stdout, "  openai_base_url: %s\n", redactedURL(opts.Config.OpenAIBaseURL()))
 	fmt.Fprintln(stdout, "  provider_credentials: REDACTED")
 	fmt.Fprintln(stdout, "models:")
 	printRole(stdout, "default", roles.Default, opts.Config.Reasoning())
 	printRole(stdout, "plan", roles.Plan, opts.Config.PlanReasoning())
 	printRole(stdout, "smol", roles.Smol, opts.Config.SmolReasoning())
 	fmt.Fprintln(stdout, "providers:")
-	for _, p := range catalog.Providers() {
-		fmt.Fprintf(stdout, "  %s: api=%s key=%s present=%s base_url=%s\n", p.ID, p.API, p.KeyEnv, yesNo(providerCredentialPresent(p.ID, opts.Secrets)), p.BaseURL)
+	providers, err := adapter.Providers(opts.Config.Providers())
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	for _, name := range slices.Sorted(maps.Keys(providers)) {
+		p := providers[name]
+		noAuth := p.NoAuth != nil && *p.NoAuth
+		p.NoAuth = nil
+		fmt.Fprintf(stdout, "  %s: api=%s protocol=%s key=%s present=%s auth_required=%s base_url=%s\n", name, p.API(), p.Protocol, p.APIKeyEnv, yesNo(p.CredentialPresent(opts.Secrets.Resolve)), yesNo(!noAuth), redactedURL(p.BaseURL))
+	}
+	for _, path := range opts.Config.UntrustedProviderFiles() {
+		fmt.Fprintf(stdout, "  UNTRUSTED %s (providers not loaded; use -trust-project-providers)\n", path)
 	}
 	if listModels {
 		fmt.Fprintf(stdout, "models: (pricing as of %s, USD per million tokens)\n", catalog.AsOf())
@@ -180,7 +221,7 @@ func printRole(w io.Writer, name string, router adapter.ProviderRouter, reasonin
 	} else if router.Model.Cost.Unknown {
 		price = "unknown"
 	}
-	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, router.Model.BaseURL, price, effectiveReasoning(reasoning, router.Model), yesNo(router.Model.SupportsVision()))
+	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, redactedURL(router.Model.BaseURL), price, effectiveReasoning(reasoning, router.Model), yesNo(router.Model.SupportsVision()))
 }
 
 func printPathCheck(w io.Writer, name, path string) {
@@ -219,7 +260,12 @@ func yesNo(b bool) string {
 }
 
 func printRoleCredentialCheck(w io.Writer, role, provider string, opts commandOptions) {
-	if providerCredentialPresent(provider, opts.Secrets) {
+	providerConfig := configuredProvider(provider, opts)
+	if providerConfig.UsesCredentialChain() && !providerConfig.CredentialPresent(opts.Secrets.Resolve) {
+		fmt.Fprintf(w, "INFO %s provider credential: %s uses a native credential chain; --ping verifies it\n", role, provider)
+		return
+	}
+	if configuredProvider(provider, opts).CredentialPresent(opts.Secrets.Resolve) {
 		fmt.Fprintf(w, "PASS %s provider credential: %s present\n", role, provider)
 		return
 	}
@@ -270,6 +316,7 @@ func pingModels(stdout io.Writer, opts commandOptions) int {
 		OpenAIBaseURL:    opts.Config.OpenAIBaseURL(),
 		MaxTokens:        16,
 		SecretLookup:     opts.Secrets.Resolve,
+		Providers:        opts.Config.Providers(),
 	})
 	fmt.Fprintln(stdout, "ping:")
 	if err != nil {
@@ -280,8 +327,9 @@ func pingModels(stdout io.Writer, opts commandOptions) int {
 	for _, target := range pingTargets(roles) {
 		model := target.router.Model
 		label := fmt.Sprintf("  %s (%s:%s)", strings.Join(target.roles, "+"), model.Provider, model.ID)
-		if !providerCredentialPresent(model.Provider, opts.Secrets) {
-			fmt.Fprintf(stdout, "%s: error no %s credential\n", label, model.Provider)
+		p := configuredProvider(model.Provider, opts)
+		if !p.CredentialPresent(opts.Secrets.Resolve) && !p.UsesCredentialChain() {
+			fmt.Fprintf(stdout, "%s: error no %s credential; set %s or providers.%s.api_key\n", label, model.Provider, p.APIKeyEnv, model.Provider)
 			exitCode = 1
 			continue
 		}
@@ -295,10 +343,10 @@ func pingModels(stdout io.Writer, opts commandOptions) int {
 		switch {
 		case err != nil:
 			classified := retry.Classify(retry.Failure{Message: err.Error()}, time.Now())
-			fmt.Fprintf(stdout, "%s: error %s: %s\n", label, classified.Code, pingDetail(err.Error(), opts.Secrets))
+			fmt.Fprintf(stdout, "%s: error %s: %s\n", label, classified.Code, providerPingDetail(err.Error(), opts))
 			exitCode = 1
 		case message.StopReason == types.StopError || message.StopReason == types.StopAborted:
-			fmt.Fprintf(stdout, "%s: error %s: %s\n", label, message.ErrorCode, pingDetail(message.ErrorMessage, opts.Secrets))
+			fmt.Fprintf(stdout, "%s: error %s: %s\n", label, message.ErrorCode, providerPingDetail(message.ErrorMessage, opts))
 			exitCode = 1
 		default:
 			fmt.Fprintf(stdout, "%s: ok %s\n", label, time.Since(started).Round(time.Millisecond))
@@ -316,4 +364,23 @@ func pingDetail(message string, secrets config.SecretResolver) string {
 		}
 	}
 	return obs.RedactTruncate(message, 400)
+}
+
+func providerPingDetail(message string, opts commandOptions) string {
+	providers, _ := adapter.Providers(opts.Config.Providers())
+	for _, p := range providers {
+		values := []string{p.APIKey, p.Credential(opts.Secrets.Resolve)}
+		for _, value := range p.Headers {
+			values = append(values, value)
+		}
+		for _, value := range p.Query {
+			values = append(values, value)
+		}
+		for _, value := range values {
+			if value != "" {
+				message = strings.ReplaceAll(message, value, "[REDACTED]")
+			}
+		}
+	}
+	return pingDetail(message, opts.Secrets)
 }

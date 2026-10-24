@@ -345,14 +345,25 @@ func TestRunInputBudgetValidation(t *testing.T) {
 	for _, raw := range []string{`{"prompt":"go","budget":{"maxTurns":0}}`, `{"prompt":"go","budget":{"maxCostUsd":2}}`, `{"prompt":"go","budget":{"maxWallSeconds":61}}`} {
 		var in RunInput
 		_ = json.Unmarshal([]byte(raw), &in)
-		if _, err := in.settings(host); err == nil {
+		if _, err := in.settings(host, nil); err == nil {
 			t.Fatalf("relaxed host cap: %s", raw)
 		}
 	}
 	var in RunInput
 	_ = json.Unmarshal([]byte(`{"prompt":"go","budget":{"maxTurns":2,"maxCostUsd":0.5,"maxWallSeconds":1}}`), &in)
-	got, err := in.settings(host)
+	got, err := in.settings(host, nil)
 	if err != nil || got.Budget.MaxTurns != 2 || got.Budget.MaxCostUSD != 0.5 || got.Budget.MaxWallTime != time.Second {
 		t.Fatalf("tighten=%+v err=%v", got, err)
+	}
+}
+
+func TestRunInputAcceptsHostRegisteredProvider(t *testing.T) {
+	providers := map[string]tempest.ProviderDefinition{"gateway": {Protocol: "openai-chat", BaseURL: "https://gateway.example/v1"}}
+	settings, err := (RunInput{Prompt: "hi", Model: "gateway:model"}).settings(tempest.NewSession{}, providers)
+	if err != nil || settings.Model != "gateway:model" {
+		t.Fatalf("settings=%+v err=%v", settings, err)
+	}
+	if _, err := (RunInput{Prompt: "hi", Model: "gateway:model@https://attacker.example"}).settings(tempest.NewSession{}, providers); err == nil {
+		t.Fatal("MCP URL override allowed")
 	}
 }
