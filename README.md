@@ -1,6 +1,17 @@
+<p align="center">
+  <img src="assets/banner.jpg" alt="Francisque Millet's Mountain Landscape with Lightning, c. 1675: a lightning bolt falls from a dark storm cloud over mountains, a lake, a green valley, and a ruined arch" width="100%">
+</p>
+
 <h1 align="center">Tempest</h1>
 
 <p align="center"><strong>A coding agent you can run, resume, and embed as one Go binary.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <a href="go.mod"><img alt="Go 1.26.4" src="https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white"></a>
+  <a href="https://github.com/parthshr370/tempest"><img alt="GitHub stars" src="https://img.shields.io/github/stars/parthshr370/tempest"></a>
+  <a href="https://github.com/parthshr370/tempest/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/parthshr370/tempest"></a>
+</p>
 
 Tempest is an open-source coding agent that reads and edits files, runs commands,
 and works turn by turn until the job is done. It runs from your terminal, serves
@@ -172,3 +183,11 @@ tools, configuration, permissions, concurrency, and idiomatic Go design.
 Behavior is ported from [Pi](https://github.com/badlogic/pi-mono) by
 [Mario Zechner](https://github.com/mariozechner), extended via
 [oh-my-pi](https://github.com/can1357/oh-my-pi) by Can Bölük.
+
+Banner: [Mountain Landscape with Lightning](https://www.nationalgallery.org.uk/paintings/francisque-millet-mountain-landscape-with-lightning)
+by Francisque Millet, c. 1675, National Gallery, London. The painting is in the
+public domain; the banner is a crop of a public domain reproduction.
+
+## Star history
+
+[Star history chart](https://star-history.com/#parthshr370/tempest&Date)

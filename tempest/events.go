@@ -297,13 +297,13 @@ const maxStdinTitleBytes = 60
 func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	kind := ToolKind("other")
 	switch name {
-	case "read", "view_image":
+	case "read", "view_image", "gh":
 		kind = "read"
-	case "write", "edit", "hashline", "integrate":
+	case "write", "edit", "hashline", "integrate", "ast_edit":
 		kind = "edit"
-	case "bash", "eval", "write_stdin":
+	case "bash", "eval", "write_stdin", "gh_checkout":
 		kind = "execute"
-	case "grep", "find", "ls", "lsp_definition", "lsp_references":
+	case "grep", "find", "ls", "lsp_definition", "lsp_references", "ast_grep":
 		kind = "search"
 	case "lsp_rename", "lsp_diagnostics", "manifest_diff":
 		// rename returns a plan (applied:false); applying it is a later edit.
@@ -317,6 +317,9 @@ func toolDescription(name string, raw json.RawMessage) (string, ToolKind) {
 	}
 	var args map[string]any
 	_ = json.Unmarshal(raw, &args)
+	if name == "ast_edit" && args["apply"] != true {
+		kind = "read"
+	}
 	if name == "bash" {
 		if cmd, ok := args["command"].(string); ok {
 			return "$ " + cmd, kind

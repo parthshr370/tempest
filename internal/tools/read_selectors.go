@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.harness.dev/harness/internal/agent"
@@ -34,15 +36,22 @@ type readTarget struct {
 	hasMember bool
 	query     string
 	hasQuery  bool
+	table     string
+	sqlParams string
 }
 
 func parseReadTarget(requested string) readTarget {
 	target := readTarget{path: requested}
-	if before, query, ok := strings.Cut(requested, "?q="); ok {
+	if before, params, ok := strings.Cut(requested, "?"); ok && sqlitePath(before) {
+		target.path, target.sqlParams = before, params
+	} else if before, query, ok := strings.Cut(requested, "?q="); ok {
 		target.path, target.query, target.hasQuery = before, query, true
 	}
 	if colon := archiveMemberSplit(target.path); colon >= 0 {
 		target.member, target.path, target.hasMember = target.path[colon+1:], target.path[:colon], true
+	}
+	if colon := sqliteTableSplit(target.path); colon >= 0 {
+		target.table, target.path = target.path[colon+1:], target.path[:colon]
 	}
 	return target
 }
@@ -66,7 +75,14 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 	var name string // drives format detection
 	listing := false
 	if refs.IsURL(target.path) {
-		resource, err := options.Refs.Read(ctx, target.path)
+		var resource refs.Resource
+		var err error
+		if refs.GitHubURL(target.path) {
+			resource, err = refs.ReadGitHub(refs.WithProcessAdmission(ctx, options.AdmitProcess), cwd, target.path)
+			err = codingToolError(err, options)
+		} else {
+			resource, err = options.Refs.Read(ctx, target.path)
+		}
 		if err != nil {
 			return readSource{}, nil, err
 		}
@@ -96,8 +112,14 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 				data, listing = text, true
 			case statErr == nil && archiveKind(relPath) != "" && info.Size() > maxArchiveBytes:
 				return readSource{}, nil, fmt.Errorf("archive %s is %d bytes, over the %d MiB read limit; use bash (unzip -l, tar -tf)", displayPath, info.Size(), maxArchiveBytes>>20)
+			case statErr == nil && (sqlitePath(relPath) || strings.EqualFold(filepath.Ext(relPath), ".pdf")) && info.Size() > document.MaxCodingInput:
+				return readSource{}, nil, fmt.Errorf("%s exceeds the %d MiB SQLite/PDF read limit", displayPath, document.MaxCodingInput>>20)
 			default:
-				data, err = readFileInRoot(root, relPath)
+				if sqlitePath(relPath) || strings.EqualFold(filepath.Ext(relPath), ".pdf") {
+					data, err = readFileInRootLimit(root, relPath, document.MaxCodingInput)
+				} else {
+					data, err = readFileInRoot(root, relPath)
+				}
 			}
 		} else if artifact, ok := sessionArtifactName(options.SessionDataDir, absolutePath); ok && errors.Is(err, ErrOutsideRoot) {
 			data, err = readSessionArtifact(options.SessionDataDir, artifact)
@@ -156,8 +178,87 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 		derived(member.data, display)
 		name = target.member
 	}
-	if err := unsupportedFormat(name, src.data, src.displayPath); err != nil {
-		return readSource{}, nil, err
+	if sqlitePath(name) || bytes.HasPrefix(src.data, []byte("SQLite format 3\x00")) {
+		params, query := target.sqlParams, ""
+		if strings.HasPrefix(params, "q=") {
+			query, params = params[2:], ""
+		} else if before, after, ok := strings.Cut(params, "&q="); ok {
+			params, query = before, after
+		}
+		if target.hasQuery {
+			query = target.query
+		}
+		values, err := url.ParseQuery(params)
+		if err != nil {
+			return readSource{}, nil, fmt.Errorf("invalid SQLite query parameters: %w", err)
+		}
+		if query != "" {
+			values.Set("q", query)
+		} else if strings.Contains(target.sqlParams, "q=") {
+			return readSource{}, nil, fmt.Errorf("SQLite q must contain a read-only SELECT")
+		}
+		for key, items := range values {
+			if len(items) != 1 {
+				return readSource{}, nil, fmt.Errorf("SQLite query parameter %q must occur once", key)
+			}
+			if key == "q" && strings.TrimSpace(items[0]) == "" {
+				return readSource{}, nil, fmt.Errorf("SQLite q must contain a read-only SELECT")
+			}
+			if key != "q" && key != "limit" && key != "offset" {
+				return readSource{}, nil, fmt.Errorf("unknown SQLite query parameter %q", key)
+			}
+		}
+		limit, offset := 20, 0
+		for key, dest := range map[string]*int{"limit": &limit, "offset": &offset} {
+			if value := values.Get(key); value != "" {
+				*dest, err = strconv.Atoi(value)
+				if err != nil {
+					return readSource{}, nil, fmt.Errorf("SQLite %s must be an integer", key)
+				}
+			}
+		}
+		if values.Get("q") != "" && values.Get("limit") == "" {
+			limit = 1000
+		}
+		var wal []byte
+		if src.absolutePath != "" {
+			if rel, err := rootRelPath(cwd, src.absolutePath+"-wal"); err == nil {
+				if info, err := root.Stat(rel); err == nil && info.Size() > document.MaxCodingInput {
+					return readSource{}, nil, fmt.Errorf("SQLite WAL exceeds the %d MiB read limit", document.MaxCodingInput>>20)
+				}
+				wal, err = readFileInRootLimit(root, rel, document.MaxCodingInput)
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return readSource{}, nil, err
+				}
+			}
+		}
+		release, err := admitCodingProcess(ctx, options)
+		if err != nil {
+			return readSource{}, nil, err
+		}
+		defer release()
+		text, err := document.ReadSQLite(ctx, src.data, wal, target.table, values.Get("q"), limit, offset)
+		if err != nil {
+			return readSource{}, nil, fmt.Errorf("%s: %w", src.displayPath, err)
+		}
+		derived(text, requested)
+		return src, nil, nil
+	}
+	if strings.EqualFold(path.Ext(name), ".pdf") || bytes.HasPrefix(src.data, []byte("%PDF-")) {
+		if target.hasQuery {
+			return readSource{}, nil, fmt.Errorf("%s is a PDF; ?q= applies to JSON or SQLite", src.displayPath)
+		}
+		release, err := admitCodingProcess(ctx, options)
+		if err != nil {
+			return readSource{}, nil, err
+		}
+		defer release()
+		text, err := document.ReadPDF(ctx, src.data)
+		if err != nil {
+			return readSource{}, nil, fmt.Errorf("%s: %w", src.displayPath, err)
+		}
+		derived(text, src.displayPath)
+		return src, nil, nil
 	}
 	if mediaType := document.OOXMLMediaType(name); mediaType != "" {
 		text, err := document.ExtractOOXMLBytes(src.data, mediaType)
@@ -179,26 +280,30 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 	return src, nil, nil
 }
 
-// unsupportedFormat names formats read cannot render, so the model goes
-// straight to a tool that can instead of seeing "binary file".
-func unsupportedFormat(name string, data []byte, display string) error {
-	lower := strings.ToLower(name)
-	switch {
-	case strings.HasSuffix(lower, ".pdf") || bytes.HasPrefix(data, []byte("%PDF-")):
-		return fmt.Errorf("%s is a PDF; read does not render PDFs. Use bash, for example pdftotext %s - | head -200", display, shellWord(display))
-	case bytes.HasPrefix(data, []byte("SQLite format 3\x00")) || strings.HasSuffix(lower, ".sqlite") || strings.HasSuffix(lower, ".sqlite3"):
-		return fmt.Errorf("%s is a SQLite database; read does not query databases. Use bash, for example sqlite3 %s '.tables'", display, shellWord(display))
+func sqlitePath(name string) bool {
+	if colon := sqliteTableSplit(name); colon >= 0 {
+		name = name[:colon]
 	}
-	return nil
+	switch strings.ToLower(path.Ext(name)) {
+	case ".db", ".db3", ".sqlite", ".sqlite3":
+		return true
+	}
+	return false
 }
 
-// shellWord quotes display for a suggested command; internal URLs expand in
-// bash, so they stay as written.
-func shellWord(display string) string {
-	if refs.IsURL(display) {
-		return display
+func sqliteTableSplit(name string) int {
+	for i := strings.IndexByte(name, ':'); i >= 0; {
+		switch strings.ToLower(path.Ext(name[:i])) {
+		case ".db", ".db3", ".sqlite", ".sqlite3":
+			return i
+		}
+		next := strings.IndexByte(name[i+1:], ':')
+		if next < 0 {
+			break
+		}
+		i += next + 1
 	}
-	return "'" + strings.ReplaceAll(display, "'", `'\''`) + "'"
+	return -1
 }
 
 type dirEntry struct {

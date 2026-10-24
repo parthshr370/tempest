@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/tempest"
@@ -11,13 +12,16 @@ import (
 
 func (c *Client) handleDurable(ctx context.Context, method string, raw json.RawMessage) (any, *rpc.Error) {
 	var p struct {
-		SessionID    string            `json:"sessionId"`
-		RequestID    string            `json:"requestId"`
-		Prompt       []contentBlock    `json:"prompt"`
-		OutputSchema json.RawMessage   `json:"outputSchema"`
-		Placement    tempest.Placement `json:"placement"`
-		Commit       durable.Commit    `json:"commit"`
-		Query        durable.Query     `json:"query"`
+		SessionID    string              `json:"sessionId"`
+		RequestID    string              `json:"requestId"`
+		Prompt       []contentBlock      `json:"prompt"`
+		OutputSchema json.RawMessage     `json:"outputSchema"`
+		Placement    tempest.Placement   `json:"placement"`
+		Commit       durable.Commit      `json:"commit"`
+		Query        durable.Query       `json:"query"`
+		Task         tempest.TaskRequest `json:"task"`
+		TaskID       string              `json:"taskId"`
+		TaskQuery    tempest.TaskQuery   `json:"taskQuery"`
 	}
 	if e := decode(raw, &p); e != nil {
 		return nil, e
@@ -60,6 +64,30 @@ func (c *Client) handleDurable(ctx context.Context, method string, raw json.RawM
 		value, err = s.Commit(ctx, p.Commit)
 	case "_tempest/durable/read":
 		value, err = s.Read(ctx, p.Query)
+	case "_tempest/durable/create_task":
+		value, err = s.CreateTask(ctx, p.Task)
+	case "_tempest/durable/get_task":
+		value, err = s.Task(ctx, p.TaskID)
+	case "_tempest/durable/tasks":
+		value, err = s.Tasks(ctx, p.TaskQuery)
+	case "_tempest/durable/cancel_task":
+		err = s.CancelTask(ctx, p.TaskID)
+		value = struct{}{}
+	case "_tempest/durable/retry_task":
+		err = s.RetryTask(ctx, p.TaskID)
+		value = struct{}{}
+	case "_tempest/durable/cancel_all":
+		err = s.CancelAll(ctx)
+		value = struct{}{}
+	case "_tempest/durable/resume_pending":
+		err = s.ResumePending(ctx)
+		value = struct{}{}
+	case "_tempest/durable/next_wake":
+		wake, present := s.NextWake()
+		value = struct {
+			WakeAt  time.Time `json:"wakeAt"`
+			Present bool      `json:"present"`
+		}{wake, present}
 	}
 	if err != nil {
 		return nil, failure(err)

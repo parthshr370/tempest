@@ -8,6 +8,7 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -128,6 +129,32 @@ func readFileInRoot(root *os.Root, name string) ([]byte, error) {
 		return nil, wrapOutsideRoot(name, err)
 	}
 	return data, nil
+}
+
+func readFileInRootLimit(root *os.Root, name string, limit int64) ([]byte, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, wrapOutsideRoot(name, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	if info.Size() > limit {
+		return nil, fmt.Errorf("%s exceeds the %d MiB read limit", name, limit>>20)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > limit {
+		return nil, fmt.Errorf("%s exceeds the %d MiB read limit", name, limit>>20)
+	}
+	return content, nil
 }
 
 // ToolOutputDirName is the directory inside a session data directory that

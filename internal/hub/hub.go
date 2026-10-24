@@ -88,7 +88,7 @@ func (h *Hub) Emit(u Update) {
 }
 
 // SetDurable publishes a bounded committed projection and its watermark together.
-func (h *Hub) SetDurable(seq uint64, documents, submissions durable.Page) {
+func (h *Hub) SetDurable(seq uint64, documents, submissions, tasks durable.Page) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed || seq <= h.view.DurableSeq {
@@ -97,15 +97,17 @@ func (h *Hub) SetDurable(seq uint64, documents, submissions durable.Page) {
 	h.view.DurableSeq = seq
 	h.view.Documents = cloneRecords(documents.Records)
 	h.view.Submissions = cloneRecords(submissions.Records)
+	h.view.Tasks = cloneRecords(tasks.Records)
 	h.view.DocumentsCursor = documents.NextCursor
 	h.view.SubmissionsCursor = submissions.NextCursor
 	raw, _ := json.Marshal(struct {
 		Seq               uint64           `json:"durableSeq"`
 		Documents         []durable.Record `json:"documents"`
 		Submissions       []durable.Record `json:"submissions"`
+		Tasks             []durable.Record `json:"tasks"`
 		DocumentsCursor   string           `json:"documentsCursor,omitempty"`
 		SubmissionsCursor string           `json:"submissionsCursor,omitempty"`
-	}{seq, h.view.Documents, h.view.Submissions, documents.NextCursor, submissions.NextCursor})
+	}{seq, h.view.Documents, h.view.Submissions, h.view.Tasks, documents.NextCursor, submissions.NextCursor})
 	h.emit(Update{Kind: "tempest/durable", Update: raw})
 }
 
@@ -379,6 +381,7 @@ func (h *Hub) snapshot(replay bool) Snapshot {
 	s := h.view
 	s.Documents = cloneRecords(s.Documents)
 	s.Submissions = cloneRecords(s.Submissions)
+	s.Tasks = cloneRecords(s.Tasks)
 	s.HistoryLen = len(h.history)
 	start := max(0, len(h.history)-200)
 	streaming := 0

@@ -122,6 +122,9 @@ func Classify(f Failure, now time.Time) *Error {
 	if isContextOverflow(combined) {
 		return result(CodeContextOverflow, false)
 	}
+	if strings.HasPrefix(providerCode, "subscription_sharing_") && (f.Status == 429 || providerCode == "subscription_sharing_usage_limit_exceeded") {
+		return result(Code(providerCode), false)
+	}
 	if f.Status == 429 {
 		return result(CodeRateLimited, true)
 	}

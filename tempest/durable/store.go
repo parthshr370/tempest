@@ -191,19 +191,19 @@ func (l *Log) Commit(ctx context.Context, c Commit) (Receipt, error) {
 	// Detach caller-owned slices and raw values before retaining them.
 	raw, err := json.Marshal(c)
 	if err != nil {
-		return Receipt{}, err
+		return Receipt{}, fmt.Errorf("%w: %v", ErrInvalidCommit, err)
 	}
 	var copy Commit
 	if err = json.Unmarshal(raw, &copy); err != nil {
-		return Receipt{}, err
+		return Receipt{}, fmt.Errorf("%w: %v", ErrInvalidCommit, err)
 	}
 	c = copy
 	if err = validate(c); err != nil {
-		return Receipt{}, err
+		return Receipt{}, fmt.Errorf("%w: %v", ErrInvalidCommit, err)
 	}
 	digest, err := Digest(c)
 	if err != nil {
-		return Receipt{}, err
+		return Receipt{}, fmt.Errorf("%w: %v", ErrInvalidCommit, err)
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()

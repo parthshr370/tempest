@@ -38,7 +38,7 @@ func TestBuildPlanStackReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	allowed := map[string]bool{"read": true, "grep": true, "find": true, "ls": true, "web_search": true, "web_fetch": true, "manifest_diff": true, "view_image": true}
+	allowed := map[string]bool{"read": true, "grep": true, "find": true, "ls": true, "web_search": true, "web_fetch": true, "manifest_diff": true, "view_image": true, "ast_grep": true, "gh": true}
 	for _, tool := range stack.Agent.State().Tools {
 		if !allowed[tool.Name] {
 			t.Fatalf("plan stack exposed non-read-only tool %q", tool.Name)
@@ -47,6 +47,7 @@ func TestBuildPlanStackReadOnly(t *testing.T) {
 }
 
 func TestStackConfigFromConfigPreservesReadOnlyPlan(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
 	resolved, err := (config.Config{
 		SettingsPath: filepath.Join(t.TempDir(), "settings.json"),
 		LookupEnv:    func(string) string { return "" },
@@ -70,8 +71,8 @@ func TestStackConfigFromConfigPreservesReadOnlyPlan(t *testing.T) {
 	for _, tool := range stack.Agent.State().Tools {
 		names = append(names, tool.Name)
 	}
-	if got := strings.Join(names, ","); got != "read,grep,find,ls,view_image,manifest_diff" {
-		t.Fatalf("config-backed plan tools = %q, want read,grep,find,ls,view_image,manifest_diff", got)
+	if got := strings.Join(names, ","); got != "read,grep,find,ls,view_image,manifest_diff,gh" {
+		t.Fatalf("config-backed plan tools = %q, want read,grep,find,ls,view_image,manifest_diff,gh", got)
 	}
 }
 

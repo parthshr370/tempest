@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -157,7 +158,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 	defaults := tempest.NewSession{Model: cfg.Model(), PermissionMode: mode, Budget: budget, MCPServers: cfg.MCPServers()}
-	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers()}
+	provider := serverProvider(cfg)
 	processes, err := loadExtensionProcesses(extensionConfig, stderr)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -234,4 +235,15 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 	return 0
+}
+
+func serverProvider(cfg *config.ResolvedConfig) tempest.ProviderConfig {
+	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers()}
+	for _, model := range []string{cfg.Model(), cfg.PlanModel(), cfg.SmolModel()} {
+		if strings.HasPrefix(strings.TrimSpace(model), "openai-chatgpt:") {
+			provider.ChatGPTCredentials = tempest.OpenAIChatGPTCredentials("")
+			break
+		}
+	}
+	return provider
 }

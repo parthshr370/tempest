@@ -69,6 +69,10 @@ func TestClassifyToolTiers(t *testing.T) {
 		tools.IntegrateTool:      TierWrite,
 		tools.CheckpointTool:     TierWrite,
 		tools.RewindTool:         TierWrite,
+		tools.ASTGrepTool:        TierRead,
+		tools.ASTEditTool:        TierWrite,
+		tools.GHTool:             TierRead,
+		tools.GHCheckoutTool:     TierExec,
 	}
 	if len(tests) != len(tools.AllToolNames) {
 		t.Fatalf("tier expectations = %d; built-in tool names = %d", len(tests), len(tools.AllToolNames))
@@ -107,6 +111,11 @@ func TestGateModeTierMatrix(t *testing.T) {
 		{name: "plan edit", mode: ModePlan, tool: "edit", wantReason: "Plan mode: edit is disabled because it can mutate the workspace"},
 		{name: "plan hashline", mode: ModePlan, tool: "hashline", wantReason: "Plan mode: hashline is disabled because it can mutate the workspace"},
 		{name: "plan integrate", mode: ModePlan, tool: "integrate", wantReason: "Plan mode: integrate is disabled because it can mutate the workspace"},
+		{name: "plan ast_edit apply", mode: ModePlan, tool: "ast_edit", args: json.RawMessage(`{"apply":true}`), wantReason: "Plan mode: ast_edit is disabled because it can mutate the workspace"},
+		{name: "plan ast_edit preview", mode: ModePlan, tool: "ast_edit", args: json.RawMessage(`{}`), wantAllow: true},
+		{name: "plan gh_checkout", mode: ModePlan, tool: "gh_checkout", wantReason: "Plan mode: gh_checkout is disabled because it can mutate the workspace"},
+		{name: "plan ast_grep", mode: ModePlan, tool: "ast_grep", wantAllow: true},
+		{name: "plan gh", mode: ModePlan, tool: "gh", wantAllow: true},
 		{name: "plan safe bash", mode: ModePlan, tool: "bash", args: commandArgs("git status"), wantAllow: true},
 		{name: "plan unsafe bash", mode: ModePlan, tool: "bash", args: commandArgs("python x.py"), wantReason: "Plan mode: command blocked (not allowlisted). Disable plan mode or use a read-only command. Command: python x.py"},
 		{name: "plan task", mode: ModePlan, tool: "task", wantReason: "Plan mode: task is disabled because it can mutate the workspace"},

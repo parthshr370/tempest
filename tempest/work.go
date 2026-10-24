@@ -298,9 +298,9 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	return result, runErr
 }
 func childToolNames(kind string, parent []string) []string {
-	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message", "checkpoint"}
+	builtin := []string{"read", "grep", "find", "ls", "view_image", "web_search", "web_fetch", "message", "checkpoint", "ast_grep", "gh"}
 	if kind == "general" {
-		builtin = append(builtin, "write", "edit", "hashline", "bash", "eval", "todo_write", "rewind")
+		builtin = append(builtin, "write", "edit", "hashline", "bash", "eval", "todo_write", "rewind", "ast_edit")
 	}
 	selected := make([]string, 0, len(builtin))
 	for _, name := range builtin {
@@ -375,10 +375,29 @@ func (hooks *sessionWork) Start(ctx context.Context, info work.RunInfo) error {
 	}
 	return hooks.core.jobs.Start(ctx, info)
 }
-func (hooks *sessionWork) Idle(ctx context.Context) (bool, error) { return hooks.core.jobs.Idle(ctx) }
-func (hooks *sessionWork) Reopen(ctx context.Context) error       { return hooks.core.jobs.Reopen(ctx) }
+func (hooks *sessionWork) Idle(ctx context.Context) (bool, error) {
+	if pending, err := hooks.core.awaitForeground(ctx); pending || err != nil {
+		return pending, err
+	}
+	return hooks.core.jobs.Idle(ctx)
+}
+func (hooks *sessionWork) Reopen(ctx context.Context) error { return hooks.core.jobs.Reopen(ctx) }
 func (hooks *sessionWork) Finish(ctx context.Context, reason string) error {
-	return hooks.core.jobs.Finish(ctx, reason)
+	run, _ := hooks.core.jobs.PhaseRun()
+	err := hooks.core.jobs.Finish(ctx, reason)
+	core := hooks.core
+	core.mu.Lock()
+	if !core.closed && run.LogicalRunID != "" {
+		core.taskWorkers.Add(1)
+		go func() {
+			defer core.taskWorkers.Done()
+			if err := core.jobs.Tasks.ResumeRun(core.taskContext, run.LogicalRunID); err != nil && core.taskContext.Err() == nil {
+				core.logger.Warn("foreground task cleanup failed", "runId", run.LogicalRunID, "error", err)
+			}
+		}()
+	}
+	core.mu.Unlock()
+	return err
 }
 
 func intersectToolNames(available, selected []string) []string {

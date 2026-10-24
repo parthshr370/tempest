@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"net/url"
@@ -78,6 +79,9 @@ func ValidateModelSpecWithProviders(raw string, providers map[string]ProviderCon
 			return fmt.Errorf("unsupported model provider %q; configure it in providers", spec.Provider)
 		}
 	}
+	if spec.Provider == "openai-chatgpt" && spec.BaseURL != "" {
+		return fmt.Errorf("openai-chatgpt does not allow endpoint overrides")
+	}
 	if spec.BaseURL != "" {
 		if err := ValidateBaseURL(spec.BaseURL); err != nil {
 			return fmt.Errorf("model spec base URL is invalid: %w", err)
@@ -101,11 +105,12 @@ func ValidateBaseURL(raw string) error {
 // route is a fully resolved provider route: the model to stream, the registry
 // API id to dispatch through, and the credential material.
 type route struct {
-	Model     types.Model
-	API       string
-	APIKey    string
-	AuthToken string
-	Provider  ProviderConfig
+	Model            types.Model
+	API              string
+	APIKey           string
+	AuthToken        string
+	Provider         ProviderConfig
+	CredentialSource func(context.Context) (RequestCredential, error)
 }
 
 // resolveRoute turns the routing config + environment into a concrete provider
@@ -135,6 +140,17 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 	p, ok := registry[prov]
 	if !ok {
 		return route{}, fmt.Errorf("unsupported model provider %q; configure it in providers", prov)
+	}
+	if prov == "openai-chatgpt" {
+		if cfg.BaseURL != "" || cfg.APIKey != "" || cfg.AuthToken != "" {
+			return route{}, fmt.Errorf("openai-chatgpt cannot use API keys or base URL overrides; remove the conflicting setting")
+		}
+		if cfg.MaxTokens > 0 && !cfg.MaxTokensDefaulted || envMaxTokens(env) > 0 {
+			return route{}, fmt.Errorf("ChatGPT plan usage does not support explicit output-token caps; use turn or wall-time limits")
+		}
+		if cfg.ChatGPTCredentials == nil {
+			return route{}, fmt.Errorf("openai-chatgpt requires an explicit credential source; use OpenAIChatGPTCredentials or run tempest login openai in the CLI")
+		}
 	}
 	contextWindow := 128000
 	switch p.Protocol {
@@ -237,6 +253,10 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			key = firstNonEmpty(cfg.APIKey, env("ANTHROPIC_OAUTH_TOKEN"), key)
 		}
 		token = firstNonEmpty(token, env("ANTHROPIC_AUTH_TOKEN"))
+	}
+	if prov == "openai-chatgpt" {
+		model.Cost = types.ModelCost{Unknown: true}
+		return route{Model: model, API: model.API, Provider: p, CredentialSource: cfg.ChatGPTCredentials}, nil
 	}
 	return route{Model: model, API: model.API, APIKey: key, AuthToken: token, Provider: p}, nil
 }

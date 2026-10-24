@@ -141,9 +141,9 @@ type Outcome struct {
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
 	case "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
-		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image":
+		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image", "ast_grep", "gh":
 		return TierRead
-	case "write", "edit", "hashline", "integrate", "todo_write", "checkpoint", "rewind":
+	case "write", "edit", "hashline", "integrate", "todo_write", "checkpoint", "rewind", "ast_edit":
 		return TierWrite
 	default:
 		// Includes message: it directs other agents' work, so plan mode

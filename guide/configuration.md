@@ -31,7 +31,7 @@ Reasoning effort follows the same pattern with `-reasoning`, `-plan-reasoning` a
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](sessions-and-durability.md#runs). Zero means unlimited. |
 | `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
-| `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools, `manifest_diff`, enabled `lsp_*` tools (rename computes a plan only) and enabled read-only web/attachment tools are available; `-faux-script` still overrides the model provider. |
+| `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools (including `ast_grep` when installed and authenticated `gh`), `manifest_diff`, enabled `lsp_*` tools (rename computes a plan only) and enabled read-only web/attachment tools are available; `-faux-script` still overrides the model provider. |
 | `-attach <path>` | Attach a local file to the session; repeatable. Missing paths are startup errors. |
 | `-image <path>` | Attach a PNG, JPEG, GIF or WebP image to the prompt as an image block; repeatable. Refused at startup when the model has no image input in the catalog or the image exceeds the `view_image` limits. |
 | `-output-schema <path>` | JSON Schema for the final answer; see [Runs](sessions-and-durability.md#runs). |

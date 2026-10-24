@@ -47,11 +47,35 @@ func (s *Store) appendEnvelope(ctx context.Context, raw []byte, meta Meta, kind 
 		return err
 	}
 	changes = append(changes, extra...)
+	native, err := s.nativeTaskChanges(ctx, raw)
+	if err != nil {
+		return err
+	}
+	changes = append(changes, native...)
 	decision := fmt.Sprintf("journal:%d", meta.Seq)
 	if s.external {
 		decision = s.id + ":" + decision
 	}
 	expected := make([]durable.RevisionCheck, 0, len(extra))
+	if kind == KindJobStarted {
+		var parent struct {
+			OwnerTask     string `json:"owner_task"`
+			OwnerRevision uint64 `json:"owner_revision"`
+		}
+		entry, err := decodeEntry(raw)
+		if err != nil {
+			return err
+		}
+		if err = json.Unmarshal(entry.(WorkRecord).Payload, &parent); err != nil {
+			return err
+		}
+		if parent.OwnerTask != "" {
+			if parent.OwnerRevision == 0 {
+				return fmt.Errorf("task owner revision required")
+			}
+			expected = append(expected, durable.RevisionCheck{SessionID: s.id, Kind: durable.TaskKind, Namespace: "_tempest/tasks", ID: parent.OwnerTask, Revision: parent.OwnerRevision})
+		}
+	}
 	if kind == KindQueueEnqueued {
 		for _, ch := range extra {
 			expected = append(expected, durable.RevisionCheck{SessionID: ch.SessionID, Kind: ch.Kind, Namespace: ch.Namespace, ID: ch.ID})
@@ -141,12 +165,12 @@ func (s *Store) Commit(ctx context.Context, c durable.Commit) (durable.Receipt, 
 	}
 	for _, ch := range c.Changes {
 		if ch.SessionID != s.id {
-			return durable.Receipt{}, fmt.Errorf("foreign session commit")
+			return durable.Receipt{}, fmt.Errorf("%w: foreign session commit", durable.ErrInvalidCommit)
 		}
 	}
 	for _, check := range c.Expected {
 		if check.SessionID != s.id {
-			return durable.Receipt{}, fmt.Errorf("foreign session comparison")
+			return durable.Receipt{}, fmt.Errorf("%w: foreign session comparison", durable.ErrInvalidCommit)
 		}
 	}
 	lastID := ""
@@ -154,7 +178,7 @@ func (s *Store) Commit(ctx context.Context, c durable.Commit) (durable.Receipt, 
 		if change.Kind == durable.EntryKind && change.Namespace == "_tempest/journal" {
 			entry, err := decodeEntry(change.Value)
 			if err != nil {
-				return durable.Receipt{}, err
+				return durable.Receipt{}, fmt.Errorf("%w: %v", durable.ErrInvalidCommit, err)
 			}
 			if id := entry.meta().ID; id != "" {
 				lastID = id
@@ -165,11 +189,11 @@ func (s *Store) Commit(ctx context.Context, c durable.Commit) (durable.Receipt, 
 		if ch.Kind == durable.DocumentKind && !strings.HasPrefix(ch.Namespace, "_") {
 			schema := s.schemas[ch.Namespace]
 			if schema == nil {
-				return durable.Receipt{}, fmt.Errorf("unregistered document namespace %q", ch.Namespace)
+				return durable.Receipt{}, fmt.Errorf("%w: unregistered document namespace %q", durable.ErrInvalidCommit, ch.Namespace)
 			}
 			if !ch.Delete {
 				if _, err := schema.Validate(string(ch.Value)); err != nil {
-					return durable.Receipt{}, err
+					return durable.Receipt{}, fmt.Errorf("%w: %v", durable.ErrInvalidCommit, err)
 				}
 			}
 		}

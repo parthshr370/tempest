@@ -358,6 +358,14 @@ func GateInDirectory(ctx context.Context, mode Mode, toolName string, args json.
 // toolTier classifies a call; jobs listing is read-only.
 func toolTier(toolName string, args json.RawMessage) Tier {
 	tier := ClassifyTool(toolName)
+	if toolName == "ast_edit" {
+		var request struct {
+			Apply bool `json:"apply"`
+		}
+		if json.Unmarshal(args, &request) == nil && !request.Apply {
+			return TierRead
+		}
+	}
 	if toolName == "jobs" {
 		var request struct {
 			Action string `json:"action"`

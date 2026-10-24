@@ -18,6 +18,10 @@ use 1,048,576. These fallbacks are not a model specification.
 Configure `models[].contextWindow` and `maxTokens` for an unlisted model's actual
 limits. Every protocol reserves room for the estimated prompt and a
 4,096-token safety margin, and caps requested output at the model's output limit.
+ChatGPT plan usage is an exception: Tempest drops internal temperature and output-token
+budgets from requests, including compaction and overflow recovery. Explicit user
+output caps (`-max-tokens`, `max_tokens`, `HARNESS_MAX_TOKENS`, or SDK `MaxTokens`)
+are rejected; use turn and wall-time limits instead.
 Computed JSON costs encode `{"unknown":true}` rather than zero-dollar components.
 Unknown provider prefixes are configuration errors. Bare IDs use the Anthropic route.
 
@@ -34,6 +38,7 @@ Unknown provider prefixes are configuration errors. Bare IDs use the Anthropic r
 | `openrouter:<id>` | `OPENROUTER_API_KEY` | OpenAI Chat Completions with OpenRouter's endpoint. Model IDs may carry a `~` prefix. Point it elsewhere with `openrouter:<id>@<base-url>`. |
 | `openai:<id>` | `OPENAI_API_KEY` | Endpoint comes from `-openai-base-url`, `HARNESS_OPENAI_BASE_URL`, settings `openai_base_url`, or `OPENAI_BASE_URL`, in that order. |
 | `openai:<id>@<base-url>` | `OPENAI_API_KEY` | Explicit endpoint override. |
+| `openai-chatgpt:<id>` | Saved Sign in with ChatGPT grant | Public Responses endpoint, ChatGPT plan usage, no API-key fallback or endpoint overrides. |
 | `<custom>:<id>` | Depends on the registry entry | Any route configured in the `providers` registry. |
 
 The model ID is opaque and endpoint-specific: `claude-fable-5-1` on Anthropic
@@ -150,6 +155,7 @@ fabricated assistant turn.
 | `llamacpp` | `openai-chat` | none | `http://localhost:8080/v1` |
 | `azure` | `openai-chat` | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_ENDPOINT`, a deployment path, or `/openai/v1` |
 | `openai-responses` | `openai-responses` | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
+| `openai-chatgpt` | `openai-responses` | Saved ChatGPT sign-in | `https://api.openai.com/v1` |
 | `bedrock` | `bedrock` | `AWS_BEARER_TOKEN_BEDROCK`, or AWS credentials | `https://bedrock-runtime.<region>.amazonaws.com` |
 | `vertex` | `vertex` | Google service account or `GOOGLE_CLOUD_API_KEY` | `https://aiplatform.googleapis.com` (global) or `https://<location>-aiplatform.googleapis.com` |
 
@@ -228,6 +234,119 @@ and the same provider and model; set `supportsEncryptedReasoning: false` to turn
 both off. The session ID doubles as `prompt_cache_key`; IDs longer than 64 bytes
 use their SHA-256 hex digest. Reasoning effort and summary are sent when configured
 and supported by the model, and cached and reasoning token usage is read back.
+
+### Sign in with ChatGPT
+
+Use your own ChatGPT account's authorized plan usage with the explicit
+`openai-chatgpt:` route. Existing `openai:` and `openai-responses:` routes keep
+using API keys. Signing in never changes their billing source.
+
+```sh
+tempest login openai
+tempest auth status openai
+tempest -model openai-chatgpt:<account-model-id> -p "Explain this repository"
+tempest logout openai
+```
+
+`Continue with ChatGPT` opens the system browser. Tempest starts a
+`http://127.0.0.1:<available-port>/auth/callback` listener first. It uses an
+authorization code, S256 PKCE, state and an OIDC nonce. First use registers
+`dynamic_agent_client` with the truthful name `Tempest` and a persistent UUID
+host ID. Later sign-ins reuse the issued client ID. Tokens come from the
+documented `/api/accounts/oauth/token` endpoint, not Codex's legacy endpoints.
+Tempest verifies the ID token's RSA signature with OpenAI's JWKS, issuer,
+audience, expiry and nonce before saving the account identity.
+
+Use `--no-browser` to print the ordinary authorization URL without launching a
+browser. Open it on the same host. This is not a device-code or paste-a-token
+flow. No undocumented headless login is provided. Authorization URLs omit the
+optional retained ID-token hint so printed URLs contain no tokens.
+
+Each account registration has a stable local label. The first label is
+`default`; `tempest login openai --profile personal` adds or reauthorizes
+`personal` and selects it after successful identity validation and plan authorization.
+`tempest auth list openai` lists the saved labels.
+Use `--profile <label>` with status or logout to target another saved account.
+Reauthorizing a label with a different verified subject is rejected. Choose a new
+label for a different account or workspace, even if its email is identical.
+Running credential sources retain their selected label and never follow a later
+change to the active selection.
+If plan usage was declined, the identity stays saved without replacing a working
+active profile. Run `tempest login openai --profile personal --consent` to explicitly
+request the full scope set again with OAuth `prompt=consent`. Ordinary reauthorization
+does not force a consent screen. Tempest does not send `force_reconsent=true` because
+OpenAI has not confirmed its deployment for this integration.
+
+Credentials live in `$XDG_CONFIG_HOME/tempest/openai` when set, otherwise under
+`os.UserConfigDir()/tempest/openai`. The directory is `0700`, and credentials,
+host identity, active selection and lock files are `0600`. Writes use fsync and
+atomic rename. Per-profile advisory file locks serialize credential reads and
+updates across processes. Login releases the lock during the browser wait, then
+compares the current record before saving so concurrent refresh or logout wins.
+Before requests, near-expiry credentials refresh with the saved issued client ID
+and `resource=https://api.openai.com/v1`. Refresh has its own 30-second timeout,
+independent of turn cancellation. The store rereads after locking and immediately
+saves the rotated token pair before ID-token checks; an unvalidated refreshed
+identity cannot authorize inference, including after a restart. Temporary renewal
+outages can still use an unexpired access token.
+Tokens never enter session configuration, tool journals or doctor output.
+Doctor stays offline and shows only the account label, identity and expiry.
+This implementation uses the documented protected-file option on macOS too.
+The `security` CLI would pass a newly stored secret through process arguments
+and introduce a second store to coordinate during rotation, so Tempest does not
+use it.
+
+Logout attempts the discovery document's revocation endpoint, retries transient
+failures, and clears access, refresh and ID tokens locally. Account/client mapping
+and host identity remain for reauthorization. If remote revocation cannot be
+confirmed, Tempest says so. Disconnect the app in ChatGPT Settings in that case.
+Expired or revoked grants stop inference and tell you to run
+`tempest login openai`. They never fall back to paid API keys.
+
+Plan requests use bearer authentication against the public `/v1/responses`
+endpoint, `store:false`, `stream:true`, full input history and namespaced local
+tools. They do not use legacy Codex account-ID or beta headers. Credential,
+header, provider and endpoint overrides are rejected on this route. Internal
+temperature and output-token options are omitted, not rejected; explicitly configured
+user output caps are rejected before inference. Unrelated `openai_base_url` or
+`OPENAI_BASE_URL` settings do not affect this route. An incomplete response is not
+permission to execute a tool. A `subscription_sharing_*` HTTP 429 pauses requests
+without retrying; check [ChatGPT usage settings](https://chatgpt.com/settings/usage).
+Use a model available to your account. Catalog metadata is not entitlement.
+Plan and app limits apply, and authorized ChatGPT credits may be used.
+Dollar cost stays unknown, so `-max-cost` fails closed. Manage usage and access at
+[ChatGPT Settings](https://chatgpt.com/settings/usage).
+
+CLI one-shot and plan/smol roles use the same credential source. Single-owner ACP,
+A2A and MCP servers enable that source only when an operator-configured default,
+plan or smol model uses `openai-chatgpt:`; a client model override cannot enable
+an otherwise unconfigured grant. Child sessions inherit it. SDK users must opt in
+explicitly instead of inheriting credentials from an ambient home directory:
+
+```go
+provider := tempest.ProviderConfig{
+    ChatGPTCredentials: tempest.OpenAIChatGPTCredentials("personal"),
+}
+```
+
+Pass `provider` in `tempest.Options.Provider`, and select an
+`openai-chatgpt:<model-id>` session model. SDKs can instead supply a request-local
+credential callback. Keep saved profiles and grants scoped to one owner. Do not
+pool a ChatGPT account across unrelated remote users.
+
+Protocol tests may use `tempest login openai --no-browser --issuer
+http://127.0.0.1:<fixture-port>` with an isolated config directory. Only production
+OpenAI or an explicitly selected literal-loopback fixture authority is accepted.
+Fixture grants remain bound to that authority's `/v1` endpoint.
+
+The wire contract follows OpenAI's [registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in),
+[accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions),
+[models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
+and [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+Consent and plan-limit recovery follow OpenAI's
+[errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery);
+rotation follows the [token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference).
+
 
 ### Bedrock
 

@@ -428,10 +428,41 @@ func (s *Session) resumePending(ctx context.Context) (*Run, error) {
 		return nil, err
 	}
 	c := s.core
+	c.mu.Lock()
+	busy, closed := c.active != nil, c.closed
+	if !closed {
+		c.taskWorkers.Add(1)
+	}
+	c.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	defer c.taskWorkers.Done()
+	taskContext, cancelTaskDrain := context.WithCancel(ctx)
+	stopCloseCancel := context.AfterFunc(c.taskContext, cancelTaskDrain)
+	defer func() {
+		stopCloseCancel()
+		cancelTaskDrain()
+	}()
+	var taskErr error
+	if busy {
+		taskErr = c.jobs.Tasks.ResumeBackground(taskContext)
+	} else {
+		taskErr = c.jobs.Tasks.Resume(taskContext)
+	}
+	if taskErr != nil {
+		c.mu.Lock()
+		closing := c.closed
+		c.mu.Unlock()
+		if closing {
+			return nil, ErrClosed
+		}
+		return nil, taskErr
+	}
 	c.admission.Lock()
 	defer c.admission.Unlock()
 	c.mu.Lock()
-	busy, closed := c.active != nil, c.closed
+	busy, closed = c.active != nil, c.closed
 	c.mu.Unlock()
 	if closed {
 		return nil, ErrClosed

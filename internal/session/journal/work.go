@@ -89,6 +89,8 @@ type JobWorkspace struct {
 // JobStarted precedes every child, process and workspace effect.
 type JobStarted struct {
 	JobID          string `json:"job_id"`
+	OwnerTask      string `json:"owner_task,omitempty"`
+	OwnerRevision  uint64 `json:"owner_revision,omitempty"`
 	IdentityDigest string `json:"identity_digest"`
 	CallID         string `json:"call_id"`
 	ToolCallID     string `json:"tool_call_id"`

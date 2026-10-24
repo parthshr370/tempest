@@ -63,9 +63,11 @@ type QueueSource interface {
 }
 
 type Invocation struct {
-	RunID      string
-	CallID     string // canonical occurrence id, not the raw provider id
-	ToolCallID string // raw provider id, for correlation only
+	RunID         string
+	CallID        string // canonical occurrence id, not the raw provider id
+	ToolCallID    string // raw provider id, for correlation only
+	OwnerTask     string // host-established phase ownership, never model input
+	OwnerRevision uint64
 }
 type RunInfo struct {
 	SessionID    string
@@ -122,6 +124,7 @@ type Artifact struct {
 }
 type Job struct {
 	ID             string          `json:"id"`
+	OwnerTask      string          `json:"ownerTask,omitempty"`
 	Kind           string          `json:"kind"`  // task | bash
 	State          string          `json:"state"` // starting | running | recovering | completed | failed | cancelled | unknown
 	RunID          string          `json:"runId"` // original durable owner

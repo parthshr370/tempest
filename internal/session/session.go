@@ -67,7 +67,7 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 		}
 		switch tool.Name {
 		case "read":
-			snippets[tool.Name] = "Read files (several in one call with paths), directories, archive members, office documents, JSON queries and internal URLs"
+			snippets[tool.Name] = "Read files (several in one call with paths), directories, archive members, office documents, PDF text, SQLite, JSON queries and internal URLs"
 		case "bash":
 			snippets[tool.Name] = "Execute bash commands (ls, grep, find, etc.)"
 		case "eval":
@@ -118,6 +118,14 @@ func BuildToolSnippets(active []agent.AgentTool) map[string]string {
 			snippets[tool.Name] = "Compare two rendered Kubernetes manifest snapshots by resource"
 		case "view_image":
 			snippets[tool.Name] = "Look at a PNG, JPEG, GIF or WebP image in the workspace"
+		case "ast_grep":
+			snippets[tool.Name] = "Search workspace code with AST patterns"
+		case "ast_edit":
+			snippets[tool.Name] = "Preview structural rewrites, then apply the unchanged preview through the rollback journal"
+		case "gh":
+			snippets[tool.Name] = "Read GitHub issues, PRs, diffs, files, search results and Actions runs"
+		case "gh_checkout":
+			snippets[tool.Name] = "Check out a PR in a new workspace worktree without switching the current checkout"
 		default:
 			snippets[tool.Name] = label
 		}

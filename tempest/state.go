@@ -164,6 +164,10 @@ func (s *Session) publishDurable(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	tasks, err := s.core.store.Read(context.WithoutCancel(ctx), durable.Query{Kind: durable.TaskKind, AsOf: docs.Seq, Limit: 100, Reverse: true})
+	if err != nil {
+		return
+	}
 	for i := range docs.Records {
 		docs.Records[i].Value = nil
 		docs.Records[i].CommitID = ""
@@ -185,8 +189,20 @@ func (s *Session) publishDurable(ctx context.Context) {
 			return
 		}
 	}
+	for index := range tasks.Records {
+		record := &tasks.Records[index]
+		var task extension.Task
+		if err := json.Unmarshal(record.Value, &task); err != nil {
+			return
+		}
+		record.CommitID = ""
+		record.Value, err = json.Marshal(task.Summary())
+		if err != nil {
+			return
+		}
+	}
 	const projectionBytes = 64 << 10
-	for _, page := range []*durable.Page{&docs, &submissions} {
+	for _, page := range []*durable.Page{&docs, &submissions, &tasks} {
 		total := 0
 		for i, record := range page.Records {
 			raw, err := json.Marshal(record)
@@ -201,7 +217,7 @@ func (s *Session) publishDurable(ctx context.Context) {
 		}
 		page.NextCursor = ""
 	}
-	s.core.hub.SetDurable(docs.Seq, docs, submissions)
+	s.core.hub.SetDurable(docs.Seq, docs, submissions, tasks)
 	s.core.durablePublished = docs.Seq
 }
 

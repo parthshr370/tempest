@@ -165,7 +165,7 @@ func (r *Registry) InstallProcess(ctx context.Context, o ProcessOptions) error {
 	offered := map[string]bool{}
 	for _, c := range o.Capabilities {
 		switch c {
-		case "read", "commit", "memo", "output", "call_tool", "next", "environment_read":
+		case "read", "commit", "memo", "output", "call_tool", "next", "environment_read", "tasks":
 			offered[c] = true
 		default:
 			return fmt.Errorf("unsupported host capability %q", c)
@@ -270,6 +270,64 @@ func (r *Registry) InstallProcess(ctx context.Context, o ProcessOptions) error {
 				return out, p.rejectResult(errors.New("wrapper response missing content"))
 			}
 			return out, err
+		}
+	}
+	for i := range d.Tasks {
+		name := d.Tasks[i].Name
+		if len(d.Tasks[i].Migrations) > 0 {
+			versions := append([]uint32(nil), d.Tasks[i].Migrations...)
+			d.Tasks[i].Migrate = func(from uint32, checkpoint json.RawMessage) (json.RawMessage, error) {
+				supported := false
+				for _, version := range versions {
+					supported = supported || from == version
+				}
+				if !supported {
+					return nil, errors.New("task migration source version unsupported")
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), p.timeout)
+				defer cancel()
+				var result struct {
+					Checkpoint json.RawMessage `json:"checkpoint"`
+				}
+				// Pure transforms get no invocation token or callback grant.
+				err := p.conn.Call(ctx, methodPrefix+"tasks/step", struct {
+					Name    string `json:"name"`
+					Migrate struct {
+						FromVersion uint32          `json:"fromVersion"`
+						Checkpoint  json.RawMessage `json:"checkpoint"`
+					} `json:"migrate"`
+				}{Name: name, Migrate: struct {
+					FromVersion uint32          `json:"fromVersion"`
+					Checkpoint  json.RawMessage `json:"checkpoint"`
+				}{from, checkpoint}}, &result)
+				if err != nil {
+					return nil, err
+				}
+				if !json.Valid(result.Checkpoint) {
+					return nil, p.rejectResult(errors.New("migration checkpoint missing"))
+				}
+				return result.Checkpoint, nil
+			}
+		}
+		step := func(ctx context.Context, task Task, inv Invocation, abort bool) (TaskDecision, error) {
+			var decision TaskDecision
+			raw, err := p.call(ctx, "tasks/step", handlerRequest{Name: name, Task: &task, Abort: abort, Context: inv.Identity()}, processGrant{invocation: inv, view: inv})
+			if err != nil {
+				return decision, err
+			}
+			if err = json.Unmarshal(raw, &decision); err != nil {
+				return decision, p.rejectResult(err)
+			}
+			if decision.Kind == "" {
+				return decision, p.rejectResult(errors.New("task response missing decision"))
+			}
+			return decision, nil
+		}
+		d.Tasks[i].Run = func(ctx context.Context, task Task, inv Invocation) (TaskDecision, error) {
+			return step(ctx, task, inv, false)
+		}
+		d.Tasks[i].Abort = func(ctx context.Context, task Task, inv Invocation) (TaskDecision, error) {
+			return step(ctx, task, inv, true)
 		}
 	}
 	d.Close = p.close

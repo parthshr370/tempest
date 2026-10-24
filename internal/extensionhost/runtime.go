@@ -45,6 +45,7 @@ type Runtime struct {
 	CallTool      func(context.Context, string, string, json.RawMessage) (extension.Result, error)
 	AllowTool     func(string, extension.EffectClass) bool
 	ExecuteTool   func(context.Context, []agent.AgentTool, types.ContentBlock) (agent.AgentToolResult, error)
+	TaskOutput    func(context.Context, extension.Task, extension.OutputChunk) error
 	resumeMu      sync.Mutex
 	nestedMu      sync.Mutex
 	nestedCalls   map[string]*nestedCall

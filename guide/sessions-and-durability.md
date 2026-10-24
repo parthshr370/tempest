@@ -166,6 +166,10 @@ next model call. A budget-stopped run therefore ends on a complete turn, and
 | `-max-cost USD` | The summed cost of the run's model calls. When the model's price is unknown and its route does not report billed cost, the run is refused at startup: an unknown price is not a zero price. On a billed-cost route, a call that comes back without a cost stops the run with that error. |
 | `-max-wall-time D` | Elapsed time, as a Go duration such as `10m`. |
 
+At the turn cap, the run checks for pending foreground tasks and job deliveries
+without resuming more task phases. An empty task graph doesn't turn a clean final
+answer into `max_turns`.
+
 ### Repeated failures
 
 A failed tool call sent again unchanged fails the same way, so the loop watches for

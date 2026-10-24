@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -16,8 +17,8 @@ func TestSelectActive(t *testing.T) {
 	dir := t.TempDir()
 	all := tools.AllTools(dir, tools.ToolsOptions{})
 	active := SelectActive(all, nil, nil, "")
-	if len(active) != 11 {
-		t.Fatalf("all active = %d", len(active))
+	if len(active) != len(all) || !slices.IsSorted(ToolNames(active)) {
+		t.Fatalf("all active = %s, registry size = %d", names(active), len(all))
 	}
 	if active := SelectActive(all, []string{}, nil, ""); len(active) != 0 {
 		t.Fatalf("explicit empty allowlist activated %d tools", len(active))
@@ -27,8 +28,8 @@ func TestSelectActive(t *testing.T) {
 		t.Fatalf("readonly = %s", names(readonly))
 	}
 	excluded := SelectActive(all, nil, []string{"bash", "write"}, "")
-	if len(excluded) != 9 {
-		t.Fatalf("excluded = %d", len(excluded))
+	if len(excluded) != len(all)-2 || slices.Contains(ToolNames(excluded), "bash") || slices.Contains(ToolNames(excluded), "write") {
+		t.Fatalf("excluded = %s", names(excluded))
 	}
 }
 
@@ -130,7 +131,7 @@ func TestAppendCapabilitiesNamesChildTools(t *testing.T) {
 	for _, want := range []string{
 		"Child prompt.",
 		"<available_tools>",
-		"- read: Read files (several in one call with paths), directories, archive members, office documents, JSON queries and internal URLs",
+		"- read: " + BuildToolSnippets(active)["read"],
 		"- custom_agent: custom_agent",
 	} {
 		if !strings.Contains(got, want) {
