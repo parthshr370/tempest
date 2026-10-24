@@ -56,8 +56,11 @@ func validateService(spec *work.BashSpec) (*service, error) {
 		return nil, fmt.Errorf("%w: ready_timeout_ms must be between 1 and %d", ErrInvalidInput, work.MaxReadyTimeoutMS)
 	}
 	if spec.ReadyLog == "" && spec.ReadyPort == 0 {
+		// A deadline with nothing to wait for has no meaning. Ignoring it would
+		// hide the caller's belief that the call blocks; inventing "wait for the
+		// job to exit" would duplicate wait. Say which path fits instead.
 		if spec.ReadyTimeoutMS != 0 {
-			return nil, fmt.Errorf("%w: ready_timeout_ms needs ready_log or ready_port", ErrInvalidInput)
+			return nil, fmt.Errorf("%w: ready_timeout_ms is the deadline for ready_log (a regex an output line must match) or ready_port (a TCP port that must accept connections), and neither is set. To wait for the job to finish, drop ready_timeout_ms and call wait with the job's name or id once bash returns its handle", ErrInvalidInput)
 		}
 		return nil, nil
 	}
@@ -105,7 +108,7 @@ func (manager *Manager) JobByName(ctx context.Context, name string) (work.Job, e
 		}
 	}
 	if found == nil {
-		return work.Job{}, fmt.Errorf("%w: no job named %q in this session", ErrJobNotFound, name)
+		return work.Job{}, manager.notFoundLocked(fmt.Sprintf("no job named %q", name))
 	}
 	return cloneJob(*found), nil
 }

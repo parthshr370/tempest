@@ -230,6 +230,10 @@ const (
 	// StopOutputInvalid: the final answer still failed the run's output
 	// schema after the correction turn. [RunResult.Err] carries why.
 	StopOutputInvalid StopReason = "output_invalid"
+	// StopRepeatedFailure: the model sent the same tool call, with the same
+	// arguments, until it had failed with the same error RepeatedFailureLimit
+	// times in a row. [RunResult.Err] names the call and its error.
+	StopRepeatedFailure StopReason = "repeated_failure"
 )
 
 // RunResult is how one run ended. Prompt and Continue return it, and the run's
@@ -239,7 +243,8 @@ type RunResult struct {
 	RunID      string
 	ElapsedMS  int64
 	StopReason StopReason
-	// Err is set when StopReason is StopError or StopOutputInvalid.
+	// Err is set when StopReason is StopError, StopOutputInvalid or
+	// StopRepeatedFailure.
 	Err error
 	// Turns counts model calls made in this run.
 	Turns int

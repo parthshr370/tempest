@@ -2,7 +2,7 @@
 
 ## The problem
 
-The harness streams model output through a chain of goroutines: the provider decodes SSE, the retry decorator buffers and forwards, the agent loop folds the result. Every link shares pointer-typed data. If goroutines operate on the same memory without synchronization, the result is a data race — nondeterministic, untestable without `-race`, and capable of producing silently wrong output that passes visual inspection.
+The harness streams model output through a chain of goroutines: the provider decodes SSE, the retry decorator forwards, the agent loop folds the result. Every link shares pointer-typed data. If goroutines operate on the same memory without synchronization, the result is a data race — nondeterministic, untestable without `-race`, and capable of producing silently wrong output that passes visual inspection.
 
 We shipped one. The retry decorator received a `StreamEvent` whose `Partial` field pointed into the provider's live `AssistantBuilder`. The provider goroutine was still mutating that builder (appending content blocks, writing text deltas) while the retry decorator read `Partial` to build its logical snapshot. The Go race detector fired at `internal/retry/stream.go` `produce` / `forward`. The bug was not hypothetical: on a fast dispatch goroutine and an unbounded queue, the read and write genuinely overlapped.
 
@@ -14,7 +14,7 @@ The problem is not "retry is broken." The problem is that the `StreamEvent` type
 
 `internal/engine/stream/stream.go` models a generic `Stream[T, R]` as an **unbounded in-memory queue** drained by a dedicated `dispatch` goroutine. The producer calls `Push`; the queue grows via `append`. The `dispatch` goroutine pops from the front and sends on `s.events`. Consumers call `Events()` to get `<-chan T` or `Result(ctx)` to block for the terminal value.
 
-**Why unbounded?** Module 12 (idiomatic Go vs TypeScript) says "slow subscribers must have an explicit policy: apply backpressure, disconnect, or use a bounded persisted replay. Never allow unbounded queues." The frozen engine predates this rule and uses an unbounded queue. The retry layer adds its own independent 64-event bound (`internal/retry/stream.go:13`). Changing the frozen stream queue is out of scope.
+**Why unbounded?** Module 12 (idiomatic Go vs TypeScript) says "slow subscribers must have an explicit policy: apply backpressure, disconnect, or use a bounded persisted replay. Never allow unbounded queues." The frozen engine predates this rule and uses an unbounded queue. The retry layer adds no second queue and no event buffer: it forwards each event as it arrives (`internal/retry/stream.go:293-302`) and keeps only the current attempt's logical message. Changing the frozen stream queue is out of scope.
 
 **Why a dedicated dispatch goroutine?** The producer's `Push` never blocks on a slow consumer. The dispatch goroutine is the single sequencer: it drains the queue under a mutex, releases the lock, then sends. This means `Push` latency is `O(1)` append + signal, and consumers see events in order. The trade-off: the dispatch goroutine can run **ahead** of the producer, especially when the queue is empty. The producer pushes, releases the lock, and continues; the dispatch goroutine wakes, pops, and sends — all while the producer is already building the next event. This is the structural condition that made the `Partial` race possible.
 
@@ -32,11 +32,11 @@ The problem is not "retry is broken." The problem is that the `StreamEvent` type
 
 Here is the chain that produced the race:
 
-1. The provider (e.g., Anthropic) calls `foldContentBlockStart` at `internal/provider/anthropic/events.go:177-207`. This function appends a `ContentBlock` to `state.Output.Content` (the live `AssistantBuilder`'s message) and returns `[]types.StreamEvent{{Type: types.EvThinkingStart, ContentIndex: contentIndex, Partial: output}}`. The `Partial` field **points directly at `state.Output`** — the same `*AssistantMessage` the provider continues mutating.
+1. The provider (e.g., Anthropic) calls `foldContentBlockStart` at `internal/provider/anthropic/events.go:184-214`. This function appends a `ContentBlock` to `state.Output.Content` (the live `AssistantBuilder`'s message) and returns `[]types.StreamEvent{{Type: types.EvThinkingStart, ContentIndex: contentIndex, Partial: output}}`. The `Partial` field **points directly at `state.Output`** — the same `*AssistantMessage` the provider continues mutating.
 
 2. The provider pushes this event into the `AssistantStream`. The stream's `dispatch` goroutine dequeues it and sends it on the events channel.
 
-3. The retry decorator's `produce` goroutine receives the event. At `internal/retry/stream.go:103`, it calls `copyEvent(event)`, which at line 254 does `event.Partial = nil`. **But before the fix**, the original code read `event.Partial` to inspect content for observability classification.
+3. The retry decorator's `produce` goroutine receives the event. At `internal/retry/stream.go:121`, it calls `copyEvent(event)`, which at line 249 does `event.Partial = nil`. **But before the fix**, the original code read `event.Partial` to decide whether the attempt had produced output.
 
 4. Meanwhile, the provider goroutine is already processing the next SSE frame — maybe a `content_block_delta` that mutates `state.Output.Content[0].Thinking`. The `Partial` pointer the retry decorator held **now points to memory being written by another goroutine**.
 
@@ -62,9 +62,9 @@ The dispatch goroutine's ability to run ahead on the unbounded queue means there
 
 ### 4. The fix: never read `Partial`; rebuild from owned fields
 
-The fix has two parts:
+The fix has three parts:
 
-**Part A — `copyEvent` nils `Partial`** (`internal/retry/stream.go:253-254`):
+**Part A — `copyEvent` nils `Partial`** (`internal/retry/stream.go:248-249`):
 
 ```go
 func copyEvent(event types.StreamEvent) types.StreamEvent {
@@ -78,7 +78,7 @@ func copyEvent(event types.StreamEvent) types.StreamEvent {
 
 This is a defensive cut: the pointer is nilled before any code path can read it. If someone later adds a read of `event.Partial` between `copyEvent` and `forward`, they get nil, not a race.
 
-**Part B — `forward` rebuilds `Partial` from the Retrier's own builder** (`internal/retry/stream.go:302-311`):
+**Part B — `forward` rebuilds `Partial` from the Retrier's own builder** (`internal/retry/stream.go:292-302`):
 
 ```go
 func forward(output *stream.AssistantStream, logical *types.AssistantBuilder, event types.StreamEvent) {
@@ -89,31 +89,15 @@ func forward(output *stream.AssistantStream, logical *types.AssistantBuilder, ev
 }
 ```
 
-The Retrier owns its own `logical` `AssistantBuilder` (`internal/retry/stream.go:57`). `Fold` reads only the **owned** fields of the event — `Delta`, `Content`, `ToolCall`, `ContentIndex` — never `Partial`. After folding, `logical.Message()` returns the accumulated message. `cloneMessagePtr` deep-copies it (content blocks, argument bytes) into a fresh `*AssistantMessage`. This snapshot becomes the event's new `Partial`, owned by the output stream, not by any provider goroutine.
+The Retrier owns its own `logical` `AssistantBuilder` (`internal/retry/stream.go:60`). `Fold` reads only the **owned** fields of the event — `Delta`, `Content`, `ToolCall`, `ContentIndex` — never `Partial`. After folding, `logical.Message()` returns the accumulated message. `cloneMessagePtr` deep-copies it (content blocks, argument bytes) into a fresh `*AssistantMessage`. This snapshot becomes the event's new `Partial`, owned by the output stream, not by any provider goroutine.
 
-**Part C — `eventObservable` checks only owned fields** (`internal/retry/stream.go:317-327`):
+**Part C — no retry decision reads event content at all.** `forward` (`internal/retry/stream.go:292-302`) is the only place content events from an attempt enter the output stream, and it folds owned fields only. Whether an attempt is retried depends solely on the classification of its terminal event, computed in `forwardAttempt` (`internal/retry/stream.go:126-134`). Terminal events (`EvDone`, `EvError`) carry their own `Message`/`Err` fields, owned copies, and those are safe to inspect.
 
-```go
-func eventObservable(event types.StreamEvent) bool {
-    switch event.Type {
-    case types.EvTextDelta, types.EvThinkingDelta:
-        return event.Delta != ""
-    case types.EvTextEnd, types.EvThinkingEnd:
-        return event.Content != ""
-    case types.EvToolCallStart, types.EvToolCallDelta, types.EvToolCallEnd:
-        return true
-    }
-    return eventHasObservableOutput(event)
-}
-```
+### 5. The remaining trade-off: `redacted_thinking` in the streamed `Partial`
 
-The comment at `eventHasObservableOutput` (`internal/retry/stream.go:330-332`) explicitly states: "A non-terminal event's Partial is a live provider-owned pointer and must not be read." Terminal events (`EvDone`, `EvError`) carry their own `Message`/`Err` fields — owned copies — and those are safe to inspect.
+The rule is absolute: no consumer reads `Partial`. One narrow, cosmetic gap remains in what the streamed snapshot shows.
 
-### 5. The unresolved trade-off: `redacted_thinking` loses START observability
-
-The race-free revert is the correct V1 call, but it is **not** a fully resolved ownership contract. Here is the concrete counterexample.
-
-At `internal/provider/anthropic/events.go:189-192`, the Anthropic provider emits `EvThinkingStart` for `redacted_thinking`:
+At `internal/provider/anthropic/events.go:196-197`, the Anthropic provider emits `EvThinkingStart` for `redacted_thinking`:
 
 ```go
 case "redacted_thinking":
@@ -125,33 +109,33 @@ case "redacted_thinking":
     return []types.StreamEvent{{Type: types.EvThinkingStart, ContentIndex: contentIndex, Partial: output}}
 ```
 
-This event's **only** non-empty observable content is the `"[Reasoning redacted]"` string, which lives in `Partial.Content[contentIndex].Thinking`. The event's owned fields (`Delta`, `Content`, `ToolCall`) are all empty — it is a start event, not a delta or end. After the race-free revert, the retry decorator's `eventObservable` sees an `EvThinkingStart` with no owned content and classifies it as non-observable. If a retryable error follows before any delta, the buffered start event is discarded.
+This event's **only** non-empty content is the `"[Reasoning redacted]"` string, which lives in `Partial.Content[contentIndex].Thinking`. The event's owned fields (`Delta`, `Content`, `ToolCall`) are all empty: it is a start event, not a delta or end. `forward` folds that event into the retrier's builder, which creates an empty thinking block, and attaches the rebuilt snapshot. The streamed start event therefore carries no redacted marker.
 
-**What is actually lost?** The `redacted_thinking` start event is not replayed. However, the terminal `EvDone.Message` carries the full accumulated `AssistantMessage`, including the `"[Reasoning redacted]"` thinking block. The content is preserved at **message** granularity; it is only the **start** event's `Partial` snapshot that disappears. No user-visible corruption or duplication occurs.
+**What is actually lost?** Only the streamed snapshot of that one start event. The terminal `EvDone.Message` carries the full accumulated `AssistantMessage`, including the `"[Reasoning redacted]"` thinking block, and `copyEvent` deep-copies it. The content is preserved at **message** granularity. No user-visible corruption or duplication occurs. Retry no longer turns this into a lost event either: an attempt that fails is discarded as a whole message through `EvRetry`, never replayed event by event.
 
 **Why isn't this a simple fix?** There are two worse alternatives:
 
-1. **Read the live `Partial`** — the proven race. Non-negotiable.
-2. **Edit the frozen provider** to emit a delta event with owned content for `redacted_thinking` — requires a frozen-path exception. The design explicitly defers this: the frozen constraint stands for V1.
+1. **Read the live `Partial`**: the proven race, non-negotiable.
+2. **Edit the frozen provider** to emit a delta event with owned content for `redacted_thinking`: requires a frozen-path exception. The design explicitly defers this; the frozen constraint stands for V1.
 
-The **proper long-term fix** is an immutable event boundary at the producer: the provider should emit events whose `Partial` is an owned copy — a snapshot taken before `Push`, not a live pointer into the builder the provider continues to mutate. This would give the consumer a race-free `Partial` it can safely read for observability without requiring the consumer to rebuild from owned fields. Until that boundary exists, the race-free revert is the correct call: never read `Partial`; rebuild from owned fields.
+The **proper long-term fix** is an immutable event boundary at the producer: the provider should emit events whose `Partial` is an owned copy, a snapshot taken before `Push`, not a live pointer into the builder the provider continues to mutate. This would give the consumer a race-free `Partial` it can safely read. Until that boundary exists, the rule stays: never read `Partial`; rebuild from owned fields.
 
 ### 6. Goroutine ownership discipline
 
 The harness follows a one-writer-per-builder rule:
 
 - The **provider** owns its `foldState.Output` (`*AssistantMessage`). It writes content blocks, deltas, and usage into it. It is the sole writer.
-- The **retry decorator** owns its `logical` `*AssistantBuilder`. No other goroutine touches it. `forward` folds events into it and snapshots the result.
+- The **retry decorator** owns its `logical` `*AssistantBuilder`. No other goroutine touches it. `forward` folds events into it and snapshots the result. `EvRetry` folds into the same builder as a reset (`internal/engine/types/stream.go:114-115`), so the next attempt starts from an empty message.
 - The **agent loop** receives events and folds them into its own builder. It never reads a provider's internal state.
 
-Consumers get **clones, not references**: `cloneMessage` deep-copies `AssistantMessage` including its `Content` slice and each block's `Arguments` bytes (`internal/retry/stream.go:264-294`). A consumer mutating its clone cannot affect the producer.
+Consumers get **clones, not references**: `cloneMessage` deep-copies `AssistantMessage` including its `Content` slice and each block's `Arguments` bytes (`internal/retry/stream.go:260-290`). A consumer mutating its clone cannot affect the producer.
 
 ### 7. Context cancellation as the universal stop signal
 
 Every blocking operation in the retry path selects on `ctx.Done()`:
 
-- **Before the first attempt** (`internal/retry/stream.go:53-56`): if already canceled, push a `CodeCanceled` terminal and return.
-- **During attempt drain** (`internal/retry/stream.go:82-85`): `select` between `attemptStream.Events()` and `ctx.Done()`. The retry producer terminates even if a provider ignores cancellation and leaves its event channel open.
+- **Before the first attempt** (`internal/retry/stream.go:62-65`): if already canceled, push a `CodeCanceled` terminal and return.
+- **During attempt drain** (`internal/retry/stream.go:108-112`): `select` between `attemptStream.Events()` and `ctx.Done()`. The retry producer terminates even if a provider ignores cancellation and leaves its event channel open.
 - **During sleep** (`internal/retry/config.go:63-68`): `timerSleeper.Sleep` selects between `timer.C` and `ctx.Done()`. On cancellation, it returns `ctx.Err()` immediately. The deferred cleanup stops and drains the timer channel to prevent a goroutine leak.
 
 The `timerSleeper` drain pattern (`internal/retry/config.go:55-61`) is worth studying:
@@ -253,7 +237,7 @@ Validates `next != nil` and `cfg.Validate()` before returning a retrier. Accept-
 ```go
 func (r *Retrier) Stream(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream
 ```
-Returns an output stream immediately. Spawns one producer goroutine that manages attempts, buffering, and forwarding. The caller receives events through the returned stream.
+Returns an output stream immediately. Spawns one producer goroutine that manages attempts and forwarding. The caller receives events through the returned stream.
 
 ### Config dependencies
 
@@ -288,12 +272,22 @@ Deep-copies `Message`, `Err`, and `ToolCall`. Nils `Partial`. The caller receive
 ```go
 func forward(output *stream.AssistantStream, logical *types.AssistantBuilder, event types.StreamEvent)
 ```
-Folds event's owned fields into `logical`, snapshots the builder message, assigns to `event.Partial`, and pushes. The single point where non-terminal events enter the output stream.
+Folds event's owned fields into `logical`, snapshots the builder message, assigns to `event.Partial`, and pushes. The single point where an attempt's content events enter the output stream.
 
 ```go
-func eventObservable(event types.StreamEvent) bool
+func (r *Retrier) forwardAttempt(...) (types.StreamEvent, *Error)
 ```
-Reports whether the event carries observable output. Checks owned `Delta`, `Content`, `ToolCall` fields only; never reads `Partial`.
+Drains one attempt, forwards its non-terminal events, and returns the attempt's terminal error event plus its classification. A nil classification means a terminal event was already pushed (success or cancellation).
+
+```go
+func (r *Retrier) plan(attempt int, classified *Error) (time.Duration, *Error)
+```
+Returns the backoff before the next attempt, or the terminal error that ends the stream (non-retryable, exhausted, or a delay over `MaxDelay`).
+
+```go
+func attemptMessage(model types.Model, logical *types.AssistantBuilder, providerMessage *types.AssistantMessage, classified *Error) *types.AssistantMessage
+```
+Builds the discarded attempt's message for `EvRetry`: the provider's terminal message or the forwarded content, marked as an error with the classified code and message.
 
 ## How it works
 
@@ -330,17 +324,20 @@ Retrier.Stream(ctx, model, c, opts)
 Inside `produce`:
 
 1. Check `ctx.Err()`. If canceled, push `CodeCanceled` and return.
-2. Create `logical := NewAssistantBuilder(...)` — the Retrier-owned accumulator.
+2. Create `logical := NewAssistantBuilder(...)`, the Retrier-owned accumulator.
 3. **Attempt loop:**
    - Clone options, install `OnResponse` capture callback.
-   - Call `next.Stream(ctx, model, c, attemptOpts)` — the actual provider call.
-   - **Drain loop** (`select` on `attemptStream.Events()` and `ctx.Done()`):
+   - Call `next.Stream(ctx, model, c, attemptOpts)`, the actual provider call.
+   - **Drain loop** in `forwardAttempt` (`select` on `attemptStream.Events()` and `ctx.Done()`):
      - Receive event → `copyEvent(event)` (nils `Partial`, deep-copies owned fields).
-     - **`EvDone`**: flush buffer, push done, return.
-     - **`EvError`**: if committed or has observable output, flush and push error; else classify and retry.
-     - **Non-terminal**: if observable or buffer full → commit (flush buffer, set `committed=true`). If committed → `forward(output, logical, event)`. Else → `buffer = append(buffer, event)`.
-   - On retryable failure: compute delay, sleep via `Sleeper`, continue loop.
-   - On terminal failure: flush buffer, push terminal event, return.
+     - **`EvDone`**: push it downstream, report success.
+     - **`EvError`**: classify; report the event as the attempt's terminal failure.
+     - **Non-terminal**: `forward(output, logical, event)` immediately.
+     - **Channel closed without a terminal event**: synthesize a retryable `CodeStreamInterrupted`.
+   - If there was no classification (done or canceled), return.
+   - Build the discarded message (`attemptMessage`), ask `plan` for a delay or a terminal error.
+   - On terminal failure: push the provider's error event unchanged, or `pushTerminal`.
+   - On retry: push `EvRetry` (discarded message, attempt ordinal, delay), reset `logical`, sleep via `Sleeper`, continue the loop.
 
 ### Before/After: the `Partial` race fix
 
@@ -354,15 +351,15 @@ Inside `produce`:
 
 **What failed:** `StreamEvent.Partial` is a `*AssistantMessage` pointing into the provider's `foldState.Output`. The provider goroutine mutates it (appending blocks, writing deltas, accumulating thinking text) after pushing the event. A consumer receiving the event and reading `Partial` races with the provider's next write. The Go race detector confirms this at `internal/retry/stream.go` `produce`/`forward`.
 
-**Root cause:** The `StreamEvent` type has no ownership contract. Its doc comment at `internal/engine/types/stream.go:22-24` says "Partial (a live pointer to the builder's message — read-only until the next event)" but this is a **convention, not a synchronization mechanism**. "Read-only until the next event" assumes the consumer reads before the producer emits the next event — an assumption the unbounded dispatch queue does not guarantee.
+**Root cause:** The `StreamEvent` type has no ownership contract. Its doc comment at `internal/engine/types/stream.go:29-35` says "Partial (a live pointer to the builder's message — read-only until the next event)" but this is a **convention, not a synchronization mechanism**. "Read-only until the next event" assumes the consumer reads before the producer emits the next event, an assumption the unbounded dispatch queue does not guarantee.
 
-**Fix:** Never read `Partial`. `copyEvent` nils it. `forward` rebuilds from owned fields. Observability checks use `Delta`, `Content`, `ToolCall` only.
+**Fix:** Never read `Partial`. `copyEvent` nils it. `forward` rebuilds from owned fields. Retry decisions come from the attempt's terminal event only.
 
-**Residual trade-off:** `redacted_thinking` emits `EvThinkingStart` whose only content lives in `Partial`. The race-free revert does not replay this start event on retry. Content is preserved at message granularity (terminal `EvDone.Message`). The proper fix is an immutable event boundary at the producer, deferred per the frozen constraint.
+**Residual trade-off:** `redacted_thinking` emits `EvThinkingStart` whose only content lives in `Partial`, so the streamed snapshot of that start event lacks the redacted marker while the terminal `EvDone.Message` retains it. The proper fix is an immutable event boundary at the producer, deferred per the frozen constraint.
 
 ### Unbounded queue (known limitation)
 
-The frozen `engine/stream.Stream` uses an unbounded in-memory queue (`internal/engine/stream/stream.go:65`). A fast producer with a blocked consumer can exhaust memory. Changing this is out of scope for the retry layer. The retry decorator's own buffer is independently capped at 64 events (`internal/retry/stream.go:13`).
+The frozen `engine/stream.Stream` uses an unbounded in-memory queue (`internal/engine/stream/stream.go:65`). A fast producer with a blocked consumer can exhaust memory. Changing this is out of scope for the retry layer. The retry layer keeps no independent event queue: it holds one attempt's event at a time and forwards it (`internal/retry/stream.go:293-302`).
 
 ### dispatch goroutine lifecycle
 
@@ -378,19 +375,19 @@ The frozen `engine/stream.Stream` uses an unbounded in-memory queue (`internal/e
 
 ### Cancellation during attempt drain
 
-The `select` at `internal/retry/stream.go:82-85` includes `ctx.Done()`. If the context is canceled while the producer is blocked waiting for the next event, the producer pushes `CodeCanceled` and returns. It does not leak behind an unresponsive provider.
+The `select` at `internal/retry/stream.go:108-112` includes `ctx.Done()`. If the context is canceled while the producer is blocked waiting for the next event, the producer pushes `CodeCanceled` and returns. It does not leak behind an unresponsive provider.
 
 ### Shared RNG with mutex
 
 `lockedRandom` protects a single `*rand.Rand` shared across concurrent role streams. Without the mutex, concurrent `Float64()` calls race on the PCG generator's internal state. Jitter values could become correlated or deterministic in ways the race detector does not catch (the race is on internal fields, not on the returned value). The mutex prevents both the data race and ensures correct random sequences.
 
-### Buffer cap at 64 events
+### Retry after output: `EvRetry` and the discarded message
 
-If a provider emits 64 structural events (start/delta/end triples for many blocks) without any observable output, the retry decorator conservatively commits (`internal/retry/stream.go:122-126`). This bounds memory and disables replay. The number 64 is arbitrary but sufficient: a typical streaming response has fewer than 20 structural events before the first text delta.
+`produce` may re-send a request after events from the failed attempt were already forwarded (`internal/retry/stream.go:78-95`). It first builds the discarded attempt's message (`attemptMessage` at `stream.go:164-180`): the provider's terminal message when it sent one (with partial content and reported usage), otherwise the content forwarded so far. It pushes `types.EvRetry` with that message in `Err`, the ordinal in `Attempt`, and the delay in `RetryDelay`, and folds the event into the retrier's builder, which resets the message (`internal/engine/types/stream.go:114-115`). The agent loop turns `EvRetry` into a `message_end` for the errored attempt and appends it to the run's messages through `discarded` (`internal/agent/loop.go:796-813`, `internal/agent/loop.go:452-458`), so the journal keeps a metered record of the failed call. The next attempt's `EvStart` opens a fresh message. Nothing acts on the discarded attempt: tool calls run only after the final message, and transform, estimation and compaction skip errored assistant messages.
 
 ### Events-after-close
 
-`Push` drops events when `s.closed` is true (`internal/retry/stream.go:61-62`). The provider may push events after the stream is ended (e.g., the provider's SSE reader finishes after the terminal event was already pushed by a timeout). These are silently discarded.
+`Push` drops events when `s.closed` is true (`internal/engine/stream/stream.go:58-62`). The provider may push events after the stream is ended (e.g., the provider's SSE reader finishes after the terminal event was already pushed by a timeout). These are silently discarded.
 
 ## TypeScript to Go
 
@@ -428,7 +425,8 @@ Both TypeScript and Go support dependency injection, but Go makes it structural:
 | `internal/engine/types/stream.go` | `StreamEvent`, `StreamEventType` (all `Ev*` constants), `AssistantBuilder`, `Fold`, `Message` |
 | `internal/engine/types/message.go` | `AssistantMessage` (struct fields including `Content []ContentBlock`) |
 | `internal/engine/types/content.go` | `ContentBlock`, `BlockType` constants |
-| `internal/retry/stream.go` | `Retrier`, `Streamer`, `StreamFunc`, `New`, `Stream`, `produce`, `copyEvent`, `forward`, `flush`, `cloneMessage`, `cloneBlocks`, `cloneBlock`, `cloneMessagePtr`, `eventObservable`, `eventHasObservableOutput`, `terminalFields` |
+| `internal/retry/stream.go` | `Retrier`, `Streamer`, `StreamFunc`, `New`, `Stream`, `produce`, `forwardAttempt`, `plan`, `attemptMessage`, `copyEvent`, `forward`, `cloneMessage`, `cloneBlocks`, `cloneBlock`, `cloneMessagePtr` |
+| `internal/provider/base/watchdog.go` | `StreamTimeouts`, `StreamTimeoutsFromEnv`, `Watchdog`, `WatchStream`, `Event`, `Output`, `Stop`, `Stalled`, `Err`, `run`, `bound` |
 | `internal/retry/config.go` | `Config`, `Clock`, `Sleeper`, `Random`, `timerSleeper`, `lockedRandom`, `DefaultConfig`, `Validate` |
 | `internal/provider/anthropic/events.go` | `foldAnthropicEvent`, `foldContentBlockStart`, `foldState` (the live builder the race originated in) |
 | `12-idiomatic-go-vs-typescript.md` | Design rules for channels and streaming ownership, state and concurrency, errors, and race testing |

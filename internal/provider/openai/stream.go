@@ -16,13 +16,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
+	"go.harness.dev/harness/internal/retry"
 )
 
 // Stream starts an OpenAI chat-completions request and returns an AssistantStream
@@ -71,11 +71,8 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	streamCtx, cancel := context.WithCancel(parent)
 	defer cancel()
-	activity := make(chan struct{}, 1)
-	done := make(chan struct{})
-	var idleFired atomic.Bool
-	go watchIdle(done, activity, cancel, &idleFired)
-	defer close(done)
+	watchdog := base.WatchStream(cancel, streamTimeouts)
+	defer watchdog.Stop()
 
 	if opts == nil {
 		opts = &Options{}
@@ -130,7 +127,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -153,15 +150,13 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		ToolCallByID:    map[string]*openAIFoldBlock{},
 	}
 
-	err = iterateOpenAIEvents(reqCtx, resp.Body, func() {
-		select {
-		case activity <- struct{}{}:
-		default:
-		}
-	}, func(chunk *openAIStreamChunk) error {
+	err = iterateOpenAIEvents(reqCtx, resp.Body, watchdog.Event, func(chunk *openAIStreamChunk) error {
 		events, err := foldOpenAIChunk(chunk, state, model)
 		if err != nil {
 			return err
+		}
+		if len(events) > 0 {
+			watchdog.Output()
 		}
 		for _, ev := range events {
 			s.Push(ev)
@@ -169,15 +164,15 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		return nil
 	})
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 
 	// A clean EOF that never delivered a finish_reason is a truncated response
 	// (TS throws "Stream ended without finish_reason", openai-completions.ts:453-455).
 	// Reporting it as a successful done would hide the truncation.
-	if !state.HasFinishReason && parent.Err() == nil && !idleFired.Load() {
-		pushError(s, output, StreamTruncated(errors.New("stream ended without finish_reason")), false)
+	if !state.HasFinishReason && parent.Err() == nil && !watchdog.Stalled() {
+		pushError(s, output, &retry.Error{Code: retry.CodeStreamInterrupted, Message: "stream ended without finish_reason", Retryable: true}, false)
 		return
 	}
 
@@ -225,43 +220,6 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 	}
 	base.ApplyError(output, err)
 	s.Push(types.StreamEvent{Type: types.EvError, Reason: output.StopReason, Err: output})
-}
-
-// streamError picks the most meaningful error: a parent cancellation wins, an idle
-// timeout is wrapped as truncated, otherwise the raw transport error is returned.
-func streamError(parentErr error, err error, idle bool) error {
-	if parentErr != nil {
-		return parentErr
-	}
-	if idle {
-		return StreamTruncated(fmt.Errorf("stream idle for %s (no events); aborted to avoid a wedge: %w", streamIdleTimeout, err))
-	}
-	return err
-}
-
-// watchIdle cancels the request if no activity arrives within streamIdleTimeout,
-// setting idleFired so the caller can distinguish an idle abort from a real error.
-func watchIdle(done <-chan struct{}, activity <-chan struct{}, cancel context.CancelFunc, idleFired *atomic.Bool) {
-	idle := time.NewTimer(streamIdleTimeout)
-	defer idle.Stop()
-	for {
-		select {
-		case <-activity:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(streamIdleTimeout)
-		case <-idle.C:
-			idleFired.Store(true)
-			cancel()
-			return
-		case <-done:
-			return
-		}
-	}
 }
 
 func chatCompletionsURL(baseURL string) string {

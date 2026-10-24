@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +62,13 @@ func testStream(events ...types.StreamEvent) *stream.AssistantStream {
 func retryError(message string) types.StreamEvent {
 	return types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{ErrorMessage: message, StopReason: types.StopError}}
 }
+func eventTypes(events []types.StreamEvent) string {
+	names := make([]string, len(events))
+	for i, event := range events {
+		names[i] = string(event.Type)
+	}
+	return strings.Join(names, " ")
+}
 func collect(s *stream.AssistantStream) []types.StreamEvent {
 	var result []types.StreamEvent
 	for event := range s.Events() {
@@ -110,7 +118,7 @@ func TestHintParsingAndClassificationPrecedence(t *testing.T) {
 	}
 }
 
-func TestRetryAttemptsHintsAndNoLeakedStructuralEvents(t *testing.T) {
+func TestRetryAttemptsHintsAndDiscardedAttempt(t *testing.T) {
 	first := testStream(types.StreamEvent{Type: types.EvStart}, retryError("connection reset"))
 	second := testStream(types.StreamEvent{Type: types.EvStart}, types.StreamEvent{Type: types.EvTextStart, ContentIndex: 0}, types.StreamEvent{Type: types.EvTextDelta, ContentIndex: 0, Delta: "ok"}, types.StreamEvent{Type: types.EvDone, Reason: types.StopStop, Message: &types.AssistantMessage{StopReason: types.StopStop}})
 	source := &fakeStreamer{streams: []*stream.AssistantStream{first, second}}
@@ -123,13 +131,14 @@ func TestRetryAttemptsHintsAndNoLeakedStructuralEvents(t *testing.T) {
 	if source.calls != 2 || len(sleeper.delays) != 1 || sleeper.delays[0] != 500*time.Millisecond {
 		t.Fatalf("calls=%d delays=%v", source.calls, sleeper.delays)
 	}
-	if len(events) != 4 || events[0].Type != types.EvStart || events[2].Partial == nil || events[2].Partial.Content[0].Text != "ok" {
-		t.Fatalf("events = %+v", events)
+	if got := eventTypes(events); got != "start retry start text_start text_delta done" {
+		t.Fatalf("events = %s", got)
 	}
-	for _, event := range events[:3] {
-		if event.Partial == nil {
-			t.Fatalf("%s has nil partial", event.Type)
-		}
+	if retry := events[1]; retry.Attempt != 1 || retry.RetryDelay != 500*time.Millisecond || retry.Err == nil || retry.Err.ErrorMessage != "connection reset" || retry.Err.ErrorCode != string(CodeNetworkFailure) || retry.Err.StopReason != types.StopError {
+		t.Fatalf("retry event = %+v err=%+v", retry, retry.Err)
+	}
+	if events[4].Partial == nil || events[4].Partial.Content[0].Text != "ok" {
+		t.Fatalf("events = %+v", events)
 	}
 	source.options[0].Headers["attempt"] = "one"
 	if source.options[1].Headers["attempt"] != "" {
@@ -137,16 +146,51 @@ func TestRetryAttemptsHintsAndNoLeakedStructuralEvents(t *testing.T) {
 	}
 }
 
-func TestOutputCommits(t *testing.T) {
-	visible := testStream(types.StreamEvent{Type: types.EvTextDelta, ContentIndex: 0, Delta: "shown"}, retryError("connection reset"))
+// A transient failure after output was forwarded discards the attempt (its
+// content and reported usage travel in the retry event) and re-sends the request.
+func TestRetryAfterOutputDiscardsAttempt(t *testing.T) {
+	stalled := retryError("stream idle for 1m30s (no events)")
+	stalled.Err.ErrorCode = string(CodeStreamInterrupted)
+	stalled.Err.Content = []types.ContentBlock{{Type: types.BlockThinking, Thinking: "Let's look"}}
+	stalled.Err.Usage = types.Usage{Input: 100, TotalTokens: 100}
+	first := testStream(types.StreamEvent{Type: types.EvStart}, types.StreamEvent{Type: types.EvThinkingDelta, ContentIndex: 0, Delta: "Let's look"}, stalled)
+	final := &types.AssistantMessage{StopReason: types.StopStop, Content: []types.ContentBlock{{Type: types.BlockText, Text: "done"}}, Usage: types.Usage{Input: 100, Output: 5, TotalTokens: 105}}
+	second := testStream(types.StreamEvent{Type: types.EvStart}, types.StreamEvent{Type: types.EvTextDelta, ContentIndex: 0, Delta: "done"}, types.StreamEvent{Type: types.EvDone, Reason: types.StopStop, Message: final})
+	source := &fakeStreamer{streams: []*stream.AssistantStream{first, second}}
+	r, err := New(source, testConfig(&recordedSleeper{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := r.Stream(context.Background(), testModel(), types.Context{}, nil)
+	events := collect(out)
+	if source.calls != 2 || eventTypes(events) != "start thinking_delta retry start text_delta done" {
+		t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
+	}
+	discarded := events[2].Err
+	if discarded.Content[0].Thinking != "Let's look" || discarded.Usage.Input != 100 || discarded.ErrorCode != string(CodeStreamInterrupted) {
+		t.Fatalf("discarded attempt = %+v", discarded)
+	}
+	if partial := events[4].Partial; len(partial.Content) != 1 || partial.Content[0].Text != "done" {
+		t.Fatalf("second attempt partial carries the discarded attempt: %+v", partial)
+	}
+	message, err := out.Result(context.Background())
+	if err != nil || message.Usage.TotalTokens != 105 || out.Final().Content[0].Text != "done" {
+		t.Fatalf("result = %+v, %v; final = %+v", message, err, out.Final())
+	}
+}
+
+func TestTerminalFailureAfterOutputIsNotRetried(t *testing.T) {
+	invalid := retryError("bad tool schema")
+	invalid.Err.ErrorCode = "invalid_request_error"
+	visible := testStream(types.StreamEvent{Type: types.EvTextDelta, ContentIndex: 0, Delta: "shown"}, invalid)
 	source := &fakeStreamer{streams: []*stream.AssistantStream{visible}}
 	r, err := New(source, testConfig(&recordedSleeper{}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	events := collect(r.Stream(context.Background(), testModel(), types.Context{}, nil))
-	if source.calls != 1 || len(events) != 2 || events[1].Type != types.EvError {
-		t.Fatalf("calls=%d events=%+v", source.calls, events)
+	if source.calls != 1 || eventTypes(events) != "text_delta error" || events[1].Err.ErrorMessage != "bad tool schema" {
+		t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 	}
 }
 

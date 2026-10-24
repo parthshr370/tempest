@@ -5,12 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 )
-
-const preOutputLimit = 64
 
 // Streamer is the provider boundary decorated by [Retrier].
 type Streamer interface {
@@ -42,19 +41,22 @@ func New(next Streamer, cfg Config) (*Retrier, error) {
 	return &Retrier{next: next, cfg: cfg}, nil
 }
 
-// Stream starts one logical stream whose failed pre-output attempts remain hidden.
+// Stream starts one logical stream over as many attempts as the policy allows.
 func (r *Retrier) Stream(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 	output := stream.NewAssistantStream(model.API, model.Provider, model.ID)
 	go r.produce(ctx, output, model, c, opts)
 	return output
 }
 
-// produce keeps each attempt private until it has observable output, since we can't retry after the caller sees a response.
+// produce sends the request until an attempt completes, fails terminally, runs
+// out of attempts, or ctx ends. Every attempt's events are forwarded as they
+// arrive. An attempt that fails transiently, before or after it produced
+// output, is announced with a [types.EvRetry] event carrying the discarded
+// attempt, and the same request (same context, same options) is sent again
+// after the backoff. Re-sending after output was forwarded is safe because
+// nothing acts on a response before its terminal event: the agent loop runs
+// tool calls only after the stream reports done.
 func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, model types.Model, c types.Context, opts *types.SimpleStreamOptions) {
-	if ctx.Err() != nil {
-		r.pushCanceled(output, model, ctx.Err())
-		return
-	}
 	logical := types.NewAssistantBuilder(model.API, model.Provider, model.ID)
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
@@ -69,141 +71,127 @@ func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, m
 			}
 			return nil
 		})
-		attemptStream := r.next.Stream(ctx, model, c, attemptOpts)
-		if attemptStream == nil {
-			if r.retryFailure(ctx, output, model, attempt, response, nil, types.StopError, logical, nil, "provider stream was nil") {
-				continue
+		failed, classified := r.forwardAttempt(ctx, output, model, logical, r.next.Stream(ctx, model, c, attemptOpts), &response)
+		if classified == nil {
+			return
+		}
+		discarded := attemptMessage(model, logical, failed.Err, classified)
+		delay, terminal := r.plan(attempt, classified)
+		if terminal != nil {
+			if terminal == classified && failed.Err != nil {
+				// A terminal provider failure reaches the caller as the provider sent it.
+				output.Push(failed)
+			} else {
+				pushTerminal(output, terminal, discarded)
 			}
 			return
 		}
-		buffer := make([]types.StreamEvent, 0, preOutputLimit)
-		committed := false
-		terminal := false
-		for !terminal {
-			select {
-			case <-ctx.Done():
-				r.pushCanceled(output, model, ctx.Err())
-				return
-			case event, ok := <-attemptStream.Events():
-				if !ok {
-					if committed {
-						r.pushGeneratedWithMessage(output, model, &Error{Code: CodeStreamInterrupted, Message: "provider stream ended without terminal event", Retryable: false, Cause: errors.New("provider stream ended without terminal event")}, logical.Message())
-						return
-					}
-					if ctx.Err() != nil {
-						r.pushCanceled(output, model, ctx.Err())
-						return
-					}
-					interrupted := &Error{Code: CodeStreamInterrupted, Message: "provider stream ended without terminal event", Retryable: true, RetryAfter: retryAfterOrZero(response.Headers, r.cfg.Clock.Now()), Cause: errors.New("provider stream ended without terminal event")}
-					if r.retryClassified(ctx, output, model, attempt, interrupted, logical, buffer, nil, types.StopError) {
-						terminal = true
-						break
-					}
-					return
+		retry := types.StreamEvent{Type: types.EvRetry, Err: discarded, Attempt: attempt, RetryDelay: delay}
+		logical.Fold(retry)
+		output.Push(retry)
+		if err := r.cfg.Sleeper.Sleep(ctx, delay); err != nil || ctx.Err() != nil {
+			r.pushCanceled(output, model, ctx.Err())
+			return
+		}
+	}
+}
+
+// forwardAttempt forwards one attempt's events. It returns a nil classification
+// once a terminal event has been pushed downstream (success or cancellation);
+// otherwise it returns the attempt's terminal error event, if the provider sent
+// one, and the classified failure.
+func (r *Retrier) forwardAttempt(ctx context.Context, output *stream.AssistantStream, model types.Model, logical *types.AssistantBuilder, attemptStream *stream.AssistantStream, response *types.ProviderResponse) (types.StreamEvent, *Error) {
+	if attemptStream == nil {
+		return types.StreamEvent{}, Classify(Failure{Message: "provider stream was nil", StopReason: types.StopError, Status: response.Status, Headers: response.Headers, ContextErr: ctx.Err()}, r.cfg.Clock.Now())
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			r.pushCanceled(output, model, ctx.Err())
+			return types.StreamEvent{}, nil
+		case event, ok := <-attemptStream.Events():
+			if !ok {
+				if ctx.Err() != nil {
+					r.pushCanceled(output, model, ctx.Err())
+					return types.StreamEvent{}, nil
 				}
-				event = copyEvent(event)
-				switch event.Type {
-				case types.EvDone:
-					flush(output, logical, buffer)
-					output.Push(event)
-					return
-				case types.EvError:
-					if committed || eventHasObservableOutput(event) {
-						flush(output, logical, buffer)
-						output.Push(event)
-						return
-					}
-					message, code, reason := terminalFields(event)
-					if r.retryFailure(ctx, output, model, attempt, response, event.Err, reason, logical, buffer, joinProviderMessage(code, message)) {
-						terminal = true
-						break
-					}
-					return
-				default:
-					if !committed && (eventObservable(event) || len(buffer)+1 >= preOutputLimit) {
-						committed = true
-						flush(output, logical, buffer)
-						buffer = nil
-					}
-					if committed {
-						forward(output, logical, event)
-					} else {
-						buffer = append(buffer, event)
-					}
+				cause := errors.New("provider stream ended without terminal event")
+				return types.StreamEvent{}, &Error{Code: CodeStreamInterrupted, Message: cause.Error(), Retryable: true, RetryAfter: retryAfterOrZero(response.Headers, r.cfg.Clock.Now()), Cause: cause}
+			}
+			event = copyEvent(event)
+			switch event.Type {
+			case types.EvDone:
+				output.Push(event)
+				return types.StreamEvent{}, nil
+			case types.EvError:
+				failure := Failure{StopReason: event.Reason, Status: response.Status, Headers: response.Headers, ContextErr: ctx.Err()}
+				if event.Err != nil {
+					failure.Message, failure.ProviderCode = event.Err.ErrorMessage, event.Err.ErrorCode
 				}
+				if strings.TrimSpace(failure.Message) == "" {
+					failure.Message = fmt.Sprintf("provider failure: %s", failure.ProviderCode)
+				}
+				return event, Classify(failure, r.cfg.Clock.Now())
+			default:
+				forward(output, logical, event)
 			}
 		}
 	}
 }
 
-// retryFailure classifies a provider failure and applies the retry policy.
-func (r *Retrier) retryFailure(ctx context.Context, output *stream.AssistantStream, model types.Model, attempt int, response types.ProviderResponse, errMessage *types.AssistantMessage, reason types.StopReason, logical *types.AssistantBuilder, buffer []types.StreamEvent, fallback string) bool {
-	message, code := fallback, ""
-	if errMessage != nil {
-		message, code = errMessage.ErrorMessage, errMessage.ErrorCode
-	}
-	classified := Classify(Failure{Message: message, ProviderCode: code, StopReason: reason, Status: response.Status, Headers: response.Headers, ContextErr: ctx.Err()}, r.cfg.Clock.Now())
-	return r.retryClassified(ctx, output, model, attempt, classified, logical, buffer, errMessage, reason)
-}
-
-// retryClassified applies the retry/backoff/exhaustion policy to an already
-// classified failure. It returns true when the caller should start the next
-// attempt. A non-nil errMessage preserves the original provider terminal event
-// on a terminal outcome.
-func (r *Retrier) retryClassified(ctx context.Context, output *stream.AssistantStream, model types.Model, attempt int, classified *Error, logical *types.AssistantBuilder, buffer []types.StreamEvent, errMessage *types.AssistantMessage, reason types.StopReason) bool {
+// plan returns the wait before the failed attempt is sent again, or the error
+// that ends the stream instead.
+func (r *Retrier) plan(attempt int, classified *Error) (time.Duration, *Error) {
 	if !classified.Retryable {
-		flush(output, logical, buffer)
-		if errMessage != nil {
-			output.Push(types.StreamEvent{Type: types.EvError, Reason: reason, Err: errMessage})
-		} else {
-			r.pushGenerated(output, model, classified)
-		}
-		return false
+		return 0, classified
 	}
 	if attempt >= r.cfg.MaxAttempts {
-		r.pushGenerated(output, model, &Error{Code: CodeAttemptsExhausted, Message: "retry attempts exhausted", Attempts: attempt, Cause: classified.Cause})
-		return false
+		return 0, &Error{Code: CodeAttemptsExhausted, Message: fmt.Sprintf("retry attempts exhausted after %d attempts: %s", attempt, classified.Error()), Attempts: attempt, Cause: classified.Cause}
 	}
-	local := jitterDelay(nominalDelay(r.cfg.BaseDelay, r.cfg.BackoffCap, attempt), r.cfg.Jitter, r.cfg.Random)
-	delay := local
+	delay := jitterDelay(nominalDelay(r.cfg.BaseDelay, r.cfg.BackoffCap, attempt), r.cfg.Jitter, r.cfg.Random)
 	if classified.RetryAfter > delay {
 		delay = classified.RetryAfter
 	}
 	if r.cfg.MaxDelay > 0 && delay > r.cfg.MaxDelay {
-		r.pushGenerated(output, model, &Error{Code: CodeRetryDelayExceeded, Message: "retry delay exceeds configured maximum", Attempts: attempt, Cause: classified.Cause})
-		return false
+		return 0, &Error{Code: CodeRetryDelayExceeded, Message: fmt.Sprintf("retry delay %s exceeds the configured maximum %s: %s", delay, r.cfg.MaxDelay, classified.Error()), Attempts: attempt, Cause: classified.Cause}
 	}
-	if err := r.cfg.Sleeper.Sleep(ctx, delay); err != nil || ctx.Err() != nil {
-		r.pushCanceled(output, model, ctx.Err())
-		return false
+	return delay, nil
+}
+
+// attemptMessage is the record of a failed attempt: the provider's terminal
+// message when it sent one (its partial content and any usage it reported),
+// else the content forwarded before the stream broke.
+func attemptMessage(model types.Model, logical *types.AssistantBuilder, providerMessage *types.AssistantMessage, classified *Error) *types.AssistantMessage {
+	var message *types.AssistantMessage
+	if providerMessage != nil {
+		message = cloneMessage(providerMessage)
+	} else {
+		message = cloneMessagePtr(logical.Message())
 	}
-	return true
+	message.StopReason = types.StopError
+	if message.ErrorCode == "" {
+		message.ErrorCode = string(classified.Code)
+	}
+	if message.ErrorMessage == "" {
+		message.ErrorMessage = classified.Error()
+	}
+	message.Usage.Cost.Unknown = message.Usage.Cost.Unknown || model.Cost.Unknown
+	return message
 }
 
 func (r *Retrier) pushCanceled(output *stream.AssistantStream, model types.Model, cause error) {
-	r.pushGenerated(output, model, &Error{Code: CodeCanceled, Message: "retry canceled", Cause: cause})
-}
-
-func (r *Retrier) pushGenerated(output *stream.AssistantStream, model types.Model, classified *Error) {
-	reason := types.StopError
-	if classified.Code == CodeCanceled {
-		reason = types.StopAborted
-	}
-	output.Push(types.StreamEvent{Type: types.EvError, Reason: reason, Err: &types.AssistantMessage{
-		API: model.API, Provider: model.Provider, Model: model.ID, StopReason: reason,
-		ErrorCode: string(classified.Code), ErrorMessage: classified.Error(),
+	pushTerminal(output, &Error{Code: CodeCanceled, Message: "retry canceled", Cause: cause}, &types.AssistantMessage{
+		API: model.API, Provider: model.Provider, Model: model.ID,
 		Usage: types.Usage{Cost: types.Cost{Unknown: model.Cost.Unknown}},
-	}})
+	})
 }
 
-// pushGeneratedWithMessage preserves committed output while replacing only its terminal fields with the retry outcome.
-func (r *Retrier) pushGeneratedWithMessage(output *stream.AssistantStream, model types.Model, classified *Error, partial types.AssistantMessage) {
+// pushTerminal ends the stream with message carrying the retry outcome.
+func pushTerminal(output *stream.AssistantStream, classified *Error, message *types.AssistantMessage) {
 	reason := types.StopError
 	if classified.Code == CodeCanceled {
 		reason = types.StopAborted
 	}
-	message := cloneMessagePtr(partial)
-	message.Usage.Cost.Unknown = message.Usage.Cost.Unknown || model.Cost.Unknown
 	message.StopReason = reason
 	message.ErrorCode = string(classified.Code)
 	message.ErrorMessage = classified.Error()
@@ -301,13 +289,6 @@ func cloneBlock(block types.ContentBlock) types.ContentBlock {
 	return clone
 }
 
-// flush commits buffered pre-output events only once this attempt has become visible.
-func flush(output *stream.AssistantStream, logical *types.AssistantBuilder, events []types.StreamEvent) {
-	for _, event := range events {
-		forward(output, logical, event)
-	}
-}
-
 // forward rebuilds each partial snapshot from retry-owned state before handing it to the caller.
 func forward(output *stream.AssistantStream, logical *types.AssistantBuilder, event types.StreamEvent) {
 	// event.Partial is a live pointer into the provider's builder, mutated
@@ -322,54 +303,4 @@ func forward(output *stream.AssistantStream, logical *types.AssistantBuilder, ev
 
 func cloneMessagePtr(message types.AssistantMessage) *types.AssistantMessage {
 	return cloneMessage(&message)
-}
-
-// eventObservable reports whether an event makes this attempt visible and therefore ineligible for retry.
-func eventObservable(event types.StreamEvent) bool {
-	switch event.Type {
-	case types.EvTextDelta, types.EvThinkingDelta:
-		return event.Delta != ""
-	case types.EvTextEnd, types.EvThinkingEnd:
-		return event.Content != ""
-	case types.EvToolCallStart, types.EvToolCallDelta, types.EvToolCallEnd:
-		return true
-	}
-	return eventHasObservableOutput(event)
-}
-
-// eventHasObservableOutput reports whether a terminal event already contains output that must not be retried.
-func eventHasObservableOutput(event types.StreamEvent) bool {
-	// Only terminal events carry an owned, final message. A non-terminal event's
-	// Partial is a live provider-owned pointer and must not be read; its content
-	// is observed via the owned Delta/Content/ToolCall checks in eventObservable.
-	var message *types.AssistantMessage
-	switch event.Type {
-	case types.EvError:
-		message = event.Err
-	case types.EvDone:
-		message = event.Message
-	}
-	if message == nil {
-		return false
-	}
-	for _, block := range message.Content {
-		if block.Type == types.BlockToolCall || block.Text != "" || block.Thinking != "" {
-			return true
-		}
-	}
-	return false
-}
-
-func terminalFields(event types.StreamEvent) (string, string, types.StopReason) {
-	if event.Err == nil {
-		return "", "", event.Reason
-	}
-	return event.Err.ErrorMessage, event.Err.ErrorCode, event.Reason
-}
-
-func joinProviderMessage(code, message string) string {
-	if strings.TrimSpace(message) != "" {
-		return message
-	}
-	return fmt.Sprintf("provider failure: %s", code)
 }

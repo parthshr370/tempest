@@ -128,7 +128,11 @@ func Classify(f Failure, now time.Time) *Error {
 	if f.Status >= 500 && f.Status <= 599 {
 		return result(CodeServerFailure, true)
 	}
-	if f.Status != 0 {
+	// Only an error status classifies the failure. With a 2xx status the
+	// provider accepted the request and the stream failed afterwards (a stall,
+	// a dropped connection, an in-stream error event), so the code and message
+	// below classify it.
+	if f.Status >= 400 {
 		switch f.Status {
 		case 401, 403:
 			return result(CodeAuthentication, false)
@@ -169,16 +173,24 @@ func Classify(f Failure, now time.Time) *Error {
 
 // classifyProviderCode maps a structured provider error code to a stable
 // category. Per §3.5 a recognized code participates before message-compatibility
-// patterns, so broad message wording cannot override it.
+// patterns, so broad message wording cannot override it. Codes this package
+// assigned (providers record them through Classify) map back to themselves;
+// "canceled" does not, because only the caller's context decides cancellation.
 func classifyProviderCode(code string) (Code, bool, bool) {
 	switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(code)), "-", "_") {
 	case "rate_limit_error", "rate_limited", "too_many_requests":
 		return CodeRateLimited, true, true
-	case "overloaded_error", "overloaded", "server_error", "internal_server_error", "service_unavailable":
+	case "overloaded_error", "overloaded", "server_error", "internal_server_error", "service_unavailable", string(CodeServerFailure):
 		return CodeServerFailure, true, true
-	case "authentication_error", "permission_error", "permission_denied", "invalid_api_key":
+	case string(CodeStreamInterrupted):
+		return CodeStreamInterrupted, true, true
+	case string(CodeNetworkFailure):
+		return CodeNetworkFailure, true, true
+	case string(CodeAttemptTimeout):
+		return CodeAttemptTimeout, true, true
+	case "authentication_error", "permission_error", "permission_denied", "invalid_api_key", string(CodeAuthentication):
 		return CodeAuthentication, false, true
-	case "invalid_request_error", "not_found_error":
+	case "invalid_request_error", "not_found_error", string(CodeInvalidRequest):
 		return CodeInvalidRequest, false, true
 	default:
 		return "", false, false

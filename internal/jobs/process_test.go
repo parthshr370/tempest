@@ -101,6 +101,38 @@ func TestBashAsyncLogsWaitCancelJoinsGroup(t *testing.T) {
 		t.Fatal(rawOffset)
 	}
 }
+
+// TestBashJobOutputKeepsWriteOrderAndTailError covers what the model reads
+// from a failing background command: logs interleave stdout and stderr as the
+// command wrote them, and result_text keeps the final error, within the
+// journal's preview cap, even when the output is larger than the preview.
+func TestBashJobOutputKeepsWriteOrderAndTailError(t *testing.T) {
+	host := newHost(t, nil)
+	command := "for i in $(seq 1 1000); do echo out$i; echo err$i >&2; done; echo 'fatal: tail error' >&2; exit 3"
+	job, err := host.manager.StartBash(invocation(1), work.BashSpec{Command: command, TimeoutSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job = awaitJob(t, host.manager, job.ID)
+	if job.State != "failed" || job.ExitCode == nil || *job.ExitCode != 3 {
+		t.Fatal(job)
+	}
+	if !strings.HasSuffix(job.ResultText, "err1000\nfatal: tail error\n") || len(job.ResultText) > maxPreviewBytes {
+		t.Fatalf("result_text lost the final error or exceeds %d bytes (%d): %q", maxPreviewBytes, len(job.ResultText), job.ResultText)
+	}
+	var want strings.Builder
+	for i := 1; i <= 1000; i++ {
+		fmt.Fprintf(&want, "out%d\nerr%d\n", i, i)
+	}
+	want.WriteString("fatal: tail error\n")
+	page, err := host.manager.Logs(context.Background(), job.ID, 0, maxLogPage)
+	if err != nil || !page.EOF {
+		t.Fatal(page, err)
+	}
+	if page.Text != want.String() {
+		t.Fatalf("logs reordered stdout and stderr:\n%.400s", page.Text)
+	}
+}
 func TestBashHardOutputLimitAndReadersJoin(t *testing.T) {
 	host := newHost(t, nil)
 	job, err := host.manager.StartBash(invocation(1), work.BashSpec{Command: "/usr/bin/yes x", TimeoutSeconds: 30})

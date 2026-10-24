@@ -7,6 +7,10 @@ import (
 	"go.harness.dev/harness/internal/obs"
 )
 
+// errorLogRunes bounds an error message in a log line: enough to identify the
+// failure without flooding the log with a provider's response body.
+const errorLogRunes = 400
+
 // redactTruncate delegates to the shared redactor (internal/obs), bounding the
 // result to max runes for high-volume log fields (error messages, previews).
 func redactTruncate(s string, max int) string { return obs.RedactTruncate(s, max) }

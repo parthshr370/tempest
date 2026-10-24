@@ -46,6 +46,9 @@ func (controller *serviceController) Wait(_ context.Context, jobIDs []string, _ 
 	controller.targets = append(controller.targets, jobIDs...)
 	return []work.Job{{ID: jobIDs[0], State: "running"}}, nil
 }
+func (controller *serviceController) Jobs(context.Context, string, int) (work.JobPage, error) {
+	return work.JobPage{Jobs: []work.Job{{ID: "job_web", Kind: "bash", State: "running", Name: "web"}}}, nil
+}
 
 func TestAsyncBashServiceArguments(t *testing.T) {
 	controller := &serviceController{}
@@ -100,9 +103,10 @@ func TestManagementToolsAcceptServiceNames(t *testing.T) {
 		{LogsTool, `{"name":"web"}`, "job_web", ""},
 		{WaitTool, `{"names":["web"],"job_ids":["job_other"],"timeout":0}`, "job_other,job_web", ""},
 		{CancelTool, `{"name":"web","job_id":"job_web"}`, "", "not both"},
-		{CancelTool, `{}`, "", "job_id or name is required"},
+		// A call that names no job is told which jobs exist.
+		{CancelTool, `{}`, "", "job_web"},
 		{LogsTool, `{"name":"missing"}`, "", errNoSuchService.Error()},
-		{WaitTool, `{}`, "", "job_ids or names"},
+		{WaitTool, `{}`, "", "job_web"},
 	} {
 		controller := &serviceController{}
 		_, err := newManagementTool(test.tool, controller).Execute(context.Background(), "raw", json.RawMessage(test.args), nil)

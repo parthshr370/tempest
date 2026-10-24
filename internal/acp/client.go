@@ -292,10 +292,13 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			if result.RunID != "" {
 				c.flushWatch(ctx, s.ID(), s.Snapshot().Seq)
 			}
-			if result.StopReason == "error" || result.StopReason == "output_invalid" {
+			if result.StopReason == "error" || result.StopReason == "output_invalid" || result.StopReason == "repeated_failure" {
 				code, name, message := -32009, "run_error", "run failed"
-				if result.StopReason == "output_invalid" {
+				switch result.StopReason {
+				case "output_invalid":
 					code, name = -32022, "output_invalid"
+				case "repeated_failure":
+					code, name = -32023, "repeated_failure"
 				}
 				if result.Err != nil {
 					message = result.Err.Error()

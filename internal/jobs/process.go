@@ -93,10 +93,14 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		cancel()
 	}
 	input.attach(streams.input, cmd.Process.Pid, output)
-	var readers sync.WaitGroup
-	readers.Add(len(streams.output))
-	appendPipe := func(pipe *os.File, matcher *lineMatcher) {
-		defer readers.Done()
+	var matcher *lineMatcher
+	if record.service != nil && record.service.pattern != nil {
+		matcher = &lineMatcher{manager: manager, record: record}
+	}
+	pipe := streams.output
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
 		defer pipe.Close()
 		buffer := make([]byte, pipeBytes)
 		for {
@@ -156,14 +160,7 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 				return
 			}
 		}
-	}
-	for _, stream := range streams.output {
-		var matcher *lineMatcher
-		if record.service != nil && record.service.pattern != nil {
-			matcher = &lineMatcher{manager: manager, record: record}
-		}
-		go appendPipe(stream, matcher)
-	}
+	}()
 	if err = manager.running(context.WithoutCancel(ctx), record, cmd.Process.Pid, ""); err != nil {
 		cancel()
 	}
@@ -204,17 +201,15 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 		}
 		output.mu.Unlock()
 	}
-	// A setsid descendant can inherit the pipes or terminal after the group
-	// leader exits. It isn't ours to reattach, so close our read ends on the
+	// A setsid descendant can inherit the pipe or terminal after the group
+	// leader exits. It isn't ours to reattach, so close our read end on the
 	// same WaitDelay bound.
 	closed := make(chan struct{})
 	readerDeadline := time.AfterFunc(pipeJoinDelay, func() {
-		for _, stream := range streams.output {
-			stream.Close()
-		}
+		pipe.Close()
 		close(closed)
 	})
-	readers.Wait()
+	<-readerDone
 	if !readerDeadline.Stop() {
 		<-closed
 	}
@@ -258,7 +253,8 @@ func (manager *Manager) finishProcess(record *entry, job work.Job, output *proce
 	closeErr := output.accumulator.CloseTempFile()
 	outputErr := errors.Join(output.err, finishErr, syncErr, snapshotErr, closeErr)
 	output.mu.Unlock()
-	job.ResultText = preview(snapshot.Content, maxPreviewBytes)
+	// A command's error is usually its last output, so the preview keeps the end.
+	job.ResultText = tailPreview(snapshot.Content, maxPreviewBytes)
 	if job.Reason == "" {
 		job.State = "completed"
 	}

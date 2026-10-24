@@ -110,15 +110,24 @@ func headPreview(text string, limit int) string {
 	return preview(text, limit) + " …[truncated]"
 }
 
-// tailPreview keeps the last limit bytes on a rune boundary, where command output ends.
+// earlierOutputMarker opens a tail preview that dropped the output's start.
+const earlierOutputMarker = "[…earlier output truncated] "
+
+// tailPreview keeps the end of text, where command output ends, in at most
+// limit bytes on a rune boundary, the marker included: journaled previews
+// have a hard size cap.
 func tailPreview(text string, limit int) string {
 	text = strings.ToValidUTF8(text, "\ufffd")
 	if len(text) <= limit {
 		return text
 	}
-	text = text[len(text)-limit:]
+	marker := earlierOutputMarker
+	if limit <= len(marker) {
+		marker = ""
+	}
+	text = text[len(text)-(limit-len(marker)):]
 	for len(text) > 0 && !utf8.RuneStart(text[0]) {
 		text = text[1:]
 	}
-	return "[…earlier output truncated] " + text
+	return marker + text
 }

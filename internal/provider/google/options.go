@@ -1,13 +1,9 @@
 package google
 
 import (
-	"os"
-	"strconv"
-	"strings"
-	"time"
-
 	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/provider/base"
 )
 
 // Options configures a Gemini stream, extending the shared StreamOptions with
@@ -34,18 +30,8 @@ const (
 	defaultGoogleBaseURL = "https://generativelanguage.googleapis.com"
 )
 
-// StreamIdleTimeoutFromEnv reads HARNESS_STREAM_IDLE_SECONDS and returns it as a
-// duration, falling back to 90s when unset or invalid.
-func StreamIdleTimeoutFromEnv() time.Duration {
-	if v := strings.TrimSpace(os.Getenv("HARNESS_STREAM_IDLE_SECONDS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return time.Duration(n) * time.Second
-		}
-	}
-	return 90 * time.Second
-}
-
-var streamIdleTimeout = StreamIdleTimeoutFromEnv()
+// streamTimeouts bounds stream silence for the process lifetime.
+var streamTimeouts = base.StreamTimeoutsFromEnv()
 
 // clampMaxTokensToContext lowers maxTokens so the request plus a safety margin
 // fits inside the model's context window, never dropping below minMaxTokens.

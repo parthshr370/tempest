@@ -281,7 +281,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "session: %s (resume with -resume %s)\n", sess.ID(), sess.ID())
 	}
 	switch outcome.StopReason {
-	case agent.StopError, agent.StopOutputInvalid:
+	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure:
 		return 1
 	case agent.StopAborted:
 		return exitAborted
@@ -338,7 +338,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 	}
 	switch outcome.StopReason {
 	case agent.StopCompleted:
-	case agent.StopError, agent.StopOutputInvalid:
+	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure:
 		fmt.Fprintf(stderr, "run failed after %d turns: %v\n", outcome.Turns, outcome.Err)
 	default:
 		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)

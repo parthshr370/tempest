@@ -268,7 +268,7 @@ The summarization call uses `context.WithTimeout(context.Background(), 120s)`, n
 
 ### Stream truncation and compaction interaction
 
-The Anthropic error adapter defines `streamTruncatedError` (`internal/piai/anthropic/errors.go:8-11`), classified as `CodeStreamInterrupted`. A truncated stream may be retried (if pre-output). But if the truncation is from context overflow, `Classify` catches it first as `CodeContextOverflow` (non-retryable). The retrier surfaces the error, the loop sees `StopError`, and the turn ends without compaction — the proactive compaction hook fires on the *next* cycle (if the caller retries `Prompt`/`Continue`). Reactive overflow recovery is out of scope for V1.
+A truncated stream reaches the retry layer as `CodeStreamInterrupted` with `Retryable: true` from two places: the shared watchdog when no SSE data event arrives within its bound (`internal/provider/base/watchdog.go:111-130`, reported through `Watchdog.Err` at `watchdog.go:101-109`), and the OpenAI provider when a clean EOF never delivered a `finish_reason` (`internal/provider/openai/stream.go:171-175`). Both are retryable before or after output: the retrier announces the failed attempt with `EvRetry` and re-sends. But if the truncation is caused by context overflow, `Classify` catches it first as `CodeContextOverflow` (non-retryable, `internal/retry/error.go:121-124`), before the status and provider-code tiers run. The retrier then surfaces the error, the loop sees `StopError`, and the turn ends without compaction: the proactive compaction hook fires on the *next* cycle (if the caller retries `Prompt`/`Continue`). Reactive overflow recovery is out of scope for V1.
 
 ### Token estimation drift
 
@@ -315,7 +315,8 @@ This is the "accept interfaces, return structs" pattern applied to compaction: `
 | `internal/session/stack.go:139-152` | `BuildAgentStack` wiring: `newCompactionRunner` → `runner.hook(Agt.SetMessages)` → `PrepareNextTurnWithContext` |
 | `internal/agent/runtime.go:84,93` | `TransformContext` (optional per-request hook; the coding stack sets none), `PrepareNextTurnWithContext` (compaction hook) |
 | `internal/agent/loop.go:227-249` | `PrepareNextTurn` call site in the turn loop |
-| `internal/retry/error.go:100-124,196-198` | `Classify` → `isContextOverflow` → `CodeContextOverflow` (non-retryable); the boundary between retry and compaction |
-| `internal/retry/stream.go:46-50,138-180` | `Retrier.Stream`, `retryFailure`, `retryClassified` — transport retry that never touches compaction |
-| `internal/piai/anthropic/errors.go:8-11` | `streamTruncatedError` — stream truncation classified as `CodeStreamInterrupted`, distinct from overflow |
+| `internal/retry/error.go:100-124,179-198` | `Classify`, `isContextOverflow`, `classifyProviderCode`; the boundary between retry and compaction |
+| `internal/retry/stream.go:45-97,103-159` | `Retrier.Stream`, `produce`, `forwardAttempt`, `plan`: transport retry that never touches compaction |
+| `internal/provider/base/watchdog.go:101-130` | `Watchdog.Err`, `Watchdog.run`: a stalled stream becomes a retryable `CodeStreamInterrupted` |
+| `internal/provider/openai/stream.go:171-175` | a stream that ends without `finish_reason` becomes a retryable `CodeStreamInterrupted` |
 | `12-idiomatic-go-vs-typescript.md` | design rules: consumer-defined interfaces, accept-interface/return-struct, no public `any` |

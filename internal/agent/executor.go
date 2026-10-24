@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,10 +16,13 @@ import (
 
 // ExecutedToolCallBatch is the result of executing one assistant message's
 // tool calls: the result messages (in source order) and whether the batch
-// signaled turn termination.
+// signaled turn termination. RepeatedFailure is set when a call in the batch
+// failed the same way RepeatedFailureLimit times in a row; it is the run's
+// StopRepeatedFailure error.
 type ExecutedToolCallBatch struct {
-	Messages  []types.ToolResultMessage
-	Terminate bool
+	Messages        []types.ToolResultMessage
+	Terminate       bool
+	RepeatedFailure error
 }
 
 // preparedToolCall is a tool call that passed validation and the BeforeToolCall
@@ -90,6 +94,7 @@ func executeToolCalls(ctx context.Context, currentContext AgentContext, assistan
 func executeToolCallsSequential(ctx context.Context, currentContext AgentContext, assistantMessage types.AssistantMessage, toolCalls []types.ContentBlock, config AgentLoopConfig, emit AgentEventSink) (ExecutedToolCallBatch, error) {
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
+	var repeated error
 
 	for index, toolCall := range toolCalls {
 		ctx := invocationContext(ctx, config, index)
@@ -109,6 +114,9 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 			return ExecutedToolCallBatch{}, err
 		}
 		message := createToolResultMessage(finalized)
+		if streak := noteRepeatedFailure(ctx, currentContext.Messages, assistantMessage, messages, toolCall, &message); streak >= RepeatedFailureLimit && repeated == nil {
+			repeated = repeatedFailureError(toolCall, streak, message)
+		}
 		if err := emitToolResultMessage(ctx, message, emit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
@@ -116,7 +124,7 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls)}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated}, nil
 }
 
 // executeToolCallsParallel runs tool calls concurrently. Results are written
@@ -199,9 +207,13 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
+	var repeated error
 	for i := range toolCalls {
 		finalized := slots[i]
 		message := createToolResultMessage(finalized)
+		if streak := noteRepeatedFailure(ctx, currentContext.Messages, assistantMessage, messages, toolCalls[i], &message); streak >= RepeatedFailureLimit && repeated == nil {
+			repeated = repeatedFailureError(toolCalls[i], streak, message)
+		}
 		if err := emitToolResultMessage(ctx, message, safeEmit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
@@ -209,7 +221,7 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls)}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated}, nil
 }
 
 // shouldTerminateToolBatch reports whether the batch should end the turn.
@@ -275,7 +287,7 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 		}
 	}
 	if !found {
-		return nil, &immediateOutcome{result: createErrorToolResult("Tool " + toolCall.Name + " not found"), isError: true}
+		return nil, &immediateOutcome{result: createErrorToolResult(unknownToolMessage(toolCall.Name, currentContext.Tools)), isError: true}
 	}
 
 	defer func() {
@@ -467,6 +479,19 @@ func finalizeExecutedToolCall(ctx context.Context, currentContext AgentContext, 
 // createErrorToolResult builds a tool result whose content is the error text.
 func createErrorToolResult(message string) AgentToolResult {
 	return AgentToolResult{Content: []types.ContentBlock{types.NewText(message)}, Details: nil}
+}
+
+// unknownToolMessage names the tools the session does have, so a call to a
+// tool that isn't there can be redirected instead of retried.
+func unknownToolMessage(name string, tools []AgentTool) string {
+	if len(tools) == 0 {
+		return "Tool " + name + " not found: this session has no tools, so answer without calling one."
+	}
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	return "Tool " + name + " not found. The tools in this session are: " + strings.Join(names, ", ") + "."
 }
 
 // emitToolExecutionEnd emits the tool_execution_end event for a finalized call.

@@ -267,7 +267,7 @@ func validateWorkRecord(r WorkRecord) error {
 	case *JobCleaned:
 		valid = v.JobID != "" && v.Path != ""
 	case *RunStopRequested:
-		valid = r.RunID != "" && (v.Reason == "aborted" || v.Reason == "max_turns" || v.Reason == "max_cost" || v.Reason == "max_wall_time" || v.Reason == "error" || v.Reason == "output_invalid")
+		valid = r.RunID != "" && (v.Reason == "aborted" || v.Reason == "max_turns" || v.Reason == "max_cost" || v.Reason == "max_wall_time" || v.Reason == "error" || v.Reason == "output_invalid" || v.Reason == "repeated_failure")
 	case *CompactionCall:
 		valid = r.RunID != "" && v.CompactionID != "" && validDigest(v.SourceHash) && (v.Phase == "history" || v.Phase == "prefix") && v.Model != ""
 		if r.Type == KindCompactionCallStarted {

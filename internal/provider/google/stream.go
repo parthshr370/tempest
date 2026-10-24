@@ -18,7 +18,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
@@ -63,11 +62,8 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	streamCtx, cancel := context.WithCancel(parent)
 	defer cancel()
-	activity := make(chan struct{}, 1)
-	done := make(chan struct{})
-	var idleFired atomic.Bool
-	go watchIdle(done, activity, cancel, &idleFired)
-	defer close(done)
+	watchdog := base.WatchStream(cancel, streamTimeouts)
+	defer watchdog.Stop()
 
 	if opts == nil {
 		opts = &Options{}
@@ -123,7 +119,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 	defer resp.Body.Close()
@@ -142,15 +138,13 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	s.Push(types.StreamEvent{Type: types.EvStart, Partial: output})
 	state := &googleFoldState{Output: output}
 
-	err = iterateGoogleEvents(reqCtx, resp.Body, func() {
-		select {
-		case activity <- struct{}{}:
-		default:
-		}
-	}, func(chunk *googleStreamChunk) error {
+	err = iterateGoogleEvents(reqCtx, resp.Body, watchdog.Event, func(chunk *googleStreamChunk) error {
 		events, err := foldGoogleChunk(chunk, state, model)
 		if err != nil {
 			return err
+		}
+		if len(events) > 0 {
+			watchdog.Output()
 		}
 		for _, ev := range events {
 			s.Push(ev)
@@ -158,7 +152,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		return nil
 	})
 	if err != nil {
-		pushError(s, output, streamError(parent.Err(), err, idleFired.Load()), parent.Err() != nil)
+		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)
 		return
 	}
 
@@ -206,43 +200,6 @@ func pushError(s *stream.AssistantStream, output *types.AssistantMessage, err er
 	}
 	base.ApplyError(output, err)
 	s.Push(types.StreamEvent{Type: types.EvError, Reason: output.StopReason, Err: output})
-}
-
-// streamError picks the most meaningful error: a cancelled parent context wins,
-// then an idle-timeout truncation, otherwise the raw transport error.
-func streamError(parentErr error, err error, idle bool) error {
-	if parentErr != nil {
-		return parentErr
-	}
-	if idle {
-		return StreamTruncated(fmt.Errorf("stream idle for %s (no events); aborted to avoid a wedge: %w", streamIdleTimeout, err))
-	}
-	return err
-}
-
-// watchIdle cancels the request if no stream activity arrives within
-// streamIdleTimeout, guarding against a wedged connection that never closes.
-func watchIdle(done <-chan struct{}, activity <-chan struct{}, cancel context.CancelFunc, idleFired *atomic.Bool) {
-	idle := time.NewTimer(streamIdleTimeout)
-	defer idle.Stop()
-	for {
-		select {
-		case <-activity:
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(streamIdleTimeout)
-		case <-idle.C:
-			idleFired.Store(true)
-			cancel()
-			return
-		case <-done:
-			return
-		}
-	}
 }
 
 // generateContentURL builds the streamGenerateContent SSE endpoint for a model,

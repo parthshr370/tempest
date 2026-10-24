@@ -44,7 +44,7 @@ func TestServiceReadyByLogReleasesTheRunAndCancelsByName(t *testing.T) {
 	if final := awaitJob(t, host.manager, job.ID); final.State != "cancelled" || final.Readiness != "ready" {
 		t.Fatalf("cancelled service=%+v", final)
 	}
-	if _, err = host.manager.JobByName(context.Background(), "nope"); !errors.Is(err, ErrJobNotFound) {
+	if _, err = host.manager.JobByName(context.Background(), "nope"); !errors.Is(err, ErrJobNotFound) || !strings.Contains(err.Error(), job.ID) {
 		t.Fatalf("unknown name=%v", err)
 	}
 }

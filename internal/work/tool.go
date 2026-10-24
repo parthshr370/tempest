@@ -2,6 +2,9 @@ package work
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	types "go.harness.dev/harness/internal/engine/types"
@@ -111,6 +114,44 @@ func (page JobPage) ToolView() ToolJobPage {
 // ToolView returns page as model tools render it.
 func (page LogPage) ToolView() ToolLogPage {
 	return ToolLogPage(page)
+}
+
+// maxDescribedJobs bounds the jobs DescribeJobs names; the jobs tool pages
+// the rest.
+const maxDescribedJobs = 8
+
+// DescribeJobs ends an error about a job that couldn't be addressed: it names
+// the session's jobs, newest first, or says there are none and how to start
+// one, so the next call can target a real job instead of guessing an id. It
+// sorts jobs in place.
+func DescribeJobs(jobs []Job) string {
+	if len(jobs) == 0 {
+		return "This session has no background jobs. Start one with bash and a name (add stdin:true or pty:true to write to it), then pass that name."
+	}
+	slices.SortFunc(jobs, func(a, b Job) int {
+		if order := b.StartedAt.Compare(a.StartedAt); order != 0 {
+			return order
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	var text strings.Builder
+	text.WriteString("This session's jobs, newest first: ")
+	for index, job := range jobs[:min(len(jobs), maxDescribedJobs)] {
+		if index > 0 {
+			text.WriteString("; ")
+		}
+		text.WriteString(job.ID)
+		if job.Name != "" {
+			fmt.Fprintf(&text, " (name %q, %s, %s)", job.Name, job.Kind, job.State)
+		} else {
+			fmt.Fprintf(&text, " (%s, %s)", job.Kind, job.State)
+		}
+	}
+	if more := len(jobs) - maxDescribedJobs; more > 0 {
+		fmt.Fprintf(&text, "; and %d more, which the jobs tool lists", more)
+	}
+	text.WriteString(".")
+	return text.String()
 }
 
 func toolUsage(usage types.Usage) ToolUsage {
