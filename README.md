@@ -134,6 +134,7 @@ pages do not imply disk indexing or a bounded memory working set.
 ### Agents and automation
 
 - **Opt-in subagents** investigate read-only or code in detached worktrees when eligible.
+- **Agent types as files** in `.harness/agents`, `.claude/agents` or `<agent-dir>/agents` narrow a child's tools and pick its model role; `tempest agents list` shows them.
 - **Explicit integration** merges child patches against their pinned base, with conflict reporting.
 - **Named jobs and services** support readiness checks, logs, cancellation, stdin, and PTYs.
 - **Trusted hooks and skills** add workflow rules without loading every skill body into the prompt.

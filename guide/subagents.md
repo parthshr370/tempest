@@ -27,6 +27,71 @@ with the same child ceiling. `explore` and `general` remain built-in presets.
 Preset definitions are data, not executable project configuration. See
 [extensions](extensions.md).
 
+### Agent files
+
+An agent type can be a markdown file. At startup tempest reads, in order:
+
+1. `.harness/agents/*.md` in the working directory
+2. `.claude/agents/*.md` in the working directory (Claude Code subagents load unchanged)
+3. `<agent-dir>/agents/*.md`
+
+The first definition of a name wins. A later file with the same name is skipped
+with a startup warning that names both files. An invalid file is skipped with a
+warning that names the file and the field at fault; the other files still load.
+Files are read once per session, so an edit takes effect in the next session.
+
+```markdown
+---
+name: auditor
+description: Read-only security review of the files it is given
+tools: [read, grep]
+model: smol
+reasoning: high
+---
+Review only the files named in the task. Report each finding with its path and line.
+```
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | Lowercase letters, digits and single hyphens. `explore` and `general` are reserved. |
+| `description` | yes | Shown to the model in the subagent listing. |
+| `tools` | no | Allowlist, as a YAML list or a comma-separated string. Harness tool names, the Claude Code names `Read`, `Write`, `Edit`, `MultiEdit`, `Grep`, `Glob`, `LS`, `Bash`, `WebFetch`, `WebSearch`, `TodoWrite`, `Task`, or `mcp__*` names. Absent means the general child's tools; `[]` means none. |
+| `model` | no | `default`, `plan`, `smol`, or a model spec such as `openai-responses:gpt-6-luna`. Claude Code's `inherit`, `sonnet` and `opus` mean `default`; `haiku` means `smol`. A spec with an `@http(s)` endpoint is rejected: define the route under settings `providers`. |
+| `reasoning` | no | `off`, `minimal`, `low`, `medium` or `high`. |
+| `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string. Used when the `task` call passes no `output_schema`. |
+
+The body below the header is the agent's instructions; it is required.
+
+With `task` active, the `task` tool accepts each file agent's bare name as
+`subagent_type`, and the system prompt lists the agents once, beside `explore`
+and `general`. The listing is fixed for the session, so it does not change the
+cached prompt prefix between turns.
+
+An agent file is prompt text. It can narrow what a child may do, never widen
+it:
+
+- A file agent runs as a `general` child. Its tools are the intersection of its
+  `tools` list, the general child's built-in tools and the parent's active tools,
+  and every call still passes the child's permission ceiling. Children get no MCP
+  tools, so an `mcp__*` entry offers nothing today.
+- `default` (or no `model`) runs on the parent's default model. `smol` uses the
+  smol model and `smol_reasoning`; `plan` uses the plan model and
+  `plan_reasoning`, or the default model when the host sets no plan model. A
+  model spec is routed through the configured providers like a role model.
+  `reasoning` overrides the role's effort.
+- The agent's version is a hash of its file. A durable task resumed after the
+  file changed fails with `recorded agent preset version unavailable` instead of
+  running a different agent.
+
+With extension bundles selected, file agents are listed beside the
+`<bundle>/<preset>` names. A file agent whose name equals a bundle preset's name
+logs a startup warning naming the file and the bundle; both stay available, the
+file agent as `<name>` and the bundle's as `<bundle>/<name>`. A session in a
+remote environment loads no agent files.
+
+`tempest agents list` prints each agent's name, model and source file. It exits 1
+when any file is invalid, after naming the file and field on stderr.
+
 ### Worktrees and isolation
 
 A general child in an eligible git repository gets a **detached worktree**. A clean
