@@ -453,9 +453,8 @@ func TestGitignoreMatcher(t *testing.T) {
 		{name: "negation target not ignored", rules: "!special\nignored\n", path: "special", isDir: false, ignored: false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			matcher := parseGitignore(testCase.rules)
-			if got := matcher.Ignore(testCase.path, testCase.isDir); got != testCase.ignored {
-				t.Fatalf("Ignore(%q, %v) with rules %q = %v, want %v", testCase.path, testCase.isDir, testCase.rules, got, testCase.ignored)
+			if got := rootIgnoreSet(context.Background(), testCase.rules).excludedOrUnder(testCase.path, testCase.isDir); got != testCase.ignored {
+				t.Fatalf("excludedOrUnder(%q, %v) with rules %q = %v, want %v", testCase.path, testCase.isDir, testCase.rules, got, testCase.ignored)
 			}
 		})
 	}

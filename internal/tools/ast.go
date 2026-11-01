@@ -276,7 +276,7 @@ func newASTTool(name ToolName, cwd string, options ToolsOptions) (agent.AgentToo
 func astTargets(ctx context.Context, root *os.Root, cwd string, scopes []string, lang string, edit bool) (map[string]hashlineTarget, error) {
 	targets := map[string]hashlineTarget{}
 	visited := 0
-	ignore := loadGitignore(root)
+	ignore := rootGitignore(ctx, root)
 	for _, scope := range scopes {
 		if scope == "" || strings.Contains(scope, "://") {
 			return nil, errors.New("AST scopes must be workspace paths, not URLs or empty paths")
@@ -312,12 +312,12 @@ func astTargets(ctx context.Context, root *os.Root, cwd string, scopes []string,
 				return nil
 			}
 			if entry.IsDir() {
-				if entry.Name() == ".git" || ignore.Ignore(p, true) {
+				if entry.Name() == ".git" || (p != "." && ignore.excludedOrUnder(p, true)) {
 					return fs.SkipDir
 				}
 				return nil
 			}
-			if !entry.Type().IsRegular() || ignore.Ignore(p, false) || !matchGlobPattern(glob, searchRelative(filepath.ToSlash(rel), p)) {
+			if !entry.Type().IsRegular() || ignore.excludedOrUnder(p, false) || !matchGlobPattern(glob, searchRelative(filepath.ToSlash(rel), p)) {
 				return nil
 			}
 			if lang == "" && astLanguage(p) == "" {

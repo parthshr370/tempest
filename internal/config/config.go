@@ -357,7 +357,7 @@ const (
 type WorkspaceListing struct {
 	// Disabled is `workspace_listing: false`: new sessions take no listing.
 	Disabled bool
-	// MaxFiles is the most paths read from git or the directory walk.
+	// MaxFiles is the most paths read from git, rg or the directory walk.
 	MaxFiles int
 	// MaxBytes bounds the listed lines; past it the listing folds to
 	// per-directory counts and then cuts with a truncation line.

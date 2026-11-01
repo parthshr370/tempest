@@ -42,6 +42,19 @@ func runListingGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// withoutRg leaves only git on PATH, so a non-git workspace is listed by the
+// walk even where rg is installed.
+func withoutRg(t *testing.T) {
+	t.Helper()
+	bin := t.TempDir()
+	if git, err := exec.LookPath("git"); err == nil {
+		if err := os.Symlink(git, filepath.Join(bin, "git")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin)
+}
+
 func takeListing(t *testing.T, lease environment.Lease, cwd string, policy config.WorkspaceListing) string {
 	t.Helper()
 	listing, err := WorkspaceListing(context.Background(), lease, cwd, policy)
@@ -96,6 +109,7 @@ func TestWorkspaceListingGitSubdirectoryIsRelativeToCwd(t *testing.T) {
 }
 
 func TestWorkspaceListingWalkOutsideGitHonoursGitignore(t *testing.T) {
+	withoutRg(t)
 	dir := t.TempDir()
 	writeListingFiles(t, dir, map[string]string{
 		"main.py":                   "print(1)\n",
@@ -119,6 +133,7 @@ func TestWorkspaceListingWalkOutsideGitHonoursGitignore(t *testing.T) {
 // tree is listed by the walk and then, once it is a repository, by git; the
 // two must agree, and the cases the walk must get right are named.
 func TestWorkspaceListingWalkMatchesGitForNestedIgnoreFiles(t *testing.T) {
+	withoutRg(t)
 	// Isolate git from the machine's global excludes file.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -164,6 +179,7 @@ func TestWorkspaceListingWalkMatchesGitForNestedIgnoreFiles(t *testing.T) {
 // block the read forever. The listing still returns well inside its deadline
 // and, like git, names only regular files and symbolic links.
 func TestWorkspaceListingWalkSkipsNonRegularIgnoreFile(t *testing.T) {
+	withoutRg(t)
 	dir := t.TempDir()
 	writeListingFiles(t, dir, map[string]string{"a.go": "package a\n", "pkg/b.go": "package pkg\n"})
 	for _, name := range []string{".gitignore", "pkg/.gitignore"} {
@@ -202,8 +218,9 @@ func TestWorkspaceListingWalkSkipsNonRegularIgnoreFile(t *testing.T) {
 // An ignore file larger than the read bound is skipped whole, as git skips
 // one past its own limit, instead of being read into memory.
 func TestWorkspaceListingWalkSkipsOversizedIgnoreFile(t *testing.T) {
+	withoutRg(t)
 	dir := t.TempDir()
-	padding := strings.Repeat("#\n", gitignoreMaxBytes/len("#\n"))
+	padding := strings.Repeat("#\n", ignoreFileMaxBytes/len("#\n"))
 	writeListingFiles(t, dir, map[string]string{"a.go": "package a\n", "big.txt": "x\n", ".gitignore": "big.txt\n" + padding})
 
 	if got := strings.Join(listedLines(t, takeListing(t, nil, dir, config.WorkspaceListing{})), ","); got != ".gitignore,a.go,big.txt" {
@@ -284,16 +301,23 @@ func TestWorkspaceListingCutsWithTruncationLineWhenFoldStillTooBig(t *testing.T)
 
 func TestWorkspaceListingStopsAtMaxFiles(t *testing.T) {
 	const maxFiles = 3
-	for _, mode := range []string{"git", "walk"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, source := range []string{gitListingSource, rgListingSource, walkListingSource} {
+		t.Run(source, func(t *testing.T) {
 			dir := t.TempDir()
 			writeListingFiles(t, dir, map[string]string{"a.txt": "", "b.txt": "", "c.txt": "", "d.txt": "", "e.txt": ""})
-			if mode == "git" {
+			switch source {
+			case gitListingSource:
 				runListingGit(t, dir, "init", "-q")
+			case rgListingSource:
+				if _, err := exec.LookPath("rg"); err != nil {
+					t.Skip("rg is not installed")
+				}
+			case walkListingSource:
+				withoutRg(t)
 			}
 			listing := takeListing(t, nil, dir, config.WorkspaceListing{MaxFiles: maxFiles})
-			if !strings.Contains(listing, ` paths="3+">`) {
-				t.Fatalf("header lacks the capped count:\n%s", listing)
+			if !strings.Contains(listing, ` paths="3+">`) || !strings.Contains(listing, `source="`+source+`"`) {
+				t.Fatalf("header lacks the source or capped count:\n%s", listing)
 			}
 			lines := listedLines(t, listing)
 			if len(lines) != maxFiles+1 || lines[maxFiles] != "[truncated: stopped reading after 3 paths; use find or ls for the rest]" {
@@ -394,6 +418,7 @@ func TestWorkspaceListingRemoteIgnoresInheritedGitRouting(t *testing.T) {
 // A remote workspace that is not a git work tree gets the same ignore-aware
 // walk as a local one, run inside the environment.
 func TestWorkspaceListingRemoteWalksNonGitWorkspace(t *testing.T) {
+	withoutRg(t)
 	workspace := t.TempDir()
 	writeListingFiles(t, workspace, map[string]string{"main.py": "print(1)\n", "pkg/.gitignore": "secret.key\n", "pkg/secret.key": "private\n", "pkg/public.py": "x = 1\n"})
 	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})

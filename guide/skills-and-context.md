@@ -18,19 +18,29 @@ turns on `ls` and `find`.
   --exclude-standard`: tracked files plus untracked files that are not ignored,
   relative to the working directory. `git` runs with every inherited `GIT_*`
   variable removed and `core.fsmonitor` off, so it reads the working directory's
-  own repository and runs no configured program. Outside git it is a directory
-  walk that skips `.git`, names only regular files and symbolic links, and
-  applies every `.gitignore` in the tree as git does: each file's patterns
-  apply in its own directory and below, a deeper file outranks the ones above
-  it, the last matching pattern wins, `!` re-includes a file but nothing under
-  an excluded directory, a `/` at the start or in the middle anchors a pattern
-  to its file's directory, and `**`, trailing `/`, `\#`, `\!` and trailing
-  spaces follow git. It does not read `.git/info/exclude`, `core.excludesFile`
-  or `.ignore` files, and it opens only a regular `.gitignore` (never a FIFO
-  or a symbolic link) of at most 1 MiB; a larger one is skipped. Both stop
-  reading after `workspace_listing_max_files` paths (default 10000). Listing
-  gets 2 seconds, a hard limit: a walk that runs out of time lists what it
-  found, and a slower `git` leaves the session without a listing.
+  own repository and runs no configured program. Outside git it is `rg --files
+  --hidden --no-require-git` when `rg` is installed (with `--no-config`,
+  `--no-ignore-parent` and `--no-ignore-global`), and otherwise a directory
+  walk. Both list hidden files, skip `.git`, and apply every `.ignore` and
+  `.gitignore` in the tree the way rg does: each file's patterns apply in its
+  own directory and below, a matching `.ignore` pattern outranks every
+  `.gitignore`, and for each name the deepest file with a matching pattern
+  decides. The walk matches patterns with a port of git 2.54's own matcher
+  (`wildmatch.c` and the exclude rules in `dir.c`), so a `.gitignore` excludes
+  exactly what `git ls-files --others --exclude-standard` would: the last
+  matching pattern wins, `!` re-includes a file but nothing under an excluded
+  directory, `/` anchors, and `**`, character classes, escapes and trailing
+  spaces follow git. rg uses its own glob matcher, which can differ from git
+  on unusual patterns, and it does not name symbolic links; the walk names
+  regular files and symbolic links, as git does. Neither reads
+  `.git/info/exclude` or `core.excludesFile`. The walk opens only a regular
+  ignore file (never a FIFO or a symbolic link) of at most 1 MiB; a larger one
+  is skipped. All three stop reading after `workspace_listing_max_files`
+  paths (default 10000). Listing gets 2 seconds, a hard limit: rg or a walk
+  that runs out of time lists what it found, matching included, and a slower
+  `git` leaves the session without a listing. rg blocks on a FIFO named
+  `.ignore` or `.gitignore`, so such a workspace waits out the 2 seconds and
+  starts without a listing.
 - **Size.** The listed names fit `workspace_listing_max_bytes` (default 4096).
   Past it the listing folds to per-directory file counts (`internal/tools/ (40
   files)`); if that still does not fit it is cut, and a final

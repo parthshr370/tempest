@@ -15,7 +15,6 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
-	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,6 +41,7 @@ const workspaceListingOperation = "workspace_listing"
 // The listing sources, named in the frame's source attribute.
 const (
 	gitListingSource  = "git ls-files"
+	rgListingSource   = "rg --files"
 	walkListingSource = "directory walk"
 )
 
@@ -56,12 +56,13 @@ type workspaceFiles struct {
 
 // WorkspaceListing returns the framed session-start listing of the lease's
 // workspace, taken on the host that holds it: `git ls-files` in a git work
-// tree, else a walk that applies every .gitignore as git does. A remote
-// workspace is listed by its environment (workspaceListingOperation) with the
-// same code. cwd names the directory when lease is nil. The listing is ""
-// with a nil error when the policy disables it or the workspace has no files,
-// and "" with the reason when no cheap listing exists; the session then
-// simply starts without one.
+// tree, else `rg --files` when rg is installed, else a walk that applies
+// .ignore and .gitignore files as rg does. A remote workspace is listed by
+// its environment (workspaceListingOperation) with the same code. cwd names
+// the directory when lease is nil. The listing is "" with a nil error when
+// the policy disables it or the workspace has no files, and "" with the
+// reason when no cheap listing exists; the session then simply starts
+// without one.
 func WorkspaceListing(ctx context.Context, lease environment.Lease, cwd string, policy config.WorkspaceListing) (string, error) {
 	if policy.Disabled {
 		return "", nil
@@ -92,19 +93,29 @@ func WorkspaceListing(ctx context.Context, lease environment.Lease, cwd string, 
 }
 
 // localWorkspaceFiles lists cwd on this host. Most often a failed git means
-// cwd is not a git work tree, so the walk runs instead, unless the deadline
-// has already passed.
+// cwd is not a git work tree, so rg runs instead, or the walk when rg is not
+// installed or fails; each runs only while the deadline has not passed.
 func localWorkspaceFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFiles, error) {
-	files, gitErr := localGitFiles(ctx, cwd, maxFiles)
-	if gitErr == nil {
+	files, failures := localGitFiles(ctx, cwd, maxFiles)
+	if failures == nil {
 		return files, nil
 	}
 	if ctx.Err() != nil {
-		return workspaceFiles{}, gitErr
+		return workspaceFiles{}, failures
+	}
+	if rg, err := exec.LookPath("rg"); err == nil {
+		listed, rgErr := localRgFiles(ctx, rg, cwd, maxFiles)
+		if rgErr == nil {
+			return listed, nil
+		}
+		failures = errors.Join(failures, rgErr)
+		if ctx.Err() != nil {
+			return workspaceFiles{}, failures
+		}
 	}
 	files, walkErr := walkWorkspaceFiles(ctx, cwd, maxFiles)
 	if walkErr != nil {
-		return workspaceFiles{}, errors.Join(gitErr, walkErr)
+		return workspaceFiles{}, errors.Join(failures, walkErr)
 	}
 	return files, nil
 }
@@ -116,20 +127,93 @@ func gitListArgs(cwd string) []string {
 }
 
 func localGitFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFiles, error) {
-	argv := gitListArgs(cwd)
-	commandCtx, stop := context.WithCancel(ctx)
-	defer stop()
-	command := exec.CommandContext(commandCtx, argv[0], argv[1:]...)
-	command.Env = append(gitFreeEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
-	command.WaitDelay = time.Second
-	stdout, err := command.StdoutPipe()
+	env := append(gitFreeEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
+	names, err := runNameCommand(ctx, "", env, maxFiles, gitListArgs(cwd))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return workspaceFiles{}, fmt.Errorf("git ls-files: %w", ctxErr)
+	}
+	if err == nil {
+		err = names.exit
+	}
 	if err != nil {
 		return workspaceFiles{}, fmt.Errorf("git ls-files: %w", err)
 	}
-	if err := command.Start(); err != nil {
-		return workspaceFiles{}, fmt.Errorf("git ls-files: %w", err)
+	return workspaceFiles{source: gitListingSource, paths: sortUnique(names.paths), more: names.more}, nil
+}
+
+// rg exit statuses that still mean a listing: no file at all, or some
+// entries unreadable and the rest listed, which the walk would skip too.
+const (
+	rgExitNoFiles = 1
+	rgExitPartial = 2
+)
+
+// rgListArgs lists files as the walk does: hidden files too, entries named
+// .git skipped, .gitignore files applied outside git as well, and nothing
+// read from an rg config file, an ignore file above cwd or
+// core.excludesFile. Unlike the walk, rg does not name symbolic links.
+func rgListArgs(rg string) []string {
+	return []string{rg, "--files", "--null", "--hidden", "--glob", "!.git", "--no-require-git", "--no-config", "--no-ignore-parent", "--no-ignore-global"}
+}
+
+// localRgFiles lists cwd with rg. At the deadline it lists the names found
+// so far, as the walk does.
+func localRgFiles(ctx context.Context, rg string, cwd string, maxFiles int) (workspaceFiles, error) {
+	names, err := runNameCommand(ctx, cwd, nil, maxFiles, rgListArgs(rg))
+	files := workspaceFiles{source: rgListingSource, paths: sortUnique(names.paths), more: names.more}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if len(files.paths) == 0 {
+			return workspaceFiles{}, fmt.Errorf("rg --files: %w", ctxErr)
+		}
+		files.more = true
+		return files, nil
 	}
-	files := workspaceFiles{source: gitListingSource}
+	if err == nil && names.exit != nil && !rgExitStillListed(names.exit, len(files.paths) > 0) {
+		err = names.exit
+	}
+	if err != nil {
+		return workspaceFiles{}, fmt.Errorf("rg --files: %w", err)
+	}
+	return files, nil
+}
+
+func rgExitStillListed(exit error, listedAny bool) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(exit, &exitErr) {
+		return false
+	}
+	code := exitErr.ExitCode()
+	return (code == rgExitNoFiles && !listedAny) || (code == rgExitPartial && listedAny)
+}
+
+// listedNames is what a listing command printed.
+type listedNames struct {
+	paths []string
+	// more reports that the command was killed at maxFiles.
+	more bool
+	// exit is the command's exit error, nil after the kill at maxFiles.
+	exit error
+}
+
+// runNameCommand runs argv in dir (the current directory when "") with env
+// (the inherited one when nil) and reads its NUL-separated names, killing it
+// once maxFiles names are read. err reports a command that could not start
+// or whose output could not be read; the caller judges names.exit.
+func runNameCommand(ctx context.Context, dir string, env []string, maxFiles int, argv []string) (listedNames, error) {
+	commandCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	command := exec.CommandContext(commandCtx, argv[0], argv[1:]...)
+	command.Dir = dir
+	command.Env = env
+	command.WaitDelay = time.Second
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return listedNames{}, err
+	}
+	if err := command.Start(); err != nil {
+		return listedNames{}, err
+	}
+	var names listedNames
 	reader := bufio.NewReader(stdout)
 	var readErr error
 	for {
@@ -137,32 +221,28 @@ func localGitFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFile
 		name, readErr = reader.ReadString(0)
 		name = strings.TrimSuffix(name, "\x00")
 		if name != "" {
-			if len(files.paths) == maxFiles {
-				// Killing git ends its output; Wait reaps it and closes the pipe.
-				files.more = true
+			if len(names.paths) == maxFiles {
+				// Killing the command ends its output; Wait reaps it and
+				// closes the pipe.
+				names.more = true
 				stop()
 				break
 			}
-			files.paths = append(files.paths, name)
+			names.paths = append(names.paths, name)
 		}
 		if readErr != nil {
 			break
 		}
 	}
-	waitErr := command.Wait()
-	if err := ctx.Err(); err != nil {
-		return workspaceFiles{}, fmt.Errorf("git ls-files: %w", err)
+	names.exit = command.Wait()
+	if names.more {
+		names.exit = nil
+		return names, nil
 	}
-	if !files.more {
-		if waitErr != nil {
-			return workspaceFiles{}, fmt.Errorf("git ls-files: %w", waitErr)
-		}
-		if !errors.Is(readErr, io.EOF) {
-			return workspaceFiles{}, fmt.Errorf("git ls-files output: %w", readErr)
-		}
+	if !errors.Is(readErr, io.EOF) {
+		return names, fmt.Errorf("output: %w", readErr)
 	}
-	files.paths = sortUnique(files.paths)
-	return files, nil
+	return names, nil
 }
 
 // gitFreeEnv drops inherited GIT_* routing so git reads the cwd's repository.
@@ -179,7 +259,7 @@ func gitFreeEnv() []string {
 
 // remoteWorkspaceFiles asks the environment to list its workspace with
 // localWorkspaceFiles, so git there runs with the environment host's GIT_*
-// routing removed and a non-git workspace gets the same walk.
+// routing removed and a non-git workspace gets the same rg or walk.
 func remoteWorkspaceFiles(ctx context.Context, lease environment.Lease, maxFiles int) (workspaceFiles, error) {
 	if err := environment.Require(lease, environment.Search); err != nil {
 		return workspaceFiles{}, err
@@ -196,7 +276,7 @@ func remoteWorkspaceFiles(ctx context.Context, lease environment.Lease, maxFiles
 	if err := json.Unmarshal(raw, &reply); err != nil {
 		return workspaceFiles{}, fmt.Errorf("remote workspace listing result: %w", err)
 	}
-	if reply.Source != gitListingSource && reply.Source != walkListingSource {
+	if reply.Source != gitListingSource && reply.Source != rgListingSource && reply.Source != walkListingSource {
 		return workspaceFiles{}, fmt.Errorf("remote workspace listing has unknown source %q", reply.Source)
 	}
 	files := workspaceFiles{source: reply.Source, more: reply.More}
@@ -250,21 +330,31 @@ type workspaceWalk struct {
 	mu       sync.Mutex
 	maxFiles int
 	files    workspaceFiles
+	// done is closed when the walking goroutine returns, after err is set.
+	done chan struct{}
+	err  error
 }
 
-// walkWorkspaceFiles lists a directory that is not a git work tree. Each
-// directory's .gitignore applies below it as in git (gitignore.go), .git is
-// skipped, and, like git, only regular files and symbolic links are named.
-// It stops at maxFiles or the deadline. A filesystem call can't be
+// walkIgnoreFiles are the per-directory ignore files the walk applies,
+// highest precedence first, as rg ranks them: a matching .ignore pattern at
+// any depth outranks every .gitignore, and within each name the deepest file
+// with a matching pattern decides.
+var walkIgnoreFiles = []string{".ignore", ".gitignore"}
+
+// walkWorkspaceFiles lists a directory that is not a git work tree when rg
+// is not there to. Each directory's ignore files (walkIgnoreFiles) apply
+// below it, matched as git matches .gitignore (gitignore.go); entries named
+// .git are skipped, and, like git, only regular files and symbolic links are
+// named. It stops at maxFiles or the deadline. A filesystem call can't be
 // interrupted, so the walk runs on its own goroutine: at the deadline the
-// caller returns the names found so far, and the walk stops at its next entry.
+// caller returns the names found so far, and the walk stops at its next
+// entry or within its current ignore match (cancelPoll).
 func walkWorkspaceFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFiles, error) {
-	walk := &workspaceWalk{maxFiles: maxFiles, files: workspaceFiles{source: walkListingSource}}
-	done := make(chan error, 1)
-	go func() { done <- walk.run(ctx, cwd) }()
+	walk := startWorkspaceWalk(ctx, cwd, maxFiles)
 	var walkErr error
 	select {
-	case walkErr = <-done:
+	case <-walk.done:
+		walkErr = walk.err
 	case <-ctx.Done():
 		walkErr = ctx.Err()
 	}
@@ -280,13 +370,23 @@ func walkWorkspaceFiles(ctx context.Context, cwd string, maxFiles int) (workspac
 	return files, nil
 }
 
+// startWorkspaceWalk starts the walking goroutine.
+func startWorkspaceWalk(ctx context.Context, cwd string, maxFiles int) *workspaceWalk {
+	walk := &workspaceWalk{maxFiles: maxFiles, files: workspaceFiles{source: walkListingSource}, done: make(chan struct{})}
+	go func() {
+		walk.err = walk.run(ctx, cwd)
+		close(walk.done)
+	}()
+	return walk
+}
+
 func (walk *workspaceWalk) run(ctx context.Context, cwd string) error {
 	root, err := os.OpenRoot(cwd)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	ignores := gitignoreTree{}
+	ignores := newIgnoreSet(ctx, walkIgnoreFiles...)
 	return fs.WalkDir(root.FS(), ".", func(name string, entry fs.DirEntry, err error) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -302,13 +402,21 @@ func (walk *workspaceWalk) run(ctx context.Context, cwd string) error {
 			}
 			return nil
 		}
-		if entry.IsDir() {
-			if name != "." && (entry.Name() == ".git" || ignores.excluded(name, true)) {
+		if name == "." {
+			ignores.enter(root, "")
+			return nil
+		}
+		if entry.Name() == ".git" {
+			if entry.IsDir() {
 				return fs.SkipDir
 			}
-			if matcher := readGitignore(root, path.Join(name, ".gitignore")); matcher != nil {
-				ignores[name] = matcher
+			return nil
+		}
+		if entry.IsDir() {
+			if ignores.excluded(name, true) {
+				return fs.SkipDir
 			}
+			ignores.enter(root, name)
 			return nil
 		}
 		if !entry.Type().IsRegular() && entry.Type()&fs.ModeSymlink == 0 {

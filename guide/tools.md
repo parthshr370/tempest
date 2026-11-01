@@ -6,7 +6,7 @@ active set with `-exclude-tools` and enable the optional groups with flags:
 to the working directory through `os.Root`. `grep` and `find` fall back to pure Go
 when `rg` and `fd` are absent. Both search hidden files, honor `.gitignore` inside a
 Git repository, and skip `.git` unless you point them at it. The pure-Go fallbacks
-read only the root `.gitignore`, with git's pattern rules.
+read only the root `.gitignore`, matched with a port of git's own matcher.
 
 The one read-only exception to containment: `read` may also open this session's own
 job artifacts (`<journal>.d/jobs/<job>/` `changes.patch`, `result.txt`, `output.log`),
