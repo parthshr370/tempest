@@ -43,7 +43,7 @@ func openFixture(t *testing.T, mode string) (*Manager, string) {
 	directory := t.TempDir()
 	ledger := filepath.Join(directory, "ledger")
 	configs := []mcpconfig.Server{{Name: "fixture", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", mode, "-ledger", ledger}, StartupTimeout: "10s", CallTimeout: "5s"}}
-	manager, err := Open(context.Background(), directory, filepath.Join(directory, "output"), configs, nil, nil)
+	manager, err := Open(context.Background(), configs, Options{Cwd: directory, SpillDir: filepath.Join(directory, "output")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestMCPVersionNegotiation(t *testing.T) {
 			}
 		})
 	}
-	_, err := Open(context.Background(), t.TempDir(), t.TempDir(), []mcpconfig.Server{{Name: "modern", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", "modern"}}}, nil, nil)
+	_, err := Open(context.Background(), []mcpconfig.Server{{Name: "modern", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", "modern"}}}, Options{Cwd: t.TempDir(), SpillDir: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "mcp_version") || !strings.Contains(err.Error(), "2026-07-28") || !strings.Contains(err.Error(), "2025-06-18") {
 		t.Fatalf("version diagnostic: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestMCPDiscoveryAndSchema(t *testing.T) {
 	}
 	for _, mode := range []string{"duplicate", "repeated-cursor", "invalid-name", "external-ref"} {
 		t.Run(mode, func(t *testing.T) {
-			_, err := Open(context.Background(), t.TempDir(), t.TempDir(), []mcpconfig.Server{{Name: "fixture", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", mode}}}, nil, nil)
+			_, err := Open(context.Background(), []mcpconfig.Server{{Name: "fixture", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", mode}}}, Options{Cwd: t.TempDir(), SpillDir: t.TempDir()})
 			if err == nil {
 				t.Fatal("accepted invalid discovery")
 			}

@@ -74,56 +74,81 @@ func (h *httpTransport) begin(ctx context.Context) (context.Context, func(), err
 	stop := context.AfterFunc(h.ctx, cancel)
 	return linked, func() { stop(); cancel(); h.workers.Done() }, nil
 }
+
+// request sends one HTTP exchange. With Auth, every request carries the
+// current bearer token (MCP authorization: tokens go in every request), and
+// a 401 or 403 is retried once when Auth recovers without a user.
 func (h *httpTransport) request(ctx context.Context, method string, body []byte, initial bool, cursor string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, h.cfg.URL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	for key, value := range h.cfg.Headers {
-		req.Header.Set(key, value)
-	}
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	if method == http.MethodGet {
-		req.Header.Set("Accept", "text/event-stream")
-	}
-	if method == http.MethodPost {
-		req.Header.Set("Content-Type", "application/json")
-		// Even an operator-provided Idempotency-Key must not make Transport replay MCP.
-		req.GetBody = nil
-	}
-	if !initial {
-		h.mu.Lock()
-		session, version := h.session, h.version
-		h.mu.Unlock()
-		if session != "" {
-			req.Header.Set("Mcp-Session-Id", session)
+	for retried := false; ; retried = true {
+		req, err := http.NewRequestWithContext(ctx, method, h.cfg.URL, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
 		}
-		if version != "" {
-			req.Header.Set("MCP-Protocol-Version", version)
+		for key, value := range h.cfg.Headers {
+			req.Header.Set(key, value)
 		}
-	}
-	if cursor != "" {
-		req.Header.Set("Last-Event-ID", cursor)
-	}
-	tracecontext.Inject(ctx, req.Header)
-	response, err := h.client.Do(req)
-	if err != nil {
-		var requestError *url.Error
-		if errors.As(err, &requestError) {
-			return nil, fmt.Errorf("MCP HTTP %s: %w", method, requestError.Err)
+		token := ""
+		if h.handlers.Auth != nil {
+			if token, err = h.handlers.Auth.Token(ctx); err != nil {
+				return nil, &AuthError{Err: err}
+			}
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
 		}
-		return nil, err
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if method == http.MethodGet {
+			req.Header.Set("Accept", "text/event-stream")
+		}
+		if method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/json")
+			// Even an operator-provided Idempotency-Key must not make Transport replay MCP.
+			req.GetBody = nil
+		}
+		if !initial {
+			h.mu.Lock()
+			session, version := h.session, h.version
+			h.mu.Unlock()
+			if session != "" {
+				req.Header.Set("Mcp-Session-Id", session)
+			}
+			if version != "" {
+				req.Header.Set("MCP-Protocol-Version", version)
+			}
+		}
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
+		}
+		tracecontext.Inject(ctx, req.Header)
+		response, err := h.client.Do(req)
+		if err != nil {
+			var requestError *url.Error
+			if errors.As(err, &requestError) {
+				return nil, fmt.Errorf("MCP HTTP %s: %w", method, requestError.Err)
+			}
+			return nil, err
+		}
+		switch response.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			response.Body.Close()
+			if h.handlers.Auth == nil {
+				return nil, errors.New("mcp_auth: server rejected credentials")
+			}
+			rejection := Rejection{Status: response.StatusCode, Challenges: response.Header.Values("WWW-Authenticate"), Token: token, Retried: retried}
+			if err := h.handlers.Auth.Rejected(ctx, rejection); err != nil {
+				return nil, &AuthError{Err: err}
+			}
+			if retried {
+				return nil, &AuthError{Err: errors.New("mcp_auth: server rejected a freshly refreshed token")}
+			}
+			continue
+		case http.StatusNotFound:
+			response.Body.Close()
+			h.invalidate()
+			return nil, errors.New("mcp_disconnected: HTTP session expired; remote outcome may be unknown")
+		}
+		return response, nil
 	}
-	switch response.StatusCode {
-	case http.StatusUnauthorized, http.StatusForbidden:
-		response.Body.Close()
-		return nil, errors.New("mcp_auth: server rejected credentials")
-	case http.StatusNotFound:
-		response.Body.Close()
-		h.invalidate()
-		return nil, errors.New("mcp_disconnected: HTTP session expired; remote outcome may be unknown")
-	}
-	return response, nil
 }
 func responseType(response *http.Response) string {
 	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))

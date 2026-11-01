@@ -34,6 +34,9 @@ type Handlers struct {
 	Request      func(context.Context, string, json.RawMessage) (any, *rpc.Error)
 	Notify       func(string, json.RawMessage)
 	AdmitProcess func(context.Context) (func(), error)
+	// Auth supplies OAuth bearer tokens over HTTP; nil sends only the
+	// configured headers.
+	Auth Auth
 }
 
 type transport interface {
@@ -230,6 +233,10 @@ func (c *Client) Call(ctx context.Context, method string, params any) (raw json.
 	var rpcErr *rpc.Error
 	if errors.As(err, &rpcErr) {
 		return nil, fmt.Errorf("%s: remote JSON-RPC code %d: %w", method, rpcErr.Code, rpcErr)
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		return nil, fmt.Errorf("%s: %w", method, err)
 	}
 	return nil, fmt.Errorf("mcp_disconnected: %s: %w; remote outcome may be unknown", method, err)
 }

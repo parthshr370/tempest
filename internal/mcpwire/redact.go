@@ -30,6 +30,9 @@ func newCredentialRedactor(cfg mcpconfig.Server) credentialRedactor {
 			add(value)
 		}
 	}
+	if cfg.OAuth != nil {
+		add(cfg.OAuth.ClientSecret)
+	}
 	secrets := make([]string, 0, len(values))
 	for value := range values {
 		secrets = append(secrets, value)

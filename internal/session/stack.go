@@ -24,6 +24,7 @@ import (
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
+	"go.harness.dev/harness/internal/mcpoauth"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
@@ -168,6 +169,14 @@ type StackConfig struct {
 	DebugAdapters map[string]dap.Adapter
 	// Compaction overrides the model's context maintenance budget.
 	Compaction *compaction.CompactionSettings
+	// MCP configures the MCP client beyond its server list.
+	MCP MCPClientSettings
+}
+
+// MCPClientSettings are the session-wide MCP client options.
+type MCPClientSettings struct {
+	// CredentialDir stores OAuth tokens per server; empty disables OAuth.
+	CredentialDir string
 }
 
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
@@ -191,6 +200,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 		ListingPolicy:        cfg.WorkspaceListing(),
+		MCP:                  MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir())},
 	}
 }
 

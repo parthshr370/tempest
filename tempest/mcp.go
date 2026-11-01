@@ -1,11 +1,26 @@
 package tempest
 
 import (
+	"context"
+
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/permission"
+	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/tools"
 )
+
+// elicitor scopes the host's elicitor to this session, so ACP routes the
+// request to this session's clients. Nil stays nil: no user can be asked.
+func (c *sessionCore) elicitor(host Elicitor) question.Elicitor {
+	if host == nil {
+		return nil
+	}
+	return func(ctx context.Context, request question.Elicit) (question.ElicitResult, error) {
+		request.SessionID = c.id
+		return host(ctx, request)
+	}
+}
 
 func (c *sessionCore) selectedMCPTools() []Tool {
 	registry := make(map[tools.ToolName]agent.AgentTool, len(c.baseTools))

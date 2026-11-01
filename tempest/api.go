@@ -41,7 +41,11 @@ type Options struct {
 	Prompter            Prompter
 	// Questioner handles non-sensitive ask tool requests; nil returns a headless error.
 	Questioner QuestionHandler
-	Logger     *slog.Logger
+	// Elicitor shows MCP server elicitations and MCP authorization URLs to the
+	// user; nil declines elicitations and makes authorization name the
+	// `tempest mcp login` command instead.
+	Elicitor Elicitor
+	Logger   *slog.Logger
 	// FauxScript selects a hermetic JSON response script instead of a network provider.
 	FauxScript string
 	// Stack optionally supplies resolved models, providers, discovery and tools.
@@ -218,6 +222,15 @@ type QuestionOption = question.Option
 
 // QuestionAnswer preserves the user's selected labels and optional text.
 type QuestionAnswer = question.Answer
+
+// Elicitor presents an MCP elicitation or authorization URL to the user.
+type Elicitor = question.Elicitor
+
+// Elicit is one forwarded MCP elicitation or authorization URL.
+type Elicit = question.Elicit
+
+// ElicitResult is the user's accept, decline or cancel answer.
+type ElicitResult = question.ElicitResult
 
 // Choice is a permission option; an empty choice cancels the request.
 type Choice = permission.Choice

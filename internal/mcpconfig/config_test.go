@@ -32,6 +32,11 @@ func TestMCPConfigRejectsUnsafeVariants(t *testing.T) {
 		"timeout":         {Name: "x", Transport: "stdio", Command: "fixture", CallTimeout: "0s"},
 		"variant":         {Name: "x", Transport: "http", URL: "https://example.com/mcp", Command: "fixture"},
 		"env":             {Name: "x", Transport: "stdio", Command: "fixture", Env: map[string]string{"BAD=KEY": "v"}},
+		"auth-value":      {Name: "x", Transport: "http", URL: "https://example.com/mcp", Auth: "basic"},
+		"auth-stdio":      {Name: "x", Transport: "stdio", Command: "fixture", Auth: "oauth"},
+		"oauth-static":    {Name: "x", Transport: "http", URL: "https://example.com/mcp", Headers: map[string]string{"authorization": "Bearer k"}, OAuth: &OAuthClient{ClientID: "id"}},
+		"oauth-secret":    {Name: "x", Transport: "http", URL: "https://example.com/mcp", OAuth: &OAuthClient{ClientSecret: "s"}},
+		"oauth-scope":     {Name: "x", Transport: "http", URL: "https://example.com/mcp", OAuth: &OAuthClient{Scopes: []string{"a b"}}},
 	}
 	for _, header := range []string{"Host", "Content-Length", "Accept", "Content-Type", "MCP-Protocol-Version", "mCp-SeSsIoN-Id", "Last-Event-ID", "bad\r\nkey"} {
 		server := validHTTP

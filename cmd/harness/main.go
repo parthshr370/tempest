@@ -321,6 +321,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		Cwd:                cwd,
 		Stack:              &stack,
 		ExtensionProcesses: processes,
+		Elicitor:           question.TerminalElicitor(os.Stdin, stderr),
 		New: &tempest.NewSession{
 			Model:          selectedModel.ID,
 			Budget:         opts.Budget,
@@ -683,7 +684,8 @@ const topUsage = `Usage:
 Commands:
   serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
   env       serve an identified workspace daemon over dedicated stdio
-  mcp       run as a stdio MCP server that exposes the tempest_run tool
+  mcp       run as a stdio MCP server that exposes the tempest_run tool;
+            mcp login|logout <server> manages MCP OAuth, mcp list shows servers and sign-in state
   fork      create a sibling from a safe durable transcript entry
   reset     start an empty context without deleting audit history or spend
   compact   summarize context through the durable native task scheduler

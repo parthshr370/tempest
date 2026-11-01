@@ -12,7 +12,8 @@ import (
 	"time"
 )
 
-// Server is one operator-selected MCP endpoint. Env and Headers may contain secrets.
+// Server is one operator-selected MCP endpoint. Env, Headers and the OAuth
+// client secret may contain secrets.
 type Server struct {
 	Name           string            `json:"name"`
 	Transport      string            `json:"transport"`
@@ -24,10 +25,47 @@ type Server struct {
 	StartupTimeout string            `json:"startupTimeout,omitempty"`
 	CallTimeout    string            `json:"callTimeout,omitempty"`
 	Permission     string            `json:"permission,omitempty"`
+	// Auth "oauth" lets login discover the authorization server through
+	// well-known metadata when the server sends no 401 challenge. HTTP
+	// servers without an Authorization header answer a Bearer challenge with
+	// OAuth either way.
+	Auth  string       `json:"auth,omitempty"`
+	OAuth *OAuthClient `json:"oauth,omitempty"`
+	// Sampling declares the sampling capability so the server may request
+	// model completions; each first use is still approved by the user.
+	Sampling bool `json:"sampling,omitempty"`
+}
+
+// OAuthClient is a pre-registered OAuth client. Without ClientID the client
+// registers itself dynamically (RFC 7591).
+type OAuthClient struct {
+	ClientID     string   `json:"clientId,omitempty"`
+	ClientSecret string   `json:"clientSecret,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+}
+
+// UsesOAuth reports whether an HTTP server's 401 challenge is answered with
+// OAuth: a configured Authorization header means static credentials instead.
+func (s Server) UsesOAuth() bool {
+	if s.Transport != "http" {
+		return false
+	}
+	for name := range s.Headers {
+		if strings.EqualFold(name, "Authorization") {
+			return false
+		}
+	}
+	return true
 }
 
 var serverName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,31}$`)
 var headerName = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+// ValidName reports whether name is a usable server name; it is also safe
+// as a file name.
+func ValidName(name string) bool {
+	return serverName.MatchString(name) && !strings.Contains(name, "__")
+}
 
 // Validate rejects unsafe or ambiguous configurations before starting a server.
 func Validate(servers []Server) error { _, err := Normalize(servers); return err }
@@ -118,6 +156,30 @@ func Normalize(servers []Server) ([]Server, error) {
 			}
 		default:
 			return fail(`unknown transport: use "stdio" (with command) or "http" (with url)`)
+		}
+		if s.Auth != "" && s.Auth != "oauth" {
+			return fail(`invalid auth: use "oauth" or omit it`)
+		}
+		if (s.Auth != "" || s.OAuth != nil) && !s.UsesOAuth() {
+			return fail("auth and oauth need an HTTP server without a configured Authorization header")
+		}
+		if s.OAuth != nil {
+			client := *s.OAuth
+			if client.ClientSecret != "" && client.ClientID == "" {
+				return fail("oauth.clientSecret needs oauth.clientId")
+			}
+			for _, value := range []string{client.ClientID, client.ClientSecret} {
+				if strings.ContainsAny(value, "\x00\r\n") {
+					return fail("invalid oauth client value")
+				}
+			}
+			for _, scope := range client.Scopes {
+				if scope == "" || strings.ContainsAny(scope, " \t\r\n\"\\") {
+					return fail("oauth.scopes entries must be single scope tokens")
+				}
+			}
+			client.Scopes = append([]string(nil), client.Scopes...)
+			s.OAuth = &client
 		}
 		s.Args = append([]string(nil), s.Args...)
 		s.Env = maps.Clone(s.Env)

@@ -29,6 +29,7 @@ type call struct {
 	cancelled bool // guarded by server.mu, including reply retirement
 	token     json.RawMessage
 	form      bool
+	url       bool
 	revision  string
 }
 
@@ -51,6 +52,7 @@ type server struct {
 	initialized, ready bool
 	revision           string
 	form               bool
+	url                bool
 }
 
 // Serve negotiates one stdio MCP connection and closes all of its sessions.
@@ -186,6 +188,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 			s.revision = mcpwire.PreferredVersion
 		}
 		s.form = supportsForm(s.revision, p.Capabilities["elicitation"])
+		s.url = supportsURL(s.revision, p.Capabilities["elicitation"])
 		s.initialized = true
 		return map[string]any{"protocolVersion": s.revision, "capabilities": map[string]any{"tools": map[string]bool{"listChanged": false}}, "serverInfo": map[string]string{"name": "Tempest", "version": build.Current().Version}}, nil
 	case "ping":
@@ -242,7 +245,7 @@ func (s *server) handle(ctx context.Context, method string, raw json.RawMessage)
 		return nil, invalid(fmt.Errorf("tools/call requires a request id"))
 	}
 	callCtx, cancel := context.WithCancel(ctx)
-	c := &call{ctx: callCtx, cancel: cancel, token: tokenRaw, form: s.form, revision: s.revision}
+	c := &call{ctx: callCtx, cancel: cancel, token: tokenRaw, form: s.form, url: s.url, revision: s.revision}
 	s.mu.Lock()
 	if s.calls[id] != nil {
 		s.mu.Unlock()
@@ -365,7 +368,7 @@ func (s *server) run(c *call, in RunInput, settings tempest.NewSession, e *entry
 		}
 	} else {
 		router := &routingPrompter{conn: s.conn, timeout: s.opts.PermissionTimeout}
-		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Questioner: router.Question, Logger: s.opts.Logger, ExtensionProcesses: s.opts.ExtensionProcesses}
+		options := tempest.Options{SessionDir: s.opts.SessionDir, Cwd: cwd, New: &settings, Provider: s.opts.Provider, Stack: s.opts.Stack, Prompter: router, Questioner: router.Question, Elicitor: router.Elicit, Logger: s.opts.Logger, ExtensionProcesses: s.opts.ExtensionProcesses}
 		if in.SessionID != "" {
 			path, loaded, err := s.lookup(c.ctx, in.SessionID)
 			if err != nil {

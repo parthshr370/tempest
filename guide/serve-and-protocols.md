@@ -59,14 +59,16 @@ Claude Desktop and Cursor shape), or Tempest's array of named servers:
 | `startupTimeout` | Default `30s`. |
 | `callTimeout` | Default `2m`. |
 | `permission` | Tool permission for the server. |
+| `auth` | `"oauth"` lets `tempest mcp login` find the authorization server through well-known metadata even when the server answers without a 401. HTTP only. |
+| `oauth` | Pre-registered OAuth client: `{"clientId": "...", "clientSecret": "...", "scopes": ["..."]}`. Without it the client registers itself. HTTP only. |
 
 Unknown fields are errors that list the supported ones. Every configured server
 must start: one that fails aborts startup with an error naming the server. Fix it,
 disable it, or pass `-mcp-config ""` to run without MCP.
 
 Both stdio and Streamable HTTP clients support MCP `2025-11-25` (preferred) and
-`2025-06-18`. The handshake-free `2026-07-28` era, legacy HTTP+SSE, OAuth, sampling,
-and resource browsing are not supported.
+`2025-06-18`. The handshake-free `2026-07-28` era and legacy HTTP+SSE are not
+supported.
 
 Discovered tools use names such as `mcp__issues__lookup`. They default to
 prompt/exec-tier regardless of read-only annotations; without an approver, headless
@@ -80,6 +82,47 @@ not interpolated or stored in the journal; resume must resupply runtime MCP
 configuration. Serve keeps its startup MCP defaults for resumes that omit endpoint
 overrides, including after idle reap or server restart. Unknown-outcome MCP calls
 are never automatically replayed.
+
+### OAuth for HTTP servers
+
+An HTTP server without a configured `Authorization` header that answers `401` gets
+OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
+
+1. Protected resource metadata (RFC 9728) from the `resource_metadata` URL in the
+   `WWW-Authenticate` challenge, or from the well-known path-inserted and then root
+   URI.
+2. Authorization server metadata (RFC 8414), trying the OAuth and OpenID Connect
+   well-known locations in the specification's order. A server that does not
+   advertise PKCE `S256` is refused.
+3. The configured `oauth.clientId`, a stored dynamic registration, or a new RFC 7591
+   registration as a public client.
+4. Authorization code with PKCE `S256`, a `state` check and the RFC 8707 `resource`
+   parameter in the authorization and token requests, returning to a loopback
+   listener on `127.0.0.1`. Scope is the challenge's `scope`, else `oauth.scopes`,
+   else the resource's `scopes_supported`.
+
+```sh
+tempest mcp login docs          # opens the browser; -no-browser prints the URL
+tempest mcp list                # servers, transports and sign-in state
+tempest mcp logout docs         # forget tokens, keep the client registration
+```
+
+Tokens are stored per server in `<agent-dir>/mcp-oauth/<server>.json`, mode `0600`
+in a `0700` directory, written atomically and locked across processes. They are
+bound to the configured URL and are never sent to a server whose URL changed. An
+expiring or rejected access token is refreshed without the user; a rotated refresh
+token replaces the old one, and a rejected refresh token clears the tokens. A
+`403` with `insufficient_scope` asks for authorization again with the granted and
+challenged scopes together, then retries the request once.
+
+A server that needs authorization does not stop session startup. The first run
+authorizes it through the session's user: ACP clients that declare URL elicitation
+get an `elicitation/create` request in `url` mode, and one-shot runs on a terminal
+print the URL and wait for Enter. Headless runs, `serve` without such a client,
+and terminals that decline fail the run (or the tool call, for a step-up) with
+``mcp_auth: server docs needs authorization; run `tempest mcp login docs` ``. A
+step-up scope that no user could grant is remembered, and the next `tempest mcp
+login` requests it.
 
 ## MCP server
 

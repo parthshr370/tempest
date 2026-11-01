@@ -14,6 +14,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/mcpoauth"
 	"go.harness.dev/harness/internal/mcpwire"
 	"go.harness.dev/harness/internal/rpc"
 )
@@ -225,10 +226,9 @@ func (s *server) execution(remoteName string, outputSchema *jsonschema.Schema) f
 			} `json:"_meta"`
 		}{Name: remoteName, Arguments: args}
 		params.Meta.ProgressToken = progressToken
-		raw, err := client.Call(callCtx, "tools/call", params)
+		raw, err := s.call(ctx, client, "tools/call", params)
 		if err != nil {
-			var remoteErr *rpc.Error
-			if !errors.As(err, &remoteErr) {
+			if retirable(err) {
 				s.retire(client, err)
 			}
 			return failedTool(fmt.Sprintf("MCP server %s tools/call %s: %v", s.config.Name, remoteName, err))
@@ -242,6 +242,34 @@ func (s *server) execution(remoteName string, outputSchema *jsonschema.Schema) f
 		}
 		return result, nil
 	}
+}
+
+// call sends one request bounded by the server's call timeout. When the
+// server rejects it for authorization, the interactive login runs once and
+// the request is resent: the server refused it before processing it.
+func (s *server) call(ctx context.Context, client *mcpwire.Client, method string, params any) (json.RawMessage, error) {
+	var seen uint64
+	if s.auth != nil {
+		seen = s.auth.generation.Load()
+	}
+	raw, err := client.Call(ctx, method, params)
+	var login *mcpoauth.LoginRequired
+	if err == nil || s.auth == nil || !errors.As(err, &login) {
+		return raw, err
+	}
+	if err := s.authorize(ctx, login, seen); err != nil {
+		return nil, err
+	}
+	return client.Call(ctx, method, params)
+}
+
+// retirable reports a failure that leaves the connection in doubt; remote
+// JSON-RPC errors and authorization refusals do not.
+func retirable(err error) bool {
+	var remoteErr *rpc.Error
+	var authErr *mcpwire.AuthError
+	var login *mcpoauth.LoginRequired
+	return !errors.As(err, &remoteErr) && !errors.As(err, &authErr) && !errors.As(err, &login)
 }
 
 func (s *server) retire(client *mcpwire.Client, cause error) {

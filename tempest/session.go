@@ -567,7 +567,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	c.permissionPolicy = &cfg.PermissionPolicy
 	// MCP spills sit with the session's other tool output, where read can open them.
 	cfg.AdmitProcess = o.admitProcess
-	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), selectedMCP, logger, o.admitProcess)
+	c.mcp, err = mcpclient.Open(ctx, selectedMCP, mcpclient.Options{Cwd: cwd, SpillDir: filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), Logger: logger, AdmitProcess: o.admitProcess, CredentialDir: cfg.MCP.CredentialDir, Elicit: c.elicitor(o.Elicitor)})
 	if err != nil {
 		return nil, err
 	}

@@ -20,6 +20,7 @@ import (
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
+	"go.harness.dev/harness/internal/mcpoauth"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
@@ -102,7 +103,7 @@ func (c *Client) Serve() error { defer c.Close(); return c.conn.ServeOrdered(c.a
 // Close removes this connection's watchers.
 func (c *Client) Close() {
 	if c.broker != nil {
-		c.broker.setForm(c.conn, nil)
+		c.broker.setElicitation(c.conn, nil)
 	}
 	c.mu.Lock()
 	c.closed = true
@@ -125,6 +126,10 @@ func decode(raw json.RawMessage, v any) *rpc.Error {
 func failure(err error) *rpc.Error {
 	var wire *rpc.Error
 	var startup *mcpclient.StartupError
+	var login *mcpoauth.LoginRequired
+	if errors.As(err, &login) {
+		return rpc.NewError(-32013, "mcp_auth", login.Error())
+	}
 	if errors.As(err, &startup) {
 		return rpc.NewError(-32013, "mcp_startup", fmt.Sprintf("MCP server %s %s failed", startup.Server, startup.Phase))
 	}
@@ -202,7 +207,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		if p.ProtocolVersion < 1 {
 			return nil, rpc.NewError(-32602, "invalid_params", "protocolVersion must be at least 1")
 		}
-		c.broker.setForm(c.conn, p.ClientCapabilities.Elicitation)
+		c.broker.setElicitation(c.conn, p.ClientCapabilities.Elicitation)
 		c.mu.Lock()
 		c.initialized = true
 		c.notices = p.ClientCapabilities.Session.Notices
