@@ -210,6 +210,7 @@ type ResolvedConfig struct {
 	settings               []Setting
 	warnings               []string
 	workspace              *workspaceSettings
+	workspaceListing       WorkspaceListing
 }
 
 // workspaceSettings resolves another session workspace's settings on the
@@ -345,6 +346,27 @@ func (c *ResolvedConfig) PermissionDenyTools() []string {
 // Retry returns the resolved retry policy.
 func (c *ResolvedConfig) Retry() RetrySettings { return c.retry }
 
+// Default caps for the session-start workspace listing.
+const (
+	DefaultWorkspaceListingMaxFiles = 10000
+	DefaultWorkspaceListingMaxBytes = 4096
+)
+
+// WorkspaceListing is the session-start file listing policy. The zero value
+// lists with the default caps.
+type WorkspaceListing struct {
+	// Disabled is `workspace_listing: false`: new sessions take no listing.
+	Disabled bool
+	// MaxFiles is the most paths read from git or the directory walk.
+	MaxFiles int
+	// MaxBytes bounds the listed lines; past it the listing folds to
+	// per-directory counts and then cuts with a truncation line.
+	MaxBytes int
+}
+
+// WorkspaceListing returns the session-start file listing policy.
+func (c *ResolvedConfig) WorkspaceListing() WorkspaceListing { return c.workspaceListing }
+
 // Error describes a configuration field that could not be resolved.
 type Error struct {
 	Field string
@@ -409,6 +431,9 @@ type fileSettings struct {
 	DebugAdapters           map[string]dap.Adapter            `json:"debug_adapters"`
 	Environment             *string                           `json:"environment"`
 	Environments            map[string]EnvironmentProcess     `json:"environments"`
+	WorkspaceListing        *bool                             `json:"workspace_listing"`
+	ListingMaxFiles         *int                              `json:"workspace_listing_max_files"`
+	ListingMaxBytes         *int                              `json:"workspace_listing_max_bytes"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -544,6 +569,14 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if math.IsNaN(retryJitterMax) || math.IsInf(retryJitterMax, 0) || retryJitterMax < 0 || retryJitterMax > 1 || retryJitterMax < retryJitterMin {
 		return nil, &Error{Field: "retry_jitter_max", Err: errors.New("must be finite, within [0, 1], and at least retry_jitter_min")}
 	}
+	listingMaxFiles := settingValue(settings.ListingMaxFiles)
+	if listingMaxFiles <= 0 {
+		return nil, &Error{Field: "workspace_listing_max_files", Err: errors.New("must be positive")}
+	}
+	listingMaxBytes := settingValue(settings.ListingMaxBytes)
+	if listingMaxBytes <= 0 {
+		return nil, &Error{Field: "workspace_listing_max_bytes", Err: errors.New("must be positive")}
+	}
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
@@ -593,6 +626,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		settings:               layered.list,
 		warnings:               slices.Concat(resolver.operatorWarnings, layered.warnings),
 		workspace:              &workspaceSettings{resolver: resolver, root: root},
+		workspaceListing:       WorkspaceListing{Disabled: !settingValue(settings.WorkspaceListing), MaxFiles: listingMaxFiles, MaxBytes: listingMaxBytes},
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,

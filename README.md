@@ -107,13 +107,14 @@ See [providers](guide/providers.md) for model routes and credentials.
 
 ### Files and code
 
+- **Session-start workspace listing**: `git ls-files` or an ignore-aware walk, capped and journaled, in the first user message so the model skips `ls` turns.
 - **Hashline patches** use numbered reads and content tags, not copied old text.
 - **Atomic file writes** and rollback journals protect multi-file mutations.
 - **Bounded reads and search** include archives, documents, JSON queries, and internal URLs.
 - **Language servers** provide definitions, references, rename plans, and fresh diagnostics.
 - **Manifest diffs** compare rendered Kubernetes resources without running a renderer.
 
-[Tool reference](guide/tools.md) · [Code intelligence](guide/code-intelligence.md)
+[Tool reference](guide/tools.md) · [Code intelligence](guide/code-intelligence.md) · [Workspace listing](guide/skills-and-context.md#workspace-listing)
 
 ### Sessions and safety
 

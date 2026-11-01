@@ -219,6 +219,18 @@ var projectSettingTrust = []struct {
 	{"retry_max_delay_ms", `100`, gateNone},
 	{"retry_jitter_min", `0`, gateNone},
 	{"retry_jitter_max", `1`, gateNone},
+	// The session-start listing reads only path names inside the workspace,
+	// which the model lists with its own tools anyway, and sends them to the
+	// provider the operator chose. Its caps bound prompt size, which the
+	// repository already controls through its uncapped AGENTS.md, and file
+	// reading also stops at a fixed deadline. Every value applies without
+	// trust in both directions, like max_tokens.
+	{"workspace_listing", `false`, gateNone},
+	{"workspace_listing", `true`, gateNone},
+	{"workspace_listing_max_files", `1`, gateNone},
+	{"workspace_listing_max_files", `1000000`, gateNone},
+	{"workspace_listing_max_bytes", `1`, gateNone},
+	{"workspace_listing_max_bytes", `1048576`, gateNone},
 }
 
 // Every settings key has an audited trust class, and each repository value

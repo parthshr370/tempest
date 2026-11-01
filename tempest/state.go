@@ -235,6 +235,9 @@ type agentSelection struct {
 	MCPNames       []string              `json:"mcpNames,omitempty"`
 	Plan           bool                  `json:"plan,omitempty"`
 	PermissionMode PermissionMode        `json:"permissionMode,omitempty"`
+	// WorkspaceListing is the session-start file listing. It is taken once
+	// and journaled here so resume and forks reuse the same bytes.
+	WorkspaceListing string `json:"workspaceListing,omitempty"`
 }
 
 func (s *Session) persistAgent(ctx context.Context, o Options, cfg StackConfig, model string, endpoints []MCPServerConfig) error {
@@ -242,6 +245,7 @@ func (s *Session) persistAgent(ctx context.Context, o Options, cfg StackConfig, 
 	choice.HostManaged = o.hostCreate
 	choice.Plan = cfg.Plan
 	choice.PermissionMode = PermissionMode(cfg.PermissionMode)
+	choice.WorkspaceListing = cfg.WorkspaceListing
 	for _, endpoint := range endpoints {
 		choice.MCPNames = append(choice.MCPNames, endpoint.Name)
 	}
@@ -318,6 +322,9 @@ func restoreAgent(ctx context.Context, o *Options, cfg *StackConfig, loadedStore
 	if cfg.CustomPrompt == "" {
 		cfg.CustomPrompt = choice.CustomPrompt
 	}
+	// The journaled listing is part of this conversation's prompt; never
+	// re-list on resume, whatever the current policy says.
+	cfg.WorkspaceListing = choice.WorkspaceListing
 	if o.Extensions == nil {
 		o.Extensions = choice.Extensions
 	} else {

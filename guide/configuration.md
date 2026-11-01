@@ -63,7 +63,10 @@ trusts the workspace:
 
 An untrusted workspace still gets every other project setting. The keys that were
 dropped are named in one warning in the log, in `tempest doctor`, and in
-`config show`.
+`config show`. The `workspace_listing` keys apply either way, on or off and with
+caps raised or lowered: the listing holds only path names inside the workspace,
+which the model can list with its own tools, and a repository already adds what it
+likes to the prompt through its `AGENTS.md`.
 
 An untrusted repository can narrow permissions and capabilities and never widen
 them. Its `"permission_mode_default": "plan"`, `"plan": true` and
@@ -290,6 +293,7 @@ problem.
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |
 | `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
+| `HARNESS_WORKSPACE_LISTING`, `HARNESS_WORKSPACE_LISTING_MAX_FILES`, `HARNESS_WORKSPACE_LISTING_MAX_BYTES` | Session-start file listing and its caps (settings `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`). |
 | `HARNESS_STREAM_IDLE_SECONDS`, `HARNESS_STREAM_FIRST_OUTPUT_SECONDS` | Stream stall bounds: seconds without an SSE event once output has started (default 90), and before the first output (default 300, never below the idle bound). |
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
@@ -323,6 +327,7 @@ each flag and variable above, names the same setting. The main keys:
 | `providers` | Endpoint registry keyed by route name. See [Providers](providers.md#endpoint-registry). |
 | `trusted_provider_projects` | Absolute canonical paths whose project provider settings are trusted. |
 | `skill_paths` | Extra skill directories; `-skill` flags replace the list. |
+| `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 

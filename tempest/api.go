@@ -78,6 +78,9 @@ type Options struct {
 	admitProcess    func(context.Context) (func(), error)
 	hostCreate      bool
 	forkSeed        *journal.ForkSeed
+	// forkKeepsListing marks a fork of the same workspace: it carries the
+	// parent's journaled listing (or its absence) instead of listing again.
+	forkKeepsListing bool
 }
 
 // NewSession configures a new conversation.
