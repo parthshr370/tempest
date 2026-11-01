@@ -247,8 +247,12 @@ func (b *spanBatcher) run() {
 }
 
 // drain exports what is batched and queued at shutdown, stopping at the
-// deadline; spans still queued then are counted as dropped.
+// deadline; spans still queued then are counted as dropped. A batch the
+// collector rejects is counted as failed and the next one is still sent, so
+// one bad batch does not strand the rest. It returns the first export error
+// and the deadline, if either happened.
 func (b *spanBatcher) drain(ctx context.Context, batch []*span) error {
+	var failed error
 	for {
 		for len(batch) < b.maxBatch {
 			select {
@@ -260,14 +264,14 @@ func (b *spanBatcher) drain(ctx context.Context, batch []*span) error {
 			break
 		}
 		if len(batch) == 0 {
-			return nil
+			return failed
 		}
 		if ctx.Err() != nil {
 			b.dropped.Add(uint64(len(batch) + len(b.queue)))
-			return ctx.Err()
+			return errors.Join(failed, ctx.Err())
 		}
-		if err := b.send(ctx, batch); err != nil {
-			return err
+		if err := b.send(ctx, batch); err != nil && failed == nil {
+			failed = err
 		}
 		batch = batch[:0]
 	}

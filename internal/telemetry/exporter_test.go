@@ -168,3 +168,27 @@ func TestShutdownFlushHonorsDeadline(t *testing.T) {
 		t.Fatalf("shutdown error = %v, want the deadline", err)
 	}
 }
+
+// A batch the collector rejects during the final flush does not strand the
+// spans queued behind it: they are still sent, and the failure is reported.
+func TestShutdownFlushContinuesPastAFailedBatch(t *testing.T) {
+	var sent []string
+	rejected := errors.New("collector answered 503 Service Unavailable")
+	health := &exportHealth{signal: "traces"}
+	batcher := &spanBatcher{queue: make(chan *span, 8), maxBatch: 1, health: health, export: func(_ context.Context, spans []*span) error {
+		sent = append(sent, spans[0].name)
+		if len(sent) == 1 {
+			return rejected
+		}
+		return nil
+	}}
+	for _, name := range []string{"first", "second", "third"} {
+		batcher.enqueue(testSpan(name))
+	}
+	if err := batcher.drain(context.Background(), nil); !errors.Is(err, rejected) {
+		t.Fatalf("drain = %v, want the rejected batch's error", err)
+	}
+	if len(sent) != 3 || sent[2] != "third" || health.failed.Load() != 1 || batcher.dropped.Load() != 0 {
+		t.Fatalf("sent %v, %d failed, %d dropped; want all three sent and one failed", sent, health.failed.Load(), batcher.dropped.Load())
+	}
+}
