@@ -354,7 +354,7 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			waitDAPCondition(t, "attached process didn't resume after detach", func() bool {
 				select {
 				case <-exited:
-					t.Fatal("attached user process was killed")
+					t.Fatalf("attached user process exited: %v", target.ProcessState)
 				default:
 				}
 				current, err := os.ReadFile(heartbeat)

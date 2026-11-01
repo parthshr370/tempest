@@ -39,6 +39,7 @@ type adapterProcess struct {
 	transport     io.Closer
 	exited        chan struct{}
 	attached      bool
+	attachedPID   int
 	release       func()
 	cleanupOnce   sync.Once
 	cleanupErr    error
@@ -110,7 +111,7 @@ func (process *adapterProcess) cleanup() error {
 			<-process.client.done
 		}
 		// A late process event may have arrived during disconnect.
-		programErr = errors.Join(programErr, process.killPrograms())
+		programErr = errors.Join(programErr, process.killPrograms(), process.continueAttached())
 		process.outputMu.Lock()
 		process.cleanupErr = errors.Join(programErr, killErr, process.outputErr, process.output.CloseTempFile())
 		process.outputMu.Unlock()
@@ -133,6 +134,23 @@ func (process *adapterProcess) killPrograms() error {
 		result = errors.Join(result, killGroup(group))
 	}
 	return result
+}
+
+// continueAttached runs after the adapter has exited. Detaching halts the
+// target first, and debugserver halts by sending SIGSTOP; when another signal
+// (Go's preemption SIGURG, for one) wins that race, the SIGSTOP stays pending
+// and the kernel delivers it after detach, leaving the program stopped. SIGCONT
+// discards a pending stop and resumes a stopped one, and a running program
+// ignores it, so an attached program is always left running.
+func (process *adapterProcess) continueAttached() error {
+	if !process.attached || process.attachedPID <= 0 {
+		return nil
+	}
+	err := syscall.Kill(process.attachedPID, syscall.SIGCONT)
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return err
 }
 
 func (process *adapterProcess) releaseWhenGone() {
@@ -292,6 +310,10 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	}
 	for key, value := range arguments {
 		merged[key] = value
+	}
+	if action == "attach" {
+		// A local attach names its pid; cleanup leaves that program running.
+		_ = json.Unmarshal(merged["processId"], &process.attachedPID)
 	}
 	encoded, err := json.Marshal(merged)
 	if err != nil {
