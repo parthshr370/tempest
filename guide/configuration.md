@@ -27,7 +27,9 @@ variables, are data and keep any spelling.
 - **Objects merge key by key.** A layer that sets `providers.gateway.base_url` keeps
   every other field and route from the layers below.
 - **Arrays replace.** A layer that sets `permission_deny_tools` replaces the whole
-  list; nothing is appended.
+  list; nothing is appended. The exceptions are trusted project `hooks` and an
+  untrusted project's deny list, which add to the layers below (see
+  [Project settings and trust](#project-settings-and-trust)).
 - **`null` unsets.** `"max_tokens": null` in a higher layer removes the value from
   every layer below, so the built-in default applies again. `-c model=null` works the
   same way.
@@ -54,13 +56,24 @@ or choose where credentials go apply only after the operator trusts the workspac
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_mode_default`, `permission_allow_tools`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model` or `smol_model` with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
 dropped are named in one warning in the log, in `tempest doctor`, and in
 `config show`.
+
+An untrusted repository can narrow permissions and never widen them. Its
+`"permission_mode_default": "plan"` and `"plan": true` apply, since nothing is
+stricter. Its `permission_deny_tools`, in a project file or a project profile, adds
+to the list the layers below it merge to: the operator's entries stay first and the
+project's new entries follow, so `[]` changes nothing and a `null` is dropped with
+the trust warning. `config show` attributes the combined list to the highest project
+layer that added an entry, or to the operator's layer when the project added none.
+Allow lists, looser modes and `"plan": false` are dropped with the trust warning. In
+a trusted workspace these keys are a settings layer like the rest: the project's deny
+list replaces the user's and its `null` unsets it.
 
 Trusted project `hooks` add to the hooks below them instead of replacing them: each
 event's array from `settings.json`, then from `settings.local.json`, is appended to the
@@ -102,9 +115,10 @@ managed defaults, user, project, project-local, then `-c`. Project profiles pass
 same trust rules as project settings. `"profiles": {"review": null}` unsets `review`
 from every lower file, and `"profiles": null` unsets every profile below; a later file
 or `-c` can define it again. A null in a project file follows the trust rules: keys
-of a user or managed definition that the project could not set itself stay, and the
-warning names them. Selecting a profile that no file defines, or that a higher file
-unsets, is an error.
+of a user or managed definition that the project could not set, or set to `null`,
+itself stay (in an untrusted workspace, `plan` and `permission_deny_tools` among
+them), and the warning names them. Selecting a profile that no file defines, or that
+a higher file unsets, is an error.
 
 `-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
 different `--profile`: the label of a saved ChatGPT account.

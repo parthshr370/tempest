@@ -557,6 +557,8 @@ const (
 	gateOperator
 )
 
+// projectGates holds what a repository setting needs. For a key
+// narrowsPermissions checks by value, it is what a loosening value needs.
 var projectGates = map[string]trustGate{
 	"hooks":                     gateExecutable,
 	"mcp_config":                gateExecutable,
@@ -567,7 +569,8 @@ var projectGates = map[string]trustGate{
 	"cloud_policy":              gateExecutable,
 	"permission_mode_default":   gateExecutable,
 	"permission_allow_tools":    gateExecutable,
-	"attach":                    gateExecutable,
+	"permission_deny_tools":     gateExecutable,
+	"plan":                      gateExecutable,
 	"skill_paths":               gateExecutable,
 	"agent_dir":                 gateExecutable,
 	"session_dir":               gateExecutable,
@@ -595,7 +598,31 @@ func projectGate(key string, value *settingsNode) trustGate {
 		}
 		return gateNone
 	}
+	if narrowsPermissions(key, value) {
+		return gateNone
+	}
 	return projectGates[key]
+}
+
+// planModeNode is the strictest permission mode, which no lower mode is
+// stricter than.
+var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
+
+// narrowsPermissions reports whether a repository value can only tighten the
+// permissions the layers below it set, so it applies without trust: plan
+// mode, and a deny list, which an untrusted repository adds to the lists
+// below it (unionProjectDenies). Every other value of these keys, null
+// included, could lift an operator's restriction.
+func narrowsPermissions(key string, value *settingsNode) bool {
+	switch key {
+	case "plan":
+		return equalSettings(value, boolNode(true))
+	case "permission_mode_default":
+		return equalSettings(value, planModeNode)
+	case "permission_deny_tools":
+		return value.isArray
+	}
+	return false
 }
 
 // profileGate classifies a setting of a profile as a repository would change
@@ -698,10 +725,42 @@ func appendProjectHooks(stack []*settingsLayer) {
 	}
 }
 
+// unionProjectDenies makes each deny list of an untrusted repository, from a
+// project file or its profile, add to the list the layers below it merge to:
+// the repository denies more tools and cannot remove an operator's entry. A
+// list that adds no entry is removed, so config show keeps naming the layer
+// that set the entries. Layers above still replace or unset the list, and
+// managed requirements see the combined list.
+func unionProjectDenies(stack []*settingsLayer) {
+	const key = "permission_deny_tools"
+	for index, layer := range stack {
+		deny := layer.members[key]
+		if !layer.project || deny == nil {
+			continue
+		}
+		below := mergeStack(stack[:index])[key]
+		if below == nil || !below.isArray {
+			continue
+		}
+		union := below.clone()
+		for _, entry := range deny.array {
+			if !slices.ContainsFunc(union.array, func(held *settingsNode) bool { return equalSettings(held, entry) }) {
+				union.array = append(union.array, entry)
+			}
+		}
+		if len(union.array) == len(below.array) {
+			delete(layer.members, key)
+			continue
+		}
+		layer.members[key] = union
+	}
+}
+
 // keepUnremovable is what a repository's null profile definition leaves of
 // the lower definitions: from operator files, the keys the repository could
-// not have set itself under trust.
+// not have set, or set to null, itself under trust.
 func keepUnremovable(profiles []*settingsLayer, unset *settingsLayer, trust projectTrust) ([]*settingsLayer, []droppedSetting) {
+	null := &settingsNode{scalar: jsonNull}
 	var kept []*settingsLayer
 	var dropped []droppedSetting
 	for _, profile := range profiles {
@@ -712,6 +771,9 @@ func keepUnremovable(profiles []*settingsLayer, unset *settingsLayer, trust proj
 		for _, key := range slices.Sorted(maps.Keys(profile.members)) {
 			value := profile.members[key]
 			gate := profileGate(key, value)
+			if trust.refusal(gate) == "" {
+				gate = profileGate(key, null)
+			}
 			if reason := trust.refusal(gate); reason != "" {
 				remaining.members[key] = value
 				dropped = append(dropped, droppedSetting{unset, fmt.Sprintf("null profile %q kept %s from %s", profile.profile, key, profile.file), gate, reason})
@@ -1093,6 +1155,9 @@ func (r *layerResolver) resolve(root string) (*layeredSettings, error) {
 	stack, kept := r.set.stack(project, trust)
 	result.reportDropped(dropped, kept)
 	appendProjectHooks(stack)
+	if !trust.executable {
+		unionProjectDenies(stack)
+	}
 	// A SkipProject resolution only locates storage and launch definitions; the
 	// full resolution that follows reports a profile no file defines.
 	if r.set.profile != "" && !r.options.skipProject && !slices.ContainsFunc(stack, func(layer *settingsLayer) bool { return layer.name == LayerProfile }) {

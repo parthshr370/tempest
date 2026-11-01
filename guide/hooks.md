@@ -54,7 +54,7 @@ untrusted project hooks in its config warnings. The SDK's `Options.Hooks` replac
 session's hooks and is used as given.
 
 The same trust admits the other executable project settings, such as `mcp_servers`,
-`debug_adapters` and `permission_mode_default`; see
+`debug_adapters`, `permission_allow_tools` and a looser `permission_mode_default`; see
 [Project settings and trust](configuration.md#project-settings-and-trust).
 
 Model changes to hook-bearing settings require per-call approval, including bash file

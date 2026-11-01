@@ -185,7 +185,7 @@ func TestLayerPrecedenceEveryPair(t *testing.T) {
 
 func TestLayerMergeObjectsReplaceArraysAndUnsetWithNull(t *testing.T) {
 	w := newLayerWorkspace(t)
-	w.write(w.managed, `{"defaults":{"enable_web":true,"bash_timeout":"30s"}}`)
+	w.write(w.managed, `{"defaults":{"enable_web":true,"bash_timeout":"30s","permission_deny_tools":["managed"]}}`)
 	w.write(w.user, `{
 		"enable_web": null,
 		"max_tokens": 9000,
@@ -193,7 +193,7 @@ func TestLayerMergeObjectsReplaceArraysAndUnsetWithNull(t *testing.T) {
 		"debug_adapters": {"node": {"command": "node", "args": ["user.js"]}},
 		"providers": {"gw": {"protocol": "openai-chat", "base_url": "https://user.example/v1", "api_key_env": "GW_KEY"}}
 	}`)
-	w.write(w.projectPath(), `{"permission_deny_tools": ["project"], "max_tokens": null}`)
+	w.write(w.projectPath(), `{"max_tokens": null}`)
 	w.flags.Overrides = StringsInput{Set: true, Values: []string{
 		"providers.gw.base_url=https://override.example/v1",
 		`providers.extra={"protocol":"openai-chat","base_url":"https://extra.example/v1","no_auth":true}`,
@@ -201,7 +201,7 @@ func TestLayerMergeObjectsReplaceArraysAndUnsetWithNull(t *testing.T) {
 	}}
 	resolved := w.mustResolve()
 
-	if got := resolved.PermissionDenyTools(); !reflect.DeepEqual(got, []string{"project"}) {
+	if got := resolved.PermissionDenyTools(); !reflect.DeepEqual(got, []string{"user-a", "user-b"}) {
 		t.Fatalf("array not replaced: %v", got)
 	}
 	if resolved.MaxTokens() != adapter.DefaultMaxTokens || resolved.MaxTokensConfigured() {

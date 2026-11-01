@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -28,6 +29,8 @@ var gatedSamples = map[string]string{
 	"cloud_policy":              `"repo-policy.json"`,
 	"permission_mode_default":   `"bypass"`,
 	"permission_allow_tools":    `["bash"]`,
+	"permission_deny_tools":     `["bash"]`,
+	"plan":                      `true`,
 	"attach":                    `["/etc/hosts"]`,
 	"agent_dir":                 `"/tmp/repo-agent"`,
 	"session_dir":               `"/tmp/repo-sessions"`,
@@ -390,4 +393,128 @@ func TestWorkspaceHooksResolveAnotherWorkspace(t *testing.T) {
 	if _, _, err := resolveFor(t, w); err == nil || !strings.Contains(err.Error(), other.projectPath()) {
 		t.Fatalf("pinned hooks: err=%v", err)
 	}
+}
+
+// An untrusted repository narrows permissions and never widens them: its deny
+// lists add to the lists below it, and allow lists, looser modes and nulls
+// of a permission key are dropped with the trust warning. A trusted project
+// replaces them like every other settings layer.
+func TestProjectCannotWidenPermissions(t *testing.T) {
+	const userDeny = `["bash","web_fetch"]`
+	untrustedDeny := []struct {
+		name     string
+		place    func(w *layerWorkspace)
+		want     []string
+		layer    string
+		source   func(w *layerWorkspace) string
+		warnings []string
+	}{
+		{"project adds an entry", func(w *layerWorkspace) { w.write(w.projectPath(), `{"permission_deny_tools":["edit","bash"]}`) },
+			[]string{"bash", "web_fetch", "edit"}, LayerProject, (*layerWorkspace).projectPath, nil},
+		{"project empties the list", func(w *layerWorkspace) { w.write(w.projectPath(), `{"permission_deny_tools":[]}`) },
+			[]string{"bash", "web_fetch"}, LayerUser, func(w *layerWorkspace) string { return w.user }, nil},
+		{"project nulls the list", func(w *layerWorkspace) { w.write(w.projectPath(), `{"permission_deny_tools":null}`) },
+			[]string{"bash", "web_fetch"}, LayerUser, func(w *layerWorkspace) string { return w.user }, []string{"permission_deny_tools"}},
+		{"project-local replaces the list", func(w *layerWorkspace) {
+			w.write(w.projectPath(), `{"permission_deny_tools":["edit"]}`)
+			w.write(w.localPath(), `{"permission_deny_tools":["write"]}`)
+		}, []string{"bash", "web_fetch", "edit", "write"}, LayerProjectLocal, (*layerWorkspace).localPath, nil},
+		{"project profile replaces the list", func(w *layerWorkspace) {
+			w.write(w.projectPath(), `{"profiles":{"review":{"permission_deny_tools":["write"]}}}`)
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+		}, []string{"bash", "web_fetch", "write"}, LayerProfile, (*layerWorkspace).projectPath, nil},
+		{"project profile nulls the list", func(w *layerWorkspace) {
+			w.write(w.projectPath(), `{"profiles":{"review":{"permission_deny_tools":null}}}`)
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+		}, []string{"bash", "web_fetch"}, LayerUser, func(w *layerWorkspace) string { return w.user }, []string{"permission_deny_tools"}},
+		{"project nulls a profile holding the list", func(w *layerWorkspace) {
+			w.write(w.user, `{"profiles":{"review":{"permission_deny_tools":["bash","web_fetch"]}}}`)
+			w.write(w.projectPath(), `{"profiles":{"review":null}}`)
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+		}, []string{"bash", "web_fetch"}, LayerProfile, func(w *layerWorkspace) string { return w.user }, []string{"permission_deny_tools"}},
+	}
+	for _, test := range untrustedDeny {
+		t.Run("untrusted/"+test.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, `{"permission_deny_tools":`+userDeny+`}`)
+			test.place(w)
+			resolved := w.mustResolve()
+			if got := resolved.PermissionDenyTools(); !slices.Equal(got, test.want) {
+				t.Fatalf("deny tools = %v, want %v", got, test.want)
+			}
+			shown := settingFor(t, resolved, "permission_deny_tools")
+			var shownDeny []string
+			if err := json.Unmarshal(shown.Value, &shownDeny); err != nil || !slices.Equal(shownDeny, test.want) || shown.Layer != test.layer || shown.Source != test.source(w) {
+				t.Fatalf("config show = %+v, want %v from %s %s", shown, test.want, test.layer, test.source(w))
+			}
+			warnings := strings.Join(resolved.Warnings(), "\n")
+			for _, name := range test.warnings {
+				if !strings.Contains(warnings, name) || !strings.Contains(warnings, w.projectPath()) || !strings.Contains(warnings, "-trust-project-hooks") {
+					t.Fatalf("warnings %q do not name %s in %s", warnings, name, w.projectPath())
+				}
+			}
+		})
+	}
+
+	looser := []struct {
+		name    string
+		user    string
+		project string
+		key     string
+		check   func(c *ResolvedConfig) bool
+	}{
+		{"allow entry", `{}`, `{"permission_allow_tools":["bash"]}`, "permission_allow_tools", func(c *ResolvedConfig) bool { return len(c.PermissionAllowTools()) == 0 }},
+		{"bypass mode", `{"permission_mode_default":"plan"}`, `{"permission_mode_default":"bypass"}`, "permission_mode_default", func(c *ResolvedConfig) bool { return c.PermissionModeDefault() == "plan" }},
+		{"default mode", `{"permission_mode_default":"plan"}`, `{"permission_mode_default":"default"}`, "permission_mode_default", func(c *ResolvedConfig) bool { return c.PermissionModeDefault() == "plan" }},
+		{"null mode", `{"permission_mode_default":"plan"}`, `{"permission_mode_default":null}`, "permission_mode_default", func(c *ResolvedConfig) bool { return c.PermissionModeDefault() == "plan" }},
+		{"plan off", `{"plan":true}`, `{"plan":false}`, "plan", (*ResolvedConfig).Plan},
+		{"null plan", `{"plan":true}`, `{"plan":null}`, "plan", (*ResolvedConfig).Plan},
+		{"plan off in a profile", `{"plan":true}`, `{"profiles":{"review":{"plan":false}}}`, "plan", (*ResolvedConfig).Plan},
+		{"null profile holding plan", `{"profiles":{"review":{"plan":true}}}`, `{"profiles":{"review":null}}`, "plan", (*ResolvedConfig).Plan},
+	}
+	for _, test := range looser {
+		t.Run("untrusted/"+test.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			if strings.Contains(test.user+test.project, profilesKey) {
+				w.flags.Profile = StringInput{Value: "review", Set: true}
+			}
+			w.write(w.user, test.user)
+			w.write(w.projectPath(), test.project)
+			resolved := w.mustResolve()
+			if !test.check(resolved) {
+				t.Fatalf("untrusted %s widened permissions", test.project)
+			}
+			if warnings := strings.Join(resolved.Warnings(), "\n"); !strings.Contains(warnings, test.key) || !strings.Contains(warnings, w.projectPath()) {
+				t.Fatalf("warnings %q do not name %s", warnings, test.key)
+			}
+		})
+	}
+
+	t.Run("untrusted project narrows the mode and plan", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"permission_mode_default":"bypass"}`)
+		w.write(w.projectPath(), `{"permission_mode_default":"plan","plan":true}`)
+		resolved := w.mustResolve()
+		if resolved.PermissionModeDefault() != "plan" || !resolved.Plan() || len(resolved.Warnings()) != 0 {
+			t.Fatalf("mode=%q plan=%t warnings=%q", resolved.PermissionModeDefault(), resolved.Plan(), resolved.Warnings())
+		}
+	})
+
+	t.Run("trusted project replaces", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+		w.write(w.user, `{"permission_deny_tools":`+userDeny+`,"permission_mode_default":"plan","plan":true}`)
+		w.write(w.projectPath(), `{"permission_deny_tools":["edit"],"permission_allow_tools":["bash"],"permission_mode_default":"bypass","plan":false}`)
+		resolved := w.mustResolve()
+		if !slices.Equal(resolved.PermissionDenyTools(), []string{"edit"}) || !slices.Equal(resolved.PermissionAllowTools(), []string{"bash"}) || resolved.PermissionModeDefault() != "bypass" || resolved.Plan() {
+			t.Fatalf("deny=%v allow=%v mode=%q plan=%t", resolved.PermissionDenyTools(), resolved.PermissionAllowTools(), resolved.PermissionModeDefault(), resolved.Plan())
+		}
+		if shown := settingFor(t, resolved, "permission_deny_tools"); shown.Layer != LayerProject || string(shown.Value) != `["edit"]` {
+			t.Fatalf("config show = %+v", shown)
+		}
+		w.write(w.projectPath(), `{"permission_deny_tools":null}`)
+		if deny := w.mustResolve().PermissionDenyTools(); len(deny) != 0 {
+			t.Fatalf("trusted null left deny tools %v", deny)
+		}
+	})
 }
