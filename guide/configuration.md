@@ -16,6 +16,10 @@ Managed requirements sit above every layer: a pinned key cannot be changed. The
 command does not read `.env`. Export variables before running it.
 
 Every settings file is one JSON object with the keys in [Settings file](#settings-file).
+Key names are exact: `Hooks`, `OPENAI_BASE_URL` or any other spelling of a settings
+key, at any depth, is an unknown key and has no effect (see [Strict mode](#strict-mode)).
+Names inside maps, such as provider route names, header names and environment
+variables, are data and keep any spelling.
 `tempest config show` prints the result; see [Inspecting settings](#inspecting-settings).
 
 ## How layers combine
@@ -50,15 +54,30 @@ or choose where credentials go apply only after the operator trusts the workspac
 
 | Keys | Applied when |
 |---|---|
-| `mcp_config`, `mcp_servers`, `lsp_config`, `debug_adapters`, `cloud_policy`, `permission_mode_default`, `permission_allow_tools`, `attach`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_mode_default`, `permission_allow_tools`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model` or `smol_model` with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
 dropped are named in one warning in the log, in `tempest doctor`, and in
-`config show`. Top-level project `hooks` keep their own rules: the hook runner appends
-them to user hooks for each session's workspace, behind the same trust. See
+`config show`.
+
+Trusted project `hooks` add to the hooks below them instead of replacing them: each
+event's array from `settings.json`, then from `settings.local.json`, is appended to the
+user's. A project `null` for `hooks` or for one event is ignored with a warning, so a
+repository cannot remove the operator's hooks. Otherwise project hooks are a settings
+layer like any other: a profile, `-c hooks=null` or `-c hooks.SessionStart=[]`
+replaces or unsets them, managed requirements on `hooks` see the combined arrays, and
+`config show` lists them. A session opened in another workspace (`serve`, ACP, the
+SDK) gets that workspace's project hooks from the same resolution. See
 [hooks](hooks.md#trust).
+
+A project file the operator has not trusted that cannot be used (invalid JSON, not an
+object, a value of the wrong type, not a regular file, or larger than 4 MiB) is
+skipped with a warning naming the file and the reason, and the run goes on with the
+other layers. A trusted workspace's file, any user or managed file, and any file under
+`-strict-config` stops startup with an error that names the file instead. A key the
+trust rules drop is never type-checked, so its value cannot invalidate the file.
 
 Project files are read from the working directory. With `-environment` set to a
 remote environment, project files on the host are not read.
@@ -79,8 +98,13 @@ A profile is a partial settings object under `profiles.<name>` in any settings f
 Select one with `-profile review` or `HARNESS_PROFILE=review`; the flag wins. The
 profile layer sits above project-local settings and below `HARNESS_*` variables.
 When several files define the same profile, their definitions merge in file order:
-managed defaults, user, project, project-local. Project profiles pass the same trust
-rules as project settings. Selecting a profile that no file defines is an error.
+managed defaults, user, project, project-local, then `-c`. Project profiles pass the
+same trust rules as project settings. `"profiles": {"review": null}` unsets `review`
+from every lower file, and `"profiles": null` unsets every profile below; a later file
+or `-c` can define it again. A null in a project file follows the trust rules: keys
+of a user or managed definition that the project could not set itself stay, and the
+warning names them. Selecting a profile that no file defines, or that a higher file
+unsets, is an error.
 
 `-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
 different `--profile`: the label of a saved ChatGPT account.
@@ -100,7 +124,9 @@ tempest -p "fix the build" \
 ```
 
 Quote a string that looks like JSON: `-c 'model="true"'`. `-c key=null` unsets the key
-in every lower layer. Keys cannot contain dots.
+in every lower layer. Keys cannot contain dots. A malformed `-c` is an error that gives
+its position among the overrides, never its text, since a mistyped override may hold a
+credential.
 
 ## Managed requirements
 
@@ -128,19 +154,23 @@ on macOS. It has two optional sections:
   `providers.openai.api_key_env`, is allowed. A project value dropped by the trust rules
   is not a conflict.
 
-The managed file is strict: any other top-level section, or an unknown key under
-`requirements`, is an error. `requirements` cannot pin `profiles`. There is no
-environment variable that moves the file, so a user's environment cannot drop a
-requirement.
+The managed file is strict at every depth: any other top-level section, or an unknown
+key anywhere under `requirements` (such as `providers.openai.bsae_url`), is an error.
+`requirements` cannot pin `profiles`. There is no environment variable that moves the
+file, so a user's environment cannot drop a requirement.
 
 ## Strict mode
 
 By default an unknown settings key is ignored with one warning per key in the log,
-naming the key and the file, variable or `-c` that set it. A value of the wrong type
-is always an error that names the file.
+naming its dotted path (for example `providers.openai.bsae_url` or
+`mcp_servers[0].bogus`) and the file, variable or `-c` that set it. An ignored key is
+removed before anything reads the settings, so it never shows in `config show`. A value
+of the wrong type is an error that names the file, except in an untrusted project file,
+which is skipped instead (see [Project settings and trust](#project-settings-and-trust)).
 
-`-strict-config` (or `HARNESS_STRICT_CONFIG=true`) turns unknown keys into errors,
-including unknown fields inside objects such as an `mcp_servers` entry.
+`-strict-config` (or `HARNESS_STRICT_CONFIG=true`) turns unknown keys into errors at
+any depth, including fields inside provider entries, their `compatibility` and
+`models`, and `mcp_servers` entries.
 
 ## Inspecting settings
 
@@ -165,8 +195,9 @@ permission_mode_default = "default"  (requirement /etc/harness/managed-settings.
 Layers are `default`, `managed`, `user`, `project`, `project-local`, `profile`, `env`,
 `flag`, `override` and `requirement`. The source is a file path, an environment
 variable, a flag, or `-c`. Values under credential names (`api_key`, `*token`,
-`secret`, `password`, `authorization`), under `headers`, `query` and `env`, and URL
-userinfo are shown as `[REDACTED]`.
+`secret`, `password`, `authorization`), under `headers`, `query` and `env` in any
+letter case, and URL userinfo are shown as `[REDACTED]`. Configuration errors pass
+through the same log redactor.
 
 ## Model roles
 
