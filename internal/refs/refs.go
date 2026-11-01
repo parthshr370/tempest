@@ -9,6 +9,7 @@
 //	history://                 the session tree's child sessions
 //	history://<id>             one child's transcript (task job id or child session id)
 //	local://[<path>]           the root session's scratch directory, shared with its children
+//	mcp://[<server>/[<uri>]]   an MCP server's resource, read from the server by the session
 //
 // Every scheme is rooted. A path may not contain "..", and file access goes
 // through an [os.Root] on the scheme's directory, so a symlink cannot leave
@@ -39,6 +40,7 @@ const (
 	SchemeLocal   = "local"
 	SchemeIssue   = "issue"
 	SchemePR      = "pr"
+	SchemeMCP     = "mcp"
 )
 
 // LocalDirName is the local:// directory inside the root session's data
@@ -129,7 +131,7 @@ func IsURL(s string) bool {
 		return false
 	}
 	switch scheme {
-	case SchemeSkill, SchemeJob, SchemeHistory, SchemeLocal, SchemeIssue, SchemePR:
+	case SchemeSkill, SchemeJob, SchemeHistory, SchemeLocal, SchemeIssue, SchemePR, SchemeMCP:
 		return true
 	}
 	return false
@@ -139,12 +141,16 @@ func IsURL(s string) bool {
 func Parse(raw string) (Ref, error) {
 	scheme, rest, ok := strings.Cut(raw, "://")
 	if !ok || !IsURL(raw) {
-		return Ref{}, newError(CodeInvalid, raw, "not an internal URL; supported schemes are skill://, job://, history://, local://, issue:// and pr://", nil)
+		return Ref{}, newError(CodeInvalid, raw, "not an internal URL; supported schemes are skill://, job://, history://, local://, issue://, pr:// and mcp://", nil)
 	}
 	if GitHubURL(raw) {
 		if _, err := parseGitHub(raw); err != nil {
 			return Ref{}, newError(CodeInvalid, raw, err.Error(), err)
 		}
+		return Ref{Scheme: scheme, Name: rest}, nil
+	}
+	if scheme == SchemeMCP {
+		// The resource URI is the server's own, kept verbatim.
 		return Ref{Scheme: scheme, Name: rest}, nil
 	}
 	if strings.ContainsAny(rest, "?#") {
@@ -300,6 +306,8 @@ func (r *Resolver) Locate(ref Ref) (Location, error) {
 		return Location{URI: uri, Root: filepath.Join(dir, work.JobArtifactsDir, ref.Name), Name: osName(ref.Path)}, nil
 	case SchemeIssue, SchemePR:
 		return Location{}, newError(CodeTarget, uri, "GitHub references are rendered, not workspace paths; use read for issue:// and pr://", nil)
+	case SchemeMCP:
+		return Location{}, newError(CodeTarget, uri, "MCP resources are read from their server, not from disk; use read for mcp://", nil)
 	default:
 		return Location{}, newError(CodeTarget, uri, "history:// is rendered from a journal and has no file path", nil)
 	}

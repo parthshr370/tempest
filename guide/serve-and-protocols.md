@@ -124,6 +124,24 @@ and terminals that decline fail the run (or the tool call, for a step-up) with
 step-up scope that no user could grant is remembered, and the next `tempest mcp
 login` requests it.
 
+### Resources
+
+`read` opens MCP resources by URL. The resource URI follows the server name
+verbatim:
+
+```text
+read mcp://                          servers and their resource counts
+read mcp://docs/                     docs' resources and resource templates
+read mcp://docs/file:///guide.md     one resource; line ranges and ?q= apply to text
+read mcp://docs/logs://2026-11-01    a URI built from a template such as logs://{day}
+```
+
+Text contents come back as numbered rows like a file. A PNG, JPEG, GIF or WebP
+blob is passed to the model as an image; any other blob is saved under the
+session's `local://mcp/` directory and the read names that file. Tempest reads
+the server's tools, resources and resource templates as one catalog at startup,
+and re-reads all of it when the server sends any `list_changed` notification.
+
 ## MCP server
 
 ```sh

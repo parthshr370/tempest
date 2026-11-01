@@ -10,6 +10,7 @@ import (
 	"regexp"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/pathutil"
 	"go.harness.dev/harness/internal/refs"
 )
@@ -39,7 +40,14 @@ const (
 		"issue://<number> and pr://<number> read GitHub items (owner/repo/number selects another repo); pr://<number>/diff lists files, /diff/<index> reads one, /diff/all reads the full diff. These require authenticated gh. Line ranges apply to every text output."
 	localWriteHelp = "A local://<path> URL targets the session tree's private scratch directory instead of the workspace, for handing large payloads between agents; other internal URLs are read-only."
 	bashURLHelp    = "skill://<name>/<file> and local://<path> words expand to quoted absolute paths before the command is checked and run (percent-encode spaces in names)."
+	mcpReadHelp    = " mcp:// lists the MCP servers, mcp://<server>/ lists a server's resources and resource templates, and mcp://<server>/<uri> reads one resource (the server's URI verbatim, e.g. mcp://docs/file:///guide.md)."
 )
+
+// MCPResources reads MCP server resources for read's mcp:// URLs. Data is
+// the text; images are returned as blocks that follow it.
+type MCPResources interface {
+	ReadResource(ctx context.Context, uri string) (refs.Resource, []types.ContentBlock, error)
+}
 
 // grepRefs searches an internal URL: a scheme directory or file through an
 // os.Root with the pure-Go matcher, or rendered text (job listings,

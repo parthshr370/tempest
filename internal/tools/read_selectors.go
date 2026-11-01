@@ -77,10 +77,24 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 	if refs.IsURL(target.path) {
 		var resource refs.Resource
 		var err error
-		if refs.GitHubURL(target.path) {
+		switch {
+		case refs.GitHubURL(target.path):
 			resource, err = refs.ReadGitHub(refs.WithProcessAdmission(ctx, options.AdmitProcess), cwd, target.path)
 			err = codingToolError(err, options)
-		} else {
+		case strings.HasPrefix(target.path, refs.SchemeMCP+"://"):
+			if options.MCP == nil {
+				return readSource{}, nil, fmt.Errorf("%s: this session has no MCP servers", target.path)
+			}
+			var images []types.ContentBlock
+			resource, images, err = options.MCP.ReadResource(ctx, target.path)
+			if err == nil && len(images) > 0 {
+				if target.hasMember || target.hasQuery {
+					return readSource{}, nil, fmt.Errorf("%s has image content; archive members and ?q= queries apply to text", resource.URI)
+				}
+				result := agent.AgentToolResult{Content: append([]types.ContentBlock{types.NewText(fmt.Sprintf("[%s]\n%s", resource.URI, resource.Data))}, images...)}
+				return readSource{}, &result, nil
+			}
+		default:
 			resource, err = options.Refs.Read(ctx, target.path)
 		}
 		if err != nil {

@@ -20,7 +20,7 @@ import (
 )
 
 const maxCatalogPages = 128
-const maxServerTools = 2048
+const maxCatalogEntries = 2048
 const maxDefinitions = 4 << 20
 const retirementTimeout = 3 * time.Second
 const maxSchema = 64 << 10
@@ -119,76 +119,41 @@ func localReferences(raw json.RawMessage) error {
 	return nil
 }
 
-func (s *server) discover(ctx context.Context, client *mcpwire.Client) ([]agent.AgentTool, error) {
-	if client == nil {
-		return nil, errors.New("connection unavailable")
-	}
-	if !client.HasTools() {
-		return nil, nil
-	}
+// discoverTools turns a tools/list catalog into gated tools.
+func (s *server) discoverTools(ctx context.Context, client *mcpwire.Client) ([]agent.AgentTool, error) {
 	var tools []agent.AgentTool
-	cursor := ""
-	seenCursors := map[string]bool{}
 	seenNames := map[string]bool{}
-	totalBytes := 0
-	for range maxCatalogPages {
-		params := struct {
-			Cursor string `json:"cursor,omitempty"`
-		}{cursor}
-		raw, err := client.Call(ctx, "tools/list", params)
-		if err != nil {
-			return nil, err
+	err := paginate(ctx, client, "tools/list", "tools", func(definition json.RawMessage) error {
+		var remote toolDefinition
+		if json.Unmarshal(definition, &remote) != nil {
+			return errors.New("mcp_protocol: malformed tool definition")
 		}
-		var result struct {
-			Tools      []json.RawMessage `json:"tools"`
-			NextCursor string            `json:"nextCursor"`
+		if len(remote.Name) > maxModelName-len("mcp__")-len(s.config.Name)-len("__") || !remoteToolName.MatchString(remote.Name) {
+			return fmt.Errorf("mcp_tool_name: server %s has unrepresentable tool %q", s.config.Name, utf8Head(remote.Name, maxModelName))
 		}
-		if json.Unmarshal(raw, &result) != nil || result.Tools == nil {
-			return nil, errors.New("mcp_protocol: invalid tools/list result")
+		fullName := "mcp__" + s.config.Name + "__" + remote.Name
+		if seenNames[remote.Name] {
+			return fmt.Errorf("mcp_protocol: duplicate tool %q", remote.Name)
 		}
-		for _, definition := range result.Tools {
-			totalBytes += len(definition)
-			if totalBytes > maxDefinitions || len(tools) >= maxServerTools {
-				return nil, errors.New("mcp_catalog_limit: too many tool definitions")
-			}
-			var remote toolDefinition
-			if json.Unmarshal(definition, &remote) != nil {
-				return nil, errors.New("mcp_protocol: malformed tool definition")
-			}
-			if len(remote.Name) > maxModelName-len("mcp__")-len(s.config.Name)-len("__") || !remoteToolName.MatchString(remote.Name) {
-				return nil, fmt.Errorf("mcp_tool_name: server %s has unrepresentable tool %q", s.config.Name, utf8Head(remote.Name, maxModelName))
-			}
-			fullName := "mcp__" + s.config.Name + "__" + remote.Name
-			if seenNames[remote.Name] {
-				return nil, fmt.Errorf("mcp_protocol: duplicate tool %q", remote.Name)
-			}
-			seenNames[remote.Name] = true
-			if _, err = compileSchema(remote.InputSchema); err != nil {
-				return nil, fmt.Errorf("mcp_schema: tool %s input: %w", fullName, err)
-			}
-			var outputSchema *jsonschema.Schema
-			if len(remote.OutputSchema) > 0 {
-				outputSchema, err = compileSchema(remote.OutputSchema)
-				if err != nil {
-					return nil, fmt.Errorf("mcp_schema: tool %s output: %w", fullName, err)
-				}
-			}
-			label := remote.Title
-			if label == "" {
-				label = remote.Name
-			}
-			tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, OutputSchema: append(json.RawMessage(nil), remote.OutputSchema...), Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
+		seenNames[remote.Name] = true
+		if _, err := compileSchema(remote.InputSchema); err != nil {
+			return fmt.Errorf("mcp_schema: tool %s input: %w", fullName, err)
 		}
-		cursor = result.NextCursor
-		if cursor == "" {
-			return tools, nil
+		var outputSchema *jsonschema.Schema
+		if len(remote.OutputSchema) > 0 {
+			var err error
+			if outputSchema, err = compileSchema(remote.OutputSchema); err != nil {
+				return fmt.Errorf("mcp_schema: tool %s output: %w", fullName, err)
+			}
 		}
-		if seenCursors[cursor] {
-			return nil, errors.New("mcp_protocol: repeated tools/list cursor")
+		label := remote.Title
+		if label == "" {
+			label = remote.Name
 		}
-		seenCursors[cursor] = true
-	}
-	return nil, errors.New("mcp_catalog_limit: tools/list exceeds 128 pages")
+		tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, OutputSchema: append(json.RawMessage(nil), remote.OutputSchema...), Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
+		return nil
+	})
+	return tools, err
 }
 
 func failedTool(message string) (agent.AgentToolResult, error) {
@@ -282,17 +247,21 @@ func (s *server) retire(client *mcpwire.Client, cause error) {
 }
 func (s *server) notification(method string, params json.RawMessage) {
 	switch method {
-	case "notifications/tools/list_changed":
+	case "notifications/tools/list_changed", "notifications/resources/list_changed", "notifications/prompts/list_changed":
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.closed {
+		if s.closed || s.client == nil {
 			return
 		}
-		if s.client != nil && !s.client.ListChanged() {
+		caps := s.client.Capabilities()
+		negotiated := map[string]bool{"notifications/tools/list_changed": caps.ToolsListChanged, "notifications/resources/list_changed": caps.ResourcesListChanged, "notifications/prompts/list_changed": caps.PromptsListChanged}
+		if !negotiated[method] {
 			return
 		}
+		// One refresh re-reads the whole catalog: tools, resources,
+		// resource templates and prompts.
 		s.dirty = true
-		if !s.refreshing && s.client != nil {
+		if !s.refreshing {
 			s.startRefreshLocked(s.manager.ctx, false)
 		}
 	case "notifications/progress":

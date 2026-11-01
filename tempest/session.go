@@ -573,6 +573,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	c.mcpEnabled = len(selectedMCP) != 0
 	c.mcpServers = selectedMCP
+	if c.mcpEnabled {
+		cfg.MCPResources = c.mcp
+	}
 	defer func() {
 		if err != nil {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

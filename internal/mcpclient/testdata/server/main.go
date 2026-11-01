@@ -31,7 +31,12 @@ type fixture struct {
 	initialized bool
 	active      map[string]context.CancelFunc
 	generation  atomic.Uint64
+	// resourceGeneration counts reads of fixture://bump, which adds a
+	// resource and announces it.
+	resourceGeneration atomic.Uint64
 }
+
+const pixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=="
 
 func main() {
 	mode := flag.String("mode", "normal", "fixture behavior")
@@ -83,7 +88,7 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 		if f.mode == "modern" {
 			version = "2026-07-28"
 		}
-		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]bool{"listChanged": true}}, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
+		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]bool{"listChanged": true}, "resources": map[string]bool{"listChanged": true}}, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
 	case "notifications/initialized":
 		f.mu.Lock()
 		f.initialized = true
@@ -195,9 +200,49 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				}
 				text = "changed"
 			case "mixed":
-				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
+				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": pixelPNG, "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
 			}
 			return map[string]any{"content": []map[string]string{{"type": "text", "text": text}}, "isError": isError}, nil
+		}), nil
+	case "resources/list":
+		var page struct {
+			Cursor string `json:"cursor"`
+		}
+		_ = json.Unmarshal(params, &page)
+		if page.Cursor == "" {
+			return map[string]any{"resources": []map[string]string{{"uri": "file:///notes.md", "name": "notes", "title": "Project notes", "mimeType": "text/markdown", "description": "fixture notes"}}, "nextCursor": "more"}, nil
+		}
+		resources := []map[string]string{{"uri": "fixture://pixel.png", "name": "pixel", "mimeType": "image/png"}, {"uri": "fixture://data.bin", "name": "data", "mimeType": "application/octet-stream"}}
+		if f.resourceGeneration.Load() > 0 {
+			resources = append(resources, map[string]string{"uri": "fixture://added.txt", "name": "added", "mimeType": "text/plain"})
+		}
+		return map[string]any{"resources": resources}, nil
+	case "resources/templates/list":
+		return map[string]any{"resourceTemplates": []map[string]string{{"uriTemplate": "fixture://logs/{day}", "name": "logs", "mimeType": "text/plain", "description": "daily log"}}}, nil
+	case "resources/read":
+		var read struct {
+			URI string `json:"uri"`
+		}
+		_ = json.Unmarshal(params, &read)
+		return rpc.Deferred(func() (any, *rpc.Error) {
+			content := map[string]string{"uri": read.URI}
+			switch {
+			case read.URI == "file:///notes.md":
+				content["mimeType"], content["text"] = "text/markdown", "line one\nline two\nline three\n"
+			case read.URI == "fixture://pixel.png":
+				content["mimeType"], content["blob"] = "image/png", pixelPNG
+			case read.URI == "fixture://data.bin":
+				content["mimeType"], content["blob"] = "application/octet-stream", base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3})
+			case strings.HasPrefix(read.URI, "fixture://logs/"):
+				content["mimeType"], content["text"] = "text/plain", "log for "+strings.TrimPrefix(read.URI, "fixture://logs/")
+			case read.URI == "fixture://bump":
+				f.resourceGeneration.Add(1)
+				_ = f.conn.Notify(ctx, "notifications/resources/list_changed", struct{}{})
+				content["mimeType"], content["text"] = "text/plain", "bumped"
+			default:
+				return nil, rpc.NewError(-32002, "not_found", "resource not found")
+			}
+			return map[string]any{"contents": []map[string]string{content}}, nil
 		}), nil
 	default:
 		return nil, rpc.NewError(-32601, "method_not_found", "fixture doesn't implement method")

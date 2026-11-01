@@ -18,7 +18,7 @@ func TestMCPToolsOnlyBundleNeverTrustsReadHints(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"name":"read","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"idempotentHint":true}}`), &advertised); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{servers: []*server{{config: mcpconfig.Server{Name: "fixture"}, tools: []agent.AgentTool{{Tool: types.Tool{Name: "mcp__fixture__read", Parameters: advertised.InputSchema}}}}}}
+	manager := &Manager{servers: []*server{{config: mcpconfig.Server{Name: "fixture"}, catalog: catalog{tools: []agent.AgentTool{{Tool: types.Tool{Name: "mcp__fixture__read", Parameters: advertised.InputSchema}}}}}}}
 	bundles := manager.Bundles()
 	if len(bundles) != 1 || len(bundles[0].Tools) != 1 {
 		t.Fatal(bundles)
@@ -36,7 +36,7 @@ func TestProgressBudgetDoesNotFailSuccessfulMCPCall(t *testing.T) {
 		}
 		return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("completed")}}, nil
 	}}
-	manager := &Manager{servers: []*server{{config: mcpconfig.Server{Name: "fixture"}, tools: []agent.AgentTool{tool}}}}
+	manager := &Manager{servers: []*server{{config: mcpconfig.Server{Name: "fixture"}, catalog: catalog{tools: []agent.AgentTool{tool}}}}}
 	grant := extension.NewGrant(context.Background(), extension.GrantOptions{Output: func(context.Context, extension.OutputChunk) error {
 		return errors.New("observer disconnected")
 	}})

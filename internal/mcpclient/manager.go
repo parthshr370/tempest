@@ -75,7 +75,7 @@ type server struct {
 	auth           *serverAuth
 	mu             sync.Mutex
 	client         *mcpwire.Client
-	tools          []agent.AgentTool
+	catalog        catalog
 	refreshDone    chan struct{}
 	refreshing     bool
 	dirty          bool
@@ -148,7 +148,7 @@ func (m *Manager) Defaults() map[string]permission.Decision {
 	for _, peer := range m.servers {
 		decision, _ := permission.ParseDecision(peer.config.Permission)
 		peer.mu.Lock()
-		for _, tool := range peer.tools {
+		for _, tool := range peer.catalog.tools {
 			defaults[tool.Name] = decision
 		}
 		peer.mu.Unlock()
@@ -242,11 +242,11 @@ func (s *server) startRefreshLocked(ctx context.Context, reconnect bool) {
 			s.mu.Lock()
 			s.dirty = false
 			s.mu.Unlock()
-			var tools []agent.AgentTool
-			tools, err = s.discover(refreshCtx, client)
+			var next catalog
+			next, err = s.discover(refreshCtx, client)
 			s.mu.Lock()
 			if err == nil {
-				s.tools = tools
+				s.catalog = next
 				s.unavailable = nil
 			}
 			again := s.dirty && err == nil && !s.closed

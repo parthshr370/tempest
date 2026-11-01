@@ -171,6 +171,9 @@ type StackConfig struct {
 	Compaction *compaction.CompactionSettings
 	// MCP configures the MCP client beyond its server list.
 	MCP MCPClientSettings
+	// MCPResources serves read's mcp:// URLs; tempest.Open sets it to the
+	// session's MCP manager when servers are configured.
+	MCPResources tools.MCPResources
 }
 
 // MCPClientSettings are the session-wide MCP client options.
@@ -451,6 +454,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Sanitize:           cfg.Sanitize,
 		Skills:             cfg.Skills,
 		Refs:               refsResolver,
+		MCP:                cfg.MCPResources,
 		Work:               cfg.Controller,
 		Child:              cfg.Child,
 		Messenger:          cfg.Messenger,

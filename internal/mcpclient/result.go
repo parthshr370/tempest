@@ -68,6 +68,16 @@ type resultSpill struct {
 	binaryIndex int
 }
 
+// newSpill saves under spillDir; inside the session's local:// directory it
+// names its files as local:// URLs the read tool opens.
+func newSpill(spillDir string, raw []byte) resultSpill {
+	spill := resultSpill{base: spillDir, original: raw}
+	if filepath.Base(filepath.Dir(spillDir)) == refs.LocalDirName {
+		spill.localRoot = filepath.Dir(spillDir)
+	}
+	return spill
+}
+
 func (s *resultSpill) reference(path string) string {
 	if s.localRoot == "" {
 		return path
@@ -171,10 +181,7 @@ func mapResult(spillDir, serverName, toolName string, raw json.RawMessage, outpu
 	}
 	result := agent.AgentToolResult{IsError: remote.IsError}
 	details := resultDetails{MCP: mcpDetails{Server: serverName, Tool: toolName, IsError: remote.IsError}}
-	spill := resultSpill{base: spillDir, original: raw}
-	if filepath.Base(filepath.Dir(spillDir)) == refs.LocalDirName {
-		spill.localRoot = filepath.Dir(spillDir)
-	}
+	spill := newSpill(spillDir, raw)
 	contentBytes, textBytes := 2, 0
 	appendBlock := func(block types.ContentBlock) error {
 		budget := maxInlineContent - spillReferenceReserve - contentBytes
