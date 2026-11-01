@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"go.harness.dev/harness/internal/termtext"
 )
 
 // Elicit is a user request that did not come from the ask tool: an MCP
@@ -343,28 +345,29 @@ func (field formField) bounds() string {
 	return ""
 }
 
-// prompt renders one field for a line-based prompt.
+// prompt renders one field for a terminal prompt; the server-chosen parts
+// are escaped.
 func (field formField) prompt() string {
 	var text strings.Builder
-	text.WriteString("\n" + cmpOr(field.Title, field.Name))
+	text.WriteString("\n" + termtext.Line(cmpOr(field.Title, field.Name)))
 	if field.Required {
 		text.WriteString(" (required)")
 	}
 	if field.Description != "" {
-		text.WriteString(": " + field.Description)
+		text.WriteString(": " + termtext.Line(field.Description))
 	}
 	text.WriteString("\n")
 	for i, label := range field.Labels {
-		fmt.Fprintf(&text, "  %d. %s\n", i+1, label)
+		fmt.Fprintf(&text, "  %d. %s\n", i+1, termtext.Line(label))
 	}
-	hint := "Enter " + field.describe()
+	hint := "Enter " + termtext.Line(field.describe())
 	if field.Multi {
 		hint = "Enter numbers separated by commas"
 	} else if len(field.Choices) > 0 {
 		hint = "Enter a number"
 	}
 	if len(field.Default) > 0 {
-		hint += ", or press Enter for " + string(field.Default)
+		hint += ", or press Enter for " + termtext.Line(string(field.Default))
 	} else if !field.Required {
 		hint += ", or press Enter to skip"
 	}

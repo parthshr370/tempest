@@ -17,6 +17,7 @@ import (
 	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/mcpoauth"
+	"go.harness.dev/harness/internal/termtext"
 )
 
 func runMCP(args []string, stdout, stderr io.Writer) int {
@@ -101,7 +102,8 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if err := mcpLogin(ctx, server, store, noBrowser, stdout, stderr); err != nil {
-		fmt.Fprintln(stderr, err)
+		// Login errors quote authorization server text (error_description).
+		fmt.Fprintln(stderr, termtext.Message(err.Error()))
 		return 1
 	}
 	return 0
@@ -111,7 +113,7 @@ func mcpLogin(ctx context.Context, server mcpconfig.Server, store *mcpoauth.Stor
 	if !server.UsesOAuth() {
 		return fmt.Errorf("MCP server %s uses %s; OAuth applies to HTTP servers without a configured Authorization header", server.Name, mcpCredentialSource(server))
 	}
-	flow, err := mcpoauth.New(server, store, nil)
+	flow, err := mcpoauth.New(server, store)
 	if err != nil {
 		return err
 	}
@@ -123,7 +125,7 @@ func mcpLogin(ctx context.Context, server mcpconfig.Server, store *mcpoauth.Stor
 		return fmt.Errorf(`MCP server %s did not ask for authorization (no 401 or 403 answer); set "auth": "oauth" on it to sign in through its well-known OAuth metadata`, server.Name)
 	}
 	record, err := flow.Login(ctx, challenge, func(ctx context.Context, authorizationURL string) error {
-		fmt.Fprintf(stdout, "Sign in to MCP server %s. Open this URL in a browser on this host:\n%s\n", server.Name, authorizationURL)
+		fmt.Fprintf(stdout, "Sign in to MCP server %s. Open this URL in a browser on this host:\n%s\n", server.Name, termtext.Line(authorizationURL))
 		if !noBrowser {
 			if err := openSignInBrowser(ctx, authorizationURL); err != nil {
 				fmt.Fprintln(stderr, "Could not open the browser. Open the URL above manually on this host.")
@@ -139,7 +141,7 @@ func mcpLogin(ctx context.Context, server mcpconfig.Server, store *mcpoauth.Stor
 }
 
 func mcpLogout(ctx context.Context, server mcpconfig.Server, store *mcpoauth.Store) error {
-	flow, err := mcpoauth.New(server, store, nil)
+	flow, err := mcpoauth.New(server, store)
 	if err != nil {
 		return err
 	}
@@ -158,7 +160,7 @@ func printMCPServers(stdout, stderr io.Writer, servers []mcpconfig.Server, store
 		}
 		state := mcpCredentialSource(server)
 		if server.UsesOAuth() {
-			flow, err := mcpoauth.New(server, store, nil)
+			flow, err := mcpoauth.New(server, store)
 			if err != nil {
 				fmt.Fprintln(stderr, err)
 				return 1
@@ -173,7 +175,7 @@ func printMCPServers(stdout, stderr io.Writer, servers []mcpconfig.Server, store
 				state = "oauth: signed in" + describeGrant(status.Scope, status.ExpiresAt, status.Refreshable)
 			}
 			if status.PendingScope != "" {
-				state += "; needs login for more scope: " + status.PendingScope
+				state += "; needs login for more scope: " + termtext.Line(status.PendingScope)
 			}
 		}
 		extras := ""
@@ -213,7 +215,8 @@ func printMCPPrompts(ctx context.Context, stdout, stderr io.Writer, servers []mc
 	}
 	table := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	for _, prompt := range prompts {
-		fmt.Fprintf(table, "/%s %s\t%s\n", prompt.Command(), prompt.Hint(), prompt.Summary())
+		// Prompt names, arguments and descriptions are the server's text.
+		fmt.Fprintf(table, "/%s %s\t%s\n", termtext.Line(prompt.Command()), termtext.Line(prompt.Hint()), termtext.Line(prompt.Summary()))
 	}
 	if err := table.Flush(); err != nil {
 		fmt.Fprintln(stderr, err)
@@ -235,7 +238,7 @@ func mcpCredentialSource(server mcpconfig.Server) string {
 func describeGrant(scope string, expires time.Time, refreshable bool) string {
 	var parts []string
 	if scope != "" {
-		parts = append(parts, "scope "+scope)
+		parts = append(parts, "scope "+termtext.Line(scope))
 	}
 	if !expires.IsZero() {
 		parts = append(parts, "expires "+expires.UTC().Format(time.RFC3339))

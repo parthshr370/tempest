@@ -139,7 +139,7 @@ func TestMCPOAuthStepUpWithoutUserFailsTheCallAndKeepsTheScope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	flow, err := mcpoauth.New(servers[0], store, nil)
+	flow, err := mcpoauth.New(servers[0], store)
 	if err != nil {
 		t.Fatal(err)
 	}

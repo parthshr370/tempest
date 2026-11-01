@@ -2,9 +2,12 @@ package mcpoauth_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,7 +47,7 @@ func newHarness(t *testing.T, options mcpoauthtest.Options, client *mcpconfig.OA
 	if err != nil {
 		t.Fatal(err)
 	}
-	flow, err := mcpoauth.New(servers[0], store, nil)
+	flow, err := mcpoauth.New(servers[0], store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +205,7 @@ func TestTokensAreNotSentToAReconfiguredURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	moved, err := mcpoauth.New(servers[0], h.store, nil)
+	moved, err := mcpoauth.New(servers[0], h.store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,5 +227,66 @@ func TestStepUpScopeIsKeptForTheNextLogin(t *testing.T) {
 	}
 	if status, err := h.flow.Status(); err != nil || status.PendingScope != "" || status.Scope != "mcp:read mcp:write" {
 		t.Fatalf("status = %#v %v", status, err)
+	}
+}
+
+func TestLoginDoesNotFetchResourceMetadataFromAnotherOrigin(t *testing.T) {
+	var probes atomic.Int32
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probes.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(probe.Close)
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	challenge.ResourceMetadata = probe.URL + "/metadata-probe"
+	if _, err := h.flow.Login(t.Context(), challenge, h.fixture.Browse); err != nil {
+		t.Fatalf("login with a cross-origin metadata hint should fall back to the server's own well-known metadata: %v", err)
+	}
+	if n := probes.Load(); n != 0 {
+		t.Fatalf("Tempest fetched the server-named cross-origin URL %d times", n)
+	}
+}
+
+func TestLoginRefusesToReachInternalAuthorizationServerOfRemoteServer(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	mcpoauth.TreatServerAsRemote(h.flow)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.flow.Login(t.Context(), challenge, h.fixture.Browse)
+	if err == nil || !strings.Contains(err.Error(), "refusing to reach 127.0.0.1, a loopback address") {
+		t.Fatalf("login via an internal authorization server = %v", err)
+	}
+	if h.fixture.Registrations() != 0 || len(h.fixture.Authorizations()) != 0 {
+		t.Fatal("the internal authorization server was contacted")
+	}
+}
+
+func TestDiscoveryDoesNotFollowRedirects(t *testing.T) {
+	var probes atomic.Int32
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { probes.Add(1) }))
+	t.Cleanup(probe.Close)
+	mcp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, probe.URL+"/internal", http.StatusFound)
+	}))
+	t.Cleanup(mcp.Close)
+	servers, err := mcpconfig.Normalize([]mcpconfig.Server{{Name: "redirecting", Transport: "http", URL: mcp.URL + "/mcp"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow, err := mcpoauth.New(servers[0], mcpoauth.NewStore(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Login(t.Context(), mcpoauth.Challenge{}, nil); err == nil {
+		t.Fatal("login succeeded through redirects")
+	}
+	if probes.Load() != 0 {
+		t.Fatal("a discovery redirect was followed")
 	}
 }

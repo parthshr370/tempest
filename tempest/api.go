@@ -208,6 +208,15 @@ type Prompter interface {
 	Approve(context.Context, Ask) (Choice, error)
 }
 
+// Attendance is implemented by a Prompter that knows whether anyone can
+// answer a session's asks right now, as serve's broker does: it reports false
+// while no approving client is attached. Requests that must not wait for a
+// user who may never come (MCP sampling) treat an unattended session as
+// headless. A Prompter without it is taken to have a user.
+type Attendance interface {
+	Attended(sessionID string) bool
+}
+
 // QuestionHandler presents a question and stops when its context is cancelled.
 type QuestionHandler = question.Handler
 

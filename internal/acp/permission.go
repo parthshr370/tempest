@@ -85,6 +85,16 @@ func (b *Broker) authorized(id string, c *rpc.Conn) bool {
 	return b.approvers[id][c] > 0
 }
 
+var _ tempest.Attendance = (*Broker)(nil)
+
+// Attended implements tempest.Attendance: a session is attended while a
+// client that approves its asks is attached.
+func (b *Broker) Attended(sessionID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.approvers[sessionID]) > 0
+}
+
 // Approve implements tempest.Prompter. Session owns the hub ask and final arbitration.
 func (b *Broker) Approve(ctx context.Context, ask tempest.Ask) (tempest.Choice, error) {
 	askCtx, cancel := context.WithCancel(ctx)

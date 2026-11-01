@@ -234,6 +234,12 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 		if f.resourceGeneration.Load() > 0 {
 			resources = append(resources, map[string]string{"uri": "fixture://added.txt", "name": "added", "mimeType": "text/plain"})
 		}
+		if f.mode == "oversized" {
+			resources = append(resources, map[string]string{"uri": "fixture://long-line.txt", "name": "long-line", "mimeType": "text/plain"},
+				map[string]string{"uri": "fixture://big-with-image", "name": "big-with-image"},
+				map[string]string{"uri": "https://example/search?q=term", "name": "search", "mimeType": "text/plain"},
+				map[string]string{"uri": "fixture://data.json", "name": "data", "mimeType": "application/json"})
+		}
 		return map[string]any{"resources": resources}, nil
 	case "resources/templates/list":
 		return map[string]any{"resourceTemplates": []map[string]string{{"uriTemplate": "fixture://logs/{day}", "name": "logs", "mimeType": "text/plain", "description": "daily log"}}}, nil
@@ -262,8 +268,18 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				_ = f.conn.Notify(ctx, "notifications/resources/list_changed", struct{}{})
 				_ = f.conn.Notify(ctx, "notifications/prompts/list_changed", struct{}{})
 				content["mimeType"], content["text"] = "text/plain", "bumped"
+			case read.URI == "fixture://long-line.txt":
+				content["mimeType"], content["text"] = "text/plain", strings.Repeat("x", 100000)
+			case read.URI == "fixture://big-with-image":
+				text := map[string]string{"uri": "fixture://big-with-image/text", "mimeType": "text/plain", "text": strings.Repeat("row of resource text\n", 5000)}
+				image := map[string]string{"uri": "fixture://big-with-image/pixel", "mimeType": "image/png", "blob": pixelPNG}
+				return map[string]any{"contents": []map[string]string{text, image}}, nil
+			case read.URI == "https://example/search?q=term":
+				content["mimeType"], content["text"] = "text/plain", "results for term"
+			case read.URI == "fixture://data.json":
+				content["mimeType"], content["text"] = "application/json", `{"items":[{"name":"a"},{"name":"b"}]}`
 			default:
-				return nil, rpc.NewError(-32002, "not_found", "resource not found")
+				return nil, rpc.NewError(-32002, "not_found", "resource not found: "+read.URI)
 			}
 			return map[string]any{"contents": []map[string]string{content}}, nil
 		}), nil
@@ -332,7 +348,8 @@ func (f *fixture) elicit(ctx context.Context, arguments json.RawMessage) string 
 
 // sample sends sampling/createMessage with the call's value as the request
 // params (a default request when empty) and returns the client's raw reply,
-// or why there is none.
+// or why there is none. Value "async" sends the default request without
+// waiting for the reply.
 func (f *fixture) sample(ctx context.Context, arguments json.RawMessage) string {
 	var args struct {
 		Value string `json:"value"`
@@ -345,6 +362,15 @@ func (f *fixture) sample(ctx context.Context, arguments json.RawMessage) string 
 		return "sampling not declared"
 	}
 	request := json.RawMessage(`{"messages":[{"role":"user","content":{"type":"text","text":"Summarize the fixture"}}],"systemPrompt":"You are terse.","includeContext":"allServers","maxTokens":100}`)
+	if args.Value == "async" {
+		// Ask without awaiting the answer: the tool result returns first.
+		go func() {
+			var reply json.RawMessage
+			err := f.conn.Call(context.WithoutCancel(ctx), "sampling/createMessage", request, &reply)
+			f.record("sample_async", fmt.Sprint(string(reply), err))
+		}()
+		return "sampling started"
+	}
 	if args.Value != "" && args.Value != "ok" {
 		request = json.RawMessage(args.Value)
 	}

@@ -24,6 +24,12 @@ type runAccounting struct {
 	emit       AgentEventSink
 	sources    map[string]types.Usage
 	receiptsMu sync.Mutex
+	// Provider work started outside the loop joins the run until it ends.
+	joinMu sync.Mutex
+	ending bool
+	joined sync.WaitGroup
+	end    context.Context
+	endRun context.CancelFunc
 }
 
 func newLoopRun(ctx context.Context, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) (context.Context, *loopRun) {
@@ -41,6 +47,44 @@ func newLoopRun(ctx context.Context, config AgentLoopConfig, emit AgentEventSink
 	}
 	run := &loopRun{config: config, emit: emit, streamFn: streamFn, accounting: accounting, root: root, started: time.Now()}
 	return context.WithValue(ctx, localRunKey{}, run), run
+}
+
+// join admits provider work started outside the loop until the run starts
+// ending. Its context is cancelled when the run ends; done must be called
+// once the work has accounted for its spend.
+func (a *runAccounting) join(ctx context.Context) (context.Context, func(), bool) {
+	a.joinMu.Lock()
+	defer a.joinMu.Unlock()
+	if a.ending {
+		return ctx, func() {}, false
+	}
+	if a.end == nil {
+		a.end, a.endRun = context.WithCancel(context.Background())
+	}
+	a.joined.Add(1)
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(a.end, cancel)
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			stop()
+			cancel()
+			a.joined.Done()
+		})
+	}, true
+}
+
+// settle stops admitting outside work, cancels what is in flight, and waits
+// until each piece has journaled and charged its spend to this run.
+func (a *runAccounting) settle() {
+	a.joinMu.Lock()
+	a.ending = true
+	endRun := a.endRun
+	a.joinMu.Unlock()
+	if endRun != nil {
+		endRun()
+	}
+	a.joined.Wait()
 }
 
 func (a *runAccounting) total() types.Usage {

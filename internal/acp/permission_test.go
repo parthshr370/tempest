@@ -156,3 +156,18 @@ func TestPromptContentConversion(t *testing.T) {
 		}
 	}
 }
+
+func TestBrokerAttendedOnlyWhileAnApproverIsAttached(t *testing.T) {
+	b := NewBroker(0, nil)
+	if b.Attended("s") {
+		t.Fatal("attended with no approver")
+	}
+	release := b.add("s", &rpc.Conn{})
+	if !b.Attended("s") || b.Attended("other") {
+		t.Fatal("attendance does not follow the attached approver")
+	}
+	release()
+	if b.Attended("s") {
+		t.Fatal("attended after the approver left")
+	}
+}

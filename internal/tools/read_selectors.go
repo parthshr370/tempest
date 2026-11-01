@@ -56,6 +56,19 @@ func parseReadTarget(requested string) readTarget {
 	return target
 }
 
+// mcpReadTarget parses an mcp://<server>/<uri> read. The resource URI is
+// opaque and may carry its own ?q= (https://example/search?q=term), so a
+// ?q= selector is split off only when the URI before it is a resource the
+// server lists and the whole string is not; anything else is sent to the
+// server verbatim. Archive members and SQLite tables do not apply.
+func mcpReadTarget(ctx context.Context, resources MCPResources, requested string) readTarget {
+	cut := strings.LastIndex(requested, "?q=")
+	if cut < 0 || resources == nil || resources.ListsResource(ctx, requested) || !resources.ListsResource(ctx, requested[:cut]) {
+		return readTarget{path: requested}
+	}
+	return readTarget{path: requested[:cut], query: requested[cut+len("?q="):], hasQuery: true}
+}
+
 // readSource is what the read tool renders. isResource is set whenever data
 // is not the raw bytes of a workspace file (URL reads, listings, archive
 // members, extracted document text, query output); absolutePath is then "".
@@ -64,6 +77,10 @@ type readSource struct {
 	absolutePath string
 	displayPath  string
 	isResource   bool
+	// images follow the rows (an MCP resource with image contents).
+	images []types.ContentBlock
+	// save writes data where bash can read it, for a resource with no file.
+	save func() (string, error)
 }
 
 // loadReadSource resolves a read path (workspace file, session artifact or
@@ -71,6 +88,9 @@ type readSource struct {
 // returned as is (images).
 func loadReadSource(ctx context.Context, cwd string, root *os.Root, options ToolsOptions, requested string) (readSource, *agent.AgentToolResult, error) {
 	target := parseReadTarget(requested)
+	if strings.HasPrefix(requested, refs.SchemeMCP+"://") {
+		target = mcpReadTarget(ctx, options.MCP, requested)
+	}
 	var src readSource
 	var name string // drives format detection
 	listing := false
@@ -88,11 +108,11 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 			var images []types.ContentBlock
 			resource, images, err = options.MCP.ReadResource(ctx, target.path)
 			if err == nil && len(images) > 0 {
-				if target.hasMember || target.hasQuery {
-					return readSource{}, nil, fmt.Errorf("%s has image content; archive members and ?q= queries apply to text", resource.URI)
+				if target.hasQuery {
+					return readSource{}, nil, fmt.Errorf("%s has image content; ?q= queries apply to text", resource.URI)
 				}
-				result := agent.AgentToolResult{Content: append([]types.ContentBlock{types.NewText(fmt.Sprintf("[%s]\n%s", resource.URI, resource.Data))}, images...)}
-				return readSource{}, &result, nil
+				// The text is shown like any resource's, the images after it.
+				return readSource{data: resource.Data, displayPath: resource.URI, isResource: true, images: images, save: resource.Save}, nil, nil
 			}
 		default:
 			resource, err = options.Refs.Read(ctx, target.path)
@@ -100,7 +120,7 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 		if err != nil {
 			return readSource{}, nil, err
 		}
-		src = readSource{data: resource.Data, displayPath: resource.URI, isResource: true}
+		src = readSource{data: resource.Data, displayPath: resource.URI, isResource: true, save: resource.Save}
 		name = resource.URI
 		if resource.Dir {
 			entries := make([]dirEntry, len(resource.Entries))

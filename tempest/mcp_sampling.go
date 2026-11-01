@@ -73,16 +73,20 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 	if agt == nil {
 		return types.AssistantMessage{}, fmt.Errorf("%w: the session is still starting", mcpclient.ErrSamplingRefused)
 	}
-	// The spend belongs to the run whose tool call the server is serving.
-	runCtx, runID := agt.BackgroundProviderContext(ctx)
-	if runID == "" {
+	// The spend belongs to the live run. The request lives no longer than
+	// that run, which waits for its receipt before it ends, so the spend
+	// is journaled and charged (and held to -max-cost) under it even when
+	// the server asked without awaiting the answer in its tool call.
+	runCtx, _, done, ok := agt.JoinRun(ctx)
+	defer done()
+	if !ok {
 		return types.AssistantMessage{}, fmt.Errorf("%w: MCP sampling is answered only while a run is in progress", mcpclient.ErrSamplingRefused)
 	}
 	maxTokens := request.MaxTokens
 	if m.maxTokens > 0 && maxTokens > m.maxTokens {
 		maxTokens = m.maxTokens
 	}
-	if err := m.approve(ctx, request, maxTokens); err != nil {
+	if err := m.approve(runCtx, request, maxTokens); err != nil {
 		return types.AssistantMessage{}, err
 	}
 	if !m.model.SupportsVision() && hasImage(request.Messages) {
@@ -137,8 +141,8 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 
 // approve asks the user on a server's first request. Allow always and
 // reject always hold for the rest of the session; once-choices ask again
-// next time. Without a user the request is refused unless
-// mcp_sampling_allow_headless is set.
+// next time. Without a user (no prompter, or serve with no approving client)
+// the request is refused at once unless mcp_sampling_allow_headless is set.
 func (m *mcpSampling) approve(ctx context.Context, request mcpclient.SamplingRequest, maxTokens int) error {
 	m.mu.Lock()
 	gate := m.gates[request.Server]
@@ -157,7 +161,7 @@ func (m *mcpSampling) approve(ctx context.Context, request mcpclient.SamplingReq
 		return refused
 	}
 	core := m.session.core
-	if core.prompter == nil {
+	if !attended(core.prompter, core.id) {
 		if m.allowHeadless {
 			return nil
 		}
@@ -189,6 +193,18 @@ func (m *mcpSampling) approve(ctx context.Context, request mcpclient.SamplingReq
 		return refused
 	}
 	return nil
+}
+
+// attended reports whether a user can answer an approval now: a prompter
+// exists and, when it can tell, someone who approves is attached.
+func attended(prompter Prompter, sessionID string) bool {
+	if prompter == nil {
+		return false
+	}
+	if attendance, ok := prompter.(Attendance); ok {
+		return attendance.Attended(sessionID)
+	}
+	return true
 }
 
 // samplingInput is what the approval shows: the server, the model, the

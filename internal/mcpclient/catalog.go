@@ -228,20 +228,47 @@ func (m *Manager) ReadResource(ctx context.Context, raw string) (refs.Resource, 
 		}
 		return refs.Resource{}, nil, fmt.Errorf("MCP server %s resources/read %s: %w", name, uri, err)
 	}
-	data, images, multiple, err := mapContents(m.spillDir, result)
+	spill := newSpill(m.spillDir, result)
+	data, images, multiple, err := mapContents(&spill, result)
 	if err != nil {
 		if strings.Contains(err.Error(), "mcp_protocol") {
 			peer.retire(client, err)
 		}
 		return refs.Resource{}, nil, fmt.Errorf("MCP server %s resource %s: %w", name, uri, err)
 	}
-	return refs.Resource{URI: ResourceScheme + name + "/" + uri, Data: []byte(data), Rendered: multiple}, images, nil
+	save := func() (string, error) { return spill.file("resource.txt", []byte(data)) }
+	return refs.Resource{URI: ResourceScheme + name + "/" + uri, Data: []byte(data), Rendered: multiple, Save: save}, images, nil
+}
+
+// ListsResource reports whether raw, an mcp://<server>/<uri> URL, names a
+// resource its server lists.
+func (m *Manager) ListsResource(ctx context.Context, raw string) bool {
+	rest, ok := strings.CutPrefix(raw, ResourceScheme)
+	name, uri, _ := strings.Cut(rest, "/")
+	if !ok || uri == "" {
+		return false
+	}
+	peer, err := m.server(name)
+	if err != nil {
+		return false
+	}
+	_, snapshot, err := peer.current(ctx)
+	if err != nil {
+		return false
+	}
+	for _, entry := range snapshot.resources {
+		if entry.URI == uri {
+			return true
+		}
+	}
+	return false
 }
 
 // mapContents renders a resources/read result. One text content is returned
 // unchanged so line ranges and JSON queries apply to it; several contents
-// are each introduced by their URI.
-func mapContents(spillDir string, raw json.RawMessage) (string, []types.ContentBlock, bool, error) {
+// are each introduced by their URI. Images are delivered inline up to the
+// MCP inline content budget in total; the rest are saved like other blobs.
+func mapContents(spill *resultSpill, raw json.RawMessage) (string, []types.ContentBlock, bool, error) {
 	if len(raw) > mcpwire.MaxResponse || !utf8.Valid(raw) {
 		return "", nil, false, errors.New("mcp_protocol: malformed resources/read result")
 	}
@@ -256,8 +283,8 @@ func mapContents(spillDir string, raw json.RawMessage) (string, []types.ContentB
 	if json.Unmarshal(raw, &result) != nil || result.Contents == nil {
 		return "", nil, false, errors.New("mcp_protocol: malformed resources/read result")
 	}
-	spill := newSpill(spillDir, raw)
 	multiple := len(result.Contents) != 1
+	imageBudget := maxInlineContent - spillReferenceReserve
 	var text strings.Builder
 	var images []types.ContentBlock
 	for _, content := range result.Contents {
@@ -278,7 +305,8 @@ func mapContents(spillDir string, raw json.RawMessage) (string, []types.ContentB
 		if err != nil {
 			return "", nil, false, errors.New("mcp_protocol: invalid base64 blob")
 		}
-		if inlineImage(content.MimeType, decoded) {
+		if inlineImage(content.MimeType, decoded) && len(*content.Blob) <= imageBudget {
+			imageBudget -= len(*content.Blob)
 			images = append(images, types.NewImage(*content.Blob, content.MimeType))
 			fmt.Fprintf(&text, "Image %s (%s, %d bytes) follows.\n", content.URI, content.MimeType, len(decoded))
 			continue

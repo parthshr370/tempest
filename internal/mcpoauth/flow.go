@@ -52,27 +52,28 @@ type Client struct {
 	headers  map[string]string
 	static   *mcpconfig.OAuthClient
 	store    *Store
+	dest     *destinations
 	http     *http.Client
 	now      func() time.Time
 }
 
-// New binds a client to a normalized HTTP server configuration. A nil
-// httpClient uses a 30s timeout; redirects are never followed.
-func New(cfg mcpconfig.Server, store *Store, httpClient *http.Client) (*Client, error) {
+// New binds a client to a normalized HTTP server configuration. Requests
+// time out after 30s, never follow redirects, and reach origins other than
+// the server's only under the destination policy in destinations.go.
+func New(cfg mcpconfig.Server, store *Store) (*Client, error) {
 	resource, err := canonical(cfg.URL)
 	if err != nil {
 		return nil, err
 	}
-	var client http.Client
-	if httpClient != nil {
-		client = *httpClient
+	parsed, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, err
 	}
-	if client.Timeout == 0 {
-		client.Timeout = 30 * time.Second
-	}
-	// Credentials and codes must never follow a redirect to another endpoint.
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{server: cfg.Name, url: cfg.URL, resource: resource, headers: cfg.Headers, static: cfg.OAuth, store: store, http: &client, now: time.Now}, nil
+	dest := newDestinations(cfg.Name, parsed)
+	client := &http.Client{Timeout: 30 * time.Second, Transport: dest.transport(),
+		// Credentials and codes must never follow a redirect to another endpoint.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return &Client{server: cfg.Name, url: cfg.URL, resource: resource, headers: cfg.Headers, static: cfg.OAuth, store: store, dest: dest, http: client, now: time.Now}, nil
 }
 
 func (c *Client) bound(r Record) bool { return r.Resource == c.resource }

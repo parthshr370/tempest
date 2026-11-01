@@ -30,7 +30,7 @@ type serverAuth struct {
 }
 
 func newServerAuth(cfg mcpconfig.Server, store *mcpoauth.Store) (*serverAuth, error) {
-	flow, err := mcpoauth.New(cfg, store, nil)
+	flow, err := mcpoauth.New(cfg, store)
 	if err != nil {
 		return nil, fmt.Errorf("mcp_config: server %s: %w", cfg.Name, err)
 	}

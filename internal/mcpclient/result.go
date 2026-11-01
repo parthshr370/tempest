@@ -128,12 +128,17 @@ func (s *resultSpill) binary(encoded string) (string, error) {
 }
 
 func (s *resultSpill) binaryBytes(decoded []byte) (string, error) {
+	s.binaryIndex++
+	return s.file(fmt.Sprintf("binary-%d", s.binaryIndex), decoded)
+}
+
+// file saves data under name in the spill directory and returns its reference.
+func (s *resultSpill) file(name string, data []byte) (string, error) {
 	if err := s.ensure(); err != nil {
 		return "", err
 	}
-	s.binaryIndex++
-	path := filepath.Join(s.directory, fmt.Sprintf("binary-%d", s.binaryIndex))
-	if err := exclusiveFile(path, decoded); err != nil {
+	path := filepath.Join(s.directory, name)
+	if err := exclusiveFile(path, data); err != nil {
 		return "", fmt.Errorf("mcp_spill: %w", err)
 	}
 	return s.reference(path), nil

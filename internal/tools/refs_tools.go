@@ -47,6 +47,9 @@ const (
 // the text; images are returned as blocks that follow it.
 type MCPResources interface {
 	ReadResource(ctx context.Context, uri string) (refs.Resource, []types.ContentBlock, error)
+	// ListsResource reports whether an mcp:// URL names a resource its
+	// server lists.
+	ListsResource(ctx context.Context, uri string) bool
 }
 
 // grepRefs searches an internal URL: a scheme directory or file through an

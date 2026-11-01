@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -74,23 +73,6 @@ func covers(resource, target string) bool {
 	return t == r || strings.HasPrefix(t, r+"/")
 }
 
-// secureEndpoint enforces the specification's HTTPS rule for authorization
-// endpoints; loopback HTTP stays allowed for local servers and tests.
-func secureEndpoint(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || u.Fragment != "" || u.User != nil {
-		return fmt.Errorf("invalid endpoint %q", raw)
-	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	host := u.Hostname()
-	if ip := net.ParseIP(host); u.Scheme == "http" && (strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())) {
-		return nil
-	}
-	return fmt.Errorf("endpoint %q must use HTTPS", raw)
-}
-
 // wellKnown inserts a well-known suffix before an escaped URL path (RFC 8615).
 func wellKnown(base *url.URL, suffix, escapedPath string) string {
 	return base.Scheme + "://" + base.Host + "/.well-known/" + suffix + escapedPath
@@ -99,8 +81,10 @@ func wellKnown(base *url.URL, suffix, escapedPath string) string {
 // resourceMetadata follows the challenge's resource_metadata URL, or probes
 // the path-inserted and then the root well-known URI.
 func (c *Client) resourceMetadata(ctx context.Context, challenge Challenge) (ResourceMetadata, error) {
+	// RFC 9728 places the metadata on the resource's own origin; a hint
+	// naming another origin is not fetched, and the well-known probes run.
 	var candidates []string
-	if challenge.ResourceMetadata != "" {
+	if challenge.ResourceMetadata != "" && c.dest.sameOrigin(challenge.ResourceMetadata) {
 		candidates = []string{challenge.ResourceMetadata}
 	} else {
 		u, err := url.Parse(c.url)
@@ -118,6 +102,9 @@ func (c *Client) resourceMetadata(ctx context.Context, challenge Challenge) (Res
 		return metadata, err
 	}
 	if !found {
+		if challenge.ResourceMetadata != "" && !c.dest.sameOrigin(challenge.ResourceMetadata) {
+			return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata on its own origin; its challenge named %q on another origin, which Tempest does not fetch", c.server, challenge.ResourceMetadata)
+		}
 		return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata", c.server)
 	}
 	if metadata.Resource == "" || len(metadata.AuthorizationServers) == 0 {
@@ -132,7 +119,7 @@ func (c *Client) resourceMetadata(ctx context.Context, challenge Challenge) (Res
 // serverMetadata tries the RFC 8414 and OpenID Connect locations in the
 // order the specification lists, and requires PKCE S256 support.
 func (c *Client) serverMetadata(ctx context.Context, issuer string) (ServerMetadata, error) {
-	if err := secureEndpoint(issuer); err != nil {
+	if err := c.dest.secure(issuer); err != nil {
 		return ServerMetadata{}, err
 	}
 	u, err := url.Parse(issuer)
@@ -162,12 +149,12 @@ func (c *Client) serverMetadata(ctx context.Context, issuer string) (ServerMetad
 		if endpoint == "" {
 			return metadata, fmt.Errorf("authorization server %s metadata lacks authorization or token endpoint", issuer)
 		}
-		if err := secureEndpoint(endpoint); err != nil {
+		if err := c.dest.secure(endpoint); err != nil {
 			return metadata, err
 		}
 	}
 	if metadata.RegistrationEndpoint != "" {
-		if err := secureEndpoint(metadata.RegistrationEndpoint); err != nil {
+		if err := c.dest.secure(metadata.RegistrationEndpoint); err != nil {
 			return metadata, err
 		}
 	}
@@ -178,7 +165,7 @@ func (c *Client) serverMetadata(ctx context.Context, issuer string) (ServerMetad
 // Other statuses move to the next candidate; transport failures stop.
 func (c *Client) firstJSON(ctx context.Context, candidates []string, dst any) (bool, error) {
 	for _, candidate := range candidates {
-		if err := secureEndpoint(candidate); err != nil {
+		if err := c.dest.secure(candidate); err != nil {
 			return false, err
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate, nil)

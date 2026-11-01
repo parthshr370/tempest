@@ -113,3 +113,51 @@ func TestReadToolServesMCPResources(t *testing.T) {
 		t.Fatalf("read without servers = %v", err)
 	}
 }
+
+func TestReadToolBoundsAndRecoversMCPResources(t *testing.T) {
+	manager, _ := openFixture(t, "oversized")
+	read, err := tools.NewTool(tools.ReadTool, t.TempDir(), tools.ToolsOptions{MCP: manager})
+	if err != nil {
+		t.Fatal(err)
+	}
+	execute := func(t *testing.T, path string) (string, []types.ContentBlock) {
+		t.Helper()
+		args, _ := json.Marshal(map[string]string{"path": path})
+		result, err := read.Execute(context.Background(), "read", args, nil)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		var text strings.Builder
+		for _, block := range result.Content {
+			text.WriteString(block.Text)
+		}
+		return text.String(), result.Content
+	}
+	t.Run("text beside an image gets the read budget", func(t *testing.T) {
+		text, blocks := execute(t, "mcp://fixture/fixture://big-with-image")
+		if len(text) > 60000 || !strings.Contains(text, "Showing lines") || blocks[len(blocks)-1].Type != types.BlockImage {
+			t.Fatalf("text+image read: %d text bytes, %d blocks, ends %q", len(text), len(blocks), text[max(0, len(text)-200):])
+		}
+	})
+	t.Run("a line too long to show is saved for bash", func(t *testing.T) {
+		text, _ := execute(t, "mcp://fixture/fixture://long-line.txt")
+		_, saved, found := strings.Cut(text, "saved at ")
+		saved, _, _ = strings.Cut(saved, ";")
+		if !found {
+			t.Fatalf("oversized line read names no saved copy: %q", text)
+		}
+		if data, err := os.ReadFile(saved); err != nil || len(data) != 100000 {
+			t.Fatalf("saved copy %q: %d bytes, %v", saved, len(data), err)
+		}
+	})
+	t.Run("a listed URI with its own ?q= is read verbatim", func(t *testing.T) {
+		if text, _ := execute(t, "mcp://fixture/https://example/search?q=term"); !strings.Contains(text, "results for term") {
+			t.Fatalf("verbatim ?q= resource read = %q", text)
+		}
+	})
+	t.Run("?q= after a listed URI is a JSON query", func(t *testing.T) {
+		if text, _ := execute(t, "mcp://fixture/fixture://data.json?q=.items[1].name"); !strings.Contains(text, `"b"`) || strings.Contains(text, `"a"`) {
+			t.Fatalf("queried resource read = %q", text)
+		}
+	})
+}

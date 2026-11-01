@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
@@ -245,4 +246,125 @@ func TestSessionMCPSamplingNotDeclaredWithoutOptIn(t *testing.T) {
 	if h.session.core.sampling != nil || smol.CallCount() != 0 {
 		t.Fatal("sampling wired for a server that did not opt in")
 	}
+}
+
+// A server may ask for sampling during a tool call and return the tool
+// result without awaiting the answer. The run must not end before that
+// spend is journaled and charged to it.
+func TestSessionMCPSamplingAnsweredAfterToolResultIsChargedToTheRun(t *testing.T) {
+	smol := samplingModel("smol-model")
+	h := openSampling(t, smol, true, nil, func(stack *StackConfig) { stack.MCP.Sampling.AllowHeadless = true })
+	finishing := make(chan struct{})
+	smol.AppendResponses(func(types.Context, *types.StreamOptions, faux.State, types.Model) (types.AssistantMessage, error) {
+		<-finishing
+		// Still answering while the run reaches its end.
+		time.Sleep(300 * time.Millisecond)
+		return types.AssistantMessage{Content: []types.ContentBlock{faux.Text("late summary")}, StopReason: types.StopStop, Usage: types.Usage{Input: 7, Output: 3}}, nil
+	})
+	h.root.AppendResponses(faux.Respond(faux.ToolCall("mcp__fixture__sample", json.RawMessage(`{"value":"async"}`), "async-1")),
+		func(types.Context, *types.StreamOptions, faux.State, types.Model) (types.AssistantMessage, error) {
+			close(finishing)
+			return types.AssistantMessage{Content: []types.ContentBlock{faux.Text("done")}, StopReason: types.StopStop}, nil
+		})
+	result, err := h.session.Prompt(t.Context(), Prompt{Text: "sample the fixture without waiting"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if text := toolResults(h.session.Messages())["async-1"]; len(text.Content) == 0 || text.Content[0].Text != "sampling started" {
+		t.Fatalf("async tool result = %#v", text)
+	}
+	var source string
+	var spent types.Usage
+	for name, usage := range h.session.core.store.UsageSources() {
+		if strings.HasPrefix(name, "mcp-sampling:fixture:") {
+			source, spent = name, usage
+		}
+	}
+	if source == "" || spent.Output != 3 {
+		t.Fatalf("the late sampling spend was not journaled when the run ended: %v", h.session.core.store.UsageSources())
+	}
+	if result.Usage.Output < spent.Output {
+		t.Fatalf("run usage %+v leaves out the sampling spend %+v", result.Usage, spent)
+	}
+	path := h.session.core.store.Path()
+	if err := h.session.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := journal.Load(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UsageSources[source] != spent {
+		t.Fatalf("journal sources %v", loaded.UsageSources)
+	}
+}
+
+// Sampling spends the run's money, so a run already at -max-cost refuses
+// the request before the sampling model is called.
+func TestSessionMCPSamplingHonorsMaxCost(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	priced := types.ModelCost{Input: 100, Output: 100}
+	root := faux.New(faux.Options{Models: []faux.ModelDef{{ID: "root", Input: []string{"text"}, Cost: priced, ContextWindow: 128000, MaxTokens: 50}}})
+	smol := faux.New(faux.Options{Models: []faux.ModelDef{{ID: "smol-model", Input: []string{"text"}, Cost: priced, ContextWindow: 128000, MaxTokens: 50}}})
+	server := MCPServerConfig{Name: "fixture", Transport: "stdio", Command: mcpFixtureServer, Permission: "allow", Sampling: true}
+	stack := &StackConfig{Model: root.Model(), StreamFn: root.StreamSimple, SmolModel: smol.Model(), SmolStreamFn: smol.StreamSimple}
+	stack.MCP.Sampling.AllowHeadless = true
+	// The first root turn alone costs more than the budget.
+	s, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{MCPServers: []MCPServerConfig{server}, Budget: Budget{MaxCostUSD: 0.01}}, Stack: stack})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	smol.AppendResponses(faux.Respond(faux.Text("should not run")))
+	root.AppendResponses(faux.Respond(faux.ToolCall("mcp__fixture__sample", json.RawMessage(`{}`), "capped")), faux.Respond(faux.Text("done")))
+	if _, err := s.Prompt(t.Context(), Prompt{Text: "sample the fixture"}); err != nil {
+		t.Fatal(err)
+	}
+	if smol.CallCount() != 0 {
+		t.Fatal("sampling ran past the run's cost cap")
+	}
+	if result := toolResults(s.Messages())["capped"]; len(result.Content) == 0 || !strings.Contains(result.Content[0].Text, "sampling error") {
+		t.Fatalf("capped tool result = %#v", result)
+	}
+}
+
+// unattendedPrompter is serve's situation with no approving client: a
+// prompter exists, reports that nobody is attached, and would only time out.
+type unattendedPrompter struct{ asked chan Ask }
+
+func (p unattendedPrompter) Attended(string) bool { return false }
+func (p unattendedPrompter) Approve(ctx context.Context, ask Ask) (Choice, error) {
+	p.asked <- ask
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(2 * time.Second):
+		return "", context.DeadlineExceeded
+	}
+}
+
+func TestSessionMCPSamplingUnattendedPrompterIsHeadless(t *testing.T) {
+	t.Run("denied at once, naming the setting", func(t *testing.T) {
+		smol := samplingModel("smol-model")
+		prompter := unattendedPrompter{asked: make(chan Ask, 4)}
+		h := openSampling(t, smol, true, prompter, nil)
+		if reply := h.sample(); !strings.Contains(reply, "mcp_sampling_allow_headless") {
+			t.Fatalf("unattended reply = %q", reply)
+		}
+		if len(prompter.asked) != 0 || smol.CallCount() != 0 {
+			t.Fatal("an unattended session was asked or sampled")
+		}
+	})
+	t.Run("allowed by setting", func(t *testing.T) {
+		smol := samplingModel("smol-model")
+		prompter := unattendedPrompter{asked: make(chan Ask, 4)}
+		h := openSampling(t, smol, true, prompter, func(stack *StackConfig) { stack.MCP.Sampling.AllowHeadless = true })
+		h.answer(smol)
+		if reply := h.sample(); !strings.Contains(reply, "fixture summary") {
+			t.Fatalf("unattended reply with mcp_sampling_allow_headless = %q", reply)
+		}
+		if len(prompter.asked) != 0 {
+			t.Fatal("an unattended session was asked")
+		}
+	})
 }

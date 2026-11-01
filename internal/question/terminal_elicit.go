@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"go.harness.dev/harness/internal/termtext"
 )
 
 // TerminalElicitor shows forwarded elicitations on the controlling terminal.
@@ -40,7 +42,7 @@ func TerminalElicitor(input *os.File, output io.Writer) Elicitor {
 // terminal never opens or fetches the URL itself.
 func terminalURL(ctx context.Context, input *os.File, output io.Writer, request Elicit) (ElicitResult, error) {
 	target, _ := url.Parse(request.URL)
-	if _, err := fmt.Fprintf(output, "\n%s\nOpen this URL in a browser (host %s):\n  %s\nPress Enter once it is open, or type 'decline': ", request.Display(), target.Host, request.URL); err != nil {
+	if _, err := fmt.Fprintf(output, "\n%s\nOpen this URL in a browser (host %s):\n  %s\nPress Enter once it is open, or type 'decline': ", request.terminalDisplay(), termtext.Line(target.Host), termtext.Line(request.URL)); err != nil {
 		return ElicitResult{}, err
 	}
 	line, err := readTerminalLine(ctx, input)
@@ -58,7 +60,7 @@ func terminalForm(ctx context.Context, input *os.File, output io.Writer, request
 	if err != nil {
 		return ElicitResult{}, err
 	}
-	if _, err := fmt.Fprintf(output, "\n%s\n(type 'decline' or 'cancel' at any prompt to refuse)\n", request.Display()); err != nil {
+	if _, err := fmt.Fprintf(output, "\n%s\n(type 'decline' or 'cancel' at any prompt to refuse)\n", request.terminalDisplay()); err != nil {
 		return ElicitResult{}, err
 	}
 	content := map[string]json.RawMessage{}
@@ -81,7 +83,7 @@ func terminalForm(ctx context.Context, input *os.File, output io.Writer, request
 			if err == nil {
 				break
 			}
-			if _, err := fmt.Fprintf(output, "%v; try again: ", err); err != nil {
+			if _, err := fmt.Fprintf(output, "%s; try again: ", termtext.Line(err.Error())); err != nil {
 				return ElicitResult{}, err
 			}
 		}
