@@ -143,8 +143,9 @@ from every lower file, and `"profiles": null` unsets every profile below; a late
 or `-c` can define it again. A null in a project file follows the trust rules: keys
 of a user or managed definition that the project could not set, or set to `null`,
 itself stay (in an untrusted workspace, `plan` and `permission_deny_tools` among
-them), and the warning names them. Selecting a profile that no file defines, or that
-a higher file unsets, is an error.
+them), and the warning names them, unless an operator file or `-c` above unsets the
+profile again. Selecting a profile that no file defines, or that a higher file
+unsets, is an error.
 
 `-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
 different `--profile`: the label of a saved ChatGPT account.
