@@ -105,10 +105,11 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 	if response == nil {
 		return types.AssistantMessage{}, errors.New("sampling model returned no stream")
 	}
-	// Attempts the retry layer abandoned can still be billed.
+	// Attempts the retry layer or a fallback switch abandoned can still be
+	// billed.
 	var usage types.Usage
 	for event := range response.Events() {
-		if event.Type == types.EvRetry && event.Err != nil {
+		if (event.Type == types.EvRetry || event.Type == types.EvFallback) && event.Err != nil {
 			usage.Add(event.Err.Usage)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"go.harness.dev/harness/internal/engine/stream"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/provider/faux"
@@ -165,6 +166,42 @@ func TestSessionMCPSamplingModelOverride(t *testing.T) {
 	}
 	if calls := h.recorded(); len(calls) != 1 || calls[0].model != "sampling-model" || calls[0].maxTokens != 50 || smol.CallCount() != 0 {
 		t.Fatalf("calls %+v, smol calls %d", calls, smol.CallCount())
+	}
+}
+
+// TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded: a backup answers
+// after the sampling model failed part-way; the failed attempt's usage is
+// billed too, so it is part of the receipt, as a retried attempt's is.
+func TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded(t *testing.T) {
+	smol, backup := samplingModel("smol-model"), samplingModel("backup-model")
+	// The faux backup counts its own few tokens; the discarded attempt's
+	// are far more, so the receipt must hold at least them.
+	failed := types.Usage{Input: 1000, Output: 500}
+	chain := func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
+		out := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+		go func() {
+			out.Push(types.StreamEvent{Type: types.EvFallback, Err: &types.AssistantMessage{Model: model.ID, StopReason: types.StopError, Usage: failed}, Fallback: &types.ModelFallback{From: model, To: backup.Model(), Index: 1}})
+			for event := range backup.StreamSimple(ctx, backup.Model(), c, opts).Events() {
+				out.Push(event)
+			}
+		}()
+		return out
+	}
+	h := openSampling(t, smol, true, nil, func(stack *StackConfig) {
+		stack.MCP.Sampling = session.MCPSamplingSettings{Model: smol.Model(), StreamFn: chain, AllowHeadless: true}
+	})
+	backup.AppendResponses(faux.Respond(faux.Text("backup summary")))
+	if reply := h.sample(); !strings.Contains(reply, "backup summary") {
+		t.Fatalf("server got %q", reply)
+	}
+	var spent types.Usage
+	for name, usage := range h.session.core.store.UsageSources() {
+		if strings.HasPrefix(name, "mcp-sampling:fixture:") {
+			spent = usage
+		}
+	}
+	if spent.Input <= failed.Input || spent.Output <= failed.Output {
+		t.Fatalf("sampling receipt %+v leaves out the attempt the fallback discarded (%+v)", spent, failed)
 	}
 }
 
