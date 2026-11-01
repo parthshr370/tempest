@@ -293,6 +293,13 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			heartbeat := filepath.Join(directory, "heartbeat")
 			target := exec.Command(executable, "-test.run=^TestDAPAttachTarget$", "--", "attach-target", heartbeat)
 			target.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			// debugserver stops the target with SIGSTOP before ptrace(PT_DETACH).
+			// When Go's async preemption signal arrives first, PT_DETACH fails
+			// with EBUSY, Delve then ends debugserver, and the kernel kills the
+			// still-traced target. That's outside Tempest; guide/tools.md
+			// documents it. Without preemption signals the test sees only
+			// Tempest's detach handling.
+			target.Env = append(os.Environ(), "GODEBUG=asyncpreemptoff=1")
 			var targetOutput bytes.Buffer
 			target.Stdout, target.Stderr = &targetOutput, &targetOutput
 			if err := target.Start(); err != nil {

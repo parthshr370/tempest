@@ -378,6 +378,15 @@ breakpoint, stack, scopes, variables, evaluation, continuation and termination.
 Set `TEMPEST_TEST_DEBUGPY_ADAPTER` to a venv's `debugpy-adapter` to run that optional
 test without adding the venv to `PATH`.
 
+On macOS, detaching Delve from a Go program can kill the program, and Tempest
+can't prevent it. Delve's tracer, Apple's `debugserver`, stops the program before
+`ptrace(PT_DETACH)`. When Go's async preemption signal (`SIGURG`) arrives first,
+`PT_DETACH` fails with `EBUSY` (`debugserver` logs it), Delve ends `debugserver`
+anyway, and the kernel kills the still-traced program with `SIGKILL`. In stress
+runs with the CPU oversubscribed this hit about 6% of detaches, and none when the
+program ran with `GODEBUG=asyncpreemptoff=1`. Start a Go program with that
+setting if it must survive a detach.
+
 The stack owns the adapter and launched target process groups. It holds its host
 process permit until both are gone. Close and unanswered adapter requests send a
 disconnect bounded to 500 ms before killing owned groups; attached targets are
