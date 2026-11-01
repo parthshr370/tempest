@@ -617,6 +617,28 @@ func TestInvalidEnvironmentValueFailsOnlyWhenItWins(t *testing.T) {
 	}
 }
 
+// A field name that contains "token" or "key" is not a credential label: the
+// message after it stays readable, while credentials inside it stay masked.
+func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
+	for _, test := range []struct {
+		err  *Error
+		want string
+	}{
+		{&Error{Field: "max_tokens", Err: errors.New("must be positive")}, "config max_tokens: must be positive"},
+		{&Error{Field: "mcp_sampling_max_tokens", Err: errors.New("must be positive")}, "config mcp_sampling_max_tokens: must be positive"},
+		{&Error{Field: "providers", Err: errors.New("relay: header Authorization: Bearer abcdefgh12345")}, "config providers: relay: header Authorization: [REDACTED]"},
+	} {
+		if got := test.err.Error(); got != test.want {
+			t.Errorf("Error() = %q, want %q", got, test.want)
+		}
+	}
+	w := newLayerWorkspace(t)
+	w.write(w.projectPath(), `{"max_tokens": 0}`)
+	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "max_tokens: must be positive") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestConfigShowRedactsCredentials(t *testing.T) {
 	w := newLayerWorkspace(t)
 	w.write(w.user, `{

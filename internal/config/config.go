@@ -421,9 +421,11 @@ type Error struct {
 	Err   error
 }
 
-// Error returns a stable, field-qualified configuration failure. Text that
-// looks like a credential is masked, whatever produced the error.
-func (e *Error) Error() string { return obs.Redact(fmt.Sprintf("config %s: %v", e.Field, e.Err)) }
+// Error returns a stable, field-qualified configuration failure. Text in the
+// message that looks like a credential is masked, whatever produced it. The
+// field is a settings key, never a value, and stays outside the redactor: a
+// key such as max_tokens followed by ": " would otherwise mask the message.
+func (e *Error) Error() string { return fmt.Sprintf("config %s: %s", e.Field, obs.Redact(e.Err.Error())) }
 
 // Unwrap returns the underlying parsing or filesystem failure.
 func (e *Error) Unwrap() error { return e.Err }
