@@ -39,15 +39,35 @@ func TestAvailabilityTriggersOnlyOnUnavailableModels(t *testing.T) {
 		{"model_not_found on 404", func() (*types.AssistantMessage, int) {
 			return provider(404, `{"error":{"code":"model_not_found","message":"The model does not exist"}}`)
 		}, nil, true, CodeModelNotFound},
-		{"model_not_found on 400", func() (*types.AssistantMessage, int) {
-			return provider(400, `{"error":{"code":"model_not_found","message":"The requested model does not exist"}}`)
-		}, nil, true, CodeModelNotFound},
-		{"unknown model without a code", func() (*types.AssistantMessage, int) {
-			return provider(400, `{"error":{"message":"The model 'gpt-nope' does not exist or you do not have access to it."}}`)
+		{"openai unknown model as sent live", func() (*types.AssistantMessage, int) {
+			return provider(404, `{"error":{"message":"The model `+"`gpt-nope-0`"+` does not exist or you do not have access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}`)
 		}, nil, true, CodeModelNotFound},
 		{"anthropic unknown model", func() (*types.AssistantMessage, int) {
 			return provider(404, `{"type":"error","error":{"type":"not_found_error","message":"model: claude-nope"}}`)
 		}, nil, true, CodeModelNotFound},
+		{"google unknown model", func() (*types.AssistantMessage, int) {
+			return provider(404, `{"error":{"code":404,"message":"models/gemini-nope is not found for API version v1beta, or is not supported for generateContent.","status":"NOT_FOUND"}}`)
+		}, nil, true, CodeModelNotFound},
+		// The plan never falls back on 400: a rejected request is a
+		// configuration error, whatever its body says about models.
+		{"model_not_found code on 400", func() (*types.AssistantMessage, int) {
+			return provider(400, `{"error":{"code":"model_not_found","message":"unknown model"}}`)
+		}, nil, false, CodeInvalidRequest},
+		{"400 that mentions a model that does not exist", func() (*types.AssistantMessage, int) {
+			return provider(400, `{"error":{"message":"The model 'gpt-nope' does not exist or you do not have access to it."}}`)
+		}, nil, false, CodeInvalidRequest},
+		{"400 wrong parameter mentioning model", func() (*types.AssistantMessage, int) {
+			return provider(400, `{"error":{"type":"invalid_request_error","message":"The model parameter does not exist for this endpoint"}}`)
+		}, nil, false, CodeInvalidRequest},
+		{"404 wrong endpoint mentioning models", func() (*types.AssistantMessage, int) {
+			return provider(404, `{"error":{"message":"The /v1/models route is not available"}}`)
+		}, nil, false, CodeInvalidRequest},
+		{"404 not_found_error for a file, not the model", func() (*types.AssistantMessage, int) {
+			return provider(404, `{"type":"error","error":{"type":"not_found_error","message":"file model.bin not found"}}`)
+		}, nil, false, CodeInvalidRequest},
+		{"model_not_found code without an HTTP status", func() (*types.AssistantMessage, int) {
+			return &types.AssistantMessage{StopReason: types.StopError, ErrorCode: string(CodeModelNotFound), ErrorMessage: "model_not_found"}, 0
+		}, nil, false, CodeProviderFailure},
 		{"400 rejected request", func() (*types.AssistantMessage, int) {
 			return provider(400, `{"error":{"message":"tools are invalid"}}`)
 		}, nil, false, CodeInvalidRequest},

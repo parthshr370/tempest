@@ -104,7 +104,8 @@ unavailable:
 ```
 
 `-fallback-model <route>` (repeatable) or `HARNESS_FALLBACK_MODELS` (comma separated)
-sets the default role's list and wins over settings. A role with no entry of its own
+sets `fallback_models.default` above the settings files, in the usual
+[layer order](configuration.md). A role with no entry of its own
 uses the default role's list; an empty list turns backups off for that role.
 `serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
@@ -115,10 +116,12 @@ each role's backups under it.
 A backup gets the request only when the model is **unavailable**, after the model's
 own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts
 (including a stream that sends nothing before the stall watchdog fires), or an
-unknown model ID (`model_not_found`, or a 404 naming the model). **A configuration
-error never falls back**: HTTP 400 and other rejected requests, 401 and 403,
-context overflow and cancellation stop the run and say why, because a backup would
-hide them. A 400 falls back only when its code is `model_not_found`.
+unknown model ID: an HTTP 404 whose body is the provider's structured missing-model
+answer (OpenAI `"code": "model_not_found"`, Anthropic `not_found_error` with
+`"model: <id>"`, Google `NOT_FOUND` with `"models/<id> is not found"`). **A
+configuration error never falls back**: HTTP 400 and other rejected requests,
+whatever their body says about models, a 404 for a wrong path, 401 and 403, context
+overflow and cancellation stop the run and say why, because a backup would hide them.
 
 The backup receives the same request. Before it goes to a different provider or
 model, the adapter's usual history normalization drops provider-bound content:

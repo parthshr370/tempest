@@ -163,11 +163,12 @@ func failedEvent(model types.Model, code Code, message string) types.StreamEvent
 // Unavailable: a retry chain that ran out of attempts or exceeded its delay
 // cap on a transient failure (5xx, 529, 429, network error, timeout,
 // including no first event before the stream watchdog fired), the same
-// transient failures when the route has no retry policy, and a model the
-// endpoint does not serve (model_not_found). Never unavailable: cancellation,
-// authentication (401, 403), a rejected request (400 and other 4xx), context
-// overflow, or an unknown failure. Those are configuration or input errors
-// that a different model would hide.
+// transient failures when the route has no retry policy, and an HTTP 404
+// whose body is the provider's structured missing-model answer
+// (model_not_found; see isModelNotFound). Never unavailable: cancellation,
+// authentication (401, 403), a rejected request (400 and other 4xx, whatever
+// the body says about models), context overflow, or an unknown failure.
+// Those are configuration or input errors that a different model would hide.
 func Availability(message *types.AssistantMessage, status int, ctxErr error) (Code, bool) {
 	failure := Failure{Status: status, ContextErr: ctxErr, StopReason: types.StopError}
 	if message != nil {
@@ -186,8 +187,6 @@ func Availability(message *types.AssistantMessage, status int, ctxErr error) (Co
 			return Code(strings.TrimSpace(message.ErrorCode)), true
 		}
 		return classified.Code, true
-	case CodeModelNotFound:
-		return CodeModelNotFound, ctxErr == nil
 	}
 	classified := Classify(failure, time.Time{})
 	if classified.Code == CodeModelNotFound {
