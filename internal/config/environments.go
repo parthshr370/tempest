@@ -16,12 +16,12 @@ type EnvironmentProcess struct {
 }
 
 func resolveEnvironments(flags FlagValues, lookup func(string) string, settings fileSettings) (string, map[string]EnvironmentProcess, error) {
-	name := resolveString(flags.Environment, lookup("HARNESS_ENVIRONMENT"), settings.Environment, "")
+	name := settingString(settings.Environment)
 	processes := make(map[string]EnvironmentProcess, len(settings.Environments))
 	for id, process := range settings.Environments {
 		processes[id] = process
 	}
-	command := resolveString(flags.EnvironmentCommand, lookup("HARNESS_ENVIRONMENT_COMMAND"), nil, "")
+	command := flagOrEnvString(flags.EnvironmentCommand, lookup("HARNESS_ENVIRONMENT_COMMAND"))
 	if command != "" {
 		if name == "" {
 			return "", nil, &Error{Field: "environment_command", Err: fmt.Errorf("environment name required")}

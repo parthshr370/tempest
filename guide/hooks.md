@@ -41,9 +41,21 @@ Project hooks in `.harness/settings.json` and `.harness/settings.local.json`
 **never run without explicit operator trust**. Use `-trust-project-hooks` for the
 current workspace, or add its absolute path to user `trusted_hook_projects`.
 
-User, trusted project, then local hooks run in file order. `-no-hooks` or user
-`"no_hooks": true` disables all hooks. `tempest doctor` lists commands and skipped
-untrusted sources without executing them.
+User, trusted project, then local hooks run in file order: each project file's arrays
+are appended per event to the hooks below it, and a project `null` is ignored, so a
+project cannot replace or remove an operator's hooks. Project hooks are still a
+settings layer: a profile or `-c` (`-c hooks=null`) above them replaces or unsets
+them, managed requirements on `hooks` apply to the combined arrays, and
+`tempest config show -key hooks` lists them with their file. Only exact key names
+count; `Hooks` or `HOOKS` is an unknown key that never runs. `-no-hooks` or user
+`"no_hooks": true` disables all hooks; project files cannot set `no_hooks`.
+`tempest doctor` lists the commands without executing them and names dropped
+untrusted project hooks in its config warnings. The SDK's `Options.Hooks` replaces a
+session's hooks and is used as given.
+
+The same trust admits the other executable project settings, such as `mcp_servers`,
+`debug_adapters`, `permission_allow_tools` and a looser `permission_mode_default`; see
+[Project settings and trust](configuration.md#project-settings-and-trust).
 
 Model changes to hook-bearing settings require per-call approval, including bash file
 targets and child patches applied by `integrate`, even in bypass mode.

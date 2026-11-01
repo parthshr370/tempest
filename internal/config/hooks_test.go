@@ -31,9 +31,8 @@ func TestHooksSettingsAndDisablePrecedence(t *testing.T) {
 		t.Fatalf("env precedence %v %v", resolved, err)
 	}
 	c.Flags.NoHooks = BoolInput{Set: true, Value: true}
-	c.Flags.TrustProjectHooks = BoolInput{Set: true, Value: true}
 	resolved, err = c.Resolve()
-	if err != nil || !resolved.Hooks().NoHooks || !resolved.Hooks().TrustProjectHooks {
+	if err != nil || !resolved.Hooks().NoHooks {
 		t.Fatalf("flag precedence %v %v", resolved, err)
 	}
 	snapshot := resolved.Hooks()

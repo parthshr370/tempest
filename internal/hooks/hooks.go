@@ -36,18 +36,17 @@ type Group struct {
 	Hooks   []Command `json:"hooks"`
 }
 
-// Settings contains only operator-controlled execution and trust settings.
+// Settings are the resolved hook commands for one session. Project hooks
+// reach them only through the settings resolver (config.ResolvedConfig),
+// which applies project trust, -c overrides and managed requirements.
 type Settings struct {
-	Hooks             map[string][]Group `json:"hooks,omitempty"`
-	NoHooks           bool               `json:"no_hooks,omitempty"`
-	TrustProjectHooks bool               `json:"-"`
-	TrustedProjects   []string           `json:"trusted_hook_projects,omitempty"`
+	Hooks   map[string][]Group `json:"hooks,omitempty"`
+	NoHooks bool               `json:"no_hooks,omitempty"`
 }
 
 // Clone keeps a caller's later edits from changing an admitted session's hooks.
 func (s Settings) Clone() Settings {
 	out := s
-	out.TrustedProjects = slices.Clone(s.TrustedProjects)
 	if s.Hooks != nil {
 		out.Hooks = make(map[string][]Group, len(s.Hooks))
 		for event, groups := range s.Hooks {
@@ -98,72 +97,6 @@ func compileMatcher(pattern string) (*regexp.Regexp, error) {
 		pattern = "^(?:" + strings.Join(names, "|") + ")$"
 	}
 	return regexp.Compile(pattern)
-}
-
-// ResolveProject appends explicitly trusted project and local hooks after user hooks.
-// A repository can't grant itself trust or disable the operator's hooks.
-func ResolveProject(s Settings, cwd string) (Settings, []string, error) {
-	s = s.Clone()
-	if s.NoHooks {
-		return s, nil, nil
-	}
-	root, err := filepath.Abs(cwd)
-	if err != nil {
-		return s, nil, err
-	}
-	root, err = filepath.EvalSymlinks(root)
-	if errors.Is(err, os.ErrNotExist) {
-		// An unopened workspace has no project executable settings to discover.
-		return s, nil, s.Validate()
-	}
-	if err != nil {
-		return s, nil, err
-	}
-	trusted := s.TrustProjectHooks
-	for _, path := range s.TrustedProjects {
-		if !filepath.IsAbs(path) {
-			continue
-		}
-		resolved, err := filepath.EvalSymlinks(path)
-		if err == nil && resolved == root {
-			trusted = true
-		}
-	}
-	var skipped []string
-	for _, name := range []string{"settings.json", "settings.local.json"} {
-		path := filepath.Join(root, ".harness", name)
-		if !trusted {
-			if _, err := os.Lstat(path); err == nil {
-				skipped = append(skipped, path)
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return s, skipped, err
-			}
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return s, skipped, err
-		}
-		var project struct {
-			Hooks map[string][]Group `json:"hooks"`
-		}
-		if err := json.Unmarshal(data, &project); err != nil {
-			return s, skipped, fmt.Errorf("project hooks %s: %w", path, err)
-		}
-		if err := (Settings{Hooks: project.Hooks}).Validate(); err != nil {
-			return s, skipped, fmt.Errorf("project hooks %s: %w", path, err)
-		}
-		if s.Hooks == nil {
-			s.Hooks = map[string][]Group{}
-		}
-		for event, groups := range project.Hooks {
-			s.Hooks[event] = append(s.Hooks[event], groups...)
-		}
-	}
-	return s, skipped, s.Validate()
 }
 
 // Input is the stdin object shared with existing command-hook scripts.

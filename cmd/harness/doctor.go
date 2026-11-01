@@ -104,6 +104,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  anthropic_base_url: %s\n", redactedURL(opts.Config.AnthropicBaseURL()))
 	fmt.Fprintf(stdout, "  openai_base_url: %s\n", redactedURL(opts.Config.OpenAIBaseURL()))
 	fmt.Fprintln(stdout, "  provider_credentials: REDACTED")
+	for _, warning := range opts.Config.Warnings() {
+		fmt.Fprintf(stdout, "  WARN config: %s\n", warning)
+	}
 	fmt.Fprintln(stdout, "models:")
 	printRole(stdout, "default", roles.Default, opts.Config.Reasoning())
 	printRole(stdout, "plan", roles.Plan, opts.Config.PlanReasoning())
@@ -125,7 +128,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  %s: api=%s protocol=%s key=%s present=%s auth_required=%s base_url=%s\n", name, p.API(), p.Protocol, p.APIKeyEnv, yesNo(p.CredentialPresent(opts.Secrets.Resolve)), yesNo(!noAuth), redactedURL(p.BaseURL))
 	}
 	for _, path := range opts.Config.UntrustedProviderFiles() {
-		fmt.Fprintf(stdout, "  UNTRUSTED %s (providers not loaded; use -trust-project-providers)\n", path)
+		fmt.Fprintf(stdout, "  UNTRUSTED %s (provider settings not loaded; use -trust-project-providers)\n", path)
 	}
 	if listModels {
 		fmt.Fprintf(stdout, "models: (pricing as of %s, USD per million tokens)\n", catalog.AsOf())
@@ -164,16 +167,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  %s: %s (%s)\n", adapter.Name, status, adapter.Command)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-	hookSettings, skippedHooks, err := hooks.ResolveProject(opts.Config.Hooks(), cwd)
-	if err != nil {
-		fmt.Fprintf(stderr, "doctor hooks: %v\n", err)
-		return 1
-	}
+	// The resolved settings already hold this workspace's trusted project
+	// hooks; the WARN config lines above name any the trust rules dropped.
+	hookSettings := opts.Config.Hooks()
 	fmt.Fprintf(stdout, "hooks: disabled=%t\n", hookSettings.NoHooks)
 	for _, event := range hooks.Events {
 		for _, group := range hookSettings.Hooks[event] {
@@ -192,9 +188,6 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, warning := range hookSettings.UnmatchedToolMatchers(toolNames) {
 		fmt.Fprintf(stdout, "  WARN %s (Tempest tool names are case-sensitive; MCP names require discovery)\n", warning)
-	}
-	for _, path := range skippedHooks {
-		fmt.Fprintf(stdout, "  UNTRUSTED %s (hooks not loaded)\n", path)
 	}
 	printPathCheck(stdout, "settings file", opts.Config.SettingsPath())
 	printRoleCredentialCheck(stdout, "default", roles.Default.Model.Provider, opts)

@@ -17,7 +17,6 @@ import (
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
 	types "go.harness.dev/harness/internal/engine/types"
-	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/hub"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/jobs"
@@ -276,7 +275,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if err != nil {
 			return nil, err
 		}
+		// A caller that supplies the stack resolved and reported its own
+		// settings; only a stack built here reports this resolution's warnings.
 		if o.Stack == nil {
+			for _, warning := range defaults.Warnings() {
+				logger.Warn("config: " + warning)
+			}
 			currentEnvironment := cfg.Environment
 			cfg = session.StackConfigFromConfig(defaults)
 			cfg.Environment, cfg.Cwd = currentEnvironment, cwd
@@ -289,7 +293,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 	}
 	if o.Hooks != nil {
-		cfg.Hooks = o.Hooks.Clone()
+		// Caller-supplied hooks are the session's hooks as given.
+		cfg.Hooks, cfg.WorkspaceHooks = o.Hooks.Clone(), nil
 		cfg.HooksResolved = false
 	}
 	if !localEnvironment {
@@ -302,14 +307,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		return nil, fmt.Errorf("%w: host MCP servers need a local workspace", environment.ErrUnsupported)
 	}
 	if !cfg.HooksResolved {
-		var skipped []string
-		cfg.Hooks, skipped, err = hooks.ResolveProject(cfg.Hooks, cwd)
-		if err != nil {
+		if err = cfg.ResolveWorkspaceHooks(cwd, logger); err != nil {
 			return nil, err
-		}
-		cfg.HooksResolved = true
-		for _, path := range skipped {
-			slog.Warn("project hooks disabled: explicit trust required", "path", path)
 		}
 	}
 	modelSpec := ""

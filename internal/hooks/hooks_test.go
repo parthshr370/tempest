@@ -115,21 +115,15 @@ func TestTimeoutKillsDescendantAndCapsOutput(t *testing.T) {
 	}
 }
 
-func TestProjectTrustAndMergeOrder(t *testing.T) {
+// Groups run in settings order, which is how the settings resolver lays out
+// user, then trusted project, then project-local hooks; no_hooks builds no runner.
+func TestGroupsRunInOrderAndNoHooksDisables(t *testing.T) {
 	cwd := t.TempDir()
-	if err := os.Mkdir(filepath.Join(cwd, ".harness"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	project := `{"trusted_hook_projects":["` + cwd + `"],"no_hooks":true,"hooks":{"PreToolUse":[{"matcher":"write","hooks":[{"type":"command","command":"printf project > marker"}]}]}}`
-	if err := os.WriteFile(filepath.Join(cwd, ".harness", "settings.json"), []byte(project), 0600); err != nil {
-		t.Fatal(err)
-	}
-	user := commandSettings("PreToolUse", "printf user > marker")
-	untrusted, skipped, err := ResolveProject(user, cwd)
-	if err != nil || len(skipped) != 1 || len(untrusted.Hooks["PreToolUse"]) != 1 {
-		t.Fatalf("settings=%+v skipped=%v err=%v", untrusted, skipped, err)
-	}
-	runner, err := New(untrusted, Input{Cwd: cwd})
+	settings := Settings{Hooks: map[string][]Group{"PreToolUse": {
+		{Matcher: "write", Hooks: []Command{{Type: "command", Command: "printf user > marker"}}},
+		{Matcher: "write", Hooks: []Command{{Type: "command", Command: "printf project > marker"}}},
+	}}}
+	runner, err := New(settings, Input{Cwd: cwd})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,27 +131,11 @@ func TestProjectTrustAndMergeOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker, err := os.ReadFile(filepath.Join(cwd, "marker"))
-	if err != nil || string(marker) != "user" {
-		t.Fatalf("untrusted project command ran: %s %v", marker, err)
-	}
-	user.TrustedProjects = []string{cwd}
-	trusted, skipped, err := ResolveProject(user, cwd)
-	if err != nil || len(skipped) != 0 || trusted.NoHooks || len(trusted.Hooks["PreToolUse"]) != 2 {
-		t.Fatalf("settings=%+v skipped=%v err=%v", trusted, skipped, err)
-	}
-	runner, err = New(trusted, Input{Cwd: cwd})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runner.Run(context.Background(), Input{Event: "PreToolUse", ToolName: "write"}); err != nil {
-		t.Fatal(err)
-	}
-	marker, err = os.ReadFile(filepath.Join(cwd, "marker"))
 	if err != nil || string(marker) != "project" {
-		t.Fatalf("trusted hook ordering: %s %v", marker, err)
+		t.Fatalf("hook ordering: %s %v", marker, err)
 	}
-	trusted.NoHooks = true
-	runner, err = New(trusted, Input{Cwd: cwd})
+	settings.NoHooks = true
+	runner, err = New(settings, Input{Cwd: cwd})
 	if err != nil || runner != nil {
 		t.Fatalf("no_hooks runner=%v err=%v", runner, err)
 	}
@@ -261,14 +239,6 @@ func TestCancelNeverSettlesAsEmptySuccess(t *testing.T) {
 				t.Fatalf("cancel err=%v", err)
 			}
 		})
-	}
-}
-
-func TestProjectResolutionAllowsMissingWorkspace(t *testing.T) {
-	settings := commandSettings("PreToolUse", "exit 0")
-	resolved, skipped, err := ResolveProject(settings, filepath.Join(t.TempDir(), "not-created"))
-	if err != nil || len(skipped) != 0 || len(resolved.Hooks["PreToolUse"]) != 1 {
-		t.Fatalf("missing workspace lost operator hooks: settings=%+v skipped=%v err=%v", resolved, skipped, err)
 	}
 }
 

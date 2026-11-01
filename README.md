@@ -121,11 +121,12 @@ See [providers](guide/providers.md) for model routes and credentials.
 - **Destructive and cloud guards** ask per call; they are guardrails, not a sandbox.
 - **Checkpoint and rewind** restore protected files and retain an auditable conversation branch.
 - **Text, JSON, or NDJSON output**, with locally validated structured final answers.
+- **Layered settings** with project files, profiles, `-c` overrides, administrator-pinned requirements, and `config show` attribution.
 
 The JSONL journal adapter keeps raw committed history in memory. Bounded read
 pages do not imply disk indexing or a bounded memory working set.
 
-[Sessions and durability](guide/sessions-and-durability.md) · [Permissions](guide/permissions.md) · [Checkpoints](guide/checkpoints.md)
+[Sessions and durability](guide/sessions-and-durability.md) · [Permissions](guide/permissions.md) · [Checkpoints](guide/checkpoints.md) · [Configuration](guide/configuration.md)
 
 ### Agents and automation
 
@@ -148,14 +149,20 @@ pages do not imply disk indexing or a bounded memory working set.
 
 ## Configuration
 
-Flags override `HARNESS_*` environment variables, which override
-`~/.config/harness/settings.json`, which overrides defaults.
+Settings come in layers, each overriding the one below: built-in defaults, managed
+defaults, user `~/.config/harness/settings.json`, project `.harness/settings.json`,
+project-local `.harness/settings.local.json`, a named profile (`-profile`),
+`HARNESS_*` variables, flags, and `-c key.path=value` overrides. Managed
+requirements pin keys an administrator controls, and project settings that run code
+or route credentials apply only after explicit operator trust.
+`tempest config show` prints every effective setting with the layer that set it.
 Optional tools are enabled explicitly, including `-enable-task`, `-enable-web`,
 and `-enable-lsp`. Provider endpoints come from presets, the `providers` registry,
 or an `@<base-url>` model override.
 
-See [configuration](guide/configuration.md) for flags, environment variables,
-settings, and precedence. Run `./bin/tempest -help` for command help.
+See [configuration](guide/configuration.md) for layers, profiles, overrides,
+managed requirements, flags and environment variables. Run `./bin/tempest -help`
+for command help.
 
 ## Embedding
 

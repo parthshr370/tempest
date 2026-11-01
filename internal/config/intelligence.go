@@ -43,19 +43,15 @@ func (c *ResolvedConfig) CloudRules() []cloudcmd.Rule {
 	return append([]cloudcmd.Rule{}, c.cloudRules...)
 }
 
-// resolveLSP applies flag > HARNESS_ENABLE_LSP > enable_lsp to enablement and
-// the same order to the server file. A disabled configuration does not read
-// the file, so -enable-lsp=false always starts without language servers. An
-// empty or absent file selects the built-in server definitions.
-func resolveLSP(enableFlag BoolInput, enableEnv string, fileFlag StringInput, fileEnv string, settings fileSettings) (lsp.Config, error) {
-	enabled, err := resolveBool(enableFlag, enableEnv, settings.EnableLSP, false)
-	if err != nil {
-		return lsp.Config{}, &Error{Field: "enable_lsp", Err: err}
-	}
-	if !enabled {
+// resolveLSP reads enablement and the server file from the merged settings,
+// where -enable-lsp and -lsp-config are layers. A disabled configuration does
+// not read the file, so -enable-lsp=false always starts without language
+// servers. An empty or absent file selects the built-in server definitions.
+func resolveLSP(settings fileSettings) (lsp.Config, error) {
+	if !settingValue(settings.EnableLSP) {
 		return lsp.Normalize(lsp.Config{})
 	}
-	path := resolveString(fileFlag, fileEnv, settings.LSPConfig, "")
+	path := settingString(settings.LSPConfig)
 	if path == "" {
 		return lsp.Normalize(lsp.Config{Enabled: true})
 	}
@@ -89,8 +85,8 @@ func resolveLSP(enableFlag BoolInput, enableEnv string, fileFlag StringInput, fi
 // resolveCloudRules reads the operator's cloud policy file. No file, or an
 // explicitly empty selection, means no scoped grants or denies; the cloud
 // classifier itself stays on either way.
-func resolveCloudRules(fileFlag StringInput, fileEnv string, settings fileSettings) ([]cloudcmd.Rule, error) {
-	path := resolveString(fileFlag, fileEnv, settings.CloudPolicy, "")
+func resolveCloudRules(settings fileSettings) ([]cloudcmd.Rule, error) {
+	path := settingString(settings.CloudPolicy)
 	if path == "" {
 		return []cloudcmd.Rule{}, nil
 	}

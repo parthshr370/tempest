@@ -74,6 +74,7 @@ func runConversation(command string, args []string, stdout, stderr io.Writer) in
 		if err != nil {
 			return err
 		}
+		logConfigWarnings(resolved)
 		if sessionDir == "" {
 			sessionDir = resolved.SessionDir()
 		}

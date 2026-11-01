@@ -204,9 +204,15 @@ cannot grant itself trust.
 
 An untrusted project definition is ignored entirely, including a definition that
 would replace a built-in route, so a cloned repository cannot redirect a credential.
+The same trust covers project `anthropic_base_url`, `openai_base_url`,
+`web_search_url`, and a project `model` with an `@<base-url>` endpoint. The ignored
+keys are named in one startup warning and in `tempest doctor`.
+
 After opt-in, a project entry replaces a user entry of the same name, with
 `settings.local.json` winning by name, and preset defaults merge field by field
-underneath. An entirely new route is supported after opt-in.
+underneath. The same entry replacement holds between every settings file and profile;
+environment variables such as `AZURE_OPENAI_ENDPOINT` and `-c` overrides set single
+fields of an entry instead. An entirely new route is supported after opt-in.
 
 Trust grants access to **any environment variable** named by a project's
 `api_key_env`, not just built-in provider keys. A trusted project can send that value

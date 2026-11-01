@@ -48,7 +48,10 @@ Each tool is `read`, `write`, or `exec` tier. Modes set the baseline:
 
 Set the mode with `-permission-mode` or `HARNESS_PERMISSION_MODE`. Per-tool
 overrides use `-allow-tool` and `-deny-tool` (deny wins), or
-`HARNESS_PERMISSION_ALLOW_TOOLS` and `HARNESS_PERMISSION_DENY_TOOLS`.
+`HARNESS_PERMISSION_ALLOW_TOOLS` and `HARNESS_PERMISSION_DENY_TOOLS`. A repository's
+`.harness` settings can add deny entries and select plan mode, but loosen nothing
+until you trust the workspace; see
+[Project settings and trust](configuration.md#project-settings-and-trust).
 
 ## Destructive-command guard
 

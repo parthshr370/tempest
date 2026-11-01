@@ -1,13 +1,221 @@
 # Configuration
 
-Three layers set behavior. Each layer overrides the one below it:
+Settings come in layers. Each layer overrides the ones below it:
 
-1. Flags.
-2. `HARNESS_*` environment variables.
-3. `~/.config/harness/settings.json`.
-4. Built-in defaults.
+1. `-c key.path=value` overrides.
+2. Flags.
+3. `HARNESS_*` environment variables.
+4. The selected profile.
+5. Project-local settings, `.harness/settings.local.json` in the workspace.
+6. Project settings, `.harness/settings.json` in the workspace.
+7. User settings, `~/.config/harness/settings.json`.
+8. Managed defaults from the administrator's managed settings file.
+9. Built-in defaults.
 
-The command does not read `.env`. Export variables before running it.
+Managed requirements sit above every layer: a pinned key cannot be changed. The
+command does not read `.env`. Export variables before running it.
+
+Every settings file is one JSON object with the keys in [Settings file](#settings-file).
+Key names are exact: `Hooks`, `OPENAI_BASE_URL` or any other spelling of a settings
+key, at any depth, is an unknown key and has no effect (see [Strict mode](#strict-mode)).
+Names inside maps, such as provider route names, header names and environment
+variables, are data and keep any spelling.
+`tempest config show` prints the result; see [Inspecting settings](#inspecting-settings).
+
+## How layers combine
+
+- **Objects merge key by key.** A layer that sets `providers.gateway.base_url` keeps
+  every other field and route from the layers below.
+- **Arrays replace.** A layer that sets `permission_deny_tools` replaces the whole
+  list; nothing is appended. The exceptions are trusted project `hooks` and an
+  untrusted project's deny list, which add to the layers below (see
+  [Project settings and trust](#project-settings-and-trust)).
+- **`null` unsets.** `"max_tokens": null` in a higher layer removes the value from
+  every layer below, so the built-in default applies again. `-c model=null` works the
+  same way.
+- **Provider entries replace by name between settings files.** A `providers.<name>`
+  entry in a settings file or profile replaces the same entry from lower files whole,
+  so a project cannot inherit a user's `api_key` by reusing a route name. Environment
+  variables and `-c` set single fields.
+- **`mcp_config` and `mcp_servers` exclude each other.** A layer that selects an MCP
+  file replaces a lower inline server array, and the reverse. Both in one file is an
+  error.
+
+The `HARNESS_*` variables and flags in the tables below are layers for the settings
+key they name. `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_API_VERSION` set
+`providers.azure.base_url` and `providers.azure.query.api-version` in the
+environment layer. `ANTHROPIC_BASE_URL` and `OPENAI_BASE_URL` are built-in defaults,
+below every settings file.
+
+## Project settings and trust
+
+Repository files are untrusted. Settings in `.harness/settings.json`,
+`.harness/settings.local.json`, and the profiles defined in them that run code, read
+local files into the model context, write outside the repository, widen permissions,
+turn on web tools, or choose where credentials go apply only after the operator
+trusts the workspace:
+
+| Keys | Applied when |
+|---|---|
+| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model` or `smol_model` with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
+| `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
+
+An untrusted workspace still gets every other project setting. The keys that were
+dropped are named in one warning in the log, in `tempest doctor`, and in
+`config show`.
+
+An untrusted repository can narrow permissions and capabilities and never widen
+them. Its `"permission_mode_default": "plan"`, `"plan": true` and
+`"enable_web": false` apply, since nothing is stricter. Web tools fetch any URL the
+model names, so a repository that could turn them on could have the model send its
+contents out; `"enable_web": true` is dropped with the trust warning. Its
+`permission_deny_tools`, in a project file or a project profile, adds
+to the list the layers below it merge to: the operator's entries stay first and the
+project's new entries follow, so `[]` changes nothing and a `null` is dropped with
+the trust warning. `config show` attributes the combined list to the highest project
+layer that added an entry, or to the operator's layer when the project added none.
+Allow lists, looser modes and `"plan": false` are dropped with the trust warning. In
+a trusted workspace these keys are a settings layer like the rest: the project's deny
+list replaces the user's and its `null` unsets it.
+
+Trusted project `hooks` add to the hooks below them instead of replacing them: each
+event's array from `settings.json`, then from `settings.local.json`, is appended to the
+user's. A project `null` for `hooks` or for one event is ignored with a warning, so a
+repository cannot remove the operator's hooks. Otherwise project hooks are a settings
+layer like any other: a profile, `-c hooks=null` or `-c hooks.SessionStart=[]`
+replaces or unsets them, managed requirements on `hooks` see the combined arrays, and
+`config show` lists them. A session opened in another workspace (`serve`, ACP, the
+SDK) gets that workspace's project hooks from the same resolution. See
+[hooks](hooks.md#trust).
+
+A project file the operator has not trusted that cannot be used (invalid JSON, not an
+object, a value of the wrong type, not a regular file, or larger than 4 MiB) is
+skipped with a warning naming the file and the reason, and the run goes on with the
+other layers. A trusted workspace's file, any user or managed file, and any file under
+`-strict-config` stops startup with an error that names the file instead. A key the
+trust rules drop is never type-checked, so its value cannot invalidate the file.
+
+Project files are read from the working directory. With `-environment` set to a
+remote environment, project files on the host are not read.
+
+## Profiles
+
+A profile is a partial settings object under `profiles.<name>` in any settings file:
+
+```json
+{
+  "profiles": {
+    "review": {"model": "anthropic:claude-opus-4-8", "plan": true},
+    "cheap": {"model": "openrouter:deepseek/deepseek-chat", "reasoning": "off"}
+  }
+}
+```
+
+Select one with `-profile review` or `HARNESS_PROFILE=review`; the flag wins. The
+profile layer sits above project-local settings and below `HARNESS_*` variables.
+When several files define the same profile, their definitions merge in file order:
+managed defaults, user, project, project-local, then `-c`. Project profiles pass the
+same trust rules as project settings. `"profiles": {"review": null}` unsets `review`
+from every lower file, and `"profiles": null` unsets every profile below; a later file
+or `-c` can define it again. A null in a project file follows the trust rules: keys
+of a user or managed definition that the project could not set, or set to `null`,
+itself stay (in an untrusted workspace, `plan` and `permission_deny_tools` among
+them), and the warning names them. Selecting a profile that no file defines, or that
+a higher file unsets, is an error.
+
+`-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
+different `--profile`: the label of a saved ChatGPT account.
+
+## Overrides with `-c`
+
+`-c key.path=value` sets one setting at the highest layer. It is repeatable, and a
+later `-c` wins. The path is dotted; the value is parsed as JSON when it is valid JSON,
+and taken as a string otherwise:
+
+```sh
+tempest -p "fix the build" \
+  -c max_tokens=8000 \
+  -c providers.gateway.base_url=https://gateway.internal/v1 \
+  -c 'permission_deny_tools=["bash"]' \
+  -c model=anthropic:claude-opus-4-8
+```
+
+Quote a string that looks like JSON: `-c 'model="true"'`. `-c key=null` unsets the key
+in every lower layer. Keys cannot contain dots. A malformed `-c` is an error that gives
+its position among the overrides, never its text, since a mistyped override may hold a
+credential.
+
+## Managed requirements
+
+An administrator controls a machine-wide file: `/etc/harness/managed-settings.json` on
+Linux and other Unix systems, `/Library/Application Support/Harness/managed-settings.json`
+on macOS. It has two optional sections:
+
+```json
+{
+  "defaults": {"model": "anthropic:claude-opus-4-8"},
+  "requirements": {
+    "permission_mode_default": "default",
+    "providers": {"openai": {"base_url": "https://llm-proxy.corp.example/v1"}}
+  }
+}
+```
+
+- `defaults` is the managed defaults layer, just above built-in defaults. Users and
+  projects override it.
+- `requirements` pins every leaf value under it. A pinned value applies even when no
+  layer sets it. Any user, project, profile, environment, flag or `-c` layer that sets
+  a pinned key to a different value, or unsets it, stops startup with an error that
+  names the key, the managed file, and the layer and file, variable or flag that
+  conflicts. Setting the same value, or an unpinned sibling such as
+  `providers.openai.api_key_env`, is allowed. A project value dropped by the trust rules
+  is not a conflict.
+
+The managed file is strict at every depth: any other top-level section, or an unknown
+key anywhere under `requirements` (such as `providers.openai.bsae_url`), is an error.
+`requirements` cannot pin `profiles`. There is no environment variable that moves the
+file, so a user's environment cannot drop a requirement.
+
+## Strict mode
+
+By default an unknown settings key is ignored with one warning per key in the log,
+naming its dotted path (for example `providers.openai.bsae_url` or
+`mcp_servers[0].bogus`) and the file, variable or `-c` that set it. An ignored key is
+removed before anything reads the settings, so it never shows in `config show`. A value
+of the wrong type is an error that names the file, except in an untrusted project file,
+which is skipped instead (see [Project settings and trust](#project-settings-and-trust)).
+
+`-strict-config` (or `HARNESS_STRICT_CONFIG=true`) turns unknown keys into errors at
+any depth, including fields inside provider entries, their `compatibility` and
+`models`, and `mcp_servers` entries.
+
+## Inspecting settings
+
+`tempest config show` resolves the settings exactly as a run does and prints every
+effective value with its layer and source:
+
+```text
+$ tempest config show -c max_tokens=8000
+max_tokens = 8000  (override -c)
+model = "anthropic:claude-opus-4-8"  (user /home/me/.config/harness/settings.json)
+permission_mode_default = "default"  (requirement /etc/harness/managed-settings.json)
+...
+```
+
+- `-json` prints one object, `{"settings": {"<key>": {"value", "layer", "source"}},
+  "warnings": [...]}`.
+- `-key <path>` limits the output to one dotted key or every key below it, for
+  example `-key providers.openai`.
+- It accepts the run flags, including `-profile`, `-c`, `-strict-config` and the trust
+  flags, so the output matches a run with the same flags.
+
+Layers are `default`, `managed`, `user`, `project`, `project-local`, `profile`, `env`,
+`flag`, `override` and `requirement`. The source is a file path, an environment
+variable, a flag, or `-c`. Values under credential names (`api_key`, `*token`,
+`secret`, `password`, `authorization`), under `headers`, `query` and `env` in any
+letter case, and URL userinfo are shown as `[REDACTED]`. Configuration errors pass
+through the same log redactor.
 
 ## Model roles
 
@@ -41,8 +249,11 @@ Reasoning effort follows the same pattern with `-reasoning`, `-plan-reasoning` a
 | `-lsp-config <path>` | Operator language-server file; replaces the built-in server list. An empty path selects the built-ins. |
 | `-cloud-policy <path>` | Operator kube-context rules for `kubectl` and `helm` writes. See [Cloud commands](permissions.md#cloud-commands). |
 | `-no-hooks` | Disable all command hooks (`HARNESS_NO_HOOKS`, user `no_hooks`). |
-| `-trust-project-hooks` | Authorize project and local hook commands (`HARNESS_TRUST_PROJECT_HOOKS`); only use for trusted workspaces. |
-| `-trust-project-providers` | Authorize provider definitions in project settings (`HARNESS_TRUST_PROJECT_PROVIDERS`); project files are ignored without it. See [Providers](providers.md#project-provider-definitions). |
+| `-trust-project-hooks` | Authorize project hook commands and the other executable project settings in [Project settings and trust](#project-settings-and-trust) (`HARNESS_TRUST_PROJECT_HOOKS`); only use for trusted workspaces. |
+| `-trust-project-providers` | Authorize provider settings in project files (`HARNESS_TRUST_PROJECT_PROVIDERS`); they are ignored without it. See [Providers](providers.md#project-provider-definitions). |
+| `-profile <name>` | Apply `profiles.<name>` from the settings files (`HARNESS_PROFILE`). See [Profiles](#profiles). |
+| `-c key.path=value` | Override one setting at the highest layer; repeatable. See [Overrides with `-c`](#overrides-with--c). |
+| `-strict-config` | Fail on unknown settings keys instead of warning (`HARNESS_STRICT_CONFIG`). |
 | `-skill <path>` | Additional skill directory or `.md` file; repeatable. See [Skills](skills-and-context.md#skill-format). |
 | `-permission-mode <mode>` | Tool gate mode: `default`, `plan`, `acceptEdits` or `bypass`. |
 | `-allow-tool <name>`, `-deny-tool <name>` | Always allow or deny one tool; repeatable, deny wins. A name that is neither a built-in tool nor `mcp__*` gets a stderr warning on one-shot runs, `serve` and `mcp`. |
@@ -73,33 +284,38 @@ problem.
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
 | `HARNESS_CLOUD_POLICY` | Kube-context rule file (settings `cloud_policy`). |
-| `HARNESS_NO_HOOKS`, `HARNESS_TRUST_PROJECT_HOOKS` | Disable all hooks, or explicitly authorize project and local hooks. |
-| `HARNESS_TRUST_PROJECT_PROVIDERS` | Trust provider definitions in project settings for this run. |
+| `HARNESS_NO_HOOKS`, `HARNESS_TRUST_PROJECT_HOOKS` | Disable all hooks, or explicitly authorize project hooks and other executable project settings. |
+| `HARNESS_TRUST_PROJECT_PROVIDERS` | Trust provider settings in project files for this run. |
+| `HARNESS_PROFILE`, `HARNESS_STRICT_CONFIG` | Settings profile, and strict settings validation, as `-profile` and `-strict-config`. |
 | `HARNESS_MCP_CONFIG` | MCP server configuration file. An explicit empty path disables MCP. |
 | `HARNESS_FAUX_SCRIPT` | Scripted model for runs without a provider. |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
 ## Settings file
 
-`~/.config/harness/settings.json` holds user settings. Project settings in
-`.harness/settings.json` and `.harness/settings.local.json` may add hooks, but their
-commands never run without explicit operator trust. See [hooks](hooks.md#trust).
+`~/.config/harness/settings.json` holds user settings. Every settings file, the
+managed `defaults`, and every profile take the same keys; project files are subject
+to [Project settings and trust](#project-settings-and-trust). Each key below, and
+each flag and variable above, names the same setting. The main keys:
 
 | Key | Purpose |
 |---|---|
+| `model`, `plan_model`, `smol_model`, `max_tokens` | Role models and the output-token cap. |
 | `anthropic_base_url`, `openai_base_url` | Provider endpoints, overridden by flags and `HARNESS_*` variables. |
 | `reasoning`, `plan_reasoning`, `smol_reasoning` | Reasoning effort per role. |
+| `permission_mode_default`, `permission_allow_tools`, `permission_deny_tools` | Tool gate mode and per-tool lists. |
 | `bash_timeout` | Default shell-command timeout. |
 | `enable_lsp`, `lsp_config` | Language-server tools and server file. |
 | `cloud_policy` | Kube-context rule file. |
-| `no_hooks`, `trusted_hook_projects` | Disable hooks, or trust specific project paths. |
+| `hooks`, `no_hooks`, `trusted_hook_projects` | Hook commands, disable hooks, or trust specific project paths. |
 | `mcp_config`, `mcp_servers` | MCP configuration file or inline server array. A selected file replaces the array completely. |
 | `providers` | Endpoint registry keyed by route name. See [Providers](providers.md#endpoint-registry). |
-| `trusted_provider_projects` | Absolute canonical paths whose project provider definitions are trusted. |
-| `skill_paths` | Extra skill directories when no `-skill` flag is given. |
+| `trusted_provider_projects` | Absolute canonical paths whose project provider settings are trusted. |
+| `skill_paths` | Extra skill directories; `-skill` flags replace the list. |
 | `faux_script` | Scripted model, as `-faux-script`. |
+| `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 
 Run `./bin/tempest -help` for the full flag list and the `serve`, `mcp`, `doctor`,
-`rewind` and `version` subcommands.
+`config`, `rewind` and `version` subcommands.
 
 [Guide index](README.md) · [Tempest](../README.md)

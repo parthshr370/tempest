@@ -55,7 +55,8 @@ type Options struct {
 	// CloudRules replaces the host's exact kube-context rules; nil keeps the
 	// host default and a non-nil empty slice selects no scoped rules.
 	CloudRules []CloudRule
-	// Hooks replaces operator hook settings. Project commands still require explicit trust.
+	// Hooks replaces the session's hook settings and is used as given. Leave it
+	// nil to resolve them from settings, which add a trusted project's hooks.
 	Hooks *HookSettings
 	// Registry contains operator-installed executable bundles.
 	Registry *extension.Registry
@@ -132,7 +133,7 @@ type CloudRule = cloudcmd.Rule
 // StackConfig supplies an already resolved agent-stack recipe.
 type StackConfig = session.StackConfig
 
-// HookSettings configures command hooks and explicit project trust.
+// HookSettings configures command hooks.
 type HookSettings = hooks.Settings
 
 // HookGroup matches lifecycle commands against Tempest's snake_case tool names.

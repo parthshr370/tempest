@@ -99,7 +99,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.SessionDir.Set = true
 		case "mcp-config":
 			values.MCPConfig.Set = true
-		case "environment", "environment-command", "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
+		case "environment", "environment-command", "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers", "profile", "strict-config":
 			markIntelligenceFlag(f.Name, &values)
 		case "model":
 			values.Model.Set = true
@@ -127,6 +127,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		return 1
 	}
 	setupLogging(cfg.LogLevel(), cfg.LogFile(), cfg.LogFileMaxBytes())
+	logConfigWarnings(cfg)
 	mode, err := permission.ParseMode(cfg.PermissionModeDefault())
 	if err != nil {
 		fmt.Fprintln(stderr, err)

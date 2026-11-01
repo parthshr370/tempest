@@ -95,10 +95,15 @@ type StackConfig struct {
 	BashTimeout     time.Duration
 	// AdmitProcess holds the host slot for each actual subprocess lifetime.
 	AdmitProcess func(context.Context) (func(), error)
-	// Hooks are operator settings. Resolved hooks are inherited by task children.
+	// Hooks are the session's hook settings. Resolved hooks are inherited by
+	// task children.
 	Hooks         hooks.Settings
 	HooksResolved bool
-	HookAgentType string
+	// WorkspaceHooks resolves Hooks for the session's workspace through the
+	// settings resolver, which adds a trusted repository's hooks; nil uses
+	// Hooks as given.
+	WorkspaceHooks func(cwd string) (hooks.Settings, []string, error)
+	HookAgentType  string
 	// Work and QueueSource bind the session-owned durable runtime.
 	Work        work.RunHooks
 	Controller  work.Controller
@@ -162,10 +167,29 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		SkillPaths:           cfg.SkillPaths(),
 		BashTimeout:          cfg.BashTimeout(),
 		Hooks:                cfg.Hooks(),
+		WorkspaceHooks:       cfg.WorkspaceHooks,
 		LSP:                  &lspConfig,
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 	}
+}
+
+// ResolveWorkspaceHooks sets Hooks to the settings resolver's hooks for a
+// session in cwd, logs what that resolution ignored, and marks the hooks
+// resolved. Without WorkspaceHooks the given Hooks stand.
+func (c *StackConfig) ResolveWorkspaceHooks(cwd string, logger *slog.Logger) error {
+	if c.WorkspaceHooks != nil {
+		settings, warnings, err := c.WorkspaceHooks(cwd)
+		if err != nil {
+			return err
+		}
+		c.Hooks = settings
+		for _, warning := range warnings {
+			logger.Warn("config: " + warning)
+		}
+	}
+	c.HooksResolved = true
+	return nil
 }
 
 // AgentStack is the assembled result: a configured agent ready for Prompt/
@@ -249,13 +273,8 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		cfg.HooksResolved = true
 	}
 	if !cfg.HooksResolved && !cfg.Child {
-		var skipped []string
-		cfg.Hooks, skipped, err = hooks.ResolveProject(cfg.Hooks, cwd)
-		if err != nil {
+		if err := cfg.ResolveWorkspaceHooks(cwd, slog.Default()); err != nil {
 			return nil, err
-		}
-		for _, path := range skipped {
-			slog.Warn("project hooks disabled: explicit trust required", "path", path)
 		}
 	}
 	if cfg.Extensions != nil {
