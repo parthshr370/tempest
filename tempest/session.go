@@ -972,17 +972,21 @@ func (s *Session) close(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
-	// Drain owners may still be adopting phase replies after their handlers join.
-	// Don't close their store until admission and every task drain (run cleanup
-	// and caller drains through drainTasks) has returned.
-	c.admission.Lock()
-	c.admission.Unlock()
-	c.taskWorkers.Wait()
 	c.finishClose()
 	return c.closeErr
 }
+
+// finishClose releases the session once, from whichever path ends last: Close,
+// or an active run that outlived a timed-out Close. Drain owners may still be
+// adopting phase replies after their handlers join, so neither path closes the
+// store before admission and every task drain (run cleanup and caller drains
+// through drainTasks) has returned. c.closed is already set, so no new drain
+// registers while this waits.
 func (c *sessionCore) finishClose() {
 	c.closeOnce.Do(func() {
+		c.admission.Lock()
+		c.admission.Unlock()
+		c.taskWorkers.Wait()
 		c.closeErr = errors.Join(c.closeErr, c.jobs.Close(context.Background()))
 		if c.stackClose != nil {
 			c.closeErr = errors.Join(c.closeErr, c.stackClose())
