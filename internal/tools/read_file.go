@@ -164,15 +164,23 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	}
 	// Images that came with text (MCP resources) follow its rows.
 	result.Content = append(result.Content, source.images...)
-	// Only a read that renders successfully reports its workspace path.
-	result.Paths = source.paths()
 	return result, nil
 }
 
 // render shows a loaded source's numbered rows within the request budget,
-// or an outline.
-func (reader fileReader) render(request readRequest, selector readPathSelector, source readSource) (agent.AgentToolResult, error) {
+// or an outline. A rendered read reports its workspace path, and whether it
+// showed the whole file.
+func (reader fileReader) render(request readRequest, selector readPathSelector, source readSource) (result agent.AgentToolResult, err error) {
 	cwd, store := reader.cwd, reader.options.Hashline
+	whole := false
+	defer func() {
+		if err == nil {
+			result.Paths = source.paths()
+			for i := range result.Paths {
+				result.Paths[i].Whole = whole && !result.Paths[i].Dir
+			}
+		}
+	}()
 	data, absolutePath, displayPath, isResource := source.data, source.absolutePath, source.displayPath, source.isResource
 	header := fmt.Sprintf("[%s#%s]", displayPath, hashline.Tag(data))
 	// observe records the rows shown in full for workspace files, the
@@ -205,6 +213,7 @@ func (reader fileReader) render(request readRequest, selector readPathSelector, 
 	allLines := splitReadLines(string(data))
 	if len(allLines) == 0 {
 		observe(nil)
+		whole = true
 		return textResult(header, nil), nil
 	}
 	startLine := 0
@@ -302,5 +311,6 @@ func (reader fileReader) render(request readRequest, selector readPathSelector, 
 		}
 		observe(displayed)
 	}
+	whole = startLine == 0 && endLine == len(allLines) && !truncation.Truncated && !truncation.FirstLineExceedsLimit
 	return textResult(output, details), nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,21 +49,52 @@ func Expand(ctx context.Context, filePath string, content []byte, options Expand
 	if options.MaxDepth < 0 || options.MaxDepth > MaxImportDepth {
 		return "", &Error{Code: InvalidOptions, Path: filePath, Err: errors.New("max depth must be between 0 and 5")}
 	}
-	maxDepth := options.MaxDepth
-	if maxDepth == 0 {
-		maxDepth = MaxImportDepth
+	text, _, err := expandFrom(ctx, filePath, content, &expander{home: options.HomeDir, maxDepth: options.MaxDepth, budget: -1})
+	return text, err
+}
+
+// ExpandWithin expands imports of a file inside root, for repository files
+// that load without the user asking: every import is opened through root,
+// so neither a ../ path nor a symlink reaches a file outside it, and ~
+// imports stay literal. Imports read at most maxBytes bytes together;
+// complete is false when they were cut there.
+func ExpandWithin(ctx context.Context, root *os.Root, filePath string, content []byte, maxBytes int) (text string, complete bool, err error) {
+	if root == nil || maxBytes < 0 {
+		return "", false, &Error{Code: InvalidOptions, Path: filePath, Err: errors.New("a root and a non-negative byte limit are required")}
+	}
+	e := &expander{root: root, rootDir: filepath.Clean(root.Name()), budget: maxBytes}
+	text, e, err = expandFrom(ctx, filePath, content, e)
+	return text, e != nil && !e.truncated, err
+}
+
+// expander carries one expansion's limits and state through the import tree.
+type expander struct {
+	home     string
+	maxDepth int
+	visited  map[string]struct{}
+	// root confines imports when set; rootDir is its directory.
+	root    *os.Root
+	rootDir string
+	// budget is what imports may still read; negative is unbounded.
+	budget    int
+	truncated bool
+}
+
+func expandFrom(ctx context.Context, filePath string, content []byte, e *expander) (string, *expander, error) {
+	if e.maxDepth == 0 {
+		e.maxDepth = MaxImportDepth
 	}
 	absolute, err := filepath.Abs(filePath)
 	if err != nil {
-		return "", &Error{Code: InvalidSource, Path: filePath, Err: err}
+		return "", nil, &Error{Code: InvalidSource, Path: filePath, Err: err}
 	}
-	canonical := canonicalPath(absolute)
-	visited := map[string]struct{}{canonical: {}}
-	return expand(ctx, absolute, string(content), options.HomeDir, maxDepth, 0, visited)
+	e.visited = map[string]struct{}{canonicalPath(absolute): {}}
+	text, err := e.expand(ctx, absolute, string(content), 0)
+	return text, e, err
 }
 
 // expand walks only prose: fenced code stays literal so examples don't accidentally import local files.
-func expand(ctx context.Context, filePath, content, home string, maxDepth, depth int, visited map[string]struct{}) (string, error) {
+func (e *expander) expand(ctx context.Context, filePath, content string, depth int) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -94,7 +126,7 @@ func expand(ctx context.Context, filePath, content, home string, maxDepth, depth
 			out.WriteString(newline)
 			continue
 		}
-		expanded, err := expandLine(ctx, filePath, line, home, maxDepth, depth, visited)
+		expanded, err := e.expandLine(ctx, filePath, line, depth)
 		if err != nil {
 			return "", err
 		}
@@ -121,7 +153,7 @@ func fence(line string) (byte, int) {
 }
 
 // expandLine ignores inline code and keeps trailing prose punctuation outside a resolved import token.
-func expandLine(ctx context.Context, source, line, home string, maxDepth, depth int, visited map[string]struct{}) (string, error) {
+func (e *expander) expandLine(ctx context.Context, source, line string, depth int) (string, error) {
 	var out strings.Builder
 	inlineRun := 0
 	for i := 0; i < len(line); {
@@ -154,7 +186,7 @@ func expandLine(ctx context.Context, source, line, home string, maxDepth, depth 
 		}
 		candidate := line[i+1 : tokenEnd]
 		literal := line[i:end]
-		replacement, ok, err := importFile(ctx, source, candidate, home, maxDepth, depth, visited)
+		replacement, ok, err := e.importFile(ctx, source, candidate, depth)
 		if err != nil {
 			return "", err
 		}
@@ -182,22 +214,18 @@ func tokenWhitespace(b byte) bool {
 	}
 }
 
-// importFile leaves missing, cyclic, deep, and non-regular references literal so optional imports don't become errors.
-func importFile(ctx context.Context, source, target, home string, maxDepth, depth int, visited map[string]struct{}) (string, bool, error) {
+// importFile leaves missing, cyclic, deep, non-regular, out-of-root and
+// over-budget references literal so optional imports don't become errors.
+func (e *expander) importFile(ctx context.Context, source, target string, depth int) (string, bool, error) {
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
 	resolved := target
-	if resolved == "~" {
-		if home == "" {
+	if resolved == "~" || strings.HasPrefix(resolved, "~/") {
+		if e.home == "" || e.root != nil {
 			return "", false, nil
 		}
-		resolved = home
-	} else if strings.HasPrefix(resolved, "~/") {
-		if home == "" {
-			return "", false, nil
-		}
-		resolved = filepath.Join(home, resolved[2:])
+		resolved = filepath.Join(e.home, strings.TrimPrefix(resolved[1:], "/"))
 	} else if !filepath.IsAbs(resolved) {
 		resolved = filepath.Join(filepath.Dir(source), resolved)
 	}
@@ -206,32 +234,68 @@ func importFile(ctx context.Context, source, target, home string, maxDepth, dept
 		return "", false, nil
 	}
 	key := canonicalPath(absolute)
-	if _, exists := visited[key]; exists {
+	if _, exists := e.visited[key]; exists {
 		return "", false, nil
 	}
-	if depth >= maxDepth {
+	if depth >= e.maxDepth {
 		return "", false, nil
 	}
-	if err := ctx.Err(); err != nil {
-		return "", false, err
-	}
-	info, err := os.Stat(absolute)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", false, nil
-	}
-	data, err := os.ReadFile(absolute)
-	if err != nil {
+	data, ok := e.read(absolute)
+	if !ok {
 		return "", false, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}
-	visited[key] = struct{}{}
-	expanded, err := expand(ctx, absolute, string(data), home, maxDepth, depth+1, visited)
+	e.visited[key] = struct{}{}
+	expanded, err := e.expand(ctx, absolute, string(data), depth+1)
 	if err != nil {
 		return "", false, err
 	}
 	return expanded, true, nil
+}
+
+// read returns a regular file's bytes, through the root when there is one,
+// and at most what the budget leaves; a cut read marks the expansion
+// incomplete. Opening only regular files keeps a FIFO from blocking.
+func (e *expander) read(absolute string) ([]byte, bool) {
+	stat, open := os.Stat, func(name string) (*os.File, error) { return os.Open(name) }
+	name := absolute
+	if e.root != nil {
+		rel, err := filepath.Rel(e.rootDir, absolute)
+		if err != nil || !filepath.IsLocal(rel) {
+			return nil, false
+		}
+		name, stat, open = rel, e.root.Stat, e.root.Open
+	}
+	info, err := stat(name)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, false
+	}
+	if e.budget == 0 {
+		e.truncated = true
+		return nil, false
+	}
+	file, err := open(name)
+	if err != nil {
+		return nil, false
+	}
+	defer file.Close()
+	var reader io.Reader = file
+	if e.budget > 0 {
+		reader = io.LimitReader(file, int64(e.budget)+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, false
+	}
+	if e.budget > 0 {
+		if len(data) > e.budget {
+			data, e.truncated = data[:e.budget], true
+		}
+		e.budget -= len(data)
+	}
+	return data, true
 }
 
 // canonicalPath gives the recursion guard one identity for a file even when callers reach it through a symlink.

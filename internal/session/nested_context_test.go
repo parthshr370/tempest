@@ -67,6 +67,9 @@ func runReads(t *testing.T, cfg StackConfig, reads int) *contextRecorder {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cfg.Journal != nil {
+		defer AttachJournal(stack.Agent, cfg.Journal)()
+	}
 	result, err := stack.Agent.PromptText(context.Background(), "read a/b/x.go")
 	if err != nil || result.Err != nil {
 		t.Fatalf("run err=%v result=%v", err, result.Err)

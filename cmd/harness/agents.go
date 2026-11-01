@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -9,12 +10,14 @@ import (
 
 	"go.harness.dev/harness/internal/agentfiles"
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/discovery"
 )
 
 const agentsListUsage = `Usage: tempest agents list [flags]
 
 Lists the agent types defined as files that a run in this directory offers to
-the task tool: .harness/agents, then .claude/agents, then <agent-dir>/agents.
+the task tool: the repository root's .harness/agents, then .claude/agents, then
+<agent-dir>/agents.
 The first definition of a name wins. Prints each agent's name, model and
 source file; an invalid file is named with the field at fault and makes the
 command exit 1.
@@ -54,7 +57,14 @@ func runAgents(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "cwd error: %v\n", err)
 		return 1
 	}
-	agents, diagnostics, err := agentfiles.Load(agentfiles.Options{ProjectDir: cwd, AgentDir: resolved.AgentDir(), Providers: resolved.Providers()})
+	// A run finds the repository's agent files at its root, wherever in the
+	// repository it starts; so does the listing.
+	projectDir, err := discovery.ProjectDir(cwd)
+	if err != nil {
+		fmt.Fprintf(stderr, "cwd error: %v\n", err)
+		return 1
+	}
+	agents, diagnostics, err := agentfiles.Load(context.Background(), agentfiles.Options{ProjectDir: projectDir, AgentDir: resolved.AgentDir(), Providers: resolved.Providers()})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

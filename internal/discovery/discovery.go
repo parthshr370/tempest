@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -153,12 +155,19 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 	inputs := SessionInputs{RepoRoot: repoRoot}
 	files := options.Files.WithDefaults()
 	names := ContextNames(files.Fallback)
+	// Repository files are read through the repository root, so none of
+	// them reaches a file outside it; the user's own agent dir is trusted.
+	repo, err := os.OpenRoot(repoRoot)
+	if err != nil {
+		return SessionInputs{}, &Error{Code: ResolveRepoRoot, Op: "open root", Path: repoRoot, Err: err}
+	}
+	defer repo.Close()
 
-	userContext, err := firstCandidate(agentDir, UserContextNames)
+	userContext, err := firstCandidate(nil, agentDir, UserContextNames)
 	if err != nil {
 		return SessionInputs{}, err
 	}
-	userRule, err := readCandidate(filepath.Join(agentDir, "RULES.md"), ReadRule)
+	userRule, err := readCandidate(nil, filepath.Join(agentDir, "RULES.md"), ReadRule)
 	if err != nil {
 		return SessionInputs{}, err
 	}
@@ -169,13 +178,13 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		if err := ctx.Err(); err != nil {
 			return SessionInputs{}, err
 		}
-		nativeContext, err := readCandidate(filepath.Join(ancestor, config.ProjectConfigDirName, "AGENTS.md"), ReadContext)
+		nativeContext, err := readCandidate(repo, filepath.Join(ancestor, config.ProjectConfigDirName, "AGENTS.md"), ReadContext)
 		if err != nil {
 			return SessionInputs{}, err
 		}
 		var standalone *candidate
 		if !strings.HasPrefix(filepath.Base(ancestor), ".") {
-			standalone, err = firstCandidate(ancestor, names)
+			standalone, err = firstCandidate(repo, ancestor, names)
 		}
 		if err != nil {
 			return SessionInputs{}, err
@@ -188,7 +197,7 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 			projectContexts = append(projectContexts, *standalone)
 		}
 		if nativeRule == nil {
-			rule, err := readCandidate(filepath.Join(ancestor, config.ProjectConfigDirName, "RULES.md"), ReadRule)
+			rule, err := readCandidate(repo, filepath.Join(ancestor, config.ProjectConfigDirName, "RULES.md"), ReadRule)
 			if err != nil {
 				return SessionInputs{}, err
 			}
@@ -259,7 +268,11 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		}
 		inputs.Diagnostics = append(inputs.Diagnostics, Diagnostic{Code: code, Path: diagnostic.Path, Message: diagnostic.Message, Collision: diagnostic.Collision})
 	}
-	agents, agentDiagnostics, err := agentfiles.Load(agentfiles.Options{ProjectDir: cwd, AgentDir: agentDir, Providers: options.Providers})
+	projectDir := repoRoot
+	if options.RepoRoot == "" {
+		projectDir = projectDirOf(cwd)
+	}
+	agents, agentDiagnostics, err := agentfiles.Load(ctx, agentfiles.Options{ProjectDir: projectDir, AgentDir: agentDir, Providers: options.Providers})
 	if err != nil {
 		return SessionInputs{}, &Error{Code: LoadAgents, Op: "load agents", Err: err}
 	}
@@ -270,12 +283,41 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 	return inputs, nil
 }
 
-// readCandidate treats missing and blank optional sources as absent, keeping discovery fallback selection simple.
-func readCandidate(path string, code ErrorCode) (*candidate, error) {
-	data, err := os.ReadFile(path)
+// readCandidate treats missing and blank optional sources as absent, keeping
+// discovery fallback selection simple. A source that is not a regular file
+// fails without being opened, so a FIFO cannot block startup. With a root,
+// the source is opened through it, and one that leaves it through a symlink
+// is skipped: a repository file may not pull in a file from outside the
+// repository.
+func readCandidate(root *os.Root, path string, code ErrorCode) (*candidate, error) {
+	name, stat, open := path, os.Stat, os.Open
+	if root != nil {
+		rel, err := filepath.Rel(root.Name(), path)
+		if err != nil || !filepath.IsLocal(rel) {
+			return nil, &Error{Code: code, Op: "read", Path: path, Err: errors.New("outside the repository")}
+		}
+		name, stat, open = rel, root.Stat, root.Open
+	}
+	info, err := stat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		if root != nil && escapesRoot(root.Name(), path) {
+			slog.Warn("context file skipped: it links outside the repository", "path", path)
+			return nil, nil
+		}
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
+	}
+	if !info.Mode().IsRegular() {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: errors.New("not a regular file")}
+	}
+	file, err := open(name)
+	if err != nil {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
 	}
@@ -285,11 +327,17 @@ func readCandidate(path string, code ErrorCode) (*candidate, error) {
 	return &candidate{path: path, content: data}, nil
 }
 
+// escapesRoot reports whether path resolves outside dir.
+func escapesRoot(dir, path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && !within(canonicalPath(dir), resolved)
+}
+
 // firstCandidate returns the first nonblank file of names in dir, so
 // AGENTS.override.md shadows AGENTS.md and both shadow fallback names.
-func firstCandidate(dir string, names []string) (*candidate, error) {
+func firstCandidate(root *os.Root, dir string, names []string) (*candidate, error) {
 	for _, name := range names {
-		found, err := readCandidate(filepath.Join(dir, name), ReadContext)
+		found, err := readCandidate(root, filepath.Join(dir, name), ReadContext)
 		if err != nil || found != nil {
 			return found, err
 		}
@@ -372,16 +420,7 @@ func resolveRoot(cwd, suppliedRoot, home string) (string, []string, error) {
 		}
 		boundary = root
 	} else {
-		for dir := cwd; ; dir = filepath.Dir(dir) {
-			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-				boundary = dir
-				break
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-		}
+		boundary = gitRoot(cwd)
 		if boundary == "" && home != "" && within(home, cwd) {
 			boundary = home
 		}
@@ -398,6 +437,37 @@ func resolveRoot(cwd, suppliedRoot, home string) (string, []string, error) {
 		}
 	}
 	return boundary, ancestors, nil
+}
+
+// gitRoot is the nearest directory at or above dir that holds .git, or "".
+func gitRoot(dir string) string {
+	for ; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		if filepath.Dir(dir) == dir {
+			return ""
+		}
+	}
+}
+
+// projectDirOf is where a session in cwd finds its repository's agent
+// files: the git work tree's root, or cwd outside git.
+func projectDirOf(cwd string) string {
+	if root := gitRoot(cwd); root != "" {
+		return root
+	}
+	return cwd
+}
+
+// ProjectDir is projectDirOf for a working directory given as the user
+// wrote it.
+func ProjectDir(cwd string) (string, error) {
+	dir, err := canonicalDir(cwd)
+	if err != nil {
+		return "", err
+	}
+	return projectDirOf(dir), nil
 }
 
 // canonicalDir resolves symlinks when possible but preserves a clean absolute path for an absent directory.

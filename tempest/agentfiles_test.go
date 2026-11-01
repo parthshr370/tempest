@@ -96,7 +96,7 @@ func TestFileAgentRunsThroughChildRunner(t *testing.T) {
 			if err := os.WriteFile(agentPath, []byte(definition), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			agents, diagnostics, err := agentfiles.Load(agentfiles.Options{ProjectDir: cwd})
+			agents, diagnostics, err := agentfiles.Load(context.Background(), agentfiles.Options{ProjectDir: cwd})
 			if err != nil || len(diagnostics) != 0 || len(agents) != 1 {
 				t.Fatalf("load: %+v %+v %v", agents, diagnostics, err)
 			}
@@ -123,14 +123,8 @@ func TestFileAgentRunsThroughChildRunner(t *testing.T) {
 			case agentfiles.RoleSmol:
 				stack.SmolModel, stack.SmolStreamFn = child.Model(), childStream
 			case agentfiles.RolePlan:
-				// A host with its own stream routes the plan model by its Provider:ID spec.
-				stack.PlanModel = child.Model()
-				stack.ResolveModel = func(spec string) (types.Model, agent.StreamFn, []types.Model, error) {
-					if want := child.Model().Provider + ":" + child.Model().ID; spec != want {
-						t.Errorf("plan alias routed %q, want %q", spec, want)
-					}
-					return child.Model(), childStream, nil, nil
-				}
+				// A host that routed the plan role passes its stream.
+				stack.PlanModel, stack.PlanStreamFn = child.Model(), childStream
 			}
 			var logs bytes.Buffer
 			options := Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, Stack: stack, Logger: slog.New(slog.NewTextHandler(&logs, nil))}

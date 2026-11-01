@@ -13,7 +13,7 @@ import (
 func TestFileToolsReportTouchedPaths(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "pkg", "b.go"), "package b\n")
-	writeFile(t, filepath.Join(dir, "a.txt"), "one\n")
+	writeFile(t, filepath.Join(dir, "a.txt"), "one\ntwo\n")
 	all := AllTools(dir, ToolsOptions{})
 	for _, test := range []struct {
 		name string
@@ -21,9 +21,11 @@ func TestFileToolsReportTouchedPaths(t *testing.T) {
 		args map[string]any
 		want []agent.PathEvent
 	}{
-		{"read file", ReadTool, map[string]any{"path": "pkg/b.go"}, []agent.PathEvent{{Path: filepath.Join(dir, "pkg", "b.go")}}},
+		{"read file", ReadTool, map[string]any{"path": "pkg/b.go"}, []agent.PathEvent{{Path: filepath.Join(dir, "pkg", "b.go"), Whole: true}}},
+		{"read range", ReadTool, map[string]any{"path": "a.txt:1-1"}, []agent.PathEvent{{Path: filepath.Join(dir, "a.txt")}}},
+		{"read limit", ReadTool, map[string]any{"path": "a.txt", "limit": 1}, []agent.PathEvent{{Path: filepath.Join(dir, "a.txt")}}},
 		{"read directory", ReadTool, map[string]any{"path": "pkg"}, []agent.PathEvent{{Path: filepath.Join(dir, "pkg"), Dir: true}}},
-		{"read batch", ReadTool, map[string]any{"paths": []string{"a.txt", "missing.txt", "pkg/b.go"}}, []agent.PathEvent{{Path: filepath.Join(dir, "a.txt")}, {Path: filepath.Join(dir, "pkg", "b.go")}}},
+		{"read batch", ReadTool, map[string]any{"paths": []string{"a.txt", "missing.txt", "pkg/b.go"}}, []agent.PathEvent{{Path: filepath.Join(dir, "a.txt"), Whole: true}, {Path: filepath.Join(dir, "pkg", "b.go"), Whole: true}}},
 		{"ls", LsTool, map[string]any{"path": "pkg"}, []agent.PathEvent{{Path: filepath.Join(dir, "pkg"), Dir: true}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -3,6 +3,8 @@ package subagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,29 @@ import (
 
 // PresetResolver resolves data against the provider request's pinned generation.
 type PresetResolver func(context.Context, string) (extension.AgentPreset, error)
+
+// PresetDigest identifies a preset's whole definition. A task records it
+// next to the preset's version, so recovery runs exactly the definition the
+// task started with: a version is a 32-bit number an agent file's changed
+// bytes can collide with, the digest is not.
+func PresetDigest(preset extension.AgentPreset) string {
+	hash := sha256.New()
+	// Each field is length-prefixed, so no two definitions share an encoding.
+	field := func(value string) { fmt.Fprintf(hash, "%d:%s;", len(value), value) }
+	field(preset.ID)
+	fmt.Fprintf(hash, "%d;", preset.Version)
+	field(preset.Description)
+	field(preset.Instructions)
+	field(preset.Model)
+	field(preset.Reasoning)
+	field(string(preset.OutputSchema))
+	// A nil allowlist (default tools) differs from an empty one (no tools).
+	fmt.Fprintf(hash, "%t%d;", preset.AllowedTools == nil, len(preset.AllowedTools))
+	for _, tool := range preset.AllowedTools {
+		field(tool)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
 
 // builtinRoles describe the task tool's two built-in subagent types.
 var builtinRoles = map[string]string{
@@ -84,7 +109,7 @@ func NewPresetTool(controller work.Controller, names []string, resolve PresetRes
 				if err != nil {
 					return agent.AgentToolResult{}, err
 				}
-				spec.PresetID, spec.PresetVersion = spec.SubagentType, preset.Version
+				spec.PresetID, spec.PresetVersion, spec.PresetDigest = spec.SubagentType, preset.Version, PresetDigest(preset)
 				spec.SubagentType = "general"
 				if len(spec.OutputSchema) == 0 {
 					spec.OutputSchema = preset.OutputSchema

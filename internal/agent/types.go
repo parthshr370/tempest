@@ -64,10 +64,12 @@ type AgentToolResult struct {
 }
 
 // PathEvent is a file tool's normalized "path read or listed" fact: an
-// absolute host path and whether it is a listed directory.
+// absolute host path, whether it is a listed directory, and whether the
+// call showed the whole file (not a range, a cut page or an outline).
 type PathEvent struct {
-	Path string
-	Dir  bool
+	Path  string
+	Dir   bool
+	Whole bool
 }
 
 // AgentToolUpdateCallback streams partial tool results while Execute runs.

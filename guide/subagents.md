@@ -31,14 +31,26 @@ Preset definitions are data, not executable project configuration. See
 
 An agent type can be a markdown file. At startup tempest reads, in order:
 
-1. `.harness/agents/*.md` in the working directory
-2. `.claude/agents/*.md` in the working directory (Claude Code subagents load unchanged)
+1. `.harness/agents/*.md` at the repository root
+2. `.claude/agents/*.md` at the repository root (Claude Code subagents load unchanged)
 3. `<agent-dir>/agents/*.md`
+
+The repository root is the nearest directory at or above the working directory
+that holds `.git`; outside git it is the working directory. A session started in
+a subdirectory loads the same repository agents as one started at the root.
 
 The first definition of a name wins. A later file with the same name is skipped
 with a startup warning that names both files. An invalid file is skipped with a
 warning that names the file and the field at fault; the other files still load.
 Files are read once per session, so an edit takes effect in the next session.
+
+Loading is bounded and stays inside the repository. Only regular files load:
+a FIFO or device is skipped without being opened. A repository agent file, or
+an agent directory, that is a symlink pointing outside the repository is
+skipped with a warning; a symlink to another file inside the repository loads.
+Your own `<agent-dir>/agents` may link anywhere. A file over 64 KiB is skipped
+unread, and at most 64 agent files load; later files are named in a warning.
+A directory with more than 1024 entries is skipped.
 
 ```markdown
 ---
@@ -58,7 +70,7 @@ Review only the files named in the task. Report each finding with its path and l
 | `tools` | no | Allowlist, as a YAML list or a comma-separated string. Harness tool names, the Claude Code names `Read`, `Write`, `Edit`, `MultiEdit`, `Grep`, `Glob`, `LS`, `Bash`, `WebFetch`, `WebSearch`, `TodoWrite`, `Task`, or `mcp__*` names. Absent means the general child's tools; `[]` means none. |
 | `model` | no | `default`, `plan`, `smol`, or a model spec such as `openai-responses:gpt-6-luna`. Claude Code's `inherit`, `sonnet` and `opus` mean `default`; `haiku` means `smol`. A spec with an `@http(s)` endpoint is rejected: define the route under settings `providers`. |
 | `reasoning` | no | `off`, `minimal`, `low`, `medium` or `high`. |
-| `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string. Used when the `task` call passes no `output_schema`. |
+| `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string; an empty value is invalid. Used when the `task` call passes no `output_schema`. |
 
 The body below the header is the agent's instructions; it is required.
 
@@ -75,13 +87,17 @@ it:
   and every call still passes the child's permission ceiling. Children get no MCP
   tools, so an `mcp__*` entry offers nothing today.
 - `default` (or no `model`) runs on the parent's default model. `smol` uses the
-  smol model and `smol_reasoning`; `plan` uses the plan model and
-  `plan_reasoning`, or the default model when the host sets no plan model. A
-  model spec is routed through the configured providers like a role model.
-  `reasoning` overrides the role's effort.
-- The agent's version is a hash of its file. A durable task resumed after the
-  file changed fails with `recorded agent preset version unavailable` instead of
-  running a different agent.
+  smol model and `smol_reasoning`; `plan` uses the plan model, with its own
+  endpoint and backup models, and `plan_reasoning`, or the default model when
+  the host sets no plan model. A model spec is routed through the configured
+  providers like a role model, behind the default role's backup models, and
+  each request carries the credential of the model's own provider and
+  endpoint, never the key the host gave for another route. `reasoning`
+  overrides the role's effort.
+- A task records the agent's version and a SHA-256 digest of its whole
+  definition. A durable task resumed after the file changed fails with `agent
+  preset changed since the task started` (or `recorded agent preset version
+  unavailable`) instead of running a different agent.
 
 With extension bundles selected, file agents are listed beside the
 `<bundle>/<preset>` names. A file agent whose name equals a bundle preset's name

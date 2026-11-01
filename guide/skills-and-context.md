@@ -23,6 +23,10 @@ do not apply there.
 
 Files load user first, then repository root down to the working directory.
 `@file` imports expand in every kind of context file, including `CLAUDE.md`.
+A repository context file is read through the repository root: one that is a
+symlink pointing outside the repository is skipped with a warning, and one that
+is not a regular file (a directory or FIFO named `AGENTS.md`) stops startup
+with an error instead of blocking.
 
 The loaded files share one budget, `context_files.max_bytes` (default 65536
 bytes, counted after imports expand). The file that crosses it is cut and ends
@@ -55,15 +59,25 @@ first context file it finds there (same name order as above). Reading
   data: it refines shallower instructions for files under its directory, and the
   user's requests win over it. The system prompt never changes, so the provider's
   prompt cache keeps working.
-- Each directory surfaces once per session. The session journal records it
-  (a `context_file` record), so a resumed session neither shows it again nor
-  spends its bytes twice.
+- Each directory surfaces once per session. The record of it is written into
+  the same journal entry as the tool result that carries the file, so a resumed
+  session neither shows it again nor spends its bytes twice, and a crash before
+  that result was saved leaves no record: the resumed session shows it again.
 - Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
   and nested files count against `context_files.max_bytes` together with the
-  startup files. A cut file ends with a `[harness: cut at ...]` notice; once the
-  total is spent, a later file is named but not loaded.
-- `@file` imports expand; directories whose name starts with `.` are skipped;
-  reading a context file itself does not repeat it after the result.
+  startup files. A cut file ends with a `[harness: cut at ...]` notice. The work
+  follows the same budget: a file is read only up to the bytes it may keep, and
+  its imports only up to as many again. Once the total is spent, the next file
+  is named but not loaded, and no further directory is looked at.
+- Files are read inside the working directory, imports included. A context
+  file or an `@file` import that is a symlink pointing outside it, a `../` or
+  absolute import outside it, and a `~/` import stay unread, so a context file
+  never shows what `read` itself may not. Only regular files are opened; a FIFO
+  is skipped.
+- `@file` imports expand; directories whose name starts with `.` are skipped.
+  Reading a context file whole does not repeat it after the result; a read of
+  part of it (a line range, a limit, a page cut by the read budget), or of a
+  file whose imports the read did not expand, still surfaces the file.
 - Only `read` (files, directories, batches) and `ls` trigger it; `grep` and
   `find` results do not. It runs only for a workspace on this host, not a remote
   environment. Set `context_files.nested` to `false` to turn it off.

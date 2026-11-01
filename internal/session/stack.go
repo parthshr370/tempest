@@ -61,9 +61,14 @@ type StackConfig struct {
 	SmolModel            ptypes.Model
 	StreamFn             agent.StreamFn
 	SmolStreamFn         agent.StreamFn
-	// FallbackModels and SmolFallbackModels are the backup models behind
-	// StreamFn and SmolStreamFn, in chain order.
+	// PlanStreamFn streams PlanModel when the host routed the plan role on
+	// its own; nil streams it through StreamFn, as the plan stack does.
+	PlanStreamFn agent.StreamFn
+	// FallbackModels, PlanFallbackModels and SmolFallbackModels are the
+	// backup models behind StreamFn, PlanStreamFn and SmolStreamFn, in chain
+	// order.
 	FallbackModels     []ptypes.Model
+	PlanFallbackModels []ptypes.Model
 	SmolFallbackModels []ptypes.Model
 	// ModelRole names the role this stack's model serves for model-request
 	// hooks; empty is "plan" for a plan stack and "default" otherwise.

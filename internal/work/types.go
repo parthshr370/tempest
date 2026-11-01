@@ -95,6 +95,9 @@ type TaskSpec struct {
 	OutputSchema  json.RawMessage `json:"output_schema,omitempty"`
 	PresetID      string          `json:"preset_id,omitempty"`
 	PresetVersion uint32          `json:"preset_version,omitempty"`
+	// PresetDigest is subagent.PresetDigest of the definition the task
+	// started with; recovery refuses any other definition.
+	PresetDigest string `json:"preset_digest,omitempty"`
 }
 type BashSpec struct {
 	Command        string `json:"command"`

@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/subagent"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
@@ -497,6 +498,9 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 	if preset.Version != spec.PresetVersion {
 		return cfg, errors.New("recorded agent preset version unavailable")
 	}
+	if spec.PresetDigest != "" && subagent.PresetDigest(preset) != spec.PresetDigest {
+		return cfg, errors.New("agent preset changed since the task started")
+	}
 	switch preset.Model {
 	case "", agentfiles.RoleDefault, cfg.Model.ID, modelSpec(cfg.Model):
 	case agentfiles.RoleSmol, cfg.SmolModel.ID, modelSpec(cfg.SmolModel):
@@ -507,12 +511,25 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 			cfg.Reasoning = cfg.SmolReasoning
 		}
 	case agentfiles.RolePlan:
-		// The host routes only the default and smol streams; a distinct plan
-		// model goes through the provider router as Provider:ID.
-		if cfg.PlanModel.ID != "" && modelSpec(cfg.PlanModel) != modelSpec(cfg.Model) {
-			if cfg.Model, cfg.StreamFn, cfg.FallbackModels, err = c.routeModel(cfg, modelSpec(cfg.PlanModel)); err != nil {
+		// The plan role runs where the plan stack runs: on PlanModel with its
+		// whole route, endpoint included.
+		switch {
+		case cfg.PlanModel.ID == "" || cfg.PlanModel.Provider == cfg.Model.Provider && cfg.PlanModel.ID == cfg.Model.ID && cfg.PlanModel.BaseURL == cfg.Model.BaseURL:
+		case cfg.PlanStreamFn != nil:
+			cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.PlanModel, cfg.PlanStreamFn, cfg.PlanFallbackModels, "plan"
+		case cfg.PlanModel.Provider == cfg.Model.Provider:
+			// The default stream binds each request's credential to the
+			// model's own route, as it does for the plan stack.
+			cfg.Model, cfg.ModelRole = cfg.PlanModel, "plan"
+		default:
+			route := modelSpec(cfg.PlanModel)
+			if cfg.PlanModel.BaseURL != "" {
+				route += "@" + cfg.PlanModel.BaseURL
+			}
+			if cfg.Model, cfg.StreamFn, cfg.FallbackModels, err = c.routeModel(cfg, route); err != nil {
 				return cfg, err
 			}
+			cfg.ModelRole = "plan"
 		}
 		if cfg.PlanReasoning != "" {
 			cfg.Reasoning = cfg.PlanReasoning

@@ -23,6 +23,11 @@ func writeAgentFile(t *testing.T, path, content string) {
 func TestAgentsListShowsSourcesAndFailsOnInvalidFile(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	project, agentDir := t.TempDir(), t.TempDir()
+	// Agent files are listed from the resolved repository root.
+	project, err := filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(project)
 	native := filepath.Join(project, ".harness", "agents", "reviewer.md")
 	writeAgentFile(t, native, "---\nname: reviewer\ndescription: Reviews diffs\nmodel: haiku\n---\nReview.\n")
@@ -55,5 +60,28 @@ func TestAgentsListShowsSourcesAndFailsOnInvalidFile(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "reviewer") {
 		t.Fatalf("valid agents still listed: %s", stdout.String())
+	}
+}
+
+// agents list run below the repository root still lists the repository's
+// agent files.
+func TestAgentsListFromSubdirectoryUsesRepoRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(project, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeAgentFile(t, filepath.Join(project, ".claude", "agents", "compat.md"), "---\nname: compat-only\ndescription: Repo agent\n---\nWork.\n")
+	sub := filepath.Join(project, "pkg", "deep")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(sub)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"agents", "list", "-agent-dir", t.TempDir()}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agents list exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "compat-only") {
+		t.Fatalf("agents list in a subdirectory lost the repository agent:\n%s", stdout.String())
 	}
 }

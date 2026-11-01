@@ -1,7 +1,9 @@
 package agentfiles
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,7 +35,7 @@ func TestLoadPrecedenceAcrossThreeDirectories(t *testing.T) {
 	userOnly := writeAgent(t, filepath.Join(agentDir, "agents", "writer.md"), agentFile("writer", "User writer", ""))
 	writeAgent(t, filepath.Join(agentDir, "agents", "notes.txt"), "not an agent")
 
-	agents, diagnostics, err := Load(Options{ProjectDir: project, AgentDir: agentDir})
+	agents, diagnostics, err := Load(context.Background(), Options{ProjectDir: project, AgentDir: agentDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +81,8 @@ func TestInvalidFileNamesFileAndField(t *testing.T) {
 		{"bad-model.md", agentFile("bad-model", "d", "model: openai:gpt-5@https://evil.example/v1\n"), "model"},
 		{"bad-reasoning.md", agentFile("bad-reasoning", "d", "reasoning: extreme\n"), "reasoning"},
 		{"bad-schema.md", agentFile("bad-schema", "d", "output_schema: '{\"type\": 7}'\n"), "output_schema"},
+		{"empty-schema.md", agentFile("empty-schema", "d", "output_schema: \"\"\n"), "output_schema"},
+		{"blank-schema.md", agentFile("blank-schema", "d", "output_schema: '  '\n"), "output_schema"},
 		{"empty-body.md", "---\nname: empty\ndescription: d\n---\n\n", "body"},
 	}
 	for _, tc := range cases {
@@ -101,7 +105,7 @@ func TestInvalidFileNamesFileAndField(t *testing.T) {
 	project := t.TempDir()
 	bad := writeAgent(t, filepath.Join(project, ".harness", "agents", "bad.md"), agentFile("bad", "d", "reasoning: extreme\n"))
 	writeAgent(t, filepath.Join(project, ".harness", "agents", "good.md"), agentFile("good", "d", ""))
-	agents, diagnostics, err := Load(Options{ProjectDir: project})
+	agents, diagnostics, err := Load(context.Background(), Options{ProjectDir: project})
 	if err != nil || len(agents) != 1 || agents[0].Preset.ID != "good" {
 		t.Fatalf("agents %+v err %v", agents, err)
 	}
@@ -150,5 +154,28 @@ func TestModelAliasesAndClaudeToolNames(t *testing.T) {
 	empty := writeAgent(t, filepath.Join(dir, "none.md"), agentFile("no-tools", "d", "tools: []\n"))
 	if agent, err := Parse(empty, nil); err != nil || agent.Preset.AllowedTools == nil || len(agent.Preset.AllowedTools) != 0 {
 		t.Fatalf("an empty list must give no tools, not the default set: %+v %v", agent.Preset.AllowedTools, err)
+	}
+}
+
+// Loading is bounded: a file over MaxFileBytes is refused unread, and past
+// MaxAgents files the rest are named but not loaded.
+func TestLoadBoundsFileSizeAndCount(t *testing.T) {
+	project := t.TempDir()
+	dir := filepath.Join(project, ".harness", "agents")
+	oversized := writeAgent(t, filepath.Join(dir, "aaa-oversized.md"), agentFile("oversized", "d", "")+strings.Repeat("x", MaxFileBytes))
+	for index := range MaxAgents + 1 {
+		name := fmt.Sprintf("agent-%03d", index)
+		writeAgent(t, filepath.Join(dir, name+".md"), agentFile(name, "d", ""))
+	}
+	agents, diagnostics, err := Load(context.Background(), Options{ProjectDir: project})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != MaxAgents {
+		t.Fatalf("loaded %d agents, want %d", len(agents), MaxAgents)
+	}
+	if len(diagnostics) != 2 || diagnostics[0].Path != oversized || !strings.Contains(diagnostics[0].Message, "limit") ||
+		!strings.Contains(diagnostics[1].Message, fmt.Sprintf("at most %d", MaxAgents)) {
+		t.Fatalf("diagnostics %+v", diagnostics)
 	}
 }

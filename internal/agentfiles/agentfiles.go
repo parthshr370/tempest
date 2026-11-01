@@ -5,10 +5,12 @@
 package agentfiles
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -85,13 +87,27 @@ type Diagnostic struct {
 
 // Options locates and validates agent files.
 type Options struct {
-	// ProjectDir holds .harness/agents and .claude/agents.
+	// ProjectDir is the repository root that holds .harness/agents and
+	// .claude/agents. Its files are read through it: one that links outside
+	// it is skipped.
 	ProjectDir string
-	// AgentDir holds agents/ for user-level files.
+	// AgentDir holds agents/ for the user's own files.
 	AgentDir string
 	// Providers are the trusted configured routes a model spec may name.
 	Providers map[string]adapter.ProviderConfig
 }
+
+const (
+	// MaxFileBytes bounds one agent file. Its body becomes a child's
+	// instructions, so it gets the room the default context_files.max_bytes
+	// gives all repository instructions together.
+	MaxFileBytes = 64 << 10
+	// MaxAgents bounds how many agent files load: each one's name and
+	// description are listed in every root request's system prompt.
+	MaxAgents = 64
+	// maxDirEntries bounds the entries read from one agent directory.
+	maxDirEntries = 1024
+)
 
 // Dirs lists the agent directories in precedence order.
 func Dirs(options Options) []string {
@@ -105,31 +121,56 @@ func Dirs(options Options) []string {
 	return dirs
 }
 
-// Load reads every *.md file of each agent directory, sorted by name within a
-// directory. The first definition of a name wins; invalid and shadowed files
-// are diagnostics, not failures. Only an unreadable directory fails.
-func Load(options Options) ([]Agent, []Diagnostic, error) {
+// Load reads the *.md files of each agent directory, sorted by name within
+// a directory, up to MaxAgents files of at most MaxFileBytes each. The first
+// definition of a name wins. Invalid, shadowed, oversized, non-regular and
+// out-of-repository files, and files past the limits, are diagnostics, not
+// failures; only an unreadable directory fails.
+func Load(ctx context.Context, options Options) ([]Agent, []Diagnostic, error) {
 	var agents []Agent
 	var diagnostics []Diagnostic
+	var project *os.Root
+	if options.ProjectDir != "" {
+		var err error
+		project, err = os.OpenRoot(options.ProjectDir)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("open project directory %s: %w", options.ProjectDir, err)
+		}
+		if project != nil {
+			defer project.Close()
+		}
+	}
 	byName := map[string]string{}
 	for _, dir := range Dirs(options) {
-		entries, err := os.ReadDir(dir)
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		files := plainFiles
+		if project != nil && within(options.ProjectDir, dir) {
+			files = rootFiles(project)
+		}
+		names, err := files.list(dir)
 		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		var skipped *skipError
+		if errors.As(err, &skipped) {
+			diagnostics = append(diagnostics, Diagnostic{Path: dir, Message: skipped.Error(), Err: err})
 			continue
 		}
 		if err != nil {
 			return nil, nil, fmt.Errorf("read agent directory %s: %w", dir, err)
 		}
-		names := make([]string, 0, len(entries))
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-				names = append(names, entry.Name())
-			}
-		}
-		sort.Strings(names)
 		for _, name := range names {
+			if err := ctx.Err(); err != nil {
+				return nil, nil, err
+			}
 			path := filepath.Join(dir, name)
-			agent, err := Parse(path, options.Providers)
+			if len(agents) == MaxAgents {
+				diagnostics = append(diagnostics, Diagnostic{Path: path, Message: fmt.Sprintf("not loaded: at most %d agent files load", MaxAgents)})
+				continue
+			}
+			agent, err := parseFile(files, path, options.Providers)
 			if err != nil {
 				diagnostics = append(diagnostics, Diagnostic{Path: path, Message: err.Error(), Err: err})
 				continue
@@ -145,6 +186,121 @@ func Load(options Options) ([]Agent, []Diagnostic, error) {
 	return agents, diagnostics, nil
 }
 
+// skipError is a directory or file skipped rather than read.
+type skipError struct{ reason string }
+
+func (e *skipError) Error() string { return e.reason }
+
+// fileSource opens agent files: plainly for the user's agent dir, through
+// the project root for the repository's.
+type fileSource struct {
+	stat func(string) (os.FileInfo, error)
+	open func(string) (*os.File, error)
+	// name maps an absolute path to the name stat and open take.
+	name func(string) (string, error)
+	// escapes reports whether a path that failed to open leaves the source.
+	escapes func(string) bool
+}
+
+var plainFiles = fileSource{
+	stat:    os.Stat,
+	open:    os.Open,
+	name:    func(path string) (string, error) { return path, nil },
+	escapes: func(string) bool { return false },
+}
+
+func rootFiles(root *os.Root) fileSource {
+	dir := root.Name()
+	return fileSource{
+		stat: root.Stat,
+		open: root.Open,
+		name: func(path string) (string, error) {
+			rel, err := filepath.Rel(dir, path)
+			if err != nil || !filepath.IsLocal(rel) {
+				return "", &skipError{"outside the repository"}
+			}
+			return rel, nil
+		},
+		escapes: func(path string) bool {
+			resolved, err := filepath.EvalSymlinks(path)
+			canonical, rootErr := filepath.EvalSymlinks(dir)
+			return err == nil && rootErr == nil && !within(canonical, resolved)
+		},
+	}
+}
+
+// list returns dir's *.md names, sorted, reading at most maxDirEntries
+// entries.
+func (files fileSource) list(dir string) ([]string, error) {
+	name, err := files.name(dir)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := files.open(name)
+	if err != nil {
+		if files.escapes(dir) {
+			return nil, &skipError{"skipped: the agent directory links outside the repository"}
+		}
+		return nil, err
+	}
+	defer handle.Close()
+	entries, err := handle.ReadDir(maxDirEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if len(entries) > maxDirEntries {
+		return nil, &skipError{fmt.Sprintf("skipped: more than %d entries", maxDirEntries)}
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// read returns a regular file's bytes, refusing one over MaxFileBytes.
+// Checking the type before opening keeps a FIFO from blocking the load.
+func (files fileSource) read(path string) ([]byte, error) {
+	name, err := files.name(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := files.stat(name)
+	if err != nil {
+		if files.escapes(path) {
+			return nil, errors.New("links outside the repository")
+		}
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("not a regular file")
+	}
+	if info.Size() > MaxFileBytes {
+		return nil, fmt.Errorf("%d bytes, over the %d KiB agent file limit", info.Size(), MaxFileBytes>>10)
+	}
+	handle, err := files.open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer handle.Close()
+	data, err := io.ReadAll(io.LimitReader(handle, MaxFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxFileBytes {
+		return nil, fmt.Errorf("over the %d KiB agent file limit", MaxFileBytes>>10)
+	}
+	return data, nil
+}
+
+func within(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	return err == nil && filepath.IsLocal(rel)
+}
+
 // frontmatter is the YAML header. Tools and output_schema keep their raw
 // node so both list and string forms parse; unknown keys are ignored.
 type frontmatter struct {
@@ -158,7 +314,11 @@ type frontmatter struct {
 
 // Parse reads one agent file.
 func Parse(path string, providers map[string]adapter.ProviderConfig) (Agent, error) {
-	data, err := os.ReadFile(path)
+	return parseFile(plainFiles, path, providers)
+}
+
+func parseFile(files fileSource, path string, providers map[string]adapter.ProviderConfig) (Agent, error) {
+	data, err := files.read(path)
 	if err != nil {
 		return Agent{}, &FieldError{Path: path, Field: "file", Err: err}
 	}
@@ -319,6 +479,11 @@ func outputSchema(node yaml.Node) (json.RawMessage, error) {
 	schema, err := outputschema.Compile(raw)
 	if err != nil {
 		return nil, err
+	}
+	if schema == nil {
+		// Compile reads empty input as "no schema"; a key given empty is a
+		// mistake, not a request for free-form output.
+		return nil, errors.New("must be a JSON Schema object, not empty")
 	}
 	return schema.Raw(), nil
 }

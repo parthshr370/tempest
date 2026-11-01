@@ -299,6 +299,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.GenericRules = inputs.GenericRules
 	stack.AgentFiles = inputs.Agents
 	if opts.Config.FauxScript() == "" {
+		stack.PlanStreamFn, stack.PlanFallbackModels = roles.Plan.StreamFn, roles.Plan.Fallbacks
 		// Agent presets may name a model spec; route it like a role model,
 		// behind the default role's backups.
 		stack.ResolveModel = func(spec string) (ptypes.Model, agent.StreamFn, []ptypes.Model, error) {
