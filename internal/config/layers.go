@@ -1184,7 +1184,9 @@ func (set *layerSet) stack(project []*settingsLayer, trust projectTrust) ([]*set
 	for _, layer := range slices.Concat(files, set.overrides) {
 		if layer.profileUnset {
 			if !layer.project {
-				profiles = nil
+				// The operator's null drops every definition below it, those a
+				// repository's null kept included, so their warning goes too.
+				profiles, kept = nil, nil
 				continue
 			}
 			var unremovable []droppedSetting

@@ -554,6 +554,20 @@ func TestProfileUnset(t *testing.T) {
 			t.Fatalf("warnings %q do not name the kept key", warnings)
 		}
 	})
+	t.Run("an operator null drops what the repository's null kept", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile","permission_mode_default":"plan"}}}`)
+		w.write(w.projectPath(), `{"profiles":{"review":null}}`)
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{"profiles=null", `profiles.review={"enable_task":true}`}}
+		w.flags.Profile = StringInput{Value: "review", Set: true}
+		resolved := w.mustResolve()
+		if resolved.PermissionModeDefault() == "plan" || !resolved.EnableTask() {
+			t.Fatalf("mode=%q enable_task=%t", resolved.PermissionModeDefault(), resolved.EnableTask())
+		}
+		if warnings := resolved.Warnings(); len(warnings) != 0 {
+			t.Fatalf("warnings = %q, want none for keys the operator's null dropped", warnings)
+		}
+	})
 }
 
 func TestOverrideValues(t *testing.T) {
