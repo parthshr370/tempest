@@ -26,6 +26,7 @@ type receivedAttribute struct {
 type receivedSpan struct {
 	TraceID      string              `json:"traceId"`
 	SpanID       string              `json:"spanId"`
+	TraceState   string              `json:"traceState"`
 	ParentSpanID string              `json:"parentSpanId"`
 	Name         string              `json:"name"`
 	Kind         int                 `json:"kind"`

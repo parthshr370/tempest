@@ -304,3 +304,29 @@ func TestUntracedAgentExportsNoSpans(t *testing.T) {
 		t.Fatalf("untraced request carried trace context %q", provider.traceparents[0])
 	}
 }
+
+// Every span of a run under a remote parent records the tracestate that
+// came with that parent, as OTLP Span.trace_state.
+func TestSpansCarryTheRemoteTracestate(t *testing.T) {
+	c := newCollector(t)
+	tel := newTestTelemetry(t, c, false)
+	provider := &scriptedProvider{attempts: []func(*stream.AssistantStream){unavailableAttempt, toolCallAttempt("echo", `{}`), textAttempt("done")}}
+	agt := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: testModel, Tools: []agent.AgentTool{echoTool(nil)}}, StreamFn: retrying(t, provider), Trace: tel.Tracing()})
+	defer tel.Attach(agt, AgentInfo{})()
+	remote := tracecontext.SpanContext{TraceID: tracecontext.NewTraceID(), SpanID: tracecontext.NewSpanID(), Sampled: true, TraceState: "congo=t61rcWkgMzE"}
+	if _, err := agt.Prompt(tracecontext.WithRemoteParent(context.Background(), remote), types.UserMessage{Content: types.StringContent("hi")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tel.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	spans := collectedSpans(t, c)
+	if len(spans) != 5 {
+		t.Fatalf("span names = %v", c.spanNames(t))
+	}
+	for _, received := range spans {
+		if received.TraceState != remote.TraceState {
+			t.Errorf("%s traceState = %q, want %q", received.Name, received.TraceState, remote.TraceState)
+		}
+	}
+}

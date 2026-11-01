@@ -183,7 +183,7 @@ func assistantMessage(message types.Message) (types.AssistantMessage, bool) {
 // ctx gives a span with zero ids, which is timed but never exported.
 func newSpan(ctx context.Context, name string, kind spanKind, start time.Time) *span {
 	current := tracecontext.FromContext(ctx)
-	return &span{traceID: current.TraceID, spanID: current.SpanID, parentID: tracecontext.ParentFromContext(ctx).SpanID, name: name, kind: kind, start: start}
+	return &span{traceID: current.TraceID, spanID: current.SpanID, traceState: current.TraceState, parentID: tracecontext.ParentFromContext(ctx).SpanID, name: name, kind: kind, start: start}
 }
 
 func (l *agentListener) startRun(ctx context.Context, event agent.AgentEvent) {
@@ -334,15 +334,16 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 		provider, model = request.model.Provider, request.model.ID
 	}
 	attemptSpan := &span{
-		traceID:  request.span.traceID,
-		spanID:   tracecontext.NewSpanID(),
-		parentID: request.span.spanID,
-		name:     "chat " + model,
-		kind:     spanKindClient,
-		start:    request.attemptStart,
-		end:      failure.at,
-		status:   statusError,
-		message:  obs.RedactTruncate(failure.message.ErrorMessage, maxErrorTextRunes),
+		traceID:    request.span.traceID,
+		spanID:     tracecontext.NewSpanID(),
+		traceState: request.span.traceState,
+		parentID:   request.span.spanID,
+		name:       "chat " + model,
+		kind:       spanKindClient,
+		start:      request.attemptStart,
+		end:        failure.at,
+		status:     statusError,
+		message:    obs.RedactTruncate(failure.message.ErrorMessage, maxErrorTextRunes),
 	}
 	attemptSpan.attributes = append(attemptSpan.attributes,
 		stringAttribute("gen_ai.operation.name", "chat"),
