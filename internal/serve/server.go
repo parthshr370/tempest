@@ -349,7 +349,8 @@ func (s *Server) serveConn(c *rpc.Conn, parent tracecontext.SpanContext) error {
 	return acp.NewClient(c, s, s.broker).WithRemoteParent(parent).Serve()
 }
 
-// Handler exposes the authenticated /acp upgrade and unauthenticated /healthz.
+// Handler exposes the authenticated /acp upgrade, /a2a and /metrics, and the
+// unauthenticated /healthz.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -375,6 +376,11 @@ func (s *Server) Handler() http.Handler {
 	})))
 	mux.Handle("/a2a", s.authorize(false, true, http.HandlerFunc(s.handleA2A)))
 	mux.Handle("/.well-known/agent-card.json", s.publicCard())
+	// Metrics come from the telemetry the sessions report to, so a scrape
+	// and an OTLP export read the same instruments.
+	if s.opts.Stack != nil && s.opts.Stack.Telemetry != nil {
+		mux.Handle("/metrics", s.authorize(false, true, s.opts.Stack.Telemetry.MetricsHandler()))
+	}
 	return mux
 }
 
