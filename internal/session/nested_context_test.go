@@ -301,3 +301,57 @@ func TestNestedContextAcrossForks(t *testing.T) {
 		}
 	}
 }
+
+// Distinct assistant turns may share a timestamp and a provider call ID. A
+// delivery belongs to the one result that carried it: a later read under
+// the same timestamp and ID does not borrow a dropped result's files, and
+// neither does a held result that carried none of them.
+func TestNestedContextDeliveryIsTheResultNotItsTurnAndCallID(t *testing.T) {
+	// Every read turn carries this one timestamp.
+	const sharedTimestamp = 123
+	cwd := nestedRepo(t)
+	provider := faux.New(faux.Options{})
+	recorder := &contextRecorder{}
+	read := func(id string) faux.ResponseStep {
+		return recorder.step(faux.RespondMessage(ptypes.AssistantMessage{
+			Content:    []ptypes.ContentBlock{faux.ToolCall("read", json.RawMessage(`{"path":"a/b/x.go"}`), id)},
+			StopReason: ptypes.StopToolUse,
+			Timestamp:  sharedTimestamp,
+		}))
+	}
+	done := recorder.step(faux.Respond(faux.Text("done")))
+	provider.SetResponses(read("duplicate"), done, read("duplicate"), done, read("duplicate"), done, read("other"), done)
+	stack, err := BuildAgentStack(StackConfig{Cwd: cwd, Model: provider.Model(), StreamFn: provider.StreamSimple})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := func() {
+		t.Helper()
+		result, err := stack.Agent.PromptText(context.Background(), "read a/b/x.go")
+		if err != nil || result.Err != nil {
+			t.Fatalf("run err=%v result=%v", err, result.Err)
+		}
+	}
+	prompt()
+	if !lastReadShowsContext(t, recorder) {
+		t.Fatal("first read did not show the nested context files")
+	}
+	stack.Agent.SetMessages(nil)
+	prompt()
+	if !lastReadShowsContext(t, recorder) {
+		t.Fatal("a read after a reset, under the dropped turn's timestamp and call ID, did not show the files")
+	}
+	// A second read in the same conversation carries no files: they are shown.
+	prompt()
+	if lastReadShowsContext(t, recorder) {
+		t.Fatal("a read repeated files the conversation holds")
+	}
+	// Keep only the read that carried nothing: the files are not in the
+	// conversation, though it holds a result with the same timestamp and ID.
+	messages := stack.Agent.State().Messages
+	stack.Agent.SetMessages(messages[len(messages)-4:])
+	prompt()
+	if !lastReadShowsContext(t, recorder) {
+		t.Fatal("a held result that carried no files counted as their delivery")
+	}
+}
