@@ -1040,9 +1040,9 @@ func (s *Session) close(ctx context.Context) error {
 // finishClose releases the session once, from whichever path ends last: Close,
 // or an active run that outlived a timed-out Close. Drain owners may still be
 // adopting phase replies after their handlers join, so neither path closes the
-// store before admission and every task drain (run cleanup and caller drains
-// through drainTasks) has returned. c.closed is already set, so no new drain
-// registers while this waits.
+// store before admission and every task call (run cleanup, and caller writes
+// and drains through writeTasks) has returned. c.closed is already set, so no
+// new call registers while this waits.
 func (c *sessionCore) finishClose() {
 	c.closeOnce.Do(func() {
 		c.admission.Lock()

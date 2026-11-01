@@ -88,13 +88,12 @@ func (c *sessionCore) resumeCompactions() {
 	}
 }
 
-// drainTasks runs a caller's task mutation or drain outside run admission, so
+// writeTasks runs a caller's task mutation or drain outside run admission, so
 // a live background phase never blocks a prompt. The caller still owns phase
 // replies and store writes, so a call that starts after Close has sealed the
 // session returns ErrClosed before touching task state, and Close suspends the
-// runtime and joins every admitted call before the store closes. A call that
-// Close cut short reports ErrClosed.
-func (c *sessionCore) drainTasks(drain func() error) error {
+// runtime and joins every admitted call before the store closes.
+func (c *sessionCore) writeTasks(write func() error) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -102,15 +101,25 @@ func (c *sessionCore) drainTasks(drain func() error) error {
 	}
 	c.taskWorkers.Add(1)
 	c.mu.Unlock()
-	err := drain()
+	defer c.taskWorkers.Done()
+	return write()
+}
+
+// drainTasks is writeTasks for a call that runs phases. Close suspends the
+// runtime, which stops a drain early without an error, so a drain that ends
+// after Close sealed the session reports ErrClosed: its recorded change is
+// durable, but the phases it would have run wait for the session to reopen.
+func (c *sessionCore) drainTasks(drain func() error) error {
+	if err := c.writeTasks(drain); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	closed := c.closed
 	c.mu.Unlock()
-	c.taskWorkers.Done()
-	if err == nil && closed {
+	if closed {
 		return ErrClosed
 	}
-	return err
+	return nil
 }
 
 // CreateTask admits a phase workflow. Background roots belong to the session;
@@ -146,8 +155,11 @@ func (s *Session) CreateTask(ctx context.Context, request TaskRequest) (Task, er
 		}
 		request.RunID = run.LogicalRunID
 	}
+	// Create only records the task; its phases run later, so a creation
+	// that committed has succeeded even when Close sealed the session
+	// meanwhile, and the task runs when the session reopens.
 	var task Task
-	err := s.core.drainTasks(func() error {
+	err := s.core.writeTasks(func() error {
 		var err error
 		task, err = s.core.jobs.Tasks.Create(ctx, request)
 		return err
@@ -214,11 +226,12 @@ func (s *Session) CancelTask(ctx context.Context, id string) error {
 }
 
 // RetryTask explicitly unblocks a parked phase after correcting its definition.
+// Like CreateTask it only records; the unblocked phase runs on a later drain.
 func (s *Session) RetryTask(ctx context.Context, id string) error {
 	if err := s.authorize(ctx, "retry_task", "", id); err != nil {
 		return err
 	}
-	return s.core.drainTasks(func() error { return s.core.jobs.Tasks.Retry(ctx, id) })
+	return s.core.writeTasks(func() error { return s.core.jobs.Tasks.Retry(ctx, id) })
 }
 
 // CancelAll includes session-background roots. Cancel alone retains them.
