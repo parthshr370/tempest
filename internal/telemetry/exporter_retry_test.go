@@ -52,6 +52,10 @@ func TestExportRetriesRetryableAnswersWithinItsTimeout(t *testing.T) {
 		{"503 then accepted", []func(http.ResponseWriter){status(http.StatusServiceUnavailable, "")}, 5 * time.Second, 2, 0, false},
 		{"502 and 504 then accepted", []func(http.ResponseWriter){status(http.StatusBadGateway, ""), status(http.StatusGatewayTimeout, "")}, 5 * time.Second, 3, 0, false},
 		{"Retry-After past the timeout", []func(http.ResponseWriter){status(http.StatusServiceUnavailable, "60")}, 2 * time.Second, 1, 0, true},
+		// Seconds too many for a time.Duration, or for an int64, are past
+		// the timeout too; they must not wrap to an immediate retry.
+		{"Retry-After past a Duration", []func(http.ResponseWriter){status(http.StatusServiceUnavailable, "9223372036854775807")}, 2 * time.Second, 1, 0, true},
+		{"Retry-After past an int64", []func(http.ResponseWriter){status(http.StatusServiceUnavailable, "99999999999999999999")}, 2 * time.Second, 1, 0, true},
 		{"400 is not retried", []func(http.ResponseWriter){status(http.StatusBadRequest, "")}, 5 * time.Second, 1, 0, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

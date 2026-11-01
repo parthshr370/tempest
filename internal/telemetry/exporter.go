@@ -116,7 +116,7 @@ func (c *otlpClient) send(ctx context.Context, endpoint string, payload []byte) 
 	reply, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseDrain))
 	switch response.StatusCode {
 	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return parseRetryAfter(response.Header.Get("Retry-After"), time.Now()), true, fmt.Errorf("collector answered %s", response.Status)
+		return parseRetryAfter(response.Header.Get("Retry-After"), time.Now(), c.timeout), true, fmt.Errorf("collector answered %s", response.Status)
 	}
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return 0, false, fmt.Errorf("collector answered %s", response.Status)
@@ -128,13 +128,21 @@ func (c *otlpClient) send(ctx context.Context, endpoint string, payload []byte) 
 }
 
 // parseRetryAfter reads a Retry-After value, delay seconds or an HTTP date,
-// as a delay from now; 0 when it is absent or unreadable.
-func parseRetryAfter(value string, now time.Time) time.Duration {
-	if seconds, err := strconv.Atoi(value); err == nil {
-		return max(0, time.Duration(seconds)*time.Second)
+// as a delay from now, at most limit (the export's timeout: a longer delay
+// cannot be waited out either way); 0 when it is absent or unreadable.
+// Seconds past what a time.Duration holds are clamped too, not wrapped.
+func parseRetryAfter(value string, now time.Time, limit time.Duration) time.Duration {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds > int64(limit/time.Second) {
+			return limit
+		}
+		return time.Duration(seconds) * time.Second
 	}
 	if at, err := http.ParseTime(value); err == nil {
-		return max(0, at.Sub(now))
+		return min(max(0, at.Sub(now)), limit)
 	}
 	return 0
 }
