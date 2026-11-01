@@ -4,7 +4,9 @@
 // screen, move the cursor, retitle the window, overwrite a trusted prefix on
 // its line or reorder what follows: ECMA-48 C0 and C1 controls (ESC and the
 // CSI and OSC sequences it starts, CR, BS, BEL), and Unicode bidi and other
-// format characters. Invalid UTF-8 bytes are shown as \xNN.
+// format characters. The zero width joiner and non-joiner pass through: they
+// only shape the characters on either side (Persian words, emoji sequences)
+// and cannot move, hide or reorder text. Invalid UTF-8 bytes are shown as \xNN.
 package termtext
 
 import (
@@ -33,6 +35,8 @@ func render(text string, multiline bool) string {
 			out.WriteByte(' ')
 		case r < 0x100 && unicode.IsControl(r):
 			fmt.Fprintf(&out, `\x%02x`, r)
+		case r == '\u200c' || r == '\u200d':
+			out.WriteRune(r)
 		case unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) && r <= 0xffff:
 			fmt.Fprintf(&out, `\u%04x`, r)
 		case unicode.In(r, unicode.Cf):

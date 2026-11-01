@@ -5,6 +5,8 @@ import "testing"
 func TestEscapesControlsAndKeepsText(t *testing.T) {
 	for _, c := range []struct{ in, line, message string }{
 		{"plain ünïcode 日本", "plain ünïcode 日本", "plain ünïcode 日本"},
+		{"می\u200cروم 👩\u200d💻", "می\u200cروم 👩\u200d💻", "می\u200cروم 👩\u200d💻"},
+		{"\u200e\u200f\u061c\u2069\ufeff\u00ad", `\u200e\u200f\u061c\u2069\ufeff\u00ad`, `\u200e\u200f\u061c\u2069\ufeff\u00ad`},
 		{"\x1b[2J\x1b]0;t\x07", `\x1b[2J\x1b]0;t\x07`, `\x1b[2J\x1b]0;t\x07`},
 		{"a\rb\bc\x7f\u009b", `a\x0db\x08c\x7f\x9b`, `a\x0db\x08c\x7f\x9b`},
 		{"one\ntwo", `one\x0atwo`, "one\n  two"},

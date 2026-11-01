@@ -193,7 +193,8 @@ does: ACP clients that declared that mode get `elicitation/create`, the client o
 `tempest mcp` run gets it passed through, and a one-shot run on a terminal asks
 field by field. Every surface names the asking server. On a terminal the server's
 message, titles, descriptions, choice labels and URL are shown with control and
-format characters escaped (`\x1b[2J` appears as text), and the lines of a
+format characters escaped (`\x1b[2J` appears as text; the zero width joiner and
+non-joiner stay, so Persian words and emoji sequences render), and the lines of a
 multi-line message are indented under the `MCP server <name>:` line, so a server
 cannot clear the screen, overwrite that attribution or pose as a Tempest prompt.
 `tempest mcp prompts` and `tempest mcp login` escape server text the same way. A form schema outside the
