@@ -175,13 +175,13 @@ type authRecorder struct {
 }
 
 type recordedAuth struct {
-	authorization, apiKey, query, body string
+	authorization, apiKey, resourceKey, query, body string
 }
 
 func (a *authRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	a.mu.Lock()
-	a.requests = append(a.requests, recordedAuth{authorization: r.Header.Get("Authorization"), apiKey: r.Header.Get("X-Api-Key"), query: r.URL.RawQuery, body: string(body)})
+	a.requests = append(a.requests, recordedAuth{authorization: r.Header.Get("Authorization"), apiKey: r.Header.Get("X-Api-Key"), resourceKey: r.Header.Get("Api-Key"), query: r.URL.RawQuery, body: string(body)})
 	reply := "data: {\"choices\":[{\"delta\":{\"content\":\"from backup\"},\"finish_reason\":\"stop\"}]}\n\n"
 	if len(a.replies) > 0 {
 		reply, a.replies = a.replies[0], a.replies[1:]
@@ -324,6 +324,86 @@ func TestAgentGetAPIKeyAuthenticatesEachModelOnTheSwitchingTurn(t *testing.T) {
 	}
 }
 
+// GetApiKey answers per provider, so it cannot tell two endpoints of one
+// provider apart: the key it gives for the primary's provider is the
+// primary's endpoint key. A backup on that provider at another endpoint, even
+// on the same origin, authenticates with its own endpoint's key on the
+// switching turn and every later turn, and the resolver is never asked for
+// it. A backup at the primary's endpoint keeps the resolved key.
+func TestAgentGetAPIKeyStaysWithItsEndpointOnTheSameProvider(t *testing.T) {
+	const toolCall = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"note\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
+	note := agent.AgentTool{
+		Tool: types.Tool{Name: "note", Description: "records a note", Parameters: json.RawMessage(`{"type":"object"}`)},
+		Execute: func(context.Context, string, json.RawMessage, agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+			return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("noted")}}, nil
+		},
+	}
+	for _, tc := range []struct {
+		name, backupPath, wantBackup string
+		wantLookups                  []string
+	}{
+		{"backup at another endpoint", "/backup", "Bearer backup-own-key", []string{"openai"}},
+		{"backup at the primary's endpoint", "/primary", "Bearer primary-callback-key", []string{"openai", "openai", "openai"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &authRecorder{status: http.StatusServiceUnavailable}
+			backup := &authRecorder{replies: []string{toolCall}}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				r.Body = io.NopCloser(strings.NewReader(string(body)))
+				if strings.Contains(string(body), `"gpt-primary"`) {
+					primary.ServeHTTP(w, r)
+					return
+				}
+				backup.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			router, err := NewProviderRouter(RoutingConfig{
+				ModelID:        "openai:gpt-primary@" + server.URL + "/primary",
+				FallbackModels: []string{"openai:gpt-backup@" + server.URL + tc.backupPath},
+				Env:            func(name string) string { return map[string]string{"OPENAI_API_KEY": "backup-own-key"}[name] },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var mu sync.Mutex
+			var lookups []string
+			a := agent.NewAgent(agent.AgentOptions{
+				InitialState:   &agent.AgentState{SystemPrompt: "test", Model: router.Model, Tools: []agent.AgentTool{note}},
+				StreamFn:       router.StreamFn,
+				FallbackModels: router.Fallbacks,
+				GetApiKey: func(provider string) string {
+					mu.Lock()
+					defer mu.Unlock()
+					lookups = append(lookups, provider)
+					return map[string]string{"openai": "primary-callback-key"}[provider]
+				},
+			})
+			result, err := a.PromptText(context.Background(), "hello")
+			if err != nil || result.StopReason != agent.StopCompleted {
+				t.Fatalf("run = %+v, %v", result, err)
+			}
+			if got := primary.recorded(t); len(got) != 1 || got[0].authorization != "Bearer primary-callback-key" {
+				t.Fatalf("primary requests = %+v", got)
+			}
+			backupRequests := backup.recorded(t)
+			if len(backupRequests) != 2 {
+				t.Fatalf("backup requests = %d, want the switching turn and a later one", len(backupRequests))
+			}
+			for i, got := range backupRequests {
+				if got.authorization != tc.wantBackup {
+					t.Fatalf("backup request %d authorization = %q, want %q", i, got.authorization, tc.wantBackup)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(lookups, tc.wantLookups) {
+				t.Fatalf("GetApiKey lookups = %v, want %v", lookups, tc.wantLookups)
+			}
+		})
+	}
+}
+
 // Credentials a loop caller set on its stream options were given for the
 // primary. After the run switched, every later turn on the backup still
 // authenticates with the backup's own key, not only the turn that switched.
@@ -413,6 +493,7 @@ func TestRoutingForModelComparesResolvedRoutes(t *testing.T) {
 	inline := RoutingConfig{ModelID: "openai:gpt-primary@https://a.example", OpenAIBaseURL: "https://b.example", APIKey: "primary-key", AuthToken: "primary-token", Env: envOf(nil)}
 	configured := RoutingConfig{ModelID: "openai:gpt-primary", OpenAIBaseURL: "https://b.example", APIKey: "primary-key", AuthToken: "primary-token", Env: envOf(nil)}
 	fromEnv := RoutingConfig{APIKey: "primary-key", AuthToken: "primary-token", Env: envOf(map[string]string{"ANTHROPIC_DEFAULT_SONNET_MODEL": "openai:gpt-primary"})}
+	azure := RoutingConfig{ModelID: "azure:deployment-primary", BaseURL: "https://resource.example", APIKey: "primary-key", AuthToken: "primary-token", Env: envOf(nil)}
 	for _, tc := range []struct {
 		name     string
 		cfg      RoutingConfig
@@ -427,6 +508,11 @@ func TestRoutingForModelComparesResolvedRoutes(t *testing.T) {
 		{"environment primary, other provider", fromEnv, "anthropic:claude-backup", false},
 		{"environment primary, bare Anthropic id", fromEnv, "claude-backup", false},
 		{"environment primary, same route", fromEnv, "openai:gpt-backup", true},
+		{"azure deployment changed on the same resource", azure, "azure:deployment-other", true},
+		{"azure deployment path on the same resource", azure, "azure:deployment-other@https://resource.example/openai/deployments/deployment-other", true},
+		{"azure v1 path on the same resource", azure, "azure:deployment-other@https://resource.example/openai/v1", true},
+		{"azure resource changed", azure, "azure:deployment-other@https://other.example", false},
+		{"azure path below the resource", azure, "azure:deployment-other@https://resource.example/tenant", false},
 		{"unroutable spec", configured, "nope:model", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -441,14 +527,58 @@ func TestRoutingForModelComparesResolvedRoutes(t *testing.T) {
 }
 
 // With no Env, the effective primary is the process environment's default
-// model; its key is not carried to a model on another provider.
+// model, as NewProviderRouter resolves it: its key stays on that route and is
+// not carried to a model on another provider. An explicit Env never reads the
+// process environment.
 func TestRoutingForModelResolvesTheProcessEnvironmentPrimary(t *testing.T) {
-	for _, name := range []string{"HARNESS_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"} {
+	for _, name := range []string{"HARNESS_ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL"} {
 		t.Setenv(name, "")
 	}
+	t.Setenv("OPENAI_BASE_URL", "https://ambient.example")
 	t.Setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "openai:gpt-primary")
-	if derived := (RoutingConfig{APIKey: "primary-key"}).ForModel("anthropic:claude-backup"); derived.APIKey != "" {
+	ambient := RoutingConfig{APIKey: "primary-key"}
+	router, err := NewProviderRouter(ambient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if router.Model.Provider != "openai" || router.Model.BaseURL != "https://ambient.example" {
+		t.Fatalf("process environment primary = %+v", router.Model)
+	}
+	if derived := ambient.ForModel("openai:gpt-backup"); derived.APIKey != "primary-key" {
+		t.Fatal("a model on the primary's route lost its key")
+	}
+	if derived := ambient.ForModel("anthropic:claude-backup"); derived.APIKey != "" {
 		t.Fatalf("OpenAI primary's key carried to Anthropic: %q", derived.APIKey)
+	}
+	isolated := RoutingConfig{APIKey: "primary-key", Env: func(string) string { return "" }}
+	if derived := isolated.ForModel("anthropic:claude-backup"); derived.APIKey != "primary-key" {
+		t.Fatal("an explicit empty Env read the process environment's default model")
+	}
+}
+
+// An Azure key belongs to the resource; the route only appends the deployment
+// path for the model. An agent preset on another deployment of the configured
+// resource, derived through ForModel, authenticates with the explicit resource
+// key.
+func TestAzurePresetKeepsTheResourceKeyAcrossDeployments(t *testing.T) {
+	endpoint := &authRecorder{}
+	server := httptest.NewServer(endpoint)
+	defer server.Close()
+	config := RoutingConfig{ModelID: "azure:deployment-primary", BaseURL: server.URL, APIKey: "azure-resource-key", Env: func(string) string { return "" }}
+	derived := config.ForModel("azure:deployment-preset")
+	preset, err := NewProviderRouter(derived)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preset.Model.BaseURL != server.URL+"/openai/deployments/deployment-preset" {
+		t.Fatalf("preset endpoint = %s", preset.Model.BaseURL)
+	}
+	final, err := preset.StreamFn(context.Background(), preset.Model, types.Context{}, nil).Result(context.Background())
+	if err != nil || final.StopReason != types.StopStop {
+		t.Fatalf("derived key retained = %v; final = %+v, %v", derived.APIKey != "", final, err)
+	}
+	if got := endpoint.recorded(t); len(got) != 1 || got[0].resourceKey != "azure-resource-key" {
+		t.Fatalf("resource requests = %+v", got)
 	}
 }
 

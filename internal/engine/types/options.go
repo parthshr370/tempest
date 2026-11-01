@@ -29,12 +29,13 @@ type StreamOptions struct {
 	// Query carries endpoint parameters without persisting credentials.
 	Query  map[string]string `json:"-"`
 	NoAuth bool              `json:"-"`
-	// CredentialRoute is the route APIKey, NoAuth, Headers and Query were
-	// issued for. A provider route that sends the request anywhere else
-	// drops all four and authenticates with its own credential, so a
-	// per-request credential never reaches another provider or endpoint.
-	// Zero means the route of the model the request is sent with; a stream
-	// function that forwards a request to a different model sets it first.
+	// CredentialRoute is the route (credential scope, see [RouteOf]) APIKey,
+	// NoAuth, Headers and Query were issued for. A provider route that sends
+	// the request to another scope drops all four and authenticates with its
+	// own credential, so a per-request credential never reaches another
+	// provider or endpoint. Zero means the route of the model the request is
+	// sent with; a stream function that forwards a request to a different
+	// model sets it first.
 	CredentialRoute Route `json:"-"`
 	// APIKeyFor, when set, resolves the API key for a provider (the agent's
 	// GetApiKey). BindAPIKey applies it for the model a request is sent to,
@@ -74,16 +75,21 @@ type StreamOptions struct {
 }
 
 // BindAPIKey prepares the options' credentials for a request sent to model.
-// Credentials without a CredentialRoute were given for model. When APIKeyFor
-// resolves a key for model's provider, that key is bound to model's route; if
-// the other credentials were bound to another route they are dropped with it,
-// since they were never meant for model.
+// Credentials without a CredentialRoute were given for model. APIKeyFor
+// answers per provider, so it cannot tell two scopes of one provider apart:
+// its key for the provider of CredentialRoute is that route's key. It is
+// therefore asked for model's key when model is on CredentialRoute itself or
+// on another provider, and that key is bound to model's route, dropping the
+// other credentials if they were bound to another route, since they were never
+// meant for model. A model on CredentialRoute's provider at another scope is
+// not asked about: the binding stays, and model's provider route, seeing
+// credentials issued for another scope, authenticates with its own.
 func (o *StreamOptions) BindAPIKey(model Model) {
 	route := RouteOf(model)
 	if o.CredentialRoute == (Route{}) {
 		o.CredentialRoute = route
 	}
-	if o.APIKeyFor == nil {
+	if o.APIKeyFor == nil || route.Provider == o.CredentialRoute.Provider && route != o.CredentialRoute {
 		return
 	}
 	key := o.APIKeyFor(model.Provider)

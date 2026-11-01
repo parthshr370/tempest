@@ -145,13 +145,14 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 // ForModel derives the routing for another model spec from cfg, as a backup
 // model or an agent preset on its own model needs. cfg's endpoint and
 // credential overrides (BaseURL, APIKey, AuthToken) were given for the route
-// cfg resolves to: its provider and endpoint after the model spec, flags,
-// environment and provider defaults apply. A spec that resolves to another
-// provider drops all three and resolves its own from the provider registry
-// and Env; one that resolves to another endpoint of the same provider keeps
-// BaseURL (it is the configured endpoint) but gets no key or token. Every
-// derived route goes through here, so an override never follows a model to
-// another provider or endpoint.
+// cfg resolves to: its provider and credential scope ([types.RouteOf]: the
+// endpoint, or the Azure resource whose deployment the model selects) after
+// the model spec, flags, environment and provider defaults apply. A spec that
+// resolves to another provider drops all three and resolves its own from the
+// provider registry and Env; one that resolves to another scope of the same
+// provider keeps BaseURL (it is the configured endpoint) but gets no key or
+// token. Every derived route goes through here, so an override never follows
+// a model to another provider or endpoint.
 func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
 	derived := cfg
 	derived.ModelID = spec
@@ -164,8 +165,9 @@ func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
 	}
 	// Both sides are resolved exactly as NewProviderRouter resolves them, so
 	// an empty ModelID (the environment's default model) or a dropped inline
-	// @endpoint is compared by where the requests actually go. A route that
-	// does not resolve gets no overrides; building it reports the error.
+	// @endpoint is compared by where the requests actually go, and by the
+	// same scope BindAPIKey binds request credentials to. A route that does
+	// not resolve gets no overrides; building it reports the error.
 	from, fromErr := resolveRoute(cfg, env)
 	to, toErr := resolveRoute(derived, env)
 	switch {
@@ -217,8 +219,8 @@ func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route,
 		resolved := cloneSimpleOptions(opts)
 		if issued := resolved.CredentialRoute; issued != (types.Route{}) && issued != types.RouteOf(model) {
 			// The caller's credential and endpoint parameters were issued for
-			// another provider or endpoint (a backup model, an agent on its own
-			// model); this route authenticates with its own credential.
+			// another provider or credential scope (a backup model, an agent on
+			// its own model); this route authenticates with its own credential.
 			resolved.APIKey, resolved.Headers, resolved.Query, resolved.NoAuth = "", nil, nil, false
 		}
 		if rt.CredentialSource != nil {

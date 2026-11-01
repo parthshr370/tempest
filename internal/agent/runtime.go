@@ -91,6 +91,9 @@ type AgentOptions struct {
 	// ModelRole is the model role this agent runs on: default, plan or smol.
 	ModelRole string
 	// GetApiKey resolves a provider-specific API key; overrides the ambient key.
+	// Its key for the primary model's provider belongs to the primary's
+	// endpoint: a backup on that provider at another endpoint uses its own
+	// route's key instead (see [types.StreamOptions.BindAPIKey]).
 	GetApiKey      func(provider string) string
 	BeforeToolCall func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall  func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult

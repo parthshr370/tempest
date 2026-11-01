@@ -121,23 +121,30 @@ sets `fallback_models.default` above the settings files, in the usual
 uses the default role's list; an empty list turns backups off for that role.
 `serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
-Each backup is a full route with its own endpoint and credential. The SDK's explicit
-`ProviderConfig.APIKey`, `AuthToken` and `BaseURL` were given for the route the
-primary resolves to: its provider and endpoint once its `@<base-url>`, the endpoint
-settings, the environment (including the default model an empty `ModelID` takes from
+Each backup is a full route with its own endpoint and credential. A credential
+belongs to a provider and a **credential scope**: the endpoint the route resolves to,
+except on Azure, where it is the resource, so another deployment of the same resource
+(its `/openai/deployments/<name>` or `/openai/v1` path) is the same scope. Bedrock
+and Vertex build their regional, per-model URLs from the configured endpoint when a
+request is sent, so the endpoint is their scope. The SDK's explicit
+`ProviderConfig.APIKey`, `AuthToken` and `BaseURL` were given for the scope the
+primary resolves to once its `@<base-url>`, the endpoint settings, the environment
+(including the default model an empty `ModelID` takes from
 `ANTHROPIC_DEFAULT_SONNET_MODEL`) and the provider default apply. A backup, or an
 agent preset on its own model, keeps them only when it resolves to that same provider
-and endpoint. One on another provider gets none of the three; one on the same
-provider at another endpoint, including a backup without the primary's `@<base-url>`
-that therefore goes to the configured endpoint, keeps `BaseURL` but not the key or
-token.
+and scope. One on another provider gets none of the three; one on the same provider
+at another scope, including a backup without the primary's `@<base-url>` that
+therefore goes to the configured endpoint, keeps `BaseURL` but not the key or token.
 Request-level credentials are bound the same way: an API key, header or query
 parameter a caller sets on the request options was given for the primary's provider
-and endpoint, and a backup on another provider or endpoint never receives it, on the
-switching turn or any later one. `GetApiKey` is asked for the key of the provider each
-request goes to, the backup's included, on every turn including the one that switches;
-a backup it has no key for authenticates with its own credential. `doctor` lists each
-role's backups under it.
+and scope, and a backup on another provider or scope never receives it, on the
+switching turn or any later one. `GetApiKey(provider)` names only a provider, so it
+cannot tell two endpoints of one provider apart: its key for the primary's provider
+is the primary's. On every turn, including the one that switches, it is asked for
+the key of a model on the primary's scope or on another provider, and a backup it has
+no key for authenticates with its own credential. A backup on the primary's provider
+at another scope is never given the callback's key; it authenticates with the key its
+own route resolves. `doctor` lists each role's backups under it.
 
 A backup gets the request only when the model is **unavailable**, after the model's
 own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts
@@ -299,7 +306,10 @@ also works: set `base_url` or `AZURE_OPENAI_ENDPOINT` to
 }
 ```
 
-Select it with `-model azure:<deployment>`.
+Select it with `-model azure:<deployment>`. The key belongs to the resource, so a
+backup or agent preset on another deployment of the same resource keeps an explicit
+SDK key; a different resource, or any other path below it, is another scope and gets
+none.
 
 ## Project provider definitions
 

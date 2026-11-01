@@ -1,6 +1,9 @@
 package types
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // AnthropicCompat holds per-model Anthropic compatibility flags. Pointers keep
 // the tri-state (unset vs explicit true/false) so a nil default can be resolved
@@ -15,15 +18,34 @@ type AnthropicCompat struct {
 	AllowEmptySignature             *bool `json:"allowEmptySignature,omitempty"`
 }
 
-// Route is where a model's requests go: the provider and its endpoint. It is
-// the identity a per-request credential is bound to.
+// Route is the credential scope of a model's requests: the provider and the
+// endpoint a credential for it is issued for. It is the identity a
+// per-request credential is bound to.
 type Route struct {
 	Provider string
-	BaseURL  string
+	Scope    string
 }
 
-// RouteOf returns the route requests for model go to.
-func RouteOf(model Model) Route { return Route{Provider: model.Provider, BaseURL: model.BaseURL} }
+// RouteOf returns the credential scope of model's requests. It is the base
+// URL, except on Azure, where a key belongs to the resource: the
+// /openai/deployments/<name> path a route appends for the model, or the
+// /openai/v1 path, only selects a model within it. Every other path stays in
+// the scope, since it may itself separate tenants. Bedrock and Vertex build
+// their regional, per-model URLs from the configured endpoint when a request
+// is sent, so their base URL already is the scope.
+func RouteOf(model Model) Route {
+	scope := model.BaseURL
+	if model.Provider == "azure" {
+		if resource, ok := strings.CutSuffix(scope, "/openai/v1"); ok {
+			scope = resource
+		} else if i := strings.LastIndex(scope, "/openai/deployments/"); i >= 0 {
+			if deployment := scope[i+len("/openai/deployments/"):]; deployment != "" && !strings.Contains(deployment, "/") {
+				scope = scope[:i]
+			}
+		}
+	}
+	return Route{Provider: model.Provider, Scope: scope}
+}
 
 // Model describes an LLM plus capability metadata (02-map-ai-agent.md A16). The
 // generic Model<TApi> collapses to a concrete struct; we only carry the

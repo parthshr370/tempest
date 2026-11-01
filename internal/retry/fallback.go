@@ -102,8 +102,11 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 		})
 		attemptOpts.CredentialRoute = issued
 		if switched {
-			// A backup's key comes from the caller's resolver for its own
-			// provider, as the first model's did before the request started.
+			// A backup on another provider takes its key from the caller's
+			// resolver, as the first model did before the request started; one
+			// on the issued provider at another endpoint uses its own route's
+			// key, since the resolver's key for that provider is the issued
+			// route's (see types.StreamOptions.BindAPIKey).
 			attemptOpts.BindAPIKey(model)
 		}
 		// Admission belongs to this chain's switches, not to anything the
