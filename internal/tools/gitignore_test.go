@@ -18,6 +18,20 @@ func rootIgnoreSet(ctx context.Context, rules string) *ignoreSet {
 	return set
 }
 
+// excludedOrUnder reports whether the root-relative path or any directory
+// above it is excluded, git's is_excluded(): nothing under an excluded
+// directory can be re-included. The walks never ask it, since they do not
+// descend into an excluded directory; the matcher tests use it to check a
+// path without a walk.
+func (set *ignoreSet) excludedOrUnder(pathname string, isDir bool) bool {
+	for index := range len(pathname) {
+		if pathname[index] == '/' && set.excluded(pathname[:index], true) {
+			return true
+		}
+	}
+	return set.excluded(pathname, isDir)
+}
+
 // The port gives git's own answers on git's wildmatch test vectors.
 func TestWildmatchMatchesGitTestVectors(t *testing.T) {
 	for _, vector := range wildmatchVectors {

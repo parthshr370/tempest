@@ -229,7 +229,9 @@ source or arguments invalidate it. Operations run in order. Empty `out` deletes
 matches. Overlapping matches are refused. Narrow the pattern before retrying.
 Rewrite scopes are bounded to 256 files and 16 MiB of source per call.
 Search scans files independently and retains only the requested 50-match page;
-it does not inherit the rewrite snapshot limits. Gitignored directories are pruned.
+it does not inherit the rewrite snapshot limits. As with `grep` and `find`, the
+walk prunes gitignored entries and `.git` below a scope, but searches a scope
+named directly even when it is ignored.
 
 The binary reads source through stdin in a private directory. It never receives
 workspace paths or loads workspace parser configuration. Symlinks discovered

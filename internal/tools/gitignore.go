@@ -645,18 +645,6 @@ func (set *ignoreSet) excluded(pathname string, isDir bool) bool {
 	return set.poll.done
 }
 
-// excludedOrUnder reports whether the root-relative path or any directory
-// above it is excluded, git's is_excluded(): nothing under an excluded
-// directory can be re-included.
-func (set *ignoreSet) excludedOrUnder(pathname string, isDir bool) bool {
-	for index := range len(pathname) {
-		if pathname[index] == '/' && set.excluded(pathname[:index], true) {
-			return true
-		}
-	}
-	return set.excluded(pathname, isDir)
-}
-
 func parentDirectory(pathname string) string {
 	if slash := strings.LastIndexByte(pathname, '/'); slash >= 0 {
 		return pathname[:slash]

@@ -225,8 +225,13 @@ func TestASTSearchRepositoryScopeAndPaging(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	if targets, err := astTargets(t.Context(), root, cwd, []string{"node_modules"}, "", true); err != nil || len(targets) != 0 {
-		t.Fatalf("ignored directory was walked: %d %v", len(targets), err)
+	// Named directly, the ignored directory is searched, as grep and find
+	// search it, and an edit scope over it still meets the rewrite bounds.
+	if targets, err := astTargets(t.Context(), root, cwd, []string{"node_modules"}, "", false); err != nil || len(targets) != 8300 {
+		t.Fatalf("ignored directory named as a search scope: %d targets, %v", len(targets), err)
+	}
+	if _, err := astTargets(t.Context(), root, cwd, []string{"node_modules"}, "", true); err == nil || !strings.Contains(err.Error(), "narrow paths") {
+		t.Fatalf("an ignored directory named as an edit scope = %v, want a rewrite bound", err)
 	}
 }
 
@@ -372,5 +377,57 @@ func TestCodingLargeErrorsSpill(t *testing.T) {
 	content, readErr := os.ReadFile(path)
 	if readErr != nil || strings.Count(string(content), "failed log line") != 4000 {
 		t.Fatalf("incomplete diagnostic artifact: %v", readErr)
+	}
+}
+
+// A scope names its directory or file the way grep and find take their
+// path: the named entry is searched even when .gitignore covers it, and the
+// rules still judge what lies below it.
+func TestASTScopeSearchesAnIgnoredPathItNames(t *testing.T) {
+	cwd := t.TempDir()
+	writeFile(t, filepath.Join(cwd, ".gitignore"), "build/\n*_gen.go\n")
+	for _, name := range []string{"main.go", "x_gen.go", "build/a.go", "build/c_gen.go", "build/sub/b.go", "build/sub/d_gen.go"} {
+		writeFile(t, filepath.Join(cwd, filepath.FromSlash(name)), "package p\n")
+	}
+	root, err := os.OpenRoot(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, testCase := range []struct {
+		scope string
+		want  []string
+	}{
+		{"build", []string{"build/a.go", "build/sub/b.go"}},
+		{"build/sub", []string{"build/sub/b.go"}},
+		{"build/a.go", []string{"build/a.go"}},
+		{"x_gen.go", []string{"x_gen.go"}},
+		{".", []string{"main.go"}},
+	} {
+		targets, err := astTargets(t.Context(), root, cwd, []string{testCase.scope}, "", false)
+		if err != nil {
+			t.Fatalf("scope %s: %v", testCase.scope, err)
+		}
+		got := []string{}
+		for _, target := range targets {
+			got = append(got, filepath.ToSlash(target.rel))
+		}
+		if diff := sortedDiff(got, testCase.want); diff != "" {
+			t.Fatalf("scope %s:\n%s", testCase.scope, diff)
+		}
+		if info, err := os.Stat(filepath.Join(cwd, testCase.scope)); err != nil || !info.IsDir() {
+			continue
+		}
+		found, _, err := goFind(t.Context(), root, testCase.scope, "*.go", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantFind := []string{}
+		for _, name := range testCase.want {
+			wantFind = append(wantFind, filepath.Join(root.Name(), filepath.FromSlash(name)))
+		}
+		if diff := sortedDiff(found, wantFind); diff != "" {
+			t.Fatalf("find under %s differs:\n%s", testCase.scope, diff)
+		}
 	}
 }
