@@ -57,6 +57,13 @@ var gatedSamples = map[string]string{
 	"trusted_hook_projects":       `["/"]`,
 	"workspace_listing_max_files": `1000000`,
 	"workspace_listing_max_bytes": `1048576`,
+	"max_tokens":                  `64000`,
+	"mcp_sampling_max_tokens":     `64000`,
+	"retry_enabled":               `false`,
+	"retry_max_attempts":          `20`,
+	"retry_max_delay_ms":          `0`,
+	"bash_timeout":                `"1h"`,
+	"log_file_max_bytes":          `1`,
 	"trusted_provider_projects":   `["/"]`,
 	"environment":                 `"repo"`,
 	"environments":                `{"repo":{"argv":["repo-env"]}}`,
@@ -204,6 +211,18 @@ var projectSettingTrust = []struct {
 	{"workspace_listing_max_bytes", `4097`, gateExecutable},
 	{"workspace_listing_max_bytes", `1048576`, gateExecutable},
 	{"mcp_sampling_allow_headless", `true`, gateExecutable},
+	// Raises a cost or resource cap above the operator's value, here the
+	// built-in default, or resets it to the default with null.
+	{"max_tokens", `32001`, gateExecutable},
+	{"max_tokens", `null`, gateExecutable},
+	{"mcp_sampling_max_tokens", `32001`, gateExecutable},
+	{"retry_enabled", `null`, gateExecutable},
+	{"retry_max_attempts", `12`, gateExecutable},
+	{"retry_max_delay_ms", `300001`, gateExecutable},
+	{"retry_max_delay_ms", `0`, gateExecutable},
+	{"bash_timeout", `"11m"`, gateExecutable},
+	{"bash_timeout", `"0s"`, gateExecutable},
+	{"log_file_max_bytes", `104857601`, gateExecutable},
 	// Chooses where credentials go.
 	{"providers", `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`, gateCredentials},
 	{"anthropic_base_url", `"https://repo.example"`, gateCredentials},
@@ -252,7 +271,9 @@ var projectSettingTrust = []struct {
 	{"plan_reasoning", `"high"`, gateNone},
 	{"smol_reasoning", `"off"`, gateNone},
 	{"max_tokens", `1234`, gateNone},
+	{"max_tokens", `32000`, gateNone},
 	{"bash_timeout", `"7s"`, gateNone},
+	{"bash_timeout", `"10m"`, gateNone},
 	{"log_level", `"debug"`, gateNone},
 	{"log_file_max_bytes", `4096`, gateNone},
 	{"enable_web", `false`, gateNone},
@@ -261,10 +282,13 @@ var projectSettingTrust = []struct {
 	{"plan", `true`, gateNone},
 	{"permission_deny_tools", `["bash"]`, gateNone},
 	{"retry_enabled", `false`, gateNone},
+	{"retry_enabled", `true`, gateNone},
 	{"retry_max_attempts", `2`, gateNone},
+	{"retry_max_attempts", `11`, gateNone},
 	{"retry_base_delay_ms", `1`, gateNone},
 	{"retry_backoff_cap_ms", `9000`, gateNone},
 	{"retry_max_delay_ms", `100`, gateNone},
+	{"retry_max_delay_ms", `300000`, gateNone},
 	{"retry_jitter_min", `0`, gateNone},
 	{"retry_jitter_max", `1`, gateNone},
 	// The session-start listing may be turned off or its caps lowered below
@@ -558,6 +582,75 @@ func TestProjectListingCapsCannotRaiseTheOperatorsValues(t *testing.T) {
 	}
 }
 
+// costCaps is the part of a resolved configuration the cost and resource caps
+// set.
+type costCaps struct {
+	MaxTokens, SamplingMaxTokens int
+	RetryEnabled                 bool
+	RetryMaxAttempts, MaxDelayMS int
+	BashTimeout                  time.Duration
+	LogFileMaxBytes              int64
+}
+
+func costCapsOf(c *ResolvedConfig) costCaps {
+	retry := c.Retry()
+	return costCaps{c.MaxTokens(), c.MCPSamplingMaxTokens(), retry.Enabled, retry.MaxAttempts, retry.MaxDelayMS, c.BashTimeout(), c.LogFileMaxBytes()}
+}
+
+// An untrusted repository may lower the cost and resource caps, or turn
+// retries off, but never raise them above the operator's values: not by a
+// larger number, not by null or an invalid value that would fall back to the
+// built-in default, and not by enabling retries the operator turned off.
+// Trust lifts the ceiling.
+func TestProjectCostCapsCannotRaiseTheOperatorsValues(t *testing.T) {
+	const operator = `{"max_tokens":1000,"retry_enabled":false,"retry_max_attempts":3,"retry_max_delay_ms":5000,"bash_timeout":"30s","log_file_max_bytes":1048576}`
+	operatorCaps := costCaps{1000, 1000, false, 3, 5000, 30 * time.Second, 1048576}
+	all := []string{"max_tokens", "mcp_sampling_max_tokens", "retry_enabled", "retry_max_attempts", "retry_max_delay_ms", "bash_timeout", "log_file_max_bytes"}
+	const raise = `{"max_tokens":1001,"mcp_sampling_max_tokens":1001,"retry_enabled":true,"retry_max_attempts":4,"retry_max_delay_ms":5001,"bash_timeout":"31s","log_file_max_bytes":1048577}`
+	for _, testCase := range []struct {
+		name     string
+		operator string
+		project  string
+		want     costCaps
+		dropped  []string
+	}{
+		{"raise", operator, raise, operatorCaps, all},
+		{"lower", operator, `{"max_tokens":500,"mcp_sampling_max_tokens":400,"retry_enabled":false,"retry_max_attempts":2,"retry_max_delay_ms":100,"bash_timeout":"5s","log_file_max_bytes":1024}`, costCaps{500, 400, false, 2, 100, 5 * time.Second, 1024}, nil},
+		{"equal", operator, `{"max_tokens":1000,"mcp_sampling_max_tokens":1000,"retry_max_attempts":3,"retry_max_delay_ms":5000,"bash_timeout":"30s","log_file_max_bytes":1048576}`, operatorCaps, nil},
+		{"null resets to the default", operator, `{"max_tokens":null,"mcp_sampling_max_tokens":null,"retry_enabled":null,"retry_max_attempts":null,"retry_max_delay_ms":null,"bash_timeout":null,"log_file_max_bytes":null}`, operatorCaps, all},
+		{"invalid", operator, `{"max_tokens":0,"mcp_sampling_max_tokens":-1,"retry_enabled":"yes","retry_max_attempts":0,"retry_max_delay_ms":"soon","bash_timeout":"forever","log_file_max_bytes":0}`, operatorCaps, all},
+		{"sampling ceiling is the operator's own sampling cap", `{"max_tokens":1000,"mcp_sampling_max_tokens":200}`, `{"mcp_sampling_max_tokens":300}`, costCaps{1000, 200, true, 11, 300000, 10 * time.Minute, 100 << 20}, []string{"mcp_sampling_max_tokens"}},
+		{"an unlimited retry delay admits any limit", `{"retry_max_delay_ms":0}`, `{"retry_max_delay_ms":60000}`, costCaps{32000, 32000, true, 11, 60000, 10 * time.Minute, 100 << 20}, nil},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, testCase.operator)
+			w.write(w.projectPath(), testCase.project)
+			resolved := w.mustResolve()
+			if got := costCapsOf(resolved); got != testCase.want {
+				t.Fatalf("untrusted caps = %+v, want %+v", got, testCase.want)
+			}
+			warnings := strings.Join(resolved.Warnings(), "\n")
+			for _, key := range testCase.dropped {
+				if !strings.Contains(warnings, ": "+key+" (needs -trust-project-hooks") {
+					t.Fatalf("warnings %q do not name the dropped %s", warnings, key)
+				}
+			}
+			if testCase.dropped == nil && warnings != "" {
+				t.Fatalf("warnings = %q", warnings)
+			}
+		})
+	}
+
+	w := newLayerWorkspace(t)
+	w.write(w.user, operator)
+	w.write(w.projectPath(), raise)
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+	if got, want := costCapsOf(w.mustResolve()), (costCaps{1001, 1001, true, 4, 5001, 31 * time.Second, 1048577}); got != want {
+		t.Fatalf("trusted caps = %+v, want %+v", got, want)
+	}
+}
+
 // resolvedHookCommands lists event's commands in run order.
 func resolvedHookCommands(c *ResolvedConfig, event string) []string {
 	var commands []string
@@ -659,9 +752,11 @@ func TestProjectHooksResolveAsALayer(t *testing.T) {
 // warning; operator files, trusted projects and strict mode stay fatal.
 func TestInvalidUntrustedProjectFileIsSkipped(t *testing.T) {
 	invalid := map[string]func(w *layerWorkspace){
-		"malformed json":        func(w *layerWorkspace) { w.write(w.projectPath(), `{ broken json`) },
-		"not an object":         func(w *layerWorkspace) { w.write(w.projectPath(), `[1]`) },
-		"wrong type":            func(w *layerWorkspace) { w.write(w.projectPath(), `{"model":"anthropic:project","max_tokens":"lots"}`) },
+		"malformed json": func(w *layerWorkspace) { w.write(w.projectPath(), `{ broken json`) },
+		"not an object":  func(w *layerWorkspace) { w.write(w.projectPath(), `[1]`) },
+		"wrong type": func(w *layerWorkspace) {
+			w.write(w.projectPath(), `{"model":"anthropic:project","enable_task":"lots"}`)
+		},
 		"profiles not settings": func(w *layerWorkspace) { w.write(w.projectPath(), `{"profiles":5}`) },
 		"directory": func(w *layerWorkspace) {
 			if err := os.Mkdir(w.projectPath(), 0o700); err != nil {

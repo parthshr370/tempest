@@ -193,6 +193,8 @@ func TestLayerMergeObjectsReplaceArraysAndUnsetWithNull(t *testing.T) {
 		"debug_adapters": {"node": {"command": "node", "args": ["user.js"]}},
 		"providers": {"gw": {"protocol": "openai-chat", "base_url": "https://user.example/v1", "api_key_env": "GW_KEY"}}
 	}`)
+	// Trusted, since an untrusted repository's null cannot unset an operator cap.
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
 	w.write(w.projectPath(), `{"max_tokens": null}`)
 	w.flags.Overrides = StringsInput{Set: true, Values: []string{
 		"providers.gw.base_url=https://override.example/v1",
@@ -649,6 +651,8 @@ func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
 		}
 	}
 	w := newLayerWorkspace(t)
+	// An untrusted repository's invalid cap is dropped as above the operator's.
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
 	w.write(w.projectPath(), `{"max_tokens": 0}`)
 	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "max_tokens: must be positive") {
 		t.Fatalf("err = %v", err)
@@ -665,7 +669,10 @@ func TestInvalidValueNamesTheLayerThatSetIt(t *testing.T) {
 		field  string
 		source func(w *layerWorkspace) string
 	}{
-		{"project scalar", func(w *layerWorkspace) { w.write(w.projectPath(), `{"max_tokens": 0}`) }, "max_tokens", func(w *layerWorkspace) string { return "project " + w.projectPath() }},
+		{"project scalar", func(w *layerWorkspace) {
+			w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+			w.write(w.projectPath(), `{"max_tokens": 0}`)
+		}, "max_tokens", func(w *layerWorkspace) string { return "project " + w.projectPath() }},
 		{"project-local enum", func(w *layerWorkspace) { w.write(w.localPath(), `{"reasoning": "max"}`) }, "reasoning", func(w *layerWorkspace) string { return "project-local " + w.localPath() }},
 		{"user fallback entry", func(w *layerWorkspace) { w.write(w.user, `{"fallback_models": {"plan": ["nope:model"]}}`) }, "fallback_models.plan[0]", func(w *layerWorkspace) string { return "user " + w.user }},
 		{"environment", func(w *layerWorkspace) { w.env["HARNESS_BASH_TIMEOUT"] = "soon" }, "bash_timeout", func(*layerWorkspace) string { return "env HARNESS_BASH_TIMEOUT" }},

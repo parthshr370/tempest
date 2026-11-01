@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/obs"
@@ -632,6 +634,13 @@ var projectGates = map[string]trustGate{
 	"workspace_listing":           gateExecutable,
 	"workspace_listing_max_files": gateExecutable,
 	"workspace_listing_max_bytes": gateExecutable,
+	"max_tokens":                  gateExecutable,
+	"mcp_sampling_max_tokens":     gateExecutable,
+	"retry_enabled":               gateExecutable,
+	"retry_max_attempts":          gateExecutable,
+	"retry_max_delay_ms":          gateExecutable,
+	"bash_timeout":                gateExecutable,
+	"log_file_max_bytes":          gateExecutable,
 	// otel chooses where spans, metrics and their headers (often an API
 	// key) are sent, and whether message content goes with them.
 	"otel": gateCredentials,
@@ -680,10 +689,10 @@ var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
 // narrowsPermissions reports whether a repository value can only tighten the
 // permissions, capabilities and resource caps the layers below it set, so it
 // applies without trust: plan mode, web tools off, a deny list, which an
-// untrusted repository adds to the lists below it (unionProjectDenies), and
-// the session-start listing off or capped at most at the operator's values.
-// Every other value of these keys, null included, could lift an operator's
-// restriction.
+// untrusted repository adds to the lists below it (unionProjectDenies), the
+// session-start listing or retries off, and each cost or resource cap at
+// most at the operator's value. Every other value of these keys, null
+// included, could lift an operator's restriction.
 func narrowsPermissions(key string, value *settingsNode, operator *fileSettings) bool {
 	if operator == nil {
 		operator = &fileSettings{}
@@ -698,21 +707,63 @@ func narrowsPermissions(key string, value *settingsNode, operator *fileSettings)
 	case "permission_deny_tools":
 		return value.isArray
 	case "workspace_listing":
-		operatorLists := operator.WorkspaceListing == nil || *operator.WorkspaceListing
-		return equalSettings(value, boolNode(false)) || operatorLists && equalSettings(value, boolNode(true))
+		return offOrOperatorOn(value, operator.WorkspaceListing)
 	case "workspace_listing_max_files":
 		return withinCap(value, operator.ListingMaxFiles, DefaultWorkspaceListingMaxFiles)
 	case "workspace_listing_max_bytes":
 		return withinCap(value, operator.ListingMaxBytes, DefaultWorkspaceListingMaxBytes)
+	case "max_tokens":
+		return withinCap(value, operator.MaxTokens, adapter.DefaultMaxTokens)
+	case "mcp_sampling_max_tokens":
+		// Sampling inherits max_tokens when no layer sets its own cap.
+		return withinCap(value, cmp.Or(operator.MCPSamplingMaxTokens, operator.MaxTokens), adapter.DefaultMaxTokens)
+	case "retry_enabled":
+		return offOrOperatorOn(value, operator.RetryEnabled)
+	case "retry_max_attempts":
+		return withinCap(value, operator.RetryMaxAttempts, defaultRetryMaxAttempts)
+	case "retry_max_delay_ms":
+		// Zero or less is no limit, so under an operator's unlimited delay
+		// any whole number narrows or keeps it.
+		if operator.RetryMaxDelayMS != nil && *operator.RetryMaxDelayMS <= 0 {
+			_, whole := wholeNumber[int](value)
+			return whole
+		}
+		return withinCap(value, operator.RetryMaxDelayMS, defaultRetryMaxDelayMS)
+	case "log_file_max_bytes":
+		return withinCap(value, operator.LogFileMaxBytes, defaultLogFileMax)
+	case "bash_timeout":
+		ceiling, err := time.ParseDuration(cmp.Or(settingString(operator.BashTimeout), defaultBashTimeout))
+		var spec string
+		if err != nil || value.isNull() || json.Unmarshal(value.scalar, &spec) != nil {
+			return false
+		}
+		timeout, err := time.ParseDuration(spec)
+		return err == nil && timeout > 0 && timeout <= ceiling
 	}
 	return false
 }
 
+// offOrOperatorOn reports whether value is false, or true while the
+// operator's switch is on or unset (on by default).
+func offOrOperatorOn(value *settingsNode, operator *bool) bool {
+	operatorOn := operator == nil || *operator
+	return equalSettings(value, boolNode(false)) || operatorOn && equalSettings(value, boolNode(true))
+}
+
+// wholeNumber decodes value as a whole number; null is not one.
+func wholeNumber[N int | int64](value *settingsNode) (N, bool) {
+	var number N
+	if value.isNull() || json.Unmarshal(value.scalar, &number) != nil {
+		return 0, false
+	}
+	return number, true
+}
+
 // withinCap reports whether value is a whole number from 1 to the operator's
 // cap, or to builtin when the operator set none.
-func withinCap(value *settingsNode, operator *int, builtin int) bool {
-	var limit int
-	if json.Unmarshal(value.scalar, &limit) != nil || limit < 1 {
+func withinCap[N int | int64](value *settingsNode, operator *N, builtin N) bool {
+	limit, whole := wholeNumber[N](value)
+	if !whole || limit < 1 {
 		return false
 	}
 	ceiling := builtin
