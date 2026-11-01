@@ -259,3 +259,111 @@ func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
 		t.Fatalf("completion notice delivered after wait returned the job: %s", transcript)
 	}
 }
+
+// TestWaitWithdrawsNoticeWithItsResult checks both sides of the commit that
+// records a wait result. Until that result is journaled the job's completion
+// notice stays pending, so a crash after wait returns but before its result
+// commits resumes with the notice still to deliver; the commit that records
+// the result withdraws the notice in the same journal entry.
+func TestWaitWithdrawsNoticeWithItsResult(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"}]`)
+	owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, FauxScript: script})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := owner.core.store.Path()
+	crashed := filepath.Join(t.TempDir(), filepath.Base(path))
+	type state struct {
+		waited, pending bool
+		queued          int
+	}
+	inspect := func() (state, error) {
+		loaded, err := journal.Load(context.Background(), path)
+		if err != nil {
+			return state{}, err
+		}
+		var s state
+		for _, message := range loaded.Messages {
+			if result, ok := message.(types.ToolResultMessage); ok && result.ToolName == "wait" && !result.IsError {
+				s.waited = true
+			}
+		}
+		for _, recovery := range loaded.Recoveries {
+			if recovery.Job.Kind == "bash" {
+				s.pending = recovery.DeliveryPending
+			}
+		}
+		for _, item := range loaded.Queued {
+			if item.SourceJobID != "" {
+				s.queued++
+			}
+		}
+		return s, nil
+	}
+	var before, after state
+	var inspectErr error
+	owner.core.agent.Subscribe(func(_ context.Context, event agent.AgentEvent) error {
+		var err error
+		switch {
+		case event.Type == agent.EventToolExecutionEnd && event.ToolName == "wait":
+			// The recorder has run: wait returned, its result isn't journaled yet.
+			var raw []byte
+			if raw, err = os.ReadFile(path); err == nil {
+				err = os.WriteFile(crashed, raw, 0o600)
+			}
+			if err == nil {
+				before, err = inspect()
+			}
+		case event.Type == agent.EventMessageEnd:
+			if result, ok := event.Message.(types.ToolResultMessage); ok && result.ToolName == "wait" {
+				after, err = inspect()
+			}
+		}
+		inspectErr = errors.Join(inspectErr, err)
+		return nil
+	})
+	result, err := owner.Prompt(t.Context(), Prompt{Text: "run make_marker in the background"})
+	if err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run=%+v %v", result, err)
+	}
+	// Watchers see the withdrawal; it is published once the emission ends.
+	for deadline := time.Now().Add(5 * time.Second); len(owner.Snapshot().Queues) != 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("withdrawn notice still queued for watchers: %+v", owner.Snapshot().Queues)
+		}
+	}
+	if err = owner.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if inspectErr != nil {
+		t.Fatal(inspectErr)
+	}
+	if before.waited || !before.pending || before.queued != 1 {
+		t.Fatalf("crash before the wait result commits loses the notice: %+v", before)
+	}
+	if !after.waited || after.pending || after.queued != 0 {
+		t.Fatalf("wait result committed without withdrawing the notice: %+v", after)
+	}
+
+	resumed, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, Resume: &ResumeSession{Path: crashed, PermissionMode: permission.ModeBypass}, FauxScript: writeScript(t, `[{"text":"DONE"},{"text":"DONE"}]`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := resumed.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	if result, err = resumed.Continue(t.Context()); err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("resumed run=%+v %v", result, err)
+	}
+	transcript, err := json.Marshal(resumed.Messages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transcript), "Background job notice") {
+		t.Fatalf("resume after the crash delivered neither the wait result nor the notice: %s", transcript)
+	}
+}

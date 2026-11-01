@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,14 +42,17 @@ type DurableQueues struct {
 	cancelled map[string]bool
 	consumed  map[string]bool
 	claimed   map[string]bool
-	changed   chan struct{}
+	// withdrawals maps a tool call id to the jobs whose completion notices
+	// its result withdraws once that result commits.
+	withdrawals map[string][]string
+	changed     chan struct{}
 }
 
 var _ work.QueueSource = (*DurableQueues)(nil)
 
 // NewDurableQueues restores pending items and lifetime idempotency receipts.
 func NewDurableQueues(store *journal.Store, loaded *journal.Loaded, publish func(context.Context, work.Event) error) *DurableQueues {
-	q := &DurableQueues{store: store, publish: publish, items: map[string]work.QueueItem{}, keys: map[string]string{}, cancelled: map[string]bool{}, consumed: map[string]bool{}, claimed: map[string]bool{}, changed: make(chan struct{})}
+	q := &DurableQueues{store: store, publish: publish, items: map[string]work.QueueItem{}, keys: map[string]string{}, cancelled: map[string]bool{}, consumed: map[string]bool{}, claimed: map[string]bool{}, withdrawals: map[string][]string{}, changed: make(chan struct{})}
 	if loaded != nil {
 		for _, item := range loaded.QueueReceipts {
 			q.items[item.ID] = item
@@ -234,19 +238,75 @@ func (q *DurableQueues) removePendingLocked(id string) {
 	}
 }
 
-// WithdrawCompletion durably withdraws a job's completion notice the model
-// has not been given yet, because it already read the same terminal result
-// through wait. A notice that was never enqueued, or is already claimed or
-// consumed, is left alone.
-func (q *DurableQueues) WithdrawCompletion(ctx context.Context, jobID string) error {
-	q.mu.Lock()
-	id, ok := q.keys["job:"+jobID+":terminal"]
-	q.mu.Unlock()
-	if !ok {
-		return nil
+// WithdrawCompletion marks a job's completion notice for withdrawal by the
+// tool call bound to ctx, whose result reports the job's terminal state
+// (wait). Nothing is written here, because returning from wait is not
+// delivery: the recorder withdraws the notice in the journal entry that
+// records that call's result (commitResult). Until then the notice stays
+// pending, so a crash in between resumes with the notice still to deliver. A
+// wait outside a tool call withdraws nothing, since no model reads its result.
+func (q *DurableQueues) WithdrawCompletion(ctx context.Context, jobID string) {
+	invocation, ok := work.InvocationFromContext(ctx)
+	if !ok || invocation.CallID == "" {
+		return
 	}
-	if err := q.Cancel(ctx, id); err != nil && !errors.Is(err, ErrQueueTooLate) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if jobs := q.withdrawals[invocation.CallID]; !slices.Contains(jobs, jobID) {
+		q.withdrawals[invocation.CallID] = append(jobs, jobID)
+	}
+}
+
+// commitResult runs commit, which appends the result message of tool call
+// callID carrying the queue ids of the completion notices that call
+// withdraws, and drops those notices once that single entry has committed.
+// Notices already claimed or consumed stay to be delivered, and an error
+// result (deliver false) withdraws nothing.
+//
+// The recorder calls this inside the agent's event emission, so it must not
+// take mutation: Enqueue and Cancel hold mutation while they publish, and
+// publishing through the agent waits for that emission to end. The chosen
+// notices are claimed instead, which keeps Take from handing them to the loop
+// until the commit lands; a Cancel that races the commit is harmless, since
+// withdrawing a cancelled notice is a no-op. For the same reason the
+// cancellation events are published from their own goroutine. The committed
+// submission state reaches watchers through the store's commit observer.
+func (q *DurableQueues) commitResult(ctx context.Context, callID string, deliver bool, commit func(withdraws []string) error) error {
+	q.mu.Lock()
+	var ids []string
+	for _, jobID := range q.withdrawals[callID] {
+		if id, ok := q.keys["job:"+jobID+":terminal"]; deliver && ok && !q.cancelled[id] && !q.consumed[id] && !q.claimed[id] {
+			q.claimed[id] = true
+			ids = append(ids, id)
+		}
+	}
+	delete(q.withdrawals, callID)
+	q.mu.Unlock()
+	err := commit(ids)
+	if len(ids) == 0 {
 		return err
+	}
+	q.mu.Lock()
+	items := make([]work.QueueItem, 0, len(ids))
+	for _, id := range ids {
+		delete(q.claimed, id)
+		if err == nil {
+			q.cancelled[id] = true
+			q.removePendingLocked(id)
+			items = append(items, q.items[id])
+		}
+	}
+	q.notifyLocked()
+	q.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if q.publish != nil {
+		go func() {
+			for i := range items {
+				_ = q.publish(ctx, work.Event{Kind: "queue", Queue: &items[i], Action: "cancelled"})
+			}
+		}()
 	}
 	return nil
 }
@@ -274,10 +334,12 @@ func (q *DurableQueues) Take(ctx context.Context, kind work.QueueKind) ([]work.Q
 	return nil, nil
 }
 
-// ReleaseClaims restores uncommitted claims synchronously at a run boundary.
+// ReleaseClaims restores uncommitted claims synchronously at a run boundary
+// and forgets withdrawals whose tool results never committed.
 func (q *DurableQueues) ReleaseClaims() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	clear(q.withdrawals)
 	if len(q.claimed) == 0 {
 		return
 	}

@@ -88,6 +88,56 @@ func TestBackgroundQueueLineBoundaryCrashes(t *testing.T) {
 		}
 	})
 }
+
+// TestWaitResultWithdrawalLineBoundaryCrashes: a wait result that withdraws
+// a completion notice records both in one line, so every crash prefix holds
+// either the pending notice or the wait result, never neither (and never
+// both). A withdrawal of an unknown notice is corrupt.
+func TestWaitResultWithdrawalLineBoundaryCrashes(t *testing.T) {
+	s := newTestStore(t, t.TempDir())
+	run := Meta{RunID: "r"}
+	appendAll(t, s,
+		RunStartedRecord{Meta: run, Model: "m"},
+		MessageEntry{Meta: run, Metered: true, Message: types.AssistantMessage{Content: []types.ContentBlock{types.NewToolCall("w", "wait", json.RawMessage(`{"job_ids":["job_one"]}`))}, StopReason: types.StopToolUse}},
+		ToolStartedRecord{Meta: run, ToolCallID: "w", Tool: "wait"},
+	)
+	bgFact(t, s, "", KindQueueEnqueued, QueueEnqueued{QueueID: "completion", Kind: work.FollowUp, Text: "job done", Key: "job:job_one:terminal", SourceJobID: "job_one"})
+	appendAll(t, s,
+		ToolFinishedRecord{Meta: run, ToolCallID: "w", OK: true},
+		MessageEntry{Meta: run, Withdraws: []string{"completion"}, Message: types.ToolResultMessage{ToolCallID: "w", ToolName: "wait", Content: []types.ContentBlock{types.NewText(`{"jobs":[{"id":"job_one","state":"completed"}]}`)}}},
+	)
+	closeStore(t, s)
+	boundaryTable(t, s, func(t *testing.T, n int, l *Loaded) {
+		if n < 4 {
+			return
+		}
+		waited := false
+		for _, m := range l.Messages {
+			if v, ok := m.(types.ToolResultMessage); ok && v.ToolName == "wait" && !v.IsError {
+				waited = true
+			}
+		}
+		if waited == (len(l.Queued) == 1) {
+			t.Fatalf("wait result=%v pending notices=%d", waited, len(l.Queued))
+		}
+	})
+
+	raced := newTestStore(t, t.TempDir())
+	bgFact(t, raced, "", KindQueueEnqueued, QueueEnqueued{QueueID: "completion", Kind: work.FollowUp, Text: "job done", Key: "job:job_one:terminal", SourceJobID: "job_one"})
+	bgFact(t, raced, "", KindQueueCancelled, QueueCancelled{QueueID: "completion"})
+	appendAll(t, raced, MessageEntry{Withdraws: []string{"completion"}, Message: types.ToolResultMessage{ToolCallID: "w", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}}})
+	closeStore(t, raced)
+	if l, err := Load(context.Background(), raced.Path()); err != nil || len(l.Queued) != 0 {
+		t.Fatalf("withdrawing a cancelled notice must be a no-op: %v", err)
+	}
+
+	corrupt := newTestStore(t, t.TempDir())
+	appendAll(t, corrupt, MessageEntry{Withdraws: []string{"missing"}, Message: types.ToolResultMessage{ToolCallID: "w", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}}})
+	closeStore(t, corrupt)
+	if _, err := Load(context.Background(), corrupt.Path()); err == nil || !strings.Contains(err.Error(), "invalid queue withdrawal") {
+		t.Fatalf("unknown withdrawal loaded: %v", err)
+	}
+}
 func TestBackgroundJobLineBoundaryCrashes(t *testing.T) {
 	s := newTestStore(t, t.TempDir())
 	run := Meta{RunID: "r"}

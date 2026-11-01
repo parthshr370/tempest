@@ -1312,21 +1312,22 @@ func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.
 	}
 }
 
-// withdrawNotices drops the queued completion notices of jobs whose
-// terminal state a wait is returning: the wait result carries everything a
-// notice says, and delivering the notice afterwards would cost the model a
-// redundant turn. Settled jobs have enqueued their notice before they join,
-// so it is there to withdraw. A notice that cannot be withdrawn (already
-// claimed, or the withdrawal fails to persist) is delivered as before.
+// withdrawNotices hands the queued completion notices of jobs whose terminal
+// state a wait is returning to the queue owner, which withdraws them in the
+// same commit that records the calling tool's result: that result carries
+// everything a notice says, and delivering the notice afterwards would cost
+// the model a redundant turn. Settled jobs have enqueued their notice before
+// they join, so it is there to withdraw. Until the result commits the notice
+// stays pending, and a notice the loop already claimed is delivered as before.
 func (manager *Manager) withdrawNotices(ctx context.Context, jobIDs []string) {
 	queues, ok := manager.host.Queues.(interface {
-		WithdrawCompletion(context.Context, string) error
+		WithdrawCompletion(context.Context, string)
 	})
 	if !ok {
 		return
 	}
 	for _, jobID := range jobIDs {
-		_ = queues.WithdrawCompletion(ctx, jobID)
+		queues.WithdrawCompletion(ctx, jobID)
 	}
 }
 

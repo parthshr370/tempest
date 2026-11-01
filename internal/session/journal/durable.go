@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
@@ -502,7 +503,8 @@ func (s *Store) submissionChanges(ctx context.Context, raw []byte, meta Meta) ([
 		return nil, err
 	}
 	var queued *QueueEnqueued
-	var cancelID, consumeID, refuseID string
+	var consumeID, refuseID string
+	var cancelIDs []string
 	var finished *RunFinishedRecord
 	var started *RunStartedRecord
 	var answer string
@@ -521,10 +523,10 @@ func (s *Store) submissionChanges(ctx context.Context, raw []byte, meta Meta) ([
 			if err = json.Unmarshal(e.Payload, &q); err != nil {
 				return nil, err
 			}
-			cancelID = q.QueueID
+			cancelIDs = []string{q.QueueID}
 		}
 	case MessageEntry:
-		consumeID = e.QueueID
+		consumeID, cancelIDs = e.QueueID, e.Withdraws
 		for _, b := range assistantBlocks(e.Message) {
 			if b.Type == "text" {
 				answer += b.Text
@@ -565,7 +567,7 @@ func (s *Store) submissionChanges(ctx context.Context, raw []byte, meta Meta) ([
 		}
 		return []durable.Change{makeChange(durable.Submission{ID: queued.QueueID, RequestID: id, ClientNamespace: queued.ClientNamespace, State: "accepted", RequestHash: hash, Placement: string(queued.Kind), Payload: payload, QueueID: queued.QueueID})}, nil
 	}
-	if cancelID == "" && consumeID == "" && refuseID == "" && started == nil && finished == nil && !isAnswer {
+	if len(cancelIDs) == 0 && consumeID == "" && refuseID == "" && started == nil && finished == nil && !isAnswer {
 		return nil, nil
 	}
 	var changes []durable.Change
@@ -585,7 +587,7 @@ func (s *Store) submissionChanges(ctx context.Context, raw []byte, meta Meta) ([
 			case started != nil && (v.State == "running" || v.State == "consumed") && (v.LogicalRunID == "" || v.LogicalRunID == started.LogicalRunID || v.RunID == started.ContinuationOf):
 				v.RunID, v.LogicalRunID = started.RunID, started.LogicalRunID
 				changed = true
-			case cancelID != "" && v.QueueID == cancelID:
+			case v.QueueID != "" && slices.Contains(cancelIDs, v.QueueID):
 				v.State = "withdrawn"
 				changed = true
 			case refuseID != "" && v.QueueID == refuseID:

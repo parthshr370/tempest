@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
@@ -69,9 +70,11 @@ func TestDurableQueueAckRetryCancelAndClaims(t *testing.T) {
 	}
 }
 
-// TestDurableQueueWithdrawCompletion: a completion notice withdrawn because
-// wait returned the job stays withdrawn after a reload, while a notice the
-// loop already claimed is still delivered.
+// TestDurableQueueWithdrawCompletion: wait only marks a notice for
+// withdrawal; the commit of that call's result withdraws it, in the same
+// entry. A reload before that commit still has the notice, and one after it
+// has neither the notice nor a redelivery. Waits outside a tool call, error
+// results and notices the loop already claimed withdraw nothing.
 func TestDurableQueueWithdrawCompletion(t *testing.T) {
 	ctx := context.Background()
 	s := queueStore(t)
@@ -79,39 +82,99 @@ func TestDurableQueueWithdrawCompletion(t *testing.T) {
 	notice := func(jobID string) work.QueueInput {
 		return work.QueueInput{Kind: work.FollowUp, Text: "job " + jobID + " completed", Key: "job:" + jobID + ":terminal", SourceJobID: jobID}
 	}
+	call := func(id string) context.Context {
+		return work.WithInvocation(ctx, work.Invocation{RunID: "run", CallID: id, ToolCallID: "raw"})
+	}
+	result := func(callID string, isError bool) {
+		t.Helper()
+		err := q.commitResult(ctx, callID, !isError, func(withdraws []string) error {
+			// A notice being withdrawn is not handed to the loop meanwhile.
+			if len(withdraws) > 0 {
+				if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) > 0 {
+					t.Errorf("took %+v while withdrawing %v: %v", taken, withdraws, err)
+				}
+			}
+			return s.Append(ctx, journal.MessageEntry{Withdraws: withdraws, Message: types.ToolResultMessage{ToolCallID: "raw", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}, IsError: isError}})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	reload := func() *journal.Loaded {
+		t.Helper()
+		loaded, err := journal.Load(ctx, s.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return loaded
+	}
 	if _, err := q.Enqueue(ctx, notice("job_waited")); err != nil {
 		t.Fatal(err)
 	}
-	if err := q.WithdrawCompletion(ctx, "job_waited"); err != nil {
-		t.Fatal(err)
+	q.WithdrawCompletion(ctx, "job_waited")
+	q.WithdrawCompletion(call("wait:0"), "job_waited")
+	q.WithdrawCompletion(call("wait:0"), "job_never_finished")
+	if len(q.Snapshot()) != 1 || len(reload().Queued) != 1 {
+		t.Fatalf("notice withdrawn before the wait result committed: %+v", q.Snapshot())
 	}
-	if err := q.WithdrawCompletion(ctx, "job_never_finished"); err != nil {
-		t.Fatal("no notice to withdraw", err)
-	}
+	result("wait:0", false)
 	if pending, _ := q.Pending(); pending || len(q.PendingJobIDs()) != 0 {
 		t.Fatalf("withdrawn notice still pending: %+v", q.Snapshot())
 	}
-	loaded, err := journal.Load(ctx, s.Path())
-	if err != nil || len(loaded.Queued) != 0 {
-		t.Fatalf("withdrawal lost on reload: %+v %v", loaded.Queued, err)
+	loaded := reload()
+	if len(loaded.Queued) != 0 {
+		t.Fatalf("withdrawal lost on reload: %+v", loaded.Queued)
 	}
 	restored := NewDurableQueues(s, loaded, nil)
 	if again, err := restored.Enqueue(ctx, notice("job_waited")); err != nil || len(restored.Snapshot()) != 0 || again.SourceJobID != "job_waited" {
 		t.Fatalf("redelivery after reload: %+v %v", again, err)
 	}
 
-	claimed, err := q.Enqueue(ctx, notice("job_claimed"))
+	kept, err := q.Enqueue(ctx, notice("job_kept"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) != 1 || taken[0].ID != claimed.ID {
+	q.WithdrawCompletion(call("wait:1"), "job_kept")
+	result("wait:1", true)
+	if got := q.Snapshot(); len(got) != 1 || got[0].ID != kept.ID || len(reload().Queued) != 1 {
+		t.Fatalf("error result withdrew the notice: %+v", got)
+	}
+	if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) != 1 || taken[0].ID != kept.ID {
 		t.Fatalf("take=%+v %v", taken, err)
 	}
-	if err := q.WithdrawCompletion(ctx, "job_claimed"); err != nil {
-		t.Fatal(err)
-	}
-	if got := q.Snapshot(); len(got) != 1 || got[0].ID != claimed.ID {
+	q.WithdrawCompletion(call("wait:2"), "job_kept")
+	result("wait:2", false)
+	if got := q.Snapshot(); len(got) != 1 || got[0].ID != kept.ID || len(reload().Queued) != 1 {
 		t.Fatalf("claimed notice withdrawn: %+v", got)
+	}
+	q.WithdrawCompletion(call("wait:3"), "job_kept")
+	q.ReleaseClaims()
+	if len(q.withdrawals) != 0 {
+		t.Fatalf("withdrawal outlived its run: %+v", q.withdrawals)
+	}
+
+	// The recorder commits inside the agent's emission, and Enqueue publishes
+	// through that emission while it holds mutation, so a withdrawing commit
+	// must not need mutation: an Enqueue during the commit completes.
+	q.WithdrawCompletion(call("wait:4"), "job_kept")
+	err = q.commitResult(ctx, "wait:4", true, func(withdraws []string) error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := q.Enqueue(ctx, notice("job_late"))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("enqueue blocked behind a withdrawing commit")
+		}
+		return s.Append(ctx, journal.MessageEntry{Withdraws: withdraws, Message: types.ToolResultMessage{ToolCallID: "raw", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}}})
+	})
+	if got := q.Snapshot(); err != nil || len(got) != 1 || got[0].SourceJobID != "job_late" || len(reload().Queued) != 1 {
+		t.Fatalf("withdraw during enqueue: %+v %v", got, err)
 	}
 }
 func TestDurableQueueConcurrentKeyAndBounds(t *testing.T) {
