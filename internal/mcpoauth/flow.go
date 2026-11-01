@@ -691,12 +691,17 @@ func (t tokenResponse) validate() error {
 	return nil
 }
 
-// expiry converts expires_in, a number or a quoted number of seconds; none
-// means the token's lifetime is unknown.
+// maxLifetime bounds a stated token lifetime; a longer one, which a
+// time.Duration may not even hold, is treated as unknown.
+const maxLifetime = 100 * 365 * 24 * time.Hour
+
+// expiry converts expires_in, a number or a quoted number of seconds; none,
+// or one that is not a positive number of at most maxLifetime, means the
+// token's lifetime is unknown and it is used until the server rejects it.
 func (t tokenResponse) expiry(now time.Time) time.Time {
 	raw := strings.Trim(string(bytes.TrimSpace(t.ExpiresIn)), `"`)
 	seconds, err := strconv.ParseFloat(raw, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || !(seconds > 0 && seconds <= maxLifetime.Seconds()) {
 		return time.Time{}
 	}
 	return now.Add(time.Duration(seconds * float64(time.Second)))
