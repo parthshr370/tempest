@@ -29,6 +29,13 @@ const (
 	// everything streamed since the request started is discarded; the events
 	// that follow belong to the backup model named in Fallback.To.
 	EvFallback StreamEventType = "fallback"
+	// EvAttempt reports that the request is being sent again: a retry after
+	// its backoff, or a backup model's first attempt after a switch. It is
+	// pushed right before the provider is called, so an attempt cancelled
+	// during its backoff, or between a switch and the backup's call, is never
+	// announced. Attempt is its 1-based ordinal on the current model. A
+	// request's first attempt is not announced: it starts with the request.
+	EvAttempt StreamEventType = "attempt"
 )
 
 // ModelFallback describes one switch to a backup model: the model that failed,
@@ -50,7 +57,8 @@ type ModelFallback struct {
 // toolcall_end carries the assembled ToolCall. A retry carries the discarded
 // attempt in Err (its partial content, usage and error), its ordinal in
 // Attempt and the wait before the next attempt in RetryDelay. A fallback
-// carries the discarded attempt in Err and the model switch in Fallback.
+// carries the discarded attempt in Err and the model switch in Fallback. An
+// attempt carries the ordinal of the attempt being sent in Attempt.
 type StreamEvent struct {
 	Type         StreamEventType
 	ContentIndex int
@@ -61,7 +69,7 @@ type StreamEvent struct {
 	Partial      *AssistantMessage // content arms
 	Message      *AssistantMessage // done
 	Err          *AssistantMessage // error / retry / fallback (the discarded attempt)
-	Attempt      int               // retry: 1-based ordinal of the failed attempt
+	Attempt      int               // retry: 1-based ordinal of the failed attempt; attempt: of the one being sent
 	RetryDelay   time.Duration     // retry: wait before the next attempt
 	Fallback     *ModelFallback    // fallback: the switch to the next model
 }

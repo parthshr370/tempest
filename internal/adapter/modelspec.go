@@ -240,16 +240,17 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 	endpoint, _ := url.Parse(model.BaseURL)
 	firstPartyOpenAI := endpoint != nil && endpoint.Hostname() == "api.openai.com"
 	// OpenAI's own endpoint accepts function tools for reasoning models only
-	// on the Responses API, so the openai preset speaks Responses there for
-	// every model that reasons. Current OpenAI models reason by default, so a
-	// model the catalog and settings don't describe is treated as one; a
-	// settings entry with "reasoning": false keeps Chat Completions.
+	// on the Responses API, which serves every other model too, so the
+	// openai preset speaks Responses there unless the catalog or settings
+	// say the model does not reason ("reasoning": false keeps Chat
+	// Completions). Choosing the protocol claims no capability: a model the
+	// catalog and settings don't describe stays without reasoning support,
+	// because an unknown ID (a dated snapshot, a fine-tune) may not reason.
 	// Compatible third-party endpoints and an explicit protocol keep their
 	// wire protocol.
 	if prov == "openai" && firstPartyOpenAI && cfg.Providers[prov].Protocol == "" && (model.Reasoning || !reasoningKnown) {
 		p.Protocol = "openai-responses"
 		model.API = protocolAPI(p.Protocol)
-		model.Reasoning = true
 	}
 	model.OpenAICompat = mergeOpenAICompat(p.Compatibility, model.OpenAICompat)
 	// Unknown compatible endpoints don't inherit OpenAI-only cache fields.

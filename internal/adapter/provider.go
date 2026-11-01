@@ -74,9 +74,8 @@ type RoutingConfig struct {
 	// ChatGPTCredentials is explicit so SDK users never inherit ambient sign-in.
 	ChatGPTCredentials func(context.Context) (RequestCredential, error)
 	// FallbackModels are backup model specs tried in order when ModelID is
-	// unavailable. A backup on another provider drops BaseURL, APIKey and
-	// AuthToken, which belong to the primary's endpoint, and resolves its own
-	// credential from Env.
+	// unavailable. Each backup's routing comes from [RoutingConfig.ForModel],
+	// so one on another provider resolves its own endpoint and credential.
 	FallbackModels []string
 }
 
@@ -132,7 +131,9 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 	}
 	backups := make([]ProviderRouter, 0, len(cfg.FallbackModels))
 	for _, spec := range cfg.FallbackModels {
-		backup, err := NewProviderRouter(cfg.fallbackRoute(r.Model, spec))
+		route := cfg.ForModel(spec)
+		route.FallbackModels = nil
+		backup, err := NewProviderRouter(route)
 		if err != nil {
 			return ProviderRouter{}, fmt.Errorf("fallback model %q: %w", spec, err)
 		}
@@ -141,21 +142,27 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 	return chainRouters(r, backups)
 }
 
-// fallbackRoute derives a backup model's routing from the primary's. Endpoint
-// and credential overrides were given for the primary's provider, so a backup
-// on another provider resolves its own from the provider registry and Env.
-func (cfg RoutingConfig) fallbackRoute(primary types.Model, spec string) RoutingConfig {
-	backup := cfg
-	backup.ModelID = spec
-	backup.FallbackModels = nil
-	provider := firstNonEmpty(parseModelSpec(spec).Provider, "anthropic")
-	if provider != primary.Provider {
-		backup.BaseURL, backup.APIKey, backup.AuthToken = "", "", ""
+// ForModel derives the routing for another model spec from cfg, as a backup
+// model or an agent preset on its own model needs. cfg's endpoint and
+// credential overrides (BaseURL, APIKey, AuthToken) were given for cfg's own
+// model, so a spec on another provider drops all three and resolves its own
+// from the provider registry and Env, and a spec on the same provider that
+// names another @endpoint gets no key or token. Every derived route goes
+// through here, so an override never follows a model to another provider.
+func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
+	derived := cfg
+	derived.ModelID = spec
+	from, to := parseModelSpec(cfg.ModelID), parseModelSpec(spec)
+	switch {
+	case firstNonEmpty(to.Provider, "anthropic") != firstNonEmpty(from.Provider, "anthropic"):
+		derived.BaseURL, derived.APIKey, derived.AuthToken = "", "", ""
+	case to.BaseURL != "" && to.BaseURL != firstNonEmpty(from.BaseURL, cfg.BaseURL):
+		derived.APIKey, derived.AuthToken = "", ""
 	}
-	if provider == "openai-chatgpt" {
-		backup.MaxTokens = 0
+	if to.Provider == "openai-chatgpt" {
+		derived.MaxTokens = 0
 	}
-	return backup
+	return derived
 }
 
 // chainRouters puts a primary route and its backups behind one fallback
@@ -196,6 +203,12 @@ func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route,
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
+		if issued := resolved.CredentialRoute; issued != (types.Route{}) && issued != types.RouteOf(model) {
+			// The caller's credential and endpoint parameters were issued for
+			// another provider or endpoint (a backup model, an agent on its own
+			// model); this route authenticates with its own credential.
+			resolved.APIKey, resolved.Headers, resolved.Query, resolved.NoAuth = "", nil, nil, false
+		}
 		if rt.CredentialSource != nil {
 			if model.Provider != "openai-chatgpt" || model.API != rt.Model.API || model.BaseURL != rt.Model.BaseURL || len(model.Headers) != 0 || resolved.APIKey != "" || len(resolved.Headers) != 0 || len(resolved.Query) != 0 || resolved.NoAuth {
 				return erroredStream(model, fmt.Errorf("openai-chatgpt does not allow credential, endpoint or header overrides"))

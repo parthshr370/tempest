@@ -73,11 +73,20 @@ flowchart TD
 
 OpenAI accepts function tools for reasoning models only on the Responses API; Chat
 Completions rejects a request that has both. So on `https://api.openai.com`, the
-`openai` route uses the [Responses adapter](#openai-responses) for every model that
-reasons. Current OpenAI models reason by default, so a model ID that neither the
-catalog nor the `providers.openai.models` settings describe is treated as one: it gets
-Responses, and `-reasoning` reaches it. A catalog model without reasoning, such as
-`gpt-4.1`, and a settings entry with `"reasoning": false` keep Chat Completions.
+`openai` route uses the [Responses adapter](#openai-responses), which serves every
+model, unless the catalog or the `providers.openai.models` settings say the model does
+not reason: a catalog model without reasoning, such as `gpt-4.1`, and a settings entry
+with `"reasoning": false` keep Chat Completions.
+
+Choosing Responses claims no capability. Only the catalog or a settings entry with
+`"reasoning": true` gives a model reasoning support, so a model ID neither describes
+(a dated snapshot such as `gpt-4.1-2025-04-14`, a fine-tune, a model newer than the
+catalog) gets Responses without it: `-reasoning` is ignored with a warning and the
+model reasons, or not, at OpenAI's default. The catalog lists the gpt-6 family
+(`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`, their `-pro` variants, `gpt-6.1-sol`,
+`gpt-6.1-terra` and their `-pro` variants) with reasoning, a 1,050,000-token context
+and per-token prices, so runs on them report `cost_usd`. Those prices are the
+standard tier; OpenAI's higher rate for prompts over 272,000 tokens is not modeled.
 
 Tempest never adds a reasoning effort on its own. With `-reasoning` unset or `off`,
 no effort is sent and the model reasons at OpenAI's default; it does not quietly
@@ -110,8 +119,13 @@ uses the default role's list; an empty list turns backups off for that role.
 `serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
 Each backup is a full route with its own endpoint and credential. A backup on another
-provider never inherits the primary's `@<base-url>`, key or token. `doctor` lists
-each role's backups under it.
+provider never inherits the primary's `@<base-url>`, key or token. Request-level
+credentials are bound the same way: an API key, header or query parameter a caller sets
+on the request options, and the key `GetApiKey` resolves for the primary's provider,
+were given for the primary's provider and endpoint. A backup on another provider, or
+at another endpoint, never receives them, on the switching turn or any later one; it
+authenticates with its own credential, or on later turns with the key `GetApiKey`
+resolves for the backup's provider. `doctor` lists each role's backups under it.
 
 A backup gets the request only when the model is **unavailable**, after the model's
 own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts
@@ -133,14 +147,18 @@ changing models again would restart the provider's prompt cache. The next prompt
 tries the primary again. Each switch is:
 
 - **Journaled** as a `model_fallback` record (`from`, `to`, `reason`, `attempts`,
-  `fallback_index`), synced before the backup's reply is processed. A run resumed
-  after a crash stays on the recorded backup. If the backup is no longer configured,
-  the run resumes on its primary with a warning.
+  `fallback_index`) before the backup is called: the backup gets the request only
+  after the record is written, and if it cannot be written the run stops with that
+  error instead. A run resumed after a crash stays on the recorded backup. If the
+  backup is no longer configured, the run resumes on its primary with a warning.
 - **Published** as a `tempest/model_fallback` update on stream-json, ACP, Go
   watchers and `serve`, and as an A2A task status message.
 - **Accounted** to the model that answered: each assistant message, its usage record
-  and its cost carry the backup's provider, model and price. The failed attempts stay
-  in the transcript as errored messages with the usage the primary reported.
+  and its cost carry the backup's provider, model and price. A failed attempt that had
+  started streaming stays in the transcript as an errored message with the usage the
+  provider reported. One that failed before streaming (an HTTP error such as the 503
+  or 404 that caused the switch) has no message: its record is the log line, the
+  `PostModelRequest` hook and the switch's `model_fallback` record.
 
 A cost budget must be enforceable for every backup too. A backup with an unknown
 price is refused at startup, like the primary.
@@ -524,8 +542,11 @@ only rewritten by compaction, and the tool list is in name order.
 and each entry's `source` URL and `verified_at` date. Most direct-provider entries
 retain the imported snapshot's date. GPT-5.6 Luna's route and metadata were checked
 against OpenAI's model page on 2026-10-21. OpenRouter entries use the public
-discovery snapshot from that date. Discovery confirms exact IDs and advertised
-metadata, not a successful generation request.
+discovery snapshot from that date. The direct `openai` gpt-6 family entries take
+their context, output limit, standard-tier prices and reasoning support from the
+OpenRouter discovery entries `openai/gpt-6-*` and `openai/gpt-6.1-*` on 2026-11-01;
+those are public list prices, not a statement of OpenAI's bill. Discovery confirms
+exact IDs and advertised metadata, not a successful generation request.
 
 Routes use the vendor family for catalog lookup without changing the wire model ID:
 Responses uses OpenAI metadata, Vertex uses Google or Anthropic metadata (ignoring

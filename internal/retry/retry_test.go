@@ -131,13 +131,13 @@ func TestRetryAttemptsHintsAndDiscardedAttempt(t *testing.T) {
 	if source.calls != 2 || len(sleeper.delays) != 1 || sleeper.delays[0] != 500*time.Millisecond {
 		t.Fatalf("calls=%d delays=%v", source.calls, sleeper.delays)
 	}
-	if got := eventTypes(events); got != "start retry start text_start text_delta done" {
+	if got := eventTypes(events); got != "start retry attempt start text_start text_delta done" {
 		t.Fatalf("events = %s", got)
 	}
 	if retry := events[1]; retry.Attempt != 1 || retry.RetryDelay != 500*time.Millisecond || retry.Err == nil || retry.Err.ErrorMessage != "connection reset" || retry.Err.ErrorCode != string(CodeNetworkFailure) || retry.Err.StopReason != types.StopError {
 		t.Fatalf("retry event = %+v err=%+v", retry, retry.Err)
 	}
-	if events[4].Partial == nil || events[4].Partial.Content[0].Text != "ok" {
+	if events[2].Attempt != 2 || events[5].Partial == nil || events[5].Partial.Content[0].Text != "ok" {
 		t.Fatalf("events = %+v", events)
 	}
 	source.options[0].Headers["attempt"] = "one"
@@ -163,14 +163,14 @@ func TestRetryAfterOutputDiscardsAttempt(t *testing.T) {
 	}
 	out := r.Stream(context.Background(), testModel(), types.Context{}, nil)
 	events := collect(out)
-	if source.calls != 2 || eventTypes(events) != "start thinking_delta retry start text_delta done" {
+	if source.calls != 2 || eventTypes(events) != "start thinking_delta retry attempt start text_delta done" {
 		t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 	}
 	discarded := events[2].Err
 	if discarded.Content[0].Thinking != "Let's look" || discarded.Usage.Input != 100 || discarded.ErrorCode != string(CodeStreamInterrupted) {
 		t.Fatalf("discarded attempt = %+v", discarded)
 	}
-	if partial := events[4].Partial; len(partial.Content) != 1 || partial.Content[0].Text != "done" {
+	if partial := events[5].Partial; len(partial.Content) != 1 || partial.Content[0].Text != "done" {
 		t.Fatalf("second attempt partial carries the discarded attempt: %+v", partial)
 	}
 	message, err := out.Result(context.Background())

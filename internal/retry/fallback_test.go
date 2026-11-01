@@ -2,6 +2,9 @@ package retry
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -195,5 +198,68 @@ func TestFallbackEndsWithTheLastModelsFailure(t *testing.T) {
 	}
 	if _, err := NewFallback([]Candidate{{Model: primary}}); err == nil {
 		t.Fatal("nil stream accepted")
+	}
+}
+
+// The backup is called only after AdmitFallback accepted the switch, and its
+// call is announced. A refused switch or a request cancelled before admission
+// returns never reaches the backup.
+func TestFallbackCallsTheBackupOnlyAfterAdmission(t *testing.T) {
+	primary := types.Model{Provider: "a", API: "a-api", ID: "primary"}
+	backup := types.Model{Provider: "b", API: "b-api", ID: "backup"}
+	errRefused := errors.New("journal unavailable")
+	for _, tc := range []struct {
+		name       string
+		admit      func(context.Context, context.CancelFunc, *chainProvider) error
+		backupCall bool
+		code       Code
+	}{
+		{"admitted", func(_ context.Context, _ context.CancelFunc, provider *chainProvider) error {
+			if calls := provider.called(); len(calls) != 1 {
+				return fmt.Errorf("backup called before admission: %v", calls)
+			}
+			return nil
+		}, true, ""},
+		{"refused", func(context.Context, context.CancelFunc, *chainProvider) error { return errRefused }, false, CodeProviderFailure},
+		{"cancelled while admitting", func(ctx context.Context, cancel context.CancelFunc, _ *chainProvider) error {
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		}, false, CodeCanceled},
+		{"cancelled once admitted", func(_ context.Context, cancel context.CancelFunc, _ *chainProvider) error {
+			cancel()
+			return nil
+		}, false, CodeCanceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &chainProvider{status: map[string]int{"primary": 503}}
+			chain, err := NewFallback([]Candidate{{primary, provider}, {backup, provider}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			opts := &types.SimpleStreamOptions{}
+			opts.AdmitFallback = func(admitCtx context.Context, fallback types.ModelFallback) error {
+				if fallback.To.ID != "backup" {
+					return fmt.Errorf("admitting %+v", fallback)
+				}
+				return tc.admit(admitCtx, cancel, provider)
+			}
+			events, final := drainChain(t, chain.Stream(ctx, primary, types.Context{}, opts))
+			calledBackup := slices.Contains(provider.called(), "backup")
+			if calledBackup != tc.backupCall {
+				t.Fatalf("backup called = %v, want %v (events %s)", calledBackup, tc.backupCall, eventTypes(events))
+			}
+			if tc.backupCall {
+				if eventTypes(events) != "fallback attempt done" || events[1].Attempt != 1 || final.Model != "backup" {
+					t.Fatalf("events = %s, final = %+v", eventTypes(events), final)
+				}
+				return
+			}
+			if eventTypes(events) != "fallback error" || final.ErrorCode != string(tc.code) {
+				t.Fatalf("events = %s, final = %+v", eventTypes(events), final)
+			}
+		})
 	}
 }

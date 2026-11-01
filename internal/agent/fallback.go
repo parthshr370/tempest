@@ -24,6 +24,9 @@ func (run *loopRun) restoreFallback(choice *FallbackChoice) {
 		slog.Warn("recorded backup model is not in the fallback chain; resuming on the primary model", "backup", choice.Model, "fallback_index", choice.Index)
 		return
 	}
+	if run.config.CredentialRoute == (types.Route{}) {
+		run.config.CredentialRoute = types.RouteOf(run.config.Model)
+	}
 	run.config.Model = backups[choice.Index-1]
 	run.fallbackIndex = choice.Index
 	slog.Info("resuming on recorded backup model", "model", choice.Model, "fallback_index", choice.Index)
@@ -59,7 +62,9 @@ func newModelRequest(config AgentLoopConfig, turnID string, fallbackIndex int) *
 	return &modelRequest{hooks: config.Hooks, turnID: turnID, role: role, model: config.Model, index: fallbackIndex}
 }
 
-// begin reports the start of the next attempt on the current model.
+// begin reports the start of the next attempt on the current model: the
+// request's first, or one the stream announced with [types.EvAttempt] when it
+// was actually sent.
 func (r *modelRequest) begin() {
 	r.attempt++
 	r.open = true
@@ -100,18 +105,11 @@ func (r *modelRequest) finish(message types.AssistantMessage) {
 	}
 }
 
-// retry closes a discarded attempt and opens the next one on the same model.
-func (r *modelRequest) retry(failed *types.AssistantMessage) {
-	r.end(requestFailed, failed)
-	r.begin()
-}
-
-// switchModel closes the failed model's last attempt and opens the first
-// attempt on the backup model.
+// switchModel closes the failed model's last attempt. The backup's first
+// attempt opens when it is sent.
 func (r *modelRequest) switchModel(fallback types.ModelFallback, failed *types.AssistantMessage) {
 	r.end(requestFailed, failed)
 	r.model, r.index, r.attempt = fallback.To, fallback.Index, 0
-	r.begin()
 }
 
 func (r *modelRequest) observe(event string, request *hooks.ModelRequest) {

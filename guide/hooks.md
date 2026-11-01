@@ -86,7 +86,10 @@ Replay never runs shell hooks. Interrupted effects are not retried automatically
 
 `PreModelRequest` and `PostModelRequest` observe every request the agent loop sends
 to a model, as in Codex. Each **attempt** counts: a retry or a switch to a
-[backup model](providers.md#backup-models) gets its own pair. They are
+[backup model](providers.md#backup-models) gets its own pair. An attempt is reported
+when it is actually sent, after its retry backoff and after the switch is journaled,
+so a retry cancelled during its backoff, or a backup cancelled before it was called,
+gets no pair. They are
 **observation-only**: output and exit codes are logged and never interpreted, so they
 cannot block, rewrite or stop a request. Matchers are ignored.
 

@@ -225,7 +225,8 @@ overflow) are not retried. When the attempts run out, the run stops with `error`
 naming the attempt count and the last cause, unless the role has
 [backup models](providers.md#backup-models): then the next backup gets the same
 request, and the run stays on it until it ends. The switch is journaled as
-`model_fallback`, so a resumed run keeps it.
+`model_fallback` before the backup is called, so a crash at any later point resumes
+on the backup, and a switch the journal cannot record stops the run instead.
 
 ## Output formats
 

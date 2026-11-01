@@ -26,11 +26,13 @@ import (
 // httpStatusProvider is a faux provider behind an HTTP status. While status
 // is an error, every call reports it through OnResponse and fails the way a
 // provider's HTTP error path does; otherwise the faux provider answers.
+// onCall, when set, runs at the start of every call.
 type httpStatusProvider struct {
 	faux   *faux.Faux
 	mu     sync.Mutex
 	status int
 	calls  int
+	onCall func()
 }
 
 func newStatusProvider(provider, model string, status int) *httpStatusProvider {
@@ -53,7 +55,11 @@ func (p *httpStatusProvider) Stream(ctx context.Context, model types.Model, c ty
 	p.mu.Lock()
 	status := p.status
 	p.calls++
+	onCall := p.onCall
 	p.mu.Unlock()
+	if onCall != nil {
+		onCall()
+	}
 	if status == 0 {
 		return p.faux.StreamSimple(ctx, model, c, opts)
 	}
@@ -282,9 +288,32 @@ func TestFallbackCancelDuringBackupAborts(t *testing.T) {
 	store := newFallbackStore(t)
 	rig := newFallbackRig(t, store, http.StatusServiceUnavailable, nil, nil)
 	rig.backup.faux.SetResponses(func(c types.Context, opts *types.StreamOptions, state faux.State, model types.Model) (types.AssistantMessage, error) {
+		rig.agent.Abort()
 		<-state.Context.Done()
 		return faux.Respond(faux.Text("too late"))(c, opts, state, model)
 	})
+	result, err := rig.agent.PromptText(context.Background(), "do it")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != agent.StopAborted {
+		t.Fatalf("run = %+v err=%v", result, result.Err)
+	}
+	if rig.backup.callCount() != 1 || rig.primary.callCount() != fallbackAttempts {
+		t.Fatalf("calls primary=%d backup=%d", rig.primary.callCount(), rig.backup.callCount())
+	}
+	loaded := loadJournal(t, store.Path())
+	if !loaded.Runs[0].Finished || loaded.Runs[0].StopReason != string(agent.StopAborted) || loaded.Runs[0].Fallback == nil {
+		t.Fatalf("journal run = %+v", loaded.Runs[0])
+	}
+}
+
+// Cancelling after the switch was admitted but before the backup was called
+// never calls the backup and reports no backup attempt to the hooks.
+func TestFallbackCancelAtTheSwitchNeverCallsTheBackup(t *testing.T) {
+	runner, path := hookRecorder(t, 0)
+	store := newFallbackStore(t)
+	rig := newFallbackRig(t, store, http.StatusServiceUnavailable, nil, runner)
 	rig.agent.Subscribe(func(_ context.Context, ev agent.AgentEvent) error {
 		if ev.Type == agent.EventModelFallback {
 			rig.agent.Abort()
@@ -295,17 +324,116 @@ func TestFallbackCancelDuringBackupAborts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.StopReason != agent.StopAborted {
-		t.Fatalf("run = %+v err=%v", result, result.Err)
+	if result.StopReason != agent.StopAborted || rig.backup.callCount() != 0 || rig.primary.callCount() != fallbackAttempts {
+		t.Fatalf("run = %+v calls primary=%d backup=%d", result, rig.primary.callCount(), rig.backup.callCount())
 	}
-	// The abort can land before the backup's request is sent; either way the
-	// backup gets at most the one request and the primary no more.
-	if rig.backup.callCount() > 1 || rig.primary.callCount() != fallbackAttempts {
-		t.Fatalf("calls primary=%d backup=%d", rig.primary.callCount(), rig.backup.callCount())
+	runner.FlushObservations(context.Background())
+	inputs := readHookInputs(t, path)
+	if len(inputs) != 2*fallbackAttempts {
+		t.Fatalf("hook inputs = %d, want %d (the primary's attempts only): %v", len(inputs), 2*fallbackAttempts, inputs)
 	}
-	loaded := loadJournal(t, store.Path())
-	if !loaded.Runs[0].Finished || loaded.Runs[0].StopReason != string(agent.StopAborted) || loaded.Runs[0].Fallback == nil {
-		t.Fatalf("journal run = %+v", loaded.Runs[0])
+	for _, input := range inputs {
+		if input["model"] != "p1" {
+			t.Fatalf("hook reported a backup attempt that was never sent: %v", input)
+		}
+	}
+}
+
+// The switch to the backup is in the journal before the backup is called, so
+// a crash at any point after the backup starts resumes on the backup.
+func TestFallbackSwitchIsJournaledBeforeTheBackupIsCalled(t *testing.T) {
+	store := newFallbackStore(t)
+	rig := newFallbackRig(t, store, http.StatusServiceUnavailable, nil, nil)
+	rig.backup.faux.SetResponses(faux.Respond(faux.Text("answered by backup")))
+	var recordedAtCall []*journal.ModelFallbackRecord
+	rig.backup.onCall = func() {
+		loaded, err := journal.Load(context.Background(), store.Path())
+		if err != nil {
+			t.Errorf("load at backup call: %v", err)
+			return
+		}
+		recordedAtCall = append(recordedAtCall, loaded.Runs[0].Fallback)
+	}
+	// A listener that is slow to take the switch holds the backup back.
+	const slowListener = 50 * time.Millisecond
+	rig.agent.Subscribe(func(_ context.Context, ev agent.AgentEvent) error {
+		if ev.Type == agent.EventModelFallback {
+			time.Sleep(slowListener)
+			if rig.backup.callCount() != 0 {
+				t.Error("backup called while a listener was still taking the switch")
+			}
+		}
+		return nil
+	})
+	result, err := rig.agent.PromptText(context.Background(), "do it")
+	if err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run = %+v err=%v", result, err)
+	}
+	if len(recordedAtCall) != 1 || recordedAtCall[0] == nil || recordedAtCall[0].To != "backup:b1" {
+		t.Fatalf("switch recorded when the backup was called = %+v", recordedAtCall)
+	}
+}
+
+// A switch that cannot be journaled never reaches the backup: the run stops
+// with the journal's error instead of spending on an unrecorded model.
+func TestFallbackSwitchThatCannotBeJournaledNeverCallsTheBackup(t *testing.T) {
+	store := newFallbackStore(t)
+	rig := newFallbackRig(t, store, http.StatusServiceUnavailable, nil, nil)
+	rig.backup.faux.SetResponses(faux.Respond(faux.Text("must not answer")))
+	// The journal fails right after the primary's last attempt, so its next
+	// append is the switch.
+	rig.primary.onCall = func() {
+		if rig.primary.callCount() == fallbackAttempts {
+			if err := store.Close(); err != nil {
+				t.Errorf("close journal: %v", err)
+			}
+		}
+	}
+	result, _ := rig.agent.PromptText(context.Background(), "do it")
+	if result.Err == nil || rig.backup.callCount() != 0 {
+		t.Fatalf("run = %+v backup calls=%d", result, rig.backup.callCount())
+	}
+	if loaded := loadJournal(t, store.Path()); loaded.Runs[0].Fallback != nil {
+		t.Fatalf("journal has a switch the store refused: %+v", loaded.Runs[0].Fallback)
+	}
+}
+
+// A crash while the switch is being taken, after the journal append, leaves
+// a run that resumes on the backup; the crashed run never called it.
+func TestFallbackCrashAtTheSwitchResumesOnTheBackup(t *testing.T) {
+	ctx := context.Background()
+	store := newFallbackStore(t)
+	path := store.Path()
+	rig := newFallbackRig(t, store, http.StatusServiceUnavailable, nil, nil)
+	rig.backup.faux.SetResponses(faux.Respond(faux.Text("must not answer")))
+	rig.agent.Subscribe(func(_ context.Context, ev agent.AgentEvent) error {
+		if ev.Type == agent.EventModelFallback {
+			if err := store.Close(); err != nil {
+				t.Errorf("close at crash: %v", err)
+			}
+			return errFallbackCrash
+		}
+		return nil
+	})
+	_, _ = rig.agent.PromptText(ctx, "do it")
+	if rig.backup.callCount() != 0 {
+		t.Fatalf("crashed run called the backup %d times", rig.backup.callCount())
+	}
+
+	resumed, loaded, err := journal.OpenForResume(ctx, path, journal.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = resumed.Close() })
+	after := newFallbackRig(t, resumed, 0, loaded.Messages, nil)
+	after.primary.faux.SetResponses(faux.Respond(faux.Text("primary must not answer")))
+	after.backup.faux.SetResponses(faux.Respond(faux.Text("resumed on backup")))
+	result, err := after.agent.Continue(ctx)
+	if err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("resumed run = %+v err=%v", result, err)
+	}
+	if after.primary.callCount() != 0 || after.backup.callCount() != 1 {
+		t.Fatalf("resumed calls primary=%d backup=%d", after.primary.callCount(), after.backup.callCount())
 	}
 }
 
@@ -501,5 +629,46 @@ func TestModelRequestHooksNeverDelayTheRequest(t *testing.T) {
 	runner.FlushObservations(cancelled)
 	if time.Since(flushStarted) >= hookSleepSeconds*time.Second/2 {
 		t.Fatal("cancelled flush waited for the sleeping hook")
+	}
+}
+
+// blockingSleeper signals when a retry backoff starts and waits for the
+// request's cancellation.
+type blockingSleeper struct{ entered chan struct{} }
+
+func (s blockingSleeper) Sleep(ctx context.Context, _ time.Duration) error {
+	close(s.entered)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A retry that is cancelled during its backoff was never sent, so the hooks
+// see only the attempt that was: one PreModelRequest and its failed
+// PostModelRequest.
+func TestModelRequestHooksSkipARetryCancelledInItsBackoff(t *testing.T) {
+	runner, path := hookRecorder(t, 0)
+	rig := newFallbackRig(t, newFallbackStore(t), http.StatusServiceUnavailable, nil, runner)
+	sleeper := blockingSleeper{entered: make(chan struct{})}
+	policy := retry.DefaultConfig()
+	policy.Sleeper = sleeper
+	retrier, err := retry.New(rig.primary, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.agent.StreamFn = retrier.Stream
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = rig.agent.PromptText(ctx, "cancel the backoff")
+	}()
+	<-sleeper.entered
+	cancel()
+	<-done
+	runner.FlushObservations(context.Background())
+	inputs := readHookInputs(t, path)
+	if rig.primary.callCount() != 1 || len(inputs) != 2 || inputs[0]["hook_event_name"] != "PreModelRequest" || inputs[1]["status"] != "failed" {
+		t.Fatalf("provider calls = %d, hook inputs = %v", rig.primary.callCount(), inputs)
 	}
 }

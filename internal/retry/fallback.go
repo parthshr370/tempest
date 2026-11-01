@@ -56,8 +56,11 @@ func (f *Fallback) Models() []types.Model {
 // Stream sends the request to model and, while the answering model is
 // unavailable, to each later model in the chain. A model that is not in the
 // chain is served by the primary's stream, as a single-model route would.
-// Every switch is announced with a [types.EvFallback] event before the next
-// model's events.
+// Every switch is announced with a [types.EvFallback] event, then admitted
+// through opts.AdmitFallback when set, before the backup model is called; the
+// backup's call is announced with a [types.EvAttempt] event. A caller that
+// records switches uses admission so a crash can never leave a backup's
+// request without its recorded switch.
 func (f *Fallback) Stream(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 	output := stream.NewAssistantStream(model.API, model.Provider, model.ID)
 	go f.produce(ctx, output, f.index(model), model, c, opts)
@@ -81,6 +84,12 @@ func SameModel(a, b types.Model) bool {
 }
 
 func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, index int, model types.Model, c types.Context, opts *types.SimpleStreamOptions) {
+	// The caller's credentials were issued for the model it asked for; the
+	// provider route of a backup drops them (see types.StreamOptions).
+	issued := types.RouteOf(model)
+	if opts != nil && opts.CredentialRoute != (types.Route{}) {
+		issued = opts.CredentialRoute
+	}
 	for {
 		var status int
 		attemptOpts := cloneOptions(opts, func(received types.ProviderResponse, receivedModel types.Model) error {
@@ -90,6 +99,10 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 			}
 			return nil
 		})
+		attemptOpts.CredentialRoute = issued
+		// Admission belongs to this chain's switches, not to anything the
+		// candidate's stream might chain itself.
+		attemptOpts.AdmitFallback = nil
 		terminal, attempts, done := forwardModel(ctx, output, model, f.chain[index].Stream.Stream(ctx, model, c, attemptOpts))
 		if done {
 			return
@@ -105,8 +118,23 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 		if discarded == nil {
 			discarded = &types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, StopReason: types.StopError, ErrorCode: string(reason), Timestamp: time.Now().UnixMilli()}
 		}
-		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &types.ModelFallback{From: model, To: next, Reason: string(reason), Attempts: attempts, Index: index}})
+		fallback := types.ModelFallback{From: model, To: next, Reason: string(reason), Attempts: attempts, Index: index}
+		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &fallback})
 		model = next
+		// The backup is called only once the caller has admitted the switch
+		// (the agent loop journals it first) and nothing cancelled the request
+		// meanwhile; only then is its first attempt announced.
+		if opts != nil && opts.AdmitFallback != nil {
+			if err := opts.AdmitFallback(ctx, fallback); err != nil && ctx.Err() == nil {
+				output.Push(failedEvent(model, CodeProviderFailure, "switch to backup model "+next.Provider+":"+next.ID+" not admitted: "+err.Error()))
+				return
+			}
+		}
+		if ctx.Err() != nil {
+			output.Push(failedEvent(model, CodeCanceled, "fallback canceled"))
+			return
+		}
+		output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: 1})
 	}
 }
 

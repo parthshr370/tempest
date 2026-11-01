@@ -458,9 +458,7 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 			if c.customStream {
 				return cfg, errors.New("preset model unavailable from custom provider")
 			}
-			provider := c.providerConfig
-			provider.ModelID = preset.Model
-			router, err := adapter.NewProviderRouter(provider)
+			router, err := adapter.NewProviderRouter(c.providerConfig.ForModel(preset.Model))
 			if err != nil {
 				return cfg, err
 			}

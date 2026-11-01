@@ -535,8 +535,13 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return run.accountUsage(ctx, attempt)
 				}
 				// A switch to a backup model sticks for the rest of the run:
-				// changing models again would reset the provider's cache.
+				// changing models again would reset the provider's cache. The
+				// caller's request credentials stay bound to the model they
+				// were given for, so a later turn on the backup never sends them.
 				switched := func(fallback types.ModelFallback) error {
+					if config.CredentialRoute == (types.Route{}) {
+						config.CredentialRoute = types.RouteOf(fallback.From)
+					}
 					config.Model = fallback.To
 					run.fallbackIndex = fallback.Index
 					return run.emit(ctx, AgentEvent{Type: EventModelFallback, Fallback: &fallback})
@@ -849,9 +854,13 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // discarded accounts for it. The next attempt starts a new message. Tool calls
 // in a discarded attempt never run: they run only after the final message.
 // A switch to a backup model ([types.EvFallback]) discards the attempt the
-// same way, then reports the switch so the run stays on the backup.
+// same way and reports the switch; the backup is called only after that
+// report returned (it journals the switch), through the stream's
+// AdmitFallback, so the switch is durable before the backup can spend.
 //
-// Every attempt is reported to the model-request hooks without waiting.
+// Every attempt is reported to the model-request hooks without waiting: the
+// first when the request starts, each later one at its [types.EvAttempt],
+// when it is actually sent.
 //
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
@@ -873,15 +882,34 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		Tools:        tools,
 	}
 
-	resolvedAPIKey := config.APIKey
+	// The options' credentials were given for CredentialRoute (the run's
+	// primary once it switched, see switched), GetAPIKey's key for
+	// config.Model's own provider. A route other than the one a credential
+	// is bound to drops it (see [types.StreamOptions]).
+	options := config.SimpleStreamOptions
+	if options.CredentialRoute == (types.Route{}) {
+		options.CredentialRoute = types.RouteOf(config.Model)
+	}
 	if config.GetAPIKey != nil {
 		if key := config.GetAPIKey(config.Model.Provider); key != "" {
-			resolvedAPIKey = key
+			options.APIKey = key
+			if route := types.RouteOf(config.Model); route != options.CredentialRoute {
+				options.Headers, options.Query, options.NoAuth = nil, nil, false
+				options.CredentialRoute = route
+			}
 		}
 	}
-
-	options := config.SimpleStreamOptions
-	options.APIKey = resolvedAPIKey
+	// admitted carries the outcome of reporting each switch to the fallback
+	// chain, which waits for it before calling the backup.
+	admitted := make(chan error, 1)
+	options.AdmitFallback = func(admitCtx context.Context, _ types.ModelFallback) error {
+		select {
+		case err := <-admitted:
+			return err
+		case <-admitCtx.Done():
+			return admitCtx.Err()
+		}
+	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	request := observers.request
 	request.begin()
@@ -955,16 +983,21 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 				}
 			}
 			if event.Type == types.EvRetry || event.Fallback == nil {
-				request.retry(&attempt)
+				request.end(requestFailed, &attempt)
 				continue
 			}
 			fallback := *event.Fallback
 			slog.Warn("assistant stream fallback", "from", modelSpec(fallback.From), "to", modelSpec(fallback.To), "reason", fallback.Reason, "attempts", fallback.Attempts, "fallback_index", fallback.Index, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes))
 			request.switchModel(fallback, &attempt)
 			config.Model = fallback.To
-			if err := observers.switched(fallback); err != nil {
+			err := observers.switched(fallback)
+			admitted <- err
+			if err != nil {
 				return attempt, err
 			}
+
+		case types.EvAttempt:
+			request.begin()
 
 		case types.EvDone, types.EvError:
 			// Use background ctx for Result: we want the terminal message even

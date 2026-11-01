@@ -15,6 +15,16 @@ type AnthropicCompat struct {
 	AllowEmptySignature             *bool `json:"allowEmptySignature,omitempty"`
 }
 
+// Route is where a model's requests go: the provider and its endpoint. It is
+// the identity a per-request credential is bound to.
+type Route struct {
+	Provider string
+	BaseURL  string
+}
+
+// RouteOf returns the route requests for model go to.
+func RouteOf(model Model) Route { return Route{Provider: model.Provider, BaseURL: model.BaseURL} }
+
 // Model describes an LLM plus capability metadata (02-map-ai-agent.md A16). The
 // generic Model<TApi> collapses to a concrete struct; we only carry the
 // Anthropic compat we need.
