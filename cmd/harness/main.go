@@ -100,6 +100,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return runDoctor(args[1:], stdout, stderr)
 		case "config":
 			return runConfig(args[1:], stdout, stderr)
+		case "agents":
+			return runAgents(args[1:], stdout, stderr)
 		case "login":
 			return runLogin(args[1:], stdout, stderr)
 		case "logout":
@@ -295,8 +297,6 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.ContextFiles = inputs.ContextFiles
 	stack.Skills = inputs.Skills
 	stack.GenericRules = inputs.GenericRules
-	stack.AttachmentRegistry = attachRegistry
-	stack.AttachmentReader = attachReader
 	stack.AgentFiles = inputs.Agents
 	if opts.Config.FauxScript() == "" {
 		// Agent presets may name a model spec; route it like a role model,
@@ -306,6 +306,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return router.Model, router.StreamFn, router.Fallbacks, err
 		}
 	}
+	stack.AttachmentRegistry = attachRegistry
+	stack.AttachmentReader = attachReader
 	stack.AskUser = question.Terminal(os.Stdin, stderr)
 	processes, err := loadExtensionProcesses(opts.ExtensionConfig, stderr)
 	if err != nil {
@@ -709,6 +711,7 @@ Commands:
   logout    revoke and clear a saved ChatGPT session
   auth      show signed-in account metadata with status or list
   config    show every effective setting and the layer it came from: config show [-json] [-key k]
+  agents    list agent types defined as files, with model and source: agents list
   version   print build version
 
 Run 'tempest <command> -help' for that command's flags.
@@ -759,7 +762,7 @@ func parseExitCode(err error) int {
 func unexpectedArgument(command, arg string) error {
 	switch command {
 	case "":
-		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, config, rewind, login, logout, auth, version); see 'tempest -help'", arg)}
+		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, config, agents, rewind, login, logout, auth, version); see 'tempest -help'", arg)}
 	case "version":
 		return usageError{message: fmt.Sprintf("tempest version: unexpected argument %q; version takes no arguments", arg)}
 	default:
