@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -125,6 +126,25 @@ func buildSettingsHarness(t *testing.T) string {
 	return exe
 }
 
+// transcriptsContain reports whether any session transcript under dir holds
+// text, which is how a tool result the model received is recorded.
+func transcriptsContain(t *testing.T, dir, text string) bool {
+	t.Helper()
+	found := false
+	err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || filepath.Ext(path) != ".jsonl" {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		found = found || strings.Contains(string(data), text)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return found
+}
+
 const sessionStartMarker = `{"SessionStart":[{"hooks":[{"type":"command","command":"printf ran > marker"}]}]}`
 
 // Repository settings reach a run only through the settings resolver and
@@ -179,6 +199,53 @@ func TestCLIRepositorySettingsTrust(t *testing.T) {
 		out, _ = r.run(append(args, "-trust-project-hooks")...)
 		if requests := capture.requests(); !strings.Contains(strings.Join(requests[1:], "\n"), description) {
 			t.Fatalf("trusted run did not load the skill path\n%s", out)
+		}
+	})
+
+	t.Run("project attach outside the repository needs trust", func(t *testing.T) {
+		const sentinel = "P1_ATTACHMENT_PRIVATE_SENTINEL"
+		private := filepath.Join(t.TempDir(), "attachment.txt")
+		if err := os.WriteFile(private, []byte(sentinel), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		attach := fmt.Sprintf(`{"attach":[%q]}`, private)
+		for name, place := range map[string]func(r *settingsRun) []string{
+			"project file": func(r *settingsRun) []string { r.writeProject(attach); return nil },
+			"project profile": func(r *settingsRun) []string {
+				r.writeProject(`{"profiles":{"review":` + attach + `}}`)
+				return []string{"-profile", "review"}
+			},
+			"symlinked project file": func(r *settingsRun) []string {
+				outside := filepath.Join(t.TempDir(), "settings.json")
+				r.write(outside, attach)
+				if err := os.Symlink(outside, filepath.Join(r.repo, ".harness", "settings.json")); err != nil {
+					t.Fatal(err)
+				}
+				return nil
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				r := newSettingsRun(t, exe)
+				script := filepath.Join(t.TempDir(), "faux.json")
+				r.write(script, `[{"toolCalls":[{"id":"read-attachment","name":"attachment","arguments":{"op":"read","id":"attachment.txt"}}]},{"text":"done"}]`)
+				args := append([]string{"-p", "go", "-faux-script", script}, place(r)...)
+				// run returns whether the model was handed the file's contents.
+				run := func(extra ...string) (string, bool) {
+					sessions := filepath.Join(t.TempDir(), "sessions")
+					out, code := r.run(slices.Concat(args, []string{"-session-dir", sessions}, extra)...)
+					if code != 0 {
+						t.Fatalf("exit=%d\n%s", code, out)
+					}
+					return out, transcriptsContain(t, sessions, sentinel)
+				}
+				out, disclosed := run()
+				if disclosed || strings.Contains(out, sentinel) || !strings.Contains(out, "attach (needs -trust-project-hooks") {
+					t.Fatalf("untrusted run: disclosed=%t\n%s", disclosed, out)
+				}
+				if out, disclosed := run("-trust-project-hooks"); !disclosed {
+					t.Fatalf("trusted run did not attach the file\n%s", out)
+				}
+			})
 		}
 	})
 

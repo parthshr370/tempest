@@ -571,6 +571,7 @@ var projectGates = map[string]trustGate{
 	"permission_allow_tools":    gateExecutable,
 	"permission_deny_tools":     gateExecutable,
 	"plan":                      gateExecutable,
+	"attach":                    gateExecutable,
 	"skill_paths":               gateExecutable,
 	"agent_dir":                 gateExecutable,
 	"session_dir":               gateExecutable,

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -42,7 +43,11 @@ var gatedSamples = map[string]string{
 	"anthropic_base_url":        `"https://repo.example"`,
 	"openai_base_url":           `"https://repo.example/v1"`,
 	"web_search_url":            `"https://repo.example/search"`,
+	"model":                     `"openai:m@https://repo.example/v1"`,
+	"plan_model":                `"openai:m@https://repo.example/v1"`,
+	"smol_model":                `"openai:m@https://repo.example/v1"`,
 	"no_hooks":                  `true`,
+	"disableAllHooks":           `true`,
 	"trusted_hook_projects":     `["/"]`,
 	"trusted_provider_projects": `["/"]`,
 	"environment":               `"repo"`,
@@ -74,10 +79,10 @@ func runtimeView(c *ResolvedConfig) ResolvedConfig {
 // A key that differs from a settings key only by case or Unicode folding is
 // unknown everywhere: it never reaches decoding, whatever layer holds it.
 func TestCaseVariantKeysNeverReachDecoding(t *testing.T) {
-	keys := slices.Sorted(maps.Keys(projectGates))
-	for _, key := range keys {
-		if _, ok := gatedSamples[key]; !ok {
-			t.Fatalf("gated key %q has no sample value", key)
+	keys := slices.Sorted(maps.Keys(gatedSamples))
+	for _, setting := range projectSettingTrust {
+		if _, ok := gatedSamples[setting.key]; setting.gate != gateNone && !ok {
+			t.Fatalf("gated key %q has no sample value", setting.key)
 		}
 	}
 	baseline := newLayerWorkspace(t)
@@ -135,6 +140,250 @@ func TestCaseVariantKeysNeverReachDecoding(t *testing.T) {
 			t.Fatal("a case variant applied in a trusted project")
 		}
 	})
+}
+
+// projectSettingTrust is the trust a repository file needs before a value of
+// each settings key applies. It comes from an audit of every fileSettings
+// field for running code, reading local files into the model context,
+// writing outside the repository, widening permissions and choosing where
+// credentials go. It is written out here, not read from projectGates, so a
+// gate deleted from the resolver fails TestEveryRiskyProjectSettingNeedsTrust.
+// A key whose gate depends on its value appears once per class.
+var projectSettingTrust = []struct {
+	key   string
+	value string
+	gate  trustGate
+}{
+	// Runs code.
+	{"hooks", sessionStartHook("printf repo > marker"), gateExecutable},
+	{"mcp_config", `"repo-mcp.json"`, gateExecutable},
+	{"mcp_servers", `[{"name":"repo","transport":"stdio","command":"repo-server"}]`, gateExecutable},
+	{"lsp_config", `"repo-lsp.json"`, gateExecutable},
+	{"enable_lsp", `true`, gateExecutable},
+	{"debug_adapters", `{"repo":{"command":"repo-adapter"}}`, gateExecutable},
+	{"cloud_policy", `"repo-policy.json"`, gateExecutable},
+	{"faux_script", `"/tmp/repo-faux.json"`, gateExecutable},
+	// Reads local files into the model context.
+	{"attach", `["/outside/private.txt"]`, gateExecutable},
+	{"skill_paths", `["/outside/private-skills"]`, gateExecutable},
+	{"agent_dir", `"/outside/agent"`, gateExecutable},
+	// Writes outside the repository.
+	{"session_dir", `"/outside/sessions"`, gateExecutable},
+	{"log_file", `"/outside/repo.log"`, gateExecutable},
+	// Widens permissions.
+	{"permission_allow_tools", `["bash"]`, gateExecutable},
+	{"permission_mode_default", `"bypass"`, gateExecutable},
+	{"permission_deny_tools", `null`, gateExecutable},
+	{"plan", `false`, gateExecutable},
+	// Chooses where credentials go.
+	{"providers", `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`, gateCredentials},
+	{"anthropic_base_url", `"https://repo.example"`, gateCredentials},
+	{"openai_base_url", `"https://repo.example/v1"`, gateCredentials},
+	{"web_search_url", `"https://repo.example/search"`, gateCredentials},
+	{"model", `"openai:m@https://repo.example/v1"`, gateCredentials},
+	{"plan_model", `"openai:m@https://repo.example/v1"`, gateCredentials},
+	{"smol_model", `"openai:m@http://repo.example/v1"`, gateCredentials},
+	// Decides trust or replaces the operator's runtime.
+	{"no_hooks", `true`, gateOperator},
+	{"disableAllHooks", `true`, gateOperator},
+	{"trusted_hook_projects", `["/"]`, gateOperator},
+	{"trusted_provider_projects", `["/"]`, gateOperator},
+	{"environment", `"repo"`, gateOperator},
+	{"environments", `{"repo":{"argv":["repo-env"]}}`, gateOperator},
+	// Applies without trust.
+	{"model", `"anthropic:project"`, gateNone},
+	{"plan_model", `"anthropic:project-plan"`, gateNone},
+	{"smol_model", `"anthropic:project-smol"`, gateNone},
+	{"reasoning", `"high"`, gateNone},
+	{"plan_reasoning", `"high"`, gateNone},
+	{"smol_reasoning", `"off"`, gateNone},
+	{"max_tokens", `1234`, gateNone},
+	{"bash_timeout", `"7s"`, gateNone},
+	{"log_level", `"debug"`, gateNone},
+	{"log_file_max_bytes", `4096`, gateNone},
+	{"enable_web", `true`, gateNone},
+	{"enable_task", `true`, gateNone},
+	{"permission_mode_default", `"plan"`, gateNone},
+	{"plan", `true`, gateNone},
+	{"permission_deny_tools", `["bash"]`, gateNone},
+	{"retry_enabled", `false`, gateNone},
+	{"retry_max_attempts", `2`, gateNone},
+	{"retry_base_delay_ms", `1`, gateNone},
+	{"retry_backoff_cap_ms", `9000`, gateNone},
+	{"retry_max_delay_ms", `100`, gateNone},
+	{"retry_jitter_min", `0`, gateNone},
+	{"retry_jitter_max", `1`, gateNone},
+}
+
+// Every settings key has an audited trust class, and each repository value
+// that needs trust is dropped from the project file, the project-local file
+// and a selected project profile with the trust warning, and applies only
+// under the trust its class names.
+func TestEveryRiskyProjectSettingNeedsTrust(t *testing.T) {
+	audited := map[string]bool{}
+	for _, setting := range projectSettingTrust {
+		audited[setting.key] = true
+	}
+	schema := reflect.TypeFor[fileSettings]()
+	for field := range schema.Fields() {
+		key, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if !audited[key] {
+			t.Errorf("settings key %q has no audited trust class in projectSettingTrust", key)
+		}
+		delete(audited, key)
+	}
+	for key := range audited {
+		t.Errorf("projectSettingTrust lists %q, which is not a settings key", key)
+	}
+
+	// The operator's settings make a loosening permission value observable.
+	const user = `{"profiles":{"review":{}},"permission_deny_tools":["bash"],"plan":true}`
+	newWorkspace := func(t *testing.T) *layerWorkspace {
+		w := newLayerWorkspace(t)
+		w.flags.Profile = StringInput{Value: "review", Set: true}
+		w.write(w.user, user)
+		return w
+	}
+	want := runtimeView(newWorkspace(t).mustResolve())
+	refusals := map[trustGate]string{
+		gateExecutable:  "needs -trust-project-hooks",
+		gateCredentials: "needs -trust-project-providers",
+		gateOperator:    "operator-only",
+	}
+	placements := []struct {
+		name  string
+		file  func(w *layerWorkspace) string
+		place func(w *layerWorkspace, member string)
+	}{
+		{"project", (*layerWorkspace).projectPath, func(w *layerWorkspace, member string) { w.write(w.projectPath(), "{"+member+"}") }},
+		{"project-local", (*layerWorkspace).localPath, func(w *layerWorkspace, member string) { w.write(w.localPath(), "{"+member+"}") }},
+		{"project profile", (*layerWorkspace).projectPath, func(w *layerWorkspace, member string) {
+			w.write(w.projectPath(), `{"profiles":{"review":{`+member+`}}}`)
+		}},
+	}
+	for _, setting := range projectSettingTrust {
+		if setting.gate == gateNone {
+			t.Run("untrusted applies/"+setting.key+"="+setting.value, func(t *testing.T) {
+				w := newLayerWorkspace(t)
+				w.write(w.projectPath(), fmt.Sprintf("{%q:%s}", setting.key, setting.value))
+				resolved := w.mustResolve()
+				if warnings := resolved.Warnings(); len(warnings) != 0 {
+					t.Fatalf("warnings = %q", warnings)
+				}
+				if shown := settingFor(t, resolved, setting.key); shown.Layer != LayerProject {
+					t.Fatalf("config show = %+v, want the project layer", shown)
+				}
+			})
+			continue
+		}
+		// disableAllHooks is Claude Code's spelling of no_hooks.
+		warned := setting.key
+		if warned == "disableAllHooks" {
+			warned = "no_hooks"
+		}
+		for _, placement := range placements {
+			gate := setting.gate
+			if placement.name == "project profile" && setting.key == "hooks" {
+				// A profile replaces hook arrays, which would remove the operator's.
+				gate = gateOperator
+			}
+			refused := warned + " (" + refusals[gate]
+			resolveWith := func(t *testing.T, hooksTrust, providersTrust bool) (*layerWorkspace, *ResolvedConfig, error) {
+				t.Helper()
+				w := newWorkspace(t)
+				w.flags.TrustProjectHooks = BoolInput{Value: hooksTrust, Set: true}
+				w.flags.TrustProjectProviders = BoolInput{Value: providersTrust, Set: true}
+				placement.place(w, fmt.Sprintf("%q:%s", setting.key, setting.value))
+				resolved, err := w.resolve()
+				return w, resolved, err
+			}
+			mustResolveWith := func(t *testing.T, hooksTrust, providersTrust bool) (*layerWorkspace, *ResolvedConfig) {
+				t.Helper()
+				w, resolved, err := resolveWith(t, hooksTrust, providersTrust)
+				if err != nil {
+					t.Fatalf("resolve: %v", err)
+				}
+				return w, resolved
+			}
+			t.Run(placement.name+"/"+setting.key+"="+setting.value, func(t *testing.T) {
+				w, resolved := mustResolveWith(t, false, false)
+				if got := runtimeView(resolved); !reflect.DeepEqual(got, want) {
+					t.Fatalf("an untrusted %s changed the runtime configuration", placement.name)
+				}
+				warnings := strings.Join(resolved.Warnings(), "\n")
+				if !strings.Contains(warnings, "project settings ignored: ") || !strings.Contains(warnings, placement.file(w)+": "+refused) {
+					t.Fatalf("warnings %q do not name %s in %s", warnings, refused, placement.file(w))
+				}
+				for _, shown := range resolved.Settings() {
+					if top, _, _ := strings.Cut(shown.Key, "."); top == warned && shown.Source == placement.file(w) {
+						t.Fatalf("config show lists the dropped %+v", shown)
+					}
+				}
+				// The other trust, or both for an operator-only key, does not admit it.
+				_, resolved = mustResolveWith(t, gate != gateExecutable, gate != gateCredentials)
+				if warnings := strings.Join(resolved.Warnings(), "\n"); !strings.Contains(warnings, refused) {
+					t.Fatalf("warnings %q under the wrong trust do not name %s", warnings, refused)
+				}
+				if gate == gateOperator {
+					return
+				}
+				// An admitted value applies, or fails its own validation, as a
+				// trusted path to a missing file does.
+				_, resolved, err := resolveWith(t, gate == gateExecutable, gate == gateCredentials)
+				var configErr *Error
+				if err != nil && (!errors.As(err, &configErr) || configErr.Field != setting.key) {
+					t.Fatalf("trusted resolve: %v", err)
+				}
+				if err == nil && strings.Contains(strings.Join(resolved.Warnings(), "\n"), warned+" (") {
+					t.Fatalf("trusted %s still dropped: %q", setting.key, resolved.Warnings())
+				}
+			})
+		}
+	}
+}
+
+// An untrusted repository cannot attach a file outside it to the session:
+// the attachment tool would hand its contents to the model. That holds for
+// the project file, a selected project profile, and a project file that is a
+// symlink to a file outside the repository.
+func TestProjectAttachNeedsTrust(t *testing.T) {
+	private := filepath.Join(t.TempDir(), "private.txt")
+	if err := os.WriteFile(private, []byte("P1_ATTACHMENT_PRIVATE_SENTINEL"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	attach := fmt.Sprintf(`{"attach":[%q]}`, private)
+	for name, place := range map[string]func(t *testing.T, w *layerWorkspace){
+		"project file": func(_ *testing.T, w *layerWorkspace) { w.write(w.projectPath(), attach) },
+		"project profile": func(_ *testing.T, w *layerWorkspace) {
+			w.write(w.projectPath(), `{"profiles":{"review":`+attach+`}}`)
+		},
+		"symlinked project file": func(t *testing.T, w *layerWorkspace) {
+			outside := filepath.Join(t.TempDir(), "settings.json")
+			w.write(outside, attach)
+			if err := os.Symlink(outside, w.projectPath()); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+			w.write(w.user, `{"profiles":{"review":{}}}`)
+			place(t, w)
+			resolved := w.mustResolve()
+			if paths := resolved.AttachPaths(); len(paths) != 0 {
+				t.Fatalf("untrusted project attached %v", paths)
+			}
+			warnings := strings.Join(resolved.Warnings(), "\n")
+			if !strings.Contains(warnings, "project settings ignored: ") || !strings.Contains(warnings, w.projectPath()+": attach (needs -trust-project-hooks") {
+				t.Fatalf("warnings %q do not name attach in %s", warnings, w.projectPath())
+			}
+			w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+			if paths := w.mustResolve().AttachPaths(); !slices.Equal(paths, []string{private}) {
+				t.Fatalf("trusted project attach = %v", paths)
+			}
+		})
+	}
 }
 
 func TestProjectSkillPathsAndLSPNeedTrust(t *testing.T) {
