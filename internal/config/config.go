@@ -41,10 +41,17 @@ const (
 )
 
 const (
-	defaultModel          = "claude-opus-4-8"
-	defaultPermissionMode = "default"
-	defaultLogLevel       = "info"
-	defaultLogFileMax     = 100 << 20
+	defaultModel             = "claude-opus-4-8"
+	defaultPermissionMode    = "default"
+	defaultLogLevel          = "info"
+	defaultLogFileMax        = 100 << 20
+	defaultBashTimeout       = "10m"
+	defaultRetryMaxAttempts  = 11
+	defaultRetryBaseDelayMS  = 500
+	defaultRetryBackoffCapMS = 8000
+	defaultRetryMaxDelayMS   = 300000
+	defaultRetryJitterMin    = 0.75
+	defaultRetryJitterMax    = 1.0
 )
 
 // StringInput retains both a flag value and whether the caller set it.
@@ -109,6 +116,12 @@ type FlagValues struct {
 	TrustProjectProviders BoolInput
 	Environment           StringInput
 	EnvironmentCommand    StringInput
+	// Profile selects profiles.<name> from the settings files.
+	Profile StringInput
+	// StrictConfig makes unknown settings errors instead of warnings.
+	StrictConfig BoolInput
+	// Overrides are -c key.path=value settings, the highest layer.
+	Overrides StringsInput
 }
 
 // RetrySettings is the immutable numeric retry policy resolved at startup.
@@ -134,13 +147,19 @@ type SecretResolverFunc func(name string) (value string, present bool)
 // Resolve implements [SecretResolver].
 func (f SecretResolverFunc) Resolve(name string) (string, bool) { return f(name) }
 
-// Config is the raw configuration boundary. Flags win over HARNESS_* values,
-// which win over settings.json, which win over built-in defaults.
+// Config is the raw configuration boundary. Settings layer, low to high:
+// built-in defaults, managed defaults, user settings.json, project
+// .harness/settings.json, project .harness/settings.local.json, the selected
+// profile, HARNESS_* variables, flags, and -c overrides. Managed requirements
+// pin keys above all of them.
 type Config struct {
 	Flags        FlagValues
 	LookupEnv    func(string) string
 	SettingsPath string
-	WorkingDir   string
+	// ManagedSettingsPath overrides the administrator's managed settings file,
+	// for tests and embedders; empty selects the per-OS path.
+	ManagedSettingsPath string
+	WorkingDir          string
 	// SkipProject prevents host-path discovery for a remote workspace.
 	SkipProject bool
 }
@@ -185,6 +204,8 @@ type ResolvedConfig struct {
 	debugAdapters          map[string]dap.Adapter
 	environment            string
 	environments           map[string]EnvironmentProcess
+	settings               []Setting
+	warnings               []string
 }
 
 // Model returns the default model specification.
@@ -274,8 +295,25 @@ func (c *ResolvedConfig) OpenAIBaseURL() string { return c.openAIBaseURL }
 // FauxScript returns the hermetic faux-provider response script path.
 func (c *ResolvedConfig) FauxScript() string { return c.fauxScript }
 
-// SettingsPath returns the settings file read during resolution.
+// SettingsPath returns the user settings file read during resolution.
 func (c *ResolvedConfig) SettingsPath() string { return c.settingsPath }
+
+// Settings returns every effective settings value with the layer and file,
+// variable or flag that set it, sorted by key, credentials redacted. It is the
+// same merged tree the resolved accessors were decoded from.
+func (c *ResolvedConfig) Settings() []Setting {
+	settings := make([]Setting, len(c.settings))
+	for i, setting := range c.settings {
+		setting.Value = slices.Clone(setting.Value)
+		settings[i] = setting
+	}
+	return settings
+}
+
+// Warnings returns configuration problems that did not stop startup:
+// unknown settings and repository settings the trust gate ignored. Callers
+// log them once.
+func (c *ResolvedConfig) Warnings() []string { return slices.Clone(c.warnings) }
 
 // SkillPaths returns a defensive copy of explicit skill locations.
 func (c *ResolvedConfig) SkillPaths() []string {
@@ -307,8 +345,9 @@ func (e *Error) Error() string { return fmt.Sprintf("config %s: %v", e.Field, e.
 // Unwrap returns the underlying parsing or filesystem failure.
 func (e *Error) Unwrap() error { return e.Err }
 
-// fileSettings keeps scalar values as pointers so an omitted setting won't
-// shadow an environment value or built-in default.
+// fileSettings is the schema of every settings layer and of their merge. Scalar
+// values are pointers so an omitted setting is distinguishable from a zero.
+// Its json tags are the known top-level settings keys.
 type fileSettings struct {
 	Model                   *string                           `json:"model"`
 	PlanModel               *string                           `json:"plan_model"`
@@ -374,18 +413,7 @@ func splitCommaList(value string) []string {
 	return items
 }
 
-// resolveToolList resolves a repeatable tool-name list from flag, then env, then settings.
-func resolveToolList(flag StringsInput, env string, settings []string) []string {
-	if flag.Set {
-		return append([]string(nil), flag.Values...)
-	}
-	if strings.TrimSpace(env) != "" {
-		return splitCommaList(env)
-	}
-	return append([]string(nil), settings...)
-}
-
-// Resolve reads settings once and returns validated runtime values.
+// Resolve merges every settings layer once and returns validated runtime values.
 func (c Config) Resolve() (*ResolvedConfig, error) {
 	lookup := c.LookupEnv
 	if lookup == nil {
@@ -395,208 +423,151 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if settingsPath == "" {
 		settingsPath = GetSettingsPath()
 	}
-	settings, err := loadSettings(settingsPath)
-	if err != nil {
-		return nil, err
-	}
-	environmentName, environments, err := resolveEnvironments(c.Flags, lookup, settings)
-	if err != nil {
-		return nil, err
-	}
-	trustProviders, err := resolveBool(c.Flags.TrustProjectProviders, lookup("HARNESS_TRUST_PROJECT_PROVIDERS"), nil, false)
-	if err != nil {
-		return nil, &Error{Field: "trust_project_providers", Err: err}
-	}
-	providers, untrustedProviderFiles, err := resolveProviders(settings, c.WorkingDir, trustProviders, c.SkipProject || environmentName != "")
-	if err != nil {
-		return nil, &Error{Field: "providers", Err: err}
-	}
-	if endpoint := strings.TrimSpace(lookup("AZURE_OPENAI_ENDPOINT")); endpoint != "" {
-		p := providers["azure"]
-		p.BaseURL = endpoint
-		providers["azure"] = p
-	}
-	if version := strings.TrimSpace(lookup("AZURE_OPENAI_API_VERSION")); version != "" {
-		p := providers["azure"]
-		if p.Query == nil {
-			p.Query = map[string]string{}
-		}
-		p.Query["api-version"] = version
-		providers["azure"] = p
-	}
-	mcpServers, err := resolveMCP(c.Flags.MCPConfig, lookup("HARNESS_MCP_CONFIG"), settings)
-	if err != nil {
-		return nil, &Error{Field: "mcp_config", Err: err}
-	}
-	lspConfig, err := resolveLSP(c.Flags.EnableLSP, lookup("HARNESS_ENABLE_LSP"), c.Flags.LSPConfig, lookup("HARNESS_LSP_CONFIG"), settings)
-	if err != nil {
-		return nil, err
-	}
-	cloudRules, err := resolveCloudRules(c.Flags.CloudPolicy, lookup("HARNESS_CLOUD_POLICY"), settings)
-	if err != nil {
-		return nil, err
+	managedPath := c.ManagedSettingsPath
+	if managedPath == "" {
+		managedPath = defaultManagedSettingsPath()
 	}
 	if c.Flags.AnthropicAPIKey.Set && c.Flags.AnthropicAuthToken.Set {
 		return nil, &Error{Field: "credentials", Err: errors.New("-anthropic-api-key and -anthropic-auth-token cannot be used together")}
 	}
-
-	agentDir := resolveString(c.Flags.AgentDir, lookup(EnvAgentDir), settings.AgentDir, defaultAgentDir())
-	sessionDir := resolveString(c.Flags.SessionDir, lookup(EnvSessionDir), settings.SessionDir, filepath.Join(agentDir, "sessions"))
-	maxTokens, err := resolveInt(c.Flags.MaxTokens, lookup("HARNESS_MAX_TOKENS"), settings.MaxTokens, adapter.DefaultMaxTokens)
-	if err != nil || maxTokens <= 0 {
-		if err == nil {
-			err = errors.New("must be positive")
-		}
-		return nil, &Error{Field: "max_tokens", Err: err}
+	strict, err := flagOrEnvBool(c.Flags.StrictConfig, lookup("HARNESS_STRICT_CONFIG"))
+	if err != nil {
+		return nil, &Error{Field: "strict_config", Err: err}
 	}
-	bashTimeout, err := time.ParseDuration(resolveString(c.Flags.BashTimeout, lookup("HARNESS_BASH_TIMEOUT"), settings.BashTimeout, "10m"))
+	trustHooks, err := flagOrEnvBool(c.Flags.TrustProjectHooks, lookup("HARNESS_TRUST_PROJECT_HOOKS"))
+	if err != nil {
+		return nil, &Error{Field: "trust_project_hooks", Err: err}
+	}
+	trustProviders, err := flagOrEnvBool(c.Flags.TrustProjectProviders, lookup("HARNESS_TRUST_PROJECT_PROVIDERS"))
+	if err != nil {
+		return nil, &Error{Field: "trust_project_providers", Err: err}
+	}
+	layered, err := resolveLayers(layerOptions{
+		managedPath:    managedPath,
+		userPath:       settingsPath,
+		workingDir:     c.WorkingDir,
+		skipProject:    c.SkipProject,
+		profile:        flagOrEnvString(c.Flags.Profile, lookup("HARNESS_PROFILE")),
+		strict:         strict,
+		trustHooks:     trustHooks,
+		trustProviders: trustProviders,
+		flags:          c.Flags,
+		lookup:         lookup,
+	})
+	if err != nil {
+		return nil, err
+	}
+	settings := layered.settings
+	environmentName, environments, err := resolveEnvironments(c.Flags, lookup, settings)
+	if err != nil {
+		return nil, err
+	}
+	providers, err := resolveProviders(settings)
+	if err != nil {
+		return nil, &Error{Field: "providers", Err: err}
+	}
+	// -mcp-config and HARNESS_MCP_CONFIG already reached settings as layers.
+	mcpServers, err := resolveMCP(StringInput{}, "", settings)
+	if err != nil {
+		return nil, &Error{Field: "mcp_config", Err: err}
+	}
+	lspConfig, err := resolveLSP(settings)
+	if err != nil {
+		return nil, err
+	}
+	cloudRules, err := resolveCloudRules(settings)
+	if err != nil {
+		return nil, err
+	}
+
+	maxTokens := settingValue(settings.MaxTokens)
+	if maxTokens <= 0 {
+		return nil, &Error{Field: "max_tokens", Err: errors.New("must be positive")}
+	}
+	bashTimeout, err := time.ParseDuration(settingString(settings.BashTimeout))
 	if err != nil || bashTimeout <= 0 || bashTimeout > 2147483*time.Second {
 		if err == nil {
 			err = errors.New("must be positive and no greater than 2147483s")
 		}
 		return nil, &Error{Field: "bash_timeout", Err: err}
 	}
-	logFileMax, err := resolveInt64(c.Flags.LogFileMaxBytes, lookup("HARNESS_LOG_FILE_MAX_BYTES"), settings.LogFileMaxBytes, defaultLogFileMax)
-	if err != nil || logFileMax <= 0 {
-		if err == nil {
-			err = errors.New("must be positive")
-		}
-		return nil, &Error{Field: "log_file_max_bytes", Err: err}
+	logFileMax := settingValue(settings.LogFileMaxBytes)
+	if logFileMax <= 0 {
+		return nil, &Error{Field: "log_file_max_bytes", Err: errors.New("must be positive")}
 	}
-	webEnabled, err := resolveBool(c.Flags.EnableWeb, lookup("HARNESS_ENABLE_WEB"), settings.EnableWeb, false)
-	if err != nil {
-		return nil, &Error{Field: "enable_web", Err: err}
-	}
-	retryEnabled, err := resolveBool(BoolInput{}, lookup("HARNESS_RETRY_ENABLED"), settings.RetryEnabled, true)
-	if err != nil {
-		return nil, &Error{Field: "retry_enabled", Err: err}
-	}
-	taskEnabled, err := resolveBool(c.Flags.EnableTask, lookup("HARNESS_ENABLE_TASK"), settings.EnableTask, false)
-	if err != nil {
-		return nil, &Error{Field: "enable_task", Err: err}
-	}
-	planEnabled, err := resolveBool(c.Flags.Plan, lookup("HARNESS_PLAN"), settings.Plan, false)
-	if err != nil {
-		return nil, &Error{Field: "plan", Err: err}
-	}
-	noHooksSetting := settings.NoHooks
-	if noHooksSetting == nil {
-		noHooksSetting = settings.DisableAllHooks
-	}
-	noHooks, err := resolveBool(c.Flags.NoHooks, lookup("HARNESS_NO_HOOKS"), noHooksSetting, false)
-	if err != nil {
-		return nil, &Error{Field: "no_hooks", Err: err}
-	}
-	trustHooks, err := resolveBool(c.Flags.TrustProjectHooks, lookup("HARNESS_TRUST_PROJECT_HOOKS"), nil, false)
-	if err != nil {
-		return nil, &Error{Field: "trust_project_hooks", Err: err}
-	}
-	hookSettings := hooks.Settings{Hooks: settings.Hooks, NoHooks: noHooks, TrustProjectHooks: trustHooks, TrustedProjects: settings.TrustedHookProjects}
+	hookSettings := hooks.Settings{Hooks: settings.Hooks, NoHooks: settingValue(settings.NoHooks), TrustProjectHooks: trustHooks, TrustedProjects: settings.TrustedHookProjects}
 	if err := hookSettings.Validate(); err != nil {
 		return nil, &Error{Field: "hooks", Err: err}
 	}
-	retryMaxAttempts, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_MAX_ATTEMPTS"), settings.RetryMaxAttempts, 11)
-	if err != nil || retryMaxAttempts < 1 {
-		if err == nil {
-			err = errors.New("must be at least one")
-		}
-		return nil, &Error{Field: "retry_max_attempts", Err: err}
+	retryMaxAttempts := settingValue(settings.RetryMaxAttempts)
+	if retryMaxAttempts < 1 {
+		return nil, &Error{Field: "retry_max_attempts", Err: errors.New("must be at least one")}
 	}
-	retryBaseDelayMS, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_BASE_DELAY_MS"), settings.RetryBaseDelayMS, 500)
-	if err != nil || retryBaseDelayMS <= 0 || retryBaseDelayMS > maxRetryDurationMS {
-		if err == nil {
-			err = errors.New("must be positive and representable as a duration")
-		}
-		return nil, &Error{Field: "retry_base_delay_ms", Err: err}
+	retryBaseDelayMS := settingValue(settings.RetryBaseDelayMS)
+	if retryBaseDelayMS <= 0 || retryBaseDelayMS > maxRetryDurationMS {
+		return nil, &Error{Field: "retry_base_delay_ms", Err: errors.New("must be positive and representable as a duration")}
 	}
-	retryBackoffCapMS, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_BACKOFF_CAP_MS"), settings.RetryBackoffCapMS, 8000)
-	if err != nil || retryBackoffCapMS < retryBaseDelayMS || retryBackoffCapMS > maxRetryDurationMS {
-		if err == nil {
-			err = errors.New("must be at least retry_base_delay_ms and representable as a duration")
-		}
-		return nil, &Error{Field: "retry_backoff_cap_ms", Err: err}
+	retryBackoffCapMS := settingValue(settings.RetryBackoffCapMS)
+	if retryBackoffCapMS < retryBaseDelayMS || retryBackoffCapMS > maxRetryDurationMS {
+		return nil, &Error{Field: "retry_backoff_cap_ms", Err: errors.New("must be at least retry_base_delay_ms and representable as a duration")}
 	}
-	retryMaxDelayMS, err := resolveInt(IntInput{}, lookup("HARNESS_RETRY_MAX_DELAY_MS"), settings.RetryMaxDelayMS, 300000)
-	if err != nil {
-		return nil, &Error{Field: "retry_max_delay_ms", Err: err}
-	}
+	retryMaxDelayMS := settingValue(settings.RetryMaxDelayMS)
 	if retryMaxDelayMS > maxRetryDurationMS {
 		return nil, &Error{Field: "retry_max_delay_ms", Err: errors.New("must be representable as a duration")}
 	}
-	retryJitterMin, err := resolveFloat(lookup("HARNESS_RETRY_JITTER_MIN"), settings.RetryJitterMin, 0.75)
-	if err != nil || math.IsNaN(retryJitterMin) || math.IsInf(retryJitterMin, 0) || retryJitterMin < 0 || retryJitterMin > 1 {
-		if err == nil {
-			err = errors.New("must be finite and within [0, 1]")
-		}
-		return nil, &Error{Field: "retry_jitter_min", Err: err}
+	retryJitterMin := settingValue(settings.RetryJitterMin)
+	if math.IsNaN(retryJitterMin) || math.IsInf(retryJitterMin, 0) || retryJitterMin < 0 || retryJitterMin > 1 {
+		return nil, &Error{Field: "retry_jitter_min", Err: errors.New("must be finite and within [0, 1]")}
 	}
-	retryJitterMax, err := resolveFloat(lookup("HARNESS_RETRY_JITTER_MAX"), settings.RetryJitterMax, 1)
-	if err != nil || math.IsNaN(retryJitterMax) || math.IsInf(retryJitterMax, 0) || retryJitterMax < 0 || retryJitterMax > 1 || retryJitterMax < retryJitterMin {
-		if err == nil {
-			err = errors.New("must be finite, within [0, 1], and at least retry_jitter_min")
-		}
-		return nil, &Error{Field: "retry_jitter_max", Err: err}
+	retryJitterMax := settingValue(settings.RetryJitterMax)
+	if math.IsNaN(retryJitterMax) || math.IsInf(retryJitterMax, 0) || retryJitterMax < 0 || retryJitterMax > 1 || retryJitterMax < retryJitterMin {
+		return nil, &Error{Field: "retry_jitter_max", Err: errors.New("must be finite, within [0, 1], and at least retry_jitter_min")}
 	}
-	attachPaths := resolveToolList(c.Flags.Attach, lookup("HARNESS_ATTACH"), settings.Attach)
-	var skillPaths []string
-	if c.Flags.SkillPaths.Set {
-		skillPaths = append([]string(nil), c.Flags.SkillPaths.Values...)
-		for _, path := range skillPaths {
-			if strings.TrimSpace(path) == "" {
-				return nil, &Error{Field: "skill", Err: errors.New("must not be empty")}
-			}
-		}
-	} else {
-		skillPaths = append([]string(nil), settings.SkillPaths...)
-	}
-	permissionAllowTools := resolveToolList(c.Flags.PermissionAllowTools, lookup("HARNESS_PERMISSION_ALLOW_TOOLS"), settings.PermissionAllowTools)
-	permissionDenyTools := resolveToolList(c.Flags.PermissionDenyTools, lookup("HARNESS_PERMISSION_DENY_TOOLS"), settings.PermissionDenyTools)
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
 	}
 	resolved := &ResolvedConfig{
-		environment:           environmentName,
-		environments:          environments,
-		model:                 resolveString(c.Flags.Model, lookup("HARNESS_MODEL"), settings.Model, defaultModel),
-		planModel:             resolveString(c.Flags.PlanModel, lookup("HARNESS_PLAN_MODEL"), settings.PlanModel, ""),
-		smolModel:             resolveString(c.Flags.SmolModel, lookup("HARNESS_SMOL_MODEL"), settings.SmolModel, ""),
-		reasoning:             strings.ToLower(resolveString(c.Flags.Reasoning, lookup("HARNESS_REASONING"), settings.Reasoning, "")),
-		planReasoning:         strings.ToLower(resolveString(c.Flags.PlanReasoning, lookup("HARNESS_PLAN_REASONING"), settings.PlanReasoning, "")),
-		smolReasoning:         strings.ToLower(resolveString(c.Flags.SmolReasoning, lookup("HARNESS_SMOL_REASONING"), settings.SmolReasoning, "")),
-		maxTokens:             maxTokens,
-		maxTokensConfigured:   c.Flags.MaxTokens.Set || strings.TrimSpace(lookup("HARNESS_MAX_TOKENS")) != "" || settings.MaxTokens != nil,
-		permissionModeDefault: resolveString(c.Flags.PermissionMode, lookup("HARNESS_PERMISSION_MODE"), settings.PermissionModeDefault, defaultPermissionMode),
-		bashTimeout:           bashTimeout,
-		logLevel:              resolveLogLevel(c.Flags.LogLevel, lookup("HARNESS_LOG_LEVEL"), lookup("HARNESS_DEBUG"), settings.LogLevel),
-		logFile:               resolveString(c.Flags.LogFile, lookup("HARNESS_LOG_FILE"), settings.LogFile, ""),
-		logFileMaxBytes:       logFileMax,
-		enableWeb:             webEnabled,
-		enableTask:            taskEnabled,
-		plan:                  planEnabled,
-		attachPaths:           attachPaths,
-		webSearchURL:          resolveString(c.Flags.WebSearchURL, lookup("HARNESS_WEB_SEARCH_URL"), settings.WebSearchURL, ""),
-		agentDir:              ExpandTildePath(agentDir),
-		sessionDir:            ExpandTildePath(sessionDir),
-		// The vendor variables (ANTHROPIC_BASE_URL, OPENAI_BASE_URL) are the
-		// lowest-priority source: tempest's own flag, HARNESS_* variable and
-		// settings key all override them.
-		anthropicBaseURL:       resolveString(c.Flags.AnthropicBaseURL, lookup("HARNESS_ANTHROPIC_BASE_URL"), settings.AnthropicBaseURL, strings.TrimSpace(lookup("ANTHROPIC_BASE_URL"))),
-		openAIBaseURL:          resolveString(c.Flags.OpenAIBaseURL, lookup("HARNESS_OPENAI_BASE_URL"), settings.OpenAIBaseURL, strings.TrimSpace(lookup("OPENAI_BASE_URL"))),
-		fauxScript:             resolveString(c.Flags.FauxScript, lookup("HARNESS_FAUX_SCRIPT"), settings.FauxScript, ""),
+		environment:            environmentName,
+		environments:           environments,
+		model:                  settingString(settings.Model),
+		planModel:              settingString(settings.PlanModel),
+		smolModel:              settingString(settings.SmolModel),
+		reasoning:              strings.ToLower(settingString(settings.Reasoning)),
+		planReasoning:          strings.ToLower(settingString(settings.PlanReasoning)),
+		smolReasoning:          strings.ToLower(settingString(settings.SmolReasoning)),
+		maxTokens:              maxTokens,
+		maxTokensConfigured:    layered.configured("max_tokens"),
+		permissionModeDefault:  settingString(settings.PermissionModeDefault),
+		bashTimeout:            bashTimeout,
+		logLevel:               settingString(settings.LogLevel),
+		logFile:                settingString(settings.LogFile),
+		logFileMaxBytes:        logFileMax,
+		enableWeb:              settingValue(settings.EnableWeb),
+		enableTask:             settingValue(settings.EnableTask),
+		plan:                   settingValue(settings.Plan),
+		attachPaths:            slices.Clone(settings.Attach),
+		webSearchURL:           settingString(settings.WebSearchURL),
+		agentDir:               ExpandTildePath(settingString(settings.AgentDir)),
+		sessionDir:             ExpandTildePath(settingString(settings.SessionDir)),
+		anthropicBaseURL:       settingString(settings.AnthropicBaseURL),
+		openAIBaseURL:          settingString(settings.OpenAIBaseURL),
+		fauxScript:             settingString(settings.FauxScript),
 		settingsPath:           settingsPath,
-		skillPaths:             skillPaths,
-		permissionAllowTools:   permissionAllowTools,
-		permissionDenyTools:    permissionDenyTools,
+		skillPaths:             slices.Clone(settings.SkillPaths),
+		permissionAllowTools:   slices.Clone(settings.PermissionAllowTools),
+		permissionDenyTools:    slices.Clone(settings.PermissionDenyTools),
 		mcpServers:             mcpServers,
 		lsp:                    lspConfig,
 		cloudRules:             cloudRules,
 		hooks:                  hookSettings,
 		providers:              providers,
-		untrustedProviderFiles: untrustedProviderFiles,
+		untrustedProviderFiles: layered.untrustedProviderFiles,
 		debugAdapters:          debugAdapters,
+		settings:               layered.list,
+		warnings:               layered.warnings,
 		retry: RetrySettings{
-			Enabled:      retryEnabled,
+			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,
 			BaseDelayMS:  retryBaseDelayMS,
 			BackoffCapMS: retryBackoffCapMS,
@@ -609,6 +580,24 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		return nil, err
 	}
 	return resolved, nil
+}
+
+// settingString trims a merged string setting; unset is empty.
+func settingString(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+// settingValue dereferences a merged setting. Unset is the zero value, which
+// only happens for keys without a built-in default.
+func settingValue[T any](value *T) T {
+	var zero T
+	if value == nil {
+		return zero
+	}
+	return *value
 }
 
 // validateResolved catches values that are individually parsed but can't safely
@@ -674,115 +663,25 @@ func cloneDebugArguments(arguments map[string]json.RawMessage) map[string]json.R
 	return result
 }
 
-// loadSettings treats a missing settings file as no overrides, but keeps real
-// I/O and decode failures tied to the settings field.
-func loadSettings(path string) (fileSettings, error) {
-	contents, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return fileSettings{}, nil
-	}
-	if err != nil {
-		return fileSettings{}, &Error{Field: "settings", Err: fmt.Errorf("read %s: %w", path, err)}
-	}
-	var settings fileSettings
-	if err := json.Unmarshal(contents, &settings); err != nil {
-		return fileSettings{}, &Error{Field: "settings", Err: fmt.Errorf("decode %s: %w", path, err)}
-	}
-	return settings, nil
-}
-
-// resolveString applies configuration precedence while treating blank values as
-// unset, so they don't hide a lower-priority source.
-func resolveString(flag StringInput, env string, file *string, fallback string) string {
+// flagOrEnvString resolves an input that is not a settings key, such as the
+// profile name: the flag when set, else the nonblank variable.
+func flagOrEnvString(flag StringInput, env string) string {
 	if flag.Set {
 		return strings.TrimSpace(flag.Value)
 	}
-	if value := strings.TrimSpace(env); value != "" {
-		return value
-	}
-	if file != nil {
-		return strings.TrimSpace(*file)
-	}
-	return fallback
+	return strings.TrimSpace(env)
 }
 
-// resolveLogLevel resolves the explicit log level before its environment
-// aliases, then settings and the built-in default.
-func resolveLogLevel(flag StringInput, logLevelEnv, debugEnv string, file *string) string {
-	if flag.Set {
-		return strings.TrimSpace(flag.Value)
-	}
-	if value := strings.TrimSpace(logLevelEnv); value != "" {
-		return value
-	}
-	if strings.TrimSpace(debugEnv) != "" {
-		return "debug"
-	}
-	if file != nil {
-		return strings.TrimSpace(*file)
-	}
-	return defaultLogLevel
-}
-
-// resolveInt preserves the flag, environment, settings, and fallback precedence
-// while delaying environment parsing until it wins.
-func resolveInt(flag IntInput, env string, file *int, fallback int) (int, error) {
+// flagOrEnvBool resolves a boolean that is not a settings key, such as project
+// trust. An explicit false flag still outranks the variable.
+func flagOrEnvBool(flag BoolInput, env string) (bool, error) {
 	if flag.Set {
 		return flag.Value, nil
 	}
 	if value := strings.TrimSpace(env); value != "" {
-		parsed, err := strconv.Atoi(value)
-		return parsed, err
+		return strconv.ParseBool(value)
 	}
-	if file != nil {
-		return *file, nil
-	}
-	return fallback, nil
-}
-
-// resolveInt64 mirrors integer precedence for byte-sized settings that need an
-// int64 fallback.
-func resolveInt64(flag IntInput, env string, file *int64, fallback int64) (int64, error) {
-	if flag.Set {
-		return int64(flag.Value), nil
-	}
-	if value := strings.TrimSpace(env); value != "" {
-		parsed, err := strconv.ParseInt(value, 10, 64)
-		return parsed, err
-	}
-	if file != nil {
-		return *file, nil
-	}
-	return fallback, nil
-}
-
-// resolveBool uses BoolInput.Set so an explicit false flag still outranks every
-// lower-priority source.
-func resolveBool(flag BoolInput, env string, file *bool, fallback bool) (bool, error) {
-	if flag.Set {
-		return flag.Value, nil
-	}
-
-	if value := strings.TrimSpace(env); value != "" {
-		parsed, err := strconv.ParseBool(value)
-		return parsed, err
-	}
-	if file != nil {
-		return *file, nil
-	}
-	return fallback, nil
-}
-
-// resolveFloat has no flag source, so environment overrides settings before the
-// built-in fallback.
-func resolveFloat(env string, file *float64, fallback float64) (float64, error) {
-	if value := strings.TrimSpace(env); value != "" {
-		return strconv.ParseFloat(value, 64)
-	}
-	if file != nil {
-		return *file, nil
-	}
-	return fallback, nil
+	return false, nil
 }
 
 // ExpandTildePath expands a leading ~ or ~/ in path to the user's home directory.

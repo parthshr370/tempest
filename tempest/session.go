@@ -276,6 +276,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if err != nil {
 			return nil, err
 		}
+		for _, warning := range defaults.Warnings() {
+			logger.Warn("config: " + warning)
+		}
 		if o.Stack == nil {
 			currentEnvironment := cfg.Environment
 			cfg = session.StackConfigFromConfig(defaults)
