@@ -14,6 +14,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/validate"
 	"go.harness.dev/harness/internal/hooks"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 // ExecutedToolCallBatch is the result of executing one assistant message's
@@ -101,7 +102,7 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 	var repeated error
 
 	for index, toolCall := range toolCalls {
-		ctx := invocationContext(ctx, config, index)
+		ctx := toolCallContext(ctx, config, index)
 		if config.Hooks.Has("PreToolUse") {
 			if err := emit(ctx, toolPreparing(toolCall)); err != nil {
 				return ExecutedToolCallBatch{}, err
@@ -163,7 +164,7 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	callContexts := make([]context.Context, len(toolCalls))
 
 	for i, toolCall := range toolCalls {
-		ctx := invocationContext(ctx, config, i)
+		ctx := toolCallContext(ctx, config, i)
 		callContexts[i] = ctx
 		if config.Hooks.Has("PreToolUse") {
 			if err := safeEmit(ctx, toolPreparing(toolCall)); err != nil {
@@ -427,6 +428,13 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	}
 
 	return &preparedToolCall{toolCall: preparedCall, tool: tool, args: validatedArgs, hookContext: hookResult.Context}, nil
+}
+
+// toolCallContext is the context one tool call is prepared, executed and
+// reported under: its durable invocation and, when the run is traced, the
+// call's own span, which tools, hooks and child agents inherit.
+func toolCallContext(ctx context.Context, config AgentLoopConfig, index int) context.Context {
+	return tracecontext.StartChild(invocationContext(ctx, config, index))
 }
 
 func emitPreparedStart(ctx context.Context, call types.ContentBlock, prepared *preparedToolCall, immediate *immediateOutcome, emit AgentEventSink, started bool) error {

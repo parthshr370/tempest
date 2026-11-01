@@ -91,7 +91,9 @@ func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, m
 			}
 			return
 		}
-		retry := types.StreamEvent{Type: types.EvRetry, Err: discarded, Attempt: attempt, RetryDelay: delay}
+		// FailedAt is wall time, not cfg.Clock: it times spans, and the
+		// sleep below starts right after it.
+		retry := types.StreamEvent{Type: types.EvRetry, Err: discarded, Attempt: attempt, RetryDelay: delay, FailedAt: time.Now()}
 		logical.Fold(retry)
 		output.Push(retry)
 		if err := r.cfg.Sleeper.Sleep(ctx, delay); err != nil || ctx.Err() != nil {

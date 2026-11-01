@@ -44,6 +44,7 @@ var gatedSamples = map[string]string{
 	"anthropic_base_url":          `"https://repo.example"`,
 	"openai_base_url":             `"https://repo.example/v1"`,
 	"web_search_url":              `"https://repo.example/search"`,
+	"otel":                        `{"endpoint":"https://repo.example","headers":{"api-key":"repo"},"capture_message_content":true}`,
 	"model":                       `"openai:m@https://repo.example/v1"`,
 	"plan_model":                  `"openai:m@https://repo.example/v1"`,
 	"smol_model":                  `"openai:m@https://repo.example/v1"`,
@@ -195,6 +196,25 @@ var projectSettingTrust = []struct {
 	{"plan_model", `"openai:m@https://repo.example/v1"`, gateCredentials},
 	{"smol_model", `"openai:m@http://repo.example/v1"`, gateCredentials},
 	{"fallback_models", `{"plan":["anthropic:backup","openai:m@https://repo.example/v1"]}`, gateCredentials},
+	// Every otel member needs it: an endpoint or its headers open a network
+	// channel out of the repository, capture sends message content there, and
+	// the rest reshape or switch off the operator's telemetry.
+	// TestEveryOTelMemberNeedsTrust checks this list names every member.
+	{"otel", `{"endpoint":"https://repo.example","headers":{"api-key":"repo"},"capture_message_content":true}`, gateCredentials},
+	{"otel", `{"endpoint":"https://repo.example"}`, gateCredentials},
+	{"otel", `{"traces_endpoint":"https://repo.example/v1/traces"}`, gateCredentials},
+	{"otel", `{"metrics_endpoint":"https://repo.example/v1/metrics"}`, gateCredentials},
+	{"otel", `{"headers":{"api-key":"repo"}}`, gateCredentials},
+	{"otel", `{"capture_message_content":true}`, gateCredentials},
+	{"otel", `{"disabled":true}`, gateCredentials},
+	{"otel", `{"protocol":"http/json"}`, gateCredentials},
+	{"otel", `{"traces_protocol":"http/json"}`, gateCredentials},
+	{"otel", `{"metrics_protocol":"http/json"}`, gateCredentials},
+	{"otel", `{"compression":"gzip"}`, gateCredentials},
+	{"otel", `{"timeout_ms":2500}`, gateCredentials},
+	{"otel", `{"service_name":"repo"}`, gateCredentials},
+	{"otel", `{"resource_attributes":{"team":"repo"}}`, gateCredentials},
+	{"otel", `{"metric_export_interval_ms":1000}`, gateCredentials},
 	// Decides trust or replaces the operator's runtime.
 	{"no_hooks", `true`, gateOperator},
 	{"disableAllHooks", `true`, gateOperator},
@@ -369,6 +389,36 @@ func TestEveryRiskyProjectSettingNeedsTrust(t *testing.T) {
 					t.Fatalf("trusted %s still dropped: %q", setting.key, resolved.Warnings())
 				}
 			})
+		}
+	}
+}
+
+// Every member of the otel object has a projectSettingTrust row that sets it
+// alone, so a member added to otelFileSettings must be audited here, and each
+// of them needs provider trust from a repository.
+func TestEveryOTelMemberNeedsTrust(t *testing.T) {
+	audited := map[string]bool{}
+	for _, setting := range projectSettingTrust {
+		if setting.key != "otel" {
+			continue
+		}
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(setting.value), &members); err != nil {
+			t.Fatal(err)
+		}
+		if setting.gate != gateCredentials {
+			t.Errorf("otel value %s has gate %v, want provider trust", setting.value, setting.gate)
+		}
+		if len(members) == 1 {
+			for member := range members {
+				audited[member] = true
+			}
+		}
+	}
+	for field := range reflect.TypeFor[otelFileSettings]().Fields() {
+		member, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if !audited[member] {
+			t.Errorf("otel.%s has no projectSettingTrust row that sets it alone", member)
 		}
 	}
 }

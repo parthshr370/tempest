@@ -32,6 +32,7 @@ import (
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/subagent"
+	"go.harness.dev/harness/internal/telemetry"
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
@@ -128,6 +129,10 @@ type StackConfig struct {
 	// (local://, job://, history://) resolve against it. Empty uses Journal.
 	RootJournal string
 	Child       bool
+	// Telemetry receives this agent's events as spans and metrics; nil
+	// exports nothing. Child stacks inherit it, so subagent runs join the
+	// parent's trace.
+	Telemetry *telemetry.Telemetry
 	// RewindGuard prevents a shared-workspace child from undoing a live parent's files.
 	RewindGuard func(context.Context) error
 	// Messenger is this agent's endpoint on its session tree's message bus;
@@ -219,6 +224,7 @@ type AgentStack struct {
 	kernels          *evalkernel.Manager
 	debugger         *dap.Manager
 	ownedEnvironment environment.Lease
+	detachTelemetry  func()
 }
 
 // Close stops this stack's kernels and runs its session-end hooks.
@@ -227,7 +233,9 @@ func (s *AgentStack) Close() error {
 	if s.ownedEnvironment != nil {
 		environmentErr = s.ownedEnvironment.Close()
 	}
-	return errors.Join(s.Compaction.Close(), s.debugger.Close(), s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()), environmentErr)
+	err := errors.Join(s.Compaction.Close(), s.debugger.Close(), s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()), environmentErr)
+	s.detachTelemetry()
+	return err
 }
 
 // BuildAgentStack wires a generic coding agent: local tools, permission gating,
@@ -597,7 +605,13 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Hooks:            hookRunner,
 		Extensions:       extensionRuntime,
 		Child:            cfg.Child,
+		Trace:            cfg.Telemetry.Tracing(),
 	})
+	agentName := ""
+	if cfg.Child {
+		agentName = cfg.HookAgentType
+	}
+	detachTelemetry := cfg.Telemetry.Attach(agt, telemetry.AgentInfo{Name: agentName, SessionID: sessionID})
 	if hookRunner != nil {
 		hookRunner.PermissionMode = func() string { return string(modeFunc()) }
 		hookRunner.Once = newHookCache(cfg.Journal, cfg.Loaded, agt).run
@@ -630,7 +644,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 			checkpoints.Install(messages)
 		}
 	}
-	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugger: debugger, ownedEnvironment: ownedEnvironment}, nil
+	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugger: debugger, ownedEnvironment: ownedEnvironment, detachTelemetry: detachTelemetry}, nil
 }
 
 // thinkingLevel maps a configured reasoning effort to the agent's level;

@@ -136,6 +136,10 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	}
 	stack := session.StackConfigFromConfig(cfg)
 	stack.PermissionPolicy = toolPolicy(stderr, cfg)
+	// serve -listen keeps metrics for /metrics even without an OTLP endpoint.
+	tel := startTelemetry(cfg, command == "serve" && listen != "")
+	defer stopTelemetry(tel)
+	stack.Telemetry = tel
 	if cfg.FauxScript() != "" {
 		provider, model, err := loadFauxScript(cfg.FauxScript())
 		if err != nil {
@@ -199,8 +203,12 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		}
 		return 0
 	}
+	endpoints := "ACP /acp, A2A /a2a"
+	if tel != nil {
+		endpoints += ", metrics /metrics"
+	}
 	onListen := func(addr net.Addr) {
-		fmt.Fprintf(stderr, "tempest serve listening on http://%s (ACP /acp, A2A /a2a)\n", addr)
+		fmt.Fprintf(stderr, "tempest serve listening on http://%s (%s)\n", addr, endpoints)
 	}
 	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, ExtensionProcesses: processes, OnListen: onListen})
 	if err != nil {

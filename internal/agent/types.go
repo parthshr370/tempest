@@ -173,7 +173,9 @@ type AgentLoopConfig struct {
 	ToolExecution ToolExecutionMode
 	Hooks         *hooks.Runner
 	Child         bool
-	Extensions    ExtensionRuntime
+	// Trace starts trace spans for runs; see [AgentOptions.Trace].
+	Trace      bool
+	Extensions ExtensionRuntime
 
 	ConvertToLlm        func(messages []types.Message) []types.Message
 	TransformContext    func(ctx context.Context, messages []types.Message) []types.Message
@@ -297,9 +299,32 @@ const (
 	EventHook  AgentEventType = "hook"
 	// EventModelFallback reports that the run switched to a backup model
 	// because the model it was using is unavailable. The run stays on the
-	// backup until it ends.
+	// backup until it ends. Fallback describes the switch; the backup is
+	// called once every listener has returned.
 	EventModelFallback AgentEventType = "model_fallback"
+	// EventModelRequest is emitted just before a model request is sent;
+	// Request describes it. The message events of its response follow.
+	EventModelRequest AgentEventType = "model_request"
+	// EventModelRetry reports a failed attempt that is sent again: Message is
+	// the discarded attempt (its error and any usage), Attempt its 1-based
+	// ordinal on its model and FailedAt when the stream saw it fail. Without
+	// Fallback the same model gets the request RetryDelay after FailedAt.
+	// With Fallback the model was unavailable and the request goes to
+	// Fallback.To, whose model_fallback event follows. When the attempt had
+	// opened a message, that message's message_end follows this event.
+	EventModelRetry AgentEventType = "model_retry"
 )
+
+// ModelRequest describes one logical model request: the model, the request
+// settings and the context sent. Messages and SystemPrompt are read-only.
+type ModelRequest struct {
+	Model        types.Model
+	SystemPrompt string
+	Messages     []types.Message
+	MaxTokens    int
+	Temperature  *float64
+	Reasoning    string
+}
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
 // Type are populated, except Seq and At, which every event carries.
@@ -326,6 +351,10 @@ type AgentEvent struct {
 	Definition            ToolDefinition
 	Hook                  *hooks.Report
 	Fallback              *types.ModelFallback
+	Request               *ModelRequest
+	Attempt               int
+	RetryDelay            time.Duration
+	FailedAt              time.Time
 	QueueID               string
 	UsageSource           string
 	ChildSessionID        string

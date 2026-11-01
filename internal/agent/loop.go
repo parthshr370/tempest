@@ -61,6 +61,7 @@ import (
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -201,6 +202,7 @@ type loopRun struct {
 // edge is the one place hooks and providers can take the run down), so
 // agent_end is still emitted.
 func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body func(context.Context) error) ([]types.Message, RunResult) {
+	ctx = tracecontext.StartRun(ctx, run.config.Trace)
 	if run.config.Hooks != nil {
 		ctx = hooks.WithRun(ctx, func(ctx context.Context, report hooks.Report) error {
 			return run.emit(ctx, AgentEvent{Type: EventHook, Hook: &report})
@@ -903,7 +905,14 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			return admitCtx.Err()
 		}
 	}
-	streamCtx, cancelStream := context.WithCancel(ctx)
+	// The request's span is a sibling of the run's tool spans; providers send
+	// it as the traceparent of their HTTP requests.
+	requestCtx := tracecontext.StartChild(ctx)
+	described := &ModelRequest{Model: config.Model, SystemPrompt: llmContext.SystemPrompt, Messages: llmMessages, MaxTokens: options.MaxTokens, Temperature: options.Temperature, Reasoning: options.Reasoning}
+	if err := emit(requestCtx, AgentEvent{Type: EventModelRequest, Request: described}); err != nil {
+		return types.AssistantMessage{API: config.Model.API, Provider: config.Model.Provider, Model: config.Model.ID, StopReason: types.StopError, ErrorMessage: err.Error()}, err
+	}
+	streamCtx, cancelStream := context.WithCancel(requestCtx)
 	request := observers.request
 	request.begin()
 	defer request.end(requestCancelled, nil)
@@ -963,8 +972,19 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			if event.Type == types.EvRetry {
 				slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
 			}
+			// A switch's retry event names the backup and comes before the
+			// discarded message ends, as a retry's does; the switch itself is
+			// reported after, once the attempt is accounted.
+			retried := AgentEvent{Type: EventModelRetry, Message: attempt, Attempt: event.Attempt, RetryDelay: event.RetryDelay, FailedAt: event.FailedAt}
+			if event.Fallback != nil {
+				fallback := *event.Fallback
+				retried.Attempt, retried.Fallback = fallback.Attempts, &fallback
+			}
+			if err := emit(ctx, retried); err != nil {
+				return attempt, err
+			}
 			// An attempt that failed before streaming (an HTTP error) opened
-			// no message and reported no usage; the log line is its record.
+			// no message and reported no usage; the retry event is its record.
 			if addedPartial {
 				addedPartial = false
 				cctx.Messages[len(cctx.Messages)-1] = attempt

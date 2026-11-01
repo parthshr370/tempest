@@ -130,14 +130,15 @@ TEMPEST_TOKEN=change-me ./bin/tempest serve -listen 127.0.0.1:7777
 ```
 
 Once bound, it prints one stderr line such as
-`tempest serve listening on http://127.0.0.1:7777 (ACP /acp, A2A /a2a)`. With
+`tempest serve listening on http://127.0.0.1:7777 (ACP /acp, A2A /a2a, metrics /metrics)`. With
 `-listen 127.0.0.1:0` the line shows the port the OS picked.
 
 Connect to `ws://127.0.0.1:7777/acp` with `Authorization: Bearer change-me` or
 `?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required off
 loopback; when one is configured, loopback connections need it too.
-`GET /healthz` is unauthenticated and reports session and running counts. WebSocket
-mode does not also serve stdio.
+`GET /healthz` is unauthenticated and reports session and running counts.
+`GET /metrics` serves Prometheus text behind the same token; see
+[Telemetry](telemetry.md). WebSocket mode does not also serve stdio.
 
 ### A2A 1.0
 

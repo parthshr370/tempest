@@ -47,6 +47,7 @@ import (
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/skills"
 	"go.harness.dev/harness/internal/toolio"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/internal/truncate"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/environment"
@@ -945,6 +946,8 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			defer cancel()
 			cmd := exec.CommandContext(execCtx, shell, "-c", command)
 			cmd.Dir = cwd
+			// Nil keeps the inherited environment; a traced call adds TRACEPARENT.
+			cmd.Env = tracecontext.Environ(execCtx, nil)
 			if runtime.GOOS != "windows" {
 				cmd.WaitDelay = 2 * time.Second
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

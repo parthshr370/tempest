@@ -207,6 +207,7 @@ type ResolvedConfig struct {
 	debugAdapters          map[string]dap.Adapter
 	environment            string
 	environments           map[string]EnvironmentProcess
+	otel                   OTelSettings
 	settings               []Setting
 	warnings               []string
 	workspace              *workspaceSettings
@@ -434,6 +435,7 @@ type fileSettings struct {
 	WorkspaceListing        *bool                             `json:"workspace_listing"`
 	ListingMaxFiles         *int                              `json:"workspace_listing_max_files"`
 	ListingMaxBytes         *int                              `json:"workspace_listing_max_bytes"`
+	OTel                    *otelFileSettings                 `json:"otel"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -585,6 +587,10 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	otel, err := resolveOTel(settings.OTel)
+	if err != nil {
+		return nil, err
+	}
 	resolved := &ResolvedConfig{
 		environment:            environmentName,
 		environments:           environments,
@@ -624,6 +630,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		untrustedProviderFiles: layered.untrustedProviderFiles,
 		debugAdapters:          debugAdapters,
 		settings:               layered.list,
+		otel:                   otel,
 		warnings:               slices.Concat(resolver.operatorWarnings, layered.warnings),
 		workspace:              &workspaceSettings{resolver: resolver, root: root},
 		workspaceListing:       WorkspaceListing{Disabled: !settingValue(settings.WorkspaceListing), MaxFiles: listingMaxFiles, MaxBytes: listingMaxBytes},

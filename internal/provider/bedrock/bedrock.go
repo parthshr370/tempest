@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
 	"go.harness.dev/harness/internal/retry"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 // StreamSimple calls ConverseStream, or Converse when Transport is "http".
@@ -416,6 +417,8 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 		}
 		sign(req, body, creds, region, "bedrock", time.Now())
 	}
+	// Added after SigV4 signing: the header is not part of the signature.
+	tracecontext.Inject(req.Context(), req.Header)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fail(err)

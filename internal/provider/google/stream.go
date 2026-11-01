@@ -25,6 +25,7 @@ import (
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
 	"go.harness.dev/harness/internal/retry"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 // Stream starts a Gemini generation and returns an AssistantStream whose events
@@ -121,7 +122,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 	for key, value := range mergeHeaders(headers, model.Headers, opts.Headers) {
 		req.Header.Set(key, value)
 	}
-
+	tracecontext.Inject(req.Context(), req.Header)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)

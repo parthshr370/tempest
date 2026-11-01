@@ -108,7 +108,10 @@ func TestAgentLoopSingleTurnNoTools(t *testing.T) {
 	if events[0].Type != EventAgentStart || events[1].Type != EventTurnStart {
 		t.Fatalf("initial events = %#v", eventTypes(events[:2]))
 	}
-	assistantStart := 2
+	if events[2].Type != EventModelRequest || events[2].Request == nil || events[2].Request.SystemPrompt != "sys" {
+		t.Fatalf("request event = %#v", events[2])
+	}
+	assistantStart := 3
 	if events[assistantStart].Type != EventMessageStart || events[assistantStart].Message.Role() != "assistant" {
 		t.Fatalf("assistant start event = %#v", events[assistantStart])
 	}
@@ -296,8 +299,8 @@ func TestAgentLoopSteeringMessagesInjectedBeforeAssistant(t *testing.T) {
 	if got := <-seenPrompt; got != "user,user" {
 		t.Fatalf("llm roles = %q, want user,user", got)
 	}
-	if len(events) < 5 || events[2].Type != EventMessageStart || events[2].Message.Role() != "user" || events[4].Type != EventMessageStart || events[4].Message.Role() != "assistant" {
-		t.Fatalf("initial message events = %#v", eventTypes(events[:5]))
+	if len(events) < 6 || events[2].Type != EventMessageStart || events[2].Message.Role() != "user" || events[4].Type != EventModelRequest || events[5].Type != EventMessageStart || events[5].Message.Role() != "assistant" {
+		t.Fatalf("initial message events = %#v", eventTypes(events[:6]))
 	}
 	if len(messages) != 2 || messages[0].Role() != "user" || assistantText(t, assistantMessageAt(t, messages, 1)) != "after steering" {
 		t.Fatalf("messages = %#v", messages)

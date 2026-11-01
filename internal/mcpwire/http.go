@@ -18,6 +18,7 @@ import (
 
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/rpc"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 type httpMessage struct {
@@ -104,6 +105,7 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 	if cursor != "" {
 		req.Header.Set("Last-Event-ID", cursor)
 	}
+	tracecontext.Inject(ctx, req.Header)
 	response, err := h.client.Do(req)
 	if err != nil {
 		var requestError *url.Error

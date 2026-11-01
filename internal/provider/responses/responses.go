@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
 	"go.harness.dev/harness/internal/retry"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/internal/transport/sseparse"
 )
 
@@ -250,6 +251,7 @@ func run(parent context.Context, s *stream.AssistantStream, model types.Model, c
 	if model.Provider == "openai-chatgpt" {
 		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
+	tracecontext.Inject(req.Context(), req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		fail(err)

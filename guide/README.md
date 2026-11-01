@@ -33,6 +33,7 @@ These pages hold the command, tool, and protocol reference.
 | Page | What it covers |
 |---|---|
 | [Servers and protocols](serve-and-protocols.md) | MCP client/server, ACP, A2A 1.0, authentication, progress, approval, and recovery |
+| [Telemetry](telemetry.md) | OpenTelemetry settings, span tree and attributes, trace propagation, metric names, and `/metrics` |
 | [Go SDK](sdk.md) | In-process sessions, watches, prompts, cancellation, and the embedding example |
 | [Testing](testing.md) | Faux provider scripts, provider conformance, build commands, smoke checks, and the codebase tour |
 
