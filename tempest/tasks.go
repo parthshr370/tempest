@@ -88,6 +88,29 @@ func (c *sessionCore) resumeCompactions() {
 	}
 }
 
+// drainTasks runs a caller's task drain outside run admission, so a live
+// background phase never blocks a prompt. The drain still owns phase replies
+// and store writes, so Close suspends the runtime and joins it before the
+// store closes. A drain that Close cut short reports ErrClosed.
+func (c *sessionCore) drainTasks(drain func() error) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return ErrClosed
+	}
+	c.taskWorkers.Add(1)
+	c.mu.Unlock()
+	err := drain()
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	c.taskWorkers.Done()
+	if err == nil && closed {
+		return ErrClosed
+	}
+	return err
+}
+
 // CreateTask admits a phase workflow. Background roots belong to the session;
 // ordinary roots require the current conversational run and its permission tier.
 func (s *Session) CreateTask(ctx context.Context, request TaskRequest) (Task, error) {
@@ -177,7 +200,7 @@ func (s *Session) CancelTask(ctx context.Context, id string) error {
 	if err := s.core.jobs.Tasks.Abort(ctx, id, "cancelled"); err != nil {
 		return err
 	}
-	return s.core.jobs.Tasks.ResumeTask(ctx, id)
+	return s.core.drainTasks(func() error { return s.core.jobs.Tasks.ResumeTask(ctx, id) })
 }
 
 // RetryTask explicitly unblocks a parked phase after correcting its definition.
@@ -201,7 +224,7 @@ func (s *Session) CancelAll(ctx context.Context) error {
 			}
 		}
 	}
-	return s.core.jobs.Tasks.Resume(ctx)
+	return s.core.drainTasks(func() error { return s.core.jobs.Tasks.Resume(ctx) })
 }
 
 // NextWake returns the earliest persisted deadline without invoking code.

@@ -973,7 +973,8 @@ func (s *Session) close(ctx context.Context) error {
 		}
 	}
 	// Drain owners may still be adopting phase replies after their handlers join.
-	// Don't close their store until both admission and task drains have returned.
+	// Don't close their store until admission and every task drain (run cleanup
+	// and caller drains through drainTasks) has returned.
 	c.admission.Lock()
 	c.admission.Unlock()
 	c.taskWorkers.Wait()
