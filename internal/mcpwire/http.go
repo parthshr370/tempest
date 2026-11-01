@@ -253,7 +253,22 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 		}
 		callbackCtx, cancel := context.WithTimeout(h.ctx, mustDuration(h.cfg.CallTimeout))
 		defer cancel()
-		if err := h.postAccepted(callbackCtx, response); err != nil {
+		err := h.postAccepted(callbackCtx, response)
+		// A refused credential (the token died while the user answered)
+		// keeps the connection, as on the stream: calls in flight were
+		// authorized when sent. The answer goes once more after the next
+		// login or refresh, within its own call timeout; otherwise the
+		// server's request times out on its side.
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			select {
+			case <-h.handlers.Auth.Renewed(authErr.token):
+				err = h.postAccepted(callbackCtx, response)
+			case <-callbackCtx.Done():
+				return
+			}
+		}
+		if err != nil && !errors.As(err, &authErr) {
 			h.invalidate()
 		}
 	}()

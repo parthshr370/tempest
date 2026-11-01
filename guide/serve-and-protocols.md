@@ -133,7 +133,10 @@ longer knows (`invalid_client`) is dropped and the next login registers again. A
 challenged scopes together, then retries the request once. When the server refuses
 the token on its optional notification stream (the `GET`), only that stream stops:
 calls in flight keep running, and the stream reconnects once Tempest holds a new
-token from a login or refresh, without polling the server meanwhile.
+token from a login or refresh, without polling the server meanwhile. The same holds
+when the server refuses Tempest's answer to its own request (an elicitation reply or
+a sampling result): the connection stays, and the answer is sent once more after
+the next login or refresh, if that comes within the server's `callTimeout`.
 
 Every URL in discovery other than the server's own origin (`resource_metadata`,
 authorization servers and their endpoints) is named by the server, so Tempest

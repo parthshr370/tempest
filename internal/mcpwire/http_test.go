@@ -333,6 +333,125 @@ func TestMCPSSEResumeRefusedForAuthorizationIsNotRetryable(t *testing.T) {
 		t.Fatalf("POST sent %d times", posts.Load())
 	}
 }
+
+// renewingAuth hands out its current token and refuses every rejection,
+// as a token that needs a login does; renew stands in for that login.
+type renewingAuth struct {
+	mu      sync.Mutex
+	token   string
+	renewed chan struct{}
+}
+
+func (a *renewingAuth) Token(context.Context) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.token, nil
+}
+func (a *renewingAuth) Rejected(context.Context, Rejection) error {
+	return errors.New("mcp_auth: login required")
+}
+func (a *renewingAuth) Renewed(refused string) <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token != refused {
+		renewed := make(chan struct{})
+		close(renewed)
+		return renewed
+	}
+	return a.renewed
+}
+func (a *renewingAuth) renew(token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.token = token
+	close(a.renewed)
+	a.renewed = make(chan struct{})
+}
+
+// Tempest's answer to a server request that is refused for authorization
+// (the token died while the user answered) keeps the connection, like the
+// stream: the answer is posted once more after the next login, and only
+// within the answer's call timeout.
+func TestMCPHTTPReplyRefusedForAuthorizationKeepsTheConnection(t *testing.T) {
+	const (
+		callTimeout = time.Second
+		// settle is how long a reply that should not come is waited for.
+		settle = 100 * time.Millisecond
+	)
+	for _, renew := range []bool{true, false} {
+		t.Run(fmt.Sprintf("renewed=%v", renew), func(t *testing.T) {
+			replies := make(chan string, 4)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+					return
+				case http.MethodGet:
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				var message httpMessage
+				_ = json.NewDecoder(r.Body).Decode(&message)
+				switch message.Method {
+				case "initialize":
+					writeRPC(t, w, message.ID, json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"auth","version":"1"}}`))
+				case "notifications/initialized", "notifications/cancelled":
+					w.WriteHeader(http.StatusAccepted)
+				case "tools/call":
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"ask\",\"method\":\"ping\",\"params\":{}}\n\n")
+					_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[]}}\n\n", message.ID)
+				case "tools/list":
+					writeRPC(t, w, message.ID, json.RawMessage(`{"tools":[]}`))
+				case "":
+					authorization := r.Header.Get("Authorization")
+					replies <- authorization
+					if authorization != "Bearer new" {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					w.WriteHeader(http.StatusAccepted)
+				}
+			}))
+			defer server.Close()
+			auth := &renewingAuth{token: "old", renewed: make(chan struct{})}
+			client, err := Dial(context.Background(), mcpconfig.Server{Name: "auth", Transport: "http", URL: server.URL, CallTimeout: callTimeout.String()}, t.TempDir(), Handlers{Auth: auth})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeWire(t, client)
+			if _, err := client.Call(context.Background(), "tools/call", struct{}{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := <-replies; got != "Bearer old" {
+				t.Fatalf("first answer carried %q", got)
+			}
+			if renew {
+				auth.renew("new")
+				select {
+				case got := <-replies:
+					if got != "Bearer new" {
+						t.Fatalf("answer after the login carried %q", got)
+					}
+				case <-time.After(3 * callTimeout):
+					t.Fatal("the answer was not posted again after the login")
+				}
+			} else {
+				// The answer's call timeout passes without a login.
+				time.Sleep(callTimeout + 2*settle)
+				auth.renew("new")
+			}
+			if _, err := client.Call(context.Background(), "tools/list", struct{}{}); err != nil {
+				t.Fatalf("the answer's authorization failure closed the connection: %v", err)
+			}
+			select {
+			case got := <-replies:
+				t.Fatalf("answer posted again (%q) after its timeout or a second time", got)
+			case <-time.After(settle):
+			}
+		})
+	}
+}
 func TestMCPHTTPNoCredentialRetry(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTemporaryRedirect} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
