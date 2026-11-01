@@ -89,10 +89,18 @@ func (c *Client) WithRemoteParent(span tracecontext.SpanContext) *Client {
 	return c
 }
 
-// traced puts the run's remote parent in ctx: the prompt's _meta.traceparent
-// when it is valid, else the connection's.
-func (c *Client) traced(ctx context.Context, traceparent string) context.Context {
-	if parent, ok := tracecontext.Parse(traceparent); ok {
+// traceMeta is the W3C trace context ACP reserves at the root of _meta: a
+// prompt's run becomes the child span of its traceparent, and carries its
+// tracestate on.
+type traceMeta struct {
+	Traceparent string `json:"traceparent"`
+	Tracestate  string `json:"tracestate"`
+}
+
+// traced puts the run's remote parent in ctx: the prompt's _meta trace
+// context when its traceparent is valid, else the connection's.
+func (c *Client) traced(ctx context.Context, trace traceMeta) context.Context {
+	if parent, ok := tracecontext.ParseWithState(trace.Traceparent, trace.Tracestate); ok {
 		return tracecontext.WithRemoteParent(ctx, parent)
 	}
 	return tracecontext.WithRemoteParent(ctx, c.remoteParent)
@@ -268,10 +276,8 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		Report               string   `json:"report"`
 		Force                bool     `json:"force"`
 		Meta                 struct {
-			// Traceparent is the W3C trace context ACP reserves at the
-			// root of _meta; the prompt's run becomes its child span.
-			Traceparent string `json:"traceparent"`
-			Tempest     struct {
+			traceMeta
+			Tempest struct {
 				// OutputSchema is the session/prompt run's final-answer
 				// JSON Schema; the response's _meta.tempest.output carries
 				// the validated answer.
@@ -331,7 +337,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		if method == "session/prompt" && p.Meta.Tempest.RequestID != "" {
 			remove := c.broker.add(s.ID(), c.conn)
-			submitCtx := c.traced(ctx, p.Meta.Traceparent)
+			submitCtx := c.traced(ctx, p.Meta.traceMeta)
 			submission, err := s.Submit(submitCtx, tempest.Input{RequestID: p.Meta.Tempest.RequestID, Prompt: prompt, Placement: tempest.PlacementInput})
 			if err != nil {
 				remove()
@@ -357,7 +363,7 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		remove := c.broker.add(s.ID(), c.conn)
 		var run *tempest.Run
-		runCtx := c.traced(c.backend.RunContext(), p.Meta.Traceparent)
+		runCtx := c.traced(c.backend.RunContext(), p.Meta.traceMeta)
 		if method == "session/prompt" {
 			run, err = s.Begin(runCtx, prompt)
 		} else {

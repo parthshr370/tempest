@@ -176,7 +176,7 @@ func TestDisabledOverflowDoesNotClaimOrSummarize(t *testing.T) {
 	if err := store.AppendMessage(t.Context(), cUser("input")); err != nil {
 		t.Fatal(err)
 	}
-	got, changed, err := runner.recoverOverflow(t.Context(), summaryMessages())
+	got, changed, err := runner.recoverOverflow(t.Context(), summaryMessages(), runner.model)
 	if err != nil || changed || len(got) == 0 || provider.CallCount() != 0 {
 		t.Fatal(changed, err)
 	}

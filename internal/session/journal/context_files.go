@@ -11,7 +11,9 @@ import (
 // surfaced, so the session neither repeats it nor overspends the
 // context_files byte cap while the conversation holds it. Dir and Path are
 // workspace-relative slash paths. Withheld marks a file named instead of
-// loaded because the cap was spent.
+// loaded because the cap was spent. Frame is the hex SHA-256 of the text
+// block that delivered the file, empty when the result alone delivered it:
+// the conversation holds the file only while that result carries the block.
 //
 // It is journaled inside the MessageEntry of the tool result that delivered
 // the file, never on its own: the record and the delivered text commit
@@ -21,6 +23,7 @@ type ContextFileRecord struct {
 	Path     string `json:"path"`
 	Bytes    int    `json:"bytes"`
 	Withheld bool   `json:"withheld,omitempty"`
+	Frame    string `json:"frame,omitempty"`
 }
 
 // ContextDelivery names the tool result that delivered context files: the

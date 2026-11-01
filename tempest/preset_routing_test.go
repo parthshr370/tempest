@@ -84,7 +84,9 @@ func TestPlanAliasUsesThePlanBackupsWithoutAPlanModel(t *testing.T) {
 	preset := extension.AgentPreset{ID: "planner", Version: 3, Description: "d", Instructions: "plan", Model: "plan"}
 	model := types.Model{Provider: "openai", ID: "gpt", BaseURL: "https://default.example/v1"}
 	planBackup := types.Model{Provider: "anthropic", ID: "plan-backup"}
-	none := func(context.Context, types.Model, types.Context, *types.SimpleStreamOptions) *stream.AssistantStream { return nil }
+	none := func(context.Context, types.Model, types.Context, *types.SimpleStreamOptions) *stream.AssistantStream {
+		return nil
+	}
 	cfg := StackConfig{
 		Model:              model,
 		PlanModel:          model,

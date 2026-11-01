@@ -24,7 +24,7 @@ func TestSummaryCountsUsageOfRetriedAttempts(t *testing.T) {
 		return response
 	})
 
-	summary, err := GenerateSummaryResult(context.Background(), fn, types.Model{ID: "m"}, DefaultCompactionSettings, []types.Message{types.UserMessage{Content: types.StringContent("summarize")}}, "")
+	summary, err := Summarizer{Stream: fn}.Summary(context.Background(), types.Model{ID: "m"}, DefaultCompactionSettings, []types.Message{types.UserMessage{Content: types.StringContent("summarize")}}, "")
 
 	if err != nil || summary.Text != "summary" || summary.Usage.Input != 16 || summary.Usage.TotalTokens != 18 {
 		t.Fatalf("summary = %+v, err = %v", summary, err)

@@ -47,8 +47,8 @@ bytes, counted after imports expand). The file that crosses it is cut and ends
 with a `[harness: context files exceed context_files.max_bytes ...]` notice that
 names the cut and every file left out, so the model knows its instructions are
 incomplete. The budget bounds the work as well: each context file is read only
-up to `context_files.max_bytes` bytes, and its imports only up to as many again,
-however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
+up to `context_files.max_bytes` bytes plus one, the extra byte telling whether it
+is cut, and its imports only up to as many again, however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
 the files a run in the current directory would load, their sizes, and the
 notice if any.
 
@@ -77,17 +77,22 @@ first context file it finds there (same name order as above). Reading
   user's requests win over it. The system prompt never changes, so the provider's
   prompt cache keeps working.
 - A directory surfaces once while the conversation holds the tool result that
-  carried its file. A rewind or reset to before that result, a fork made before
-  it, or a compaction that summarizes it away lets the file surface again on
-  the next read there; a fork made after it keeps it. The record is written
+  carried its file, with that file's exact frame still in it: the journal
+  records each frame's SHA-256, so tool output that only looks like a frame
+  does not count, and neither does another result with the same call ID and
+  turn time. A rewind or reset to before
+  that result, a fork made before it, or a compaction that summarizes it away
+  lets the file surface again on the next read there; a fork made after it
+  keeps it. The record is written
   into the same journal entry as the tool result, so a resumed session neither
   shows the file again nor spends its bytes twice, and a crash before that
   result was saved leaves no record: the resumed session shows it again.
 - Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
   and nested files count against `context_files.max_bytes` together with the
   startup files. A cut file ends with a `[harness: cut at ...]` notice. The work
-  follows the same budget: a file is read only up to the bytes it may keep, and
-  its imports only up to as many again. Once the total is spent, the next file
+  follows the same budget: a file is read only up to the bytes it may keep plus
+  one, the extra byte telling whether it is cut, and its imports only up to as
+  many again. Once the total is spent, the next file
   is named but not loaded, and no further directory is looked at.
 - Files are read inside the working directory, imports included. A context
   file or an `@file` import that is a symlink pointing outside it, a `../` or
@@ -135,7 +140,9 @@ turns on `ls` and `find`.
   `git` leaves the session without a listing. rg blocks on a FIFO named
   `.ignore` or `.gitignore`, so when rg has listed no name by half the time
   left, the walk starts beside it: whichever finishes first is the listing, and
-  at the deadline rg's names are, or the walk's when rg has none. A remote
+  at the deadline rg's names are, or the walk's when rg has none. The loser is
+  stopped, and the listing waits for a stopped walk to end, at most until the
+  deadline. A remote
   environment lists its own workspace with the same code in 1.5 of the 2
   seconds, leaving the rest for its reply to arrive.
 - **Size.** The listed names fit `workspace_listing_max_bytes` (default 4096).

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -278,6 +279,43 @@ func TestWorkspaceListingKeepsSlowRgBesideTheWalk(t *testing.T) {
 	}
 	if files.source != rgListingSource || strings.Join(files.paths, ",") != "slow.go" || files.more {
 		t.Fatalf("listed %+v", files)
+	}
+}
+
+// When rg wins, the walk started beside it is stopped and waited for, so
+// no walk outlives the listing, even one held in a filesystem call that
+// cancellation cannot interrupt.
+func TestWorkspaceListingJoinsTheWalkRgBeat(t *testing.T) {
+	const (
+		budget = 3 * time.Second
+		// rg names its file after half the budget, so the walk has started;
+		// the walk's held call ends after that and before the deadline.
+		rgDelay   = "2"
+		walkDelay = time.Second
+		// stackBytes holds every goroutine's stack in a test process.
+		stackBytes = 1 << 20
+	)
+	rg := filepath.Join(t.TempDir(), "rg")
+	script := "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nsleep " + rgDelay + "\nprintf 'slow.go\\0'\n"
+	if err := os.WriteFile(rg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command(rg, "warm").Run(); err != nil {
+		t.Fatal(err)
+	}
+	held := func() { time.Sleep(walkDelay) }
+	testHookWalkEntered.Store(&held)
+	t.Cleanup(func() { testHookWalkEntered.Store(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	files, err := localRgFiles(ctx, rg, t.TempDir(), 100)
+	if err != nil || files.source != rgListingSource || strings.Join(files.paths, ",") != "slow.go" {
+		t.Fatalf("listed %+v, %v", files, err)
+	}
+	stacks := make([]byte, stackBytes)
+	if stack := string(stacks[:runtime.Stack(stacks, true)]); strings.Contains(stack, "(*workspaceWalk).run") {
+		t.Fatalf("a walk outlived the listing:\n%s", stack)
 	}
 }
 

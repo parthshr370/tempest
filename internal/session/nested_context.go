@@ -41,10 +41,11 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 	deliveries := &contextDeliveries{files: map[deliveryKey][]discovery.NestedFile{}}
 	if cfg.Loaded != nil {
 		for _, delivery := range cfg.Loaded.ContextFiles {
-			key := deliveryKey{turn: delivery.Turn, call: delivery.ToolCallID}
+			files := make([]discovery.NestedFile, 0, len(delivery.Files))
 			for _, record := range delivery.Files {
-				deliveries.files[key] = append(deliveries.files[key], discovery.NestedFile{Dir: record.Dir, Path: record.Path, Bytes: record.Bytes, Withheld: record.Withheld})
+				files = append(files, discovery.NestedFile{Dir: record.Dir, Path: record.Path, Bytes: record.Bytes, Withheld: record.Withheld, Frame: record.Frame})
 			}
+			deliveries.record(deliveryKey{turn: delivery.Turn, call: delivery.ToolCallID}, files)
 		}
 	}
 	return func(ctx context.Context, call agent.AfterToolCallContext) *agent.AfterToolCallResult {
@@ -69,12 +70,12 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 			}
 		}
 		if len(files) > 0 {
-			key := deliveryKey{turn: call.AssistantMessage.Timestamp, call: call.ToolCall.ID}
-			deliveries.files[key] = append(deliveries.files[key], files...)
+			deliveries.record(deliveryKey{turn: call.AssistantMessage.Timestamp, call: call.ToolCall.ID}, files)
+			deliveries.running = append(deliveries.running, files...)
 			if cfg.Journal != nil {
 				records := make([]journal.ContextFileRecord, 0, len(files))
 				for _, file := range files {
-					records = append(records, journal.ContextFileRecord{Dir: file.Dir, Path: file.Path, Bytes: file.Bytes, Withheld: file.Withheld})
+					records = append(records, journal.ContextFileRecord{Dir: file.Dir, Path: file.Path, Bytes: file.Bytes, Withheld: file.Withheld, Frame: file.Frame})
 				}
 				cfg.Journal.StageContextFiles(contextCallKey(ctx, call.ToolCall.ID), records)
 			}
@@ -91,7 +92,8 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 }
 
 // deliveryKey names a tool result by its assistant turn's timestamp and its
-// call ID: provider call IDs alone may repeat across turns.
+// call ID. Distinct turns may share both, so a result holds a delivered
+// file only while it also carries the file's whole frame.
 type deliveryKey struct {
 	turn int64
 	call string
@@ -102,37 +104,64 @@ type deliveryKey struct {
 type contextDeliveries struct {
 	mu    sync.Mutex
 	files map[deliveryKey][]discovery.NestedFile
+	// batch is the tool-call content of the assistant message whose calls
+	// are running. Holding it keeps its address unique to that message, so
+	// a later turn with the same timestamp and call IDs is a new batch.
+	batch []ptypes.ContentBlock
+	// running are the files the batch's calls delivered; their results
+	// are not in the conversation yet.
+	running []discovery.NestedFile
 }
 
-// shown returns the files the conversation holds: those of each tool result
-// in messages, and those of the calls in current, the batch now running,
-// whose results may not be in messages yet.
+// record adds files to the delivery under key; a file already there is
+// replaced, so it counts once however often the key recurs.
+func (d *contextDeliveries) record(key deliveryKey, files []discovery.NestedFile) {
+	recorded := d.files[key]
+	for _, file := range files {
+		recorded = slices.DeleteFunc(recorded, func(old discovery.NestedFile) bool { return old.Path == file.Path })
+		recorded = append(recorded, file)
+	}
+	d.files[key] = recorded
+}
+
+// shown returns the files the conversation holds: those each tool result
+// in messages carries, and those the batch of current, now running,
+// delivered so far.
 func (d *contextDeliveries) shown(messages []ptypes.Message, current ptypes.AssistantMessage) []discovery.NestedFile {
+	if len(current.Content) == 0 || len(d.batch) == 0 || &current.Content[0] != &d.batch[0] {
+		d.batch, d.running = current.Content, nil
+	}
+	shown := slices.Clone(d.running)
 	if len(d.files) == 0 {
-		return nil
+		return shown
 	}
-	var running []deliveryKey
-	for _, block := range current.Content {
-		if block.Type == ptypes.BlockToolCall {
-			running = append(running, deliveryKey{turn: current.Timestamp, call: block.ID})
-		}
-	}
-	var shown []discovery.NestedFile
 	var turn int64
 	for _, message := range messages {
 		switch m := message.(type) {
 		case ptypes.AssistantMessage:
 			turn = m.Timestamp
 		case ptypes.ToolResultMessage:
-			if key := (deliveryKey{turn: turn, call: m.ToolCallID}); !slices.Contains(running, key) {
-				shown = append(shown, d.files[key]...)
+			for _, file := range d.files[deliveryKey{turn: turn, call: m.ToolCallID}] {
+				if carries(m, file) {
+					shown = append(shown, file)
+				}
 			}
 		}
 	}
-	for _, key := range running {
-		shown = append(shown, d.files[key]...)
-	}
 	return shown
+}
+
+// carries reports whether result still holds file: the file's frame, the
+// exact block that delivered it, is one of the result's text blocks. A file
+// recorded without a frame, the context file the read showed whole, is held
+// by its result alone.
+func carries(result ptypes.ToolResultMessage, file discovery.NestedFile) bool {
+	if file.Bytes == 0 && !file.Withheld {
+		return true
+	}
+	return slices.ContainsFunc(result.Content, func(block ptypes.ContentBlock) bool {
+		return block.Type == ptypes.BlockText && file.Frames(block.Text)
+	})
 }
 
 // contextCallKey names a tool call the way the recorder names its result:

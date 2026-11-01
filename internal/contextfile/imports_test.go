@@ -174,3 +174,24 @@ func TestExpandNormativeImportMatrix(t *testing.T) {
 		}
 	})
 }
+
+// A cut import keeps whole characters: the byte budget never splits a
+// multi-byte rune, and the expansion reports that it was cut. The bytes the
+// cut gave back are not spent on a later import, which stays literal as it
+// did when the cut fell between characters.
+func TestExpandCutsAnImportAtARuneBoundary(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "part.md"), "ab€cd")
+	mustWrite(t, filepath.Join(dir, "next.md"), "x")
+	// The budget ends one byte into the three-byte "€".
+	text, complete, err := Expand(context.Background(), openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte("@./part.md @./next.md"), ExpandOptions{MaxBytes: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("a cut import reported a complete expansion")
+	}
+	if want := "ab @./next.md"; text != want {
+		t.Fatalf("cut import = %q, want %q", text, want)
+	}
+}

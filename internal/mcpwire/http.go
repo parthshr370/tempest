@@ -80,9 +80,10 @@ func (h *httpTransport) begin(ctx context.Context) (context.Context, func(), err
 
 // request sends one HTTP exchange. With Auth, every request carries the
 // current bearer token (MCP authorization: tokens go in every request), and
-// a 401 or 403 is retried once when Auth recovers without a user.
-func (h *httpTransport) request(ctx context.Context, method string, body []byte, initial bool, cursor string) (*http.Response, error) {
-	for retried := false; ; retried = true {
+// a 401 or 403 is retried once when Auth recovers without a user; retried
+// marks an exchange that is itself that one retry, so it is sent only once.
+func (h *httpTransport) request(ctx context.Context, method string, body []byte, initial bool, cursor string, retried bool) (*http.Response, error) {
+	for ; ; retried = true {
 		// With Auth, a rejection reports the address it came from, which
 		// bounds where OAuth discovery may go.
 		var remote net.Addr
@@ -223,6 +224,14 @@ func decodeMessage(raw []byte) (httpMessage, error) {
 	}
 	return message, nil
 }
+
+// serverMessage handles a message the server sent on a stream. ctx is that
+// stream's lifetime, within the connection's: a call's, for a message on the
+// call's response stream, which relates to that call (MCP Streamable HTTP),
+// and the connection's for the GET stream. A server request ends with it:
+// once the call is answered, cancelled or past its deadline, the server no
+// longer waits for the answer, so its handler is cancelled and nothing more
+// is posted.
 func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) error {
 	if message.Method == "" {
 		return errors.New("mcp_protocol: unexpected response on notification stream")
@@ -242,7 +251,10 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 			}
 			return
 		}
-		result, rpcErr := h.handlers.Request(h.ctx, message.Method, message.Params)
+		result, rpcErr := h.handlers.Request(ctx, message.Method, message.Params)
+		if ctx.Err() != nil {
+			return
+		}
 		response := httpMessage{JSONRPC: "2.0", ID: message.ID, Error: rpcErr}
 		if rpcErr == nil {
 			var err error
@@ -251,9 +263,29 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 				response.Error = rpc.NewError(-32603, "internal_error", "unable to encode callback result")
 			}
 		}
-		callbackCtx, cancel := context.WithTimeout(h.ctx, mustDuration(h.cfg.CallTimeout))
+		callbackCtx, cancel := context.WithTimeout(ctx, mustDuration(h.cfg.CallTimeout))
 		defer cancel()
-		if err := h.postAccepted(callbackCtx, response); err != nil {
+		err := h.postAccepted(callbackCtx, response, false)
+		// A refused credential (the token died while the user answered)
+		// keeps the connection, as on the stream: calls in flight were
+		// authorized when sent. The answer goes once more, in one POST,
+		// after the next login or refresh, while the server's request lasts
+		// and within the answer's own call timeout; otherwise the server's
+		// request times out on its side.
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			select {
+			case <-h.handlers.Auth.Renewed(authErr.token):
+			case <-callbackCtx.Done():
+			}
+			if callbackCtx.Err() != nil {
+				return
+			}
+			err = h.postAccepted(callbackCtx, response, true)
+		}
+		// An answer cut off because the server's request ended says nothing
+		// about the connection.
+		if err != nil && !errors.As(err, &authErr) && ctx.Err() == nil {
 			h.invalidate()
 		}
 	}()
@@ -263,7 +295,10 @@ func mustDuration(value string) time.Duration {
 	duration, _ := time.ParseDuration(value)
 	return duration
 }
-func (h *httpTransport) postAccepted(ctx context.Context, message httpMessage) error {
+
+// postAccepted posts a notification or an answer, which the server accepts
+// with 202; retried as for request.
+func (h *httpTransport) postAccepted(ctx context.Context, message httpMessage, retried bool) error {
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		return err
@@ -271,7 +306,7 @@ func (h *httpTransport) postAccepted(ctx context.Context, message httpMessage) e
 	if len(encoded) > MaxRequest {
 		return errors.New("mcp_output_limit: outbound message exceeds 1 MiB")
 	}
-	response, err := h.request(ctx, http.MethodPost, encoded, false, "")
+	response, err := h.request(ctx, http.MethodPost, encoded, false, "", retried)
 	if err != nil {
 		return err
 	}
@@ -299,7 +334,7 @@ func (h *httpTransport) notify(ctx context.Context, method string, params any) e
 			return err
 		}
 	}
-	return h.postAccepted(linked, message)
+	return h.postAccepted(linked, message, false)
 }
 func (h *httpTransport) call(ctx context.Context, id, method string, params any) (json.RawMessage, error) {
 	linked, done, err := h.begin(ctx)
@@ -322,7 +357,7 @@ func (h *httpTransport) call(ctx context.Context, id, method string, params any)
 	if len(encoded) > MaxRequest {
 		return nil, errors.New("mcp_output_limit: outbound request exceeds 1 MiB")
 	}
-	response, err := h.request(linked, http.MethodPost, encoded, method == "initialize", "")
+	response, err := h.request(linked, http.MethodPost, encoded, method == "initialize", "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +471,7 @@ func (h *httpTransport) readLogical(ctx context.Context, response *http.Response
 		if err := waitRetry(ctx, retry); err != nil {
 			return httpMessage{}, err
 		}
-		resumed, err := h.request(ctx, http.MethodGet, nil, false, cursor)
+		resumed, err := h.request(ctx, http.MethodGet, nil, false, cursor, false)
 		var authErr *AuthError
 		if errors.As(err, &authErr) {
 			// The server already processed the POST; only reading its
@@ -468,7 +503,7 @@ func (h *httpTransport) listen() {
 	cursor := ""
 	retry := defaultSSERetry
 	for h.ctx.Err() == nil {
-		response, err := h.request(h.ctx, http.MethodGet, nil, false, cursor)
+		response, err := h.request(h.ctx, http.MethodGet, nil, false, cursor, false)
 		if err != nil {
 			if h.ctx.Err() != nil || !h.alive() {
 				return
@@ -574,7 +609,7 @@ func (h *httpTransport) close(ctx context.Context) error {
 		h.cancel()
 		if session != "" {
 			// DELETE is cleanup only; it must survive cancellation of the request streams.
-			response, err := h.request(ctx, http.MethodDelete, nil, false, "")
+			response, err := h.request(ctx, http.MethodDelete, nil, false, "", false)
 			if err == nil {
 				response.Body.Close()
 				if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusNoContent && response.StatusCode != http.StatusMethodNotAllowed && response.StatusCode != http.StatusAccepted {

@@ -297,7 +297,11 @@ func astTargets(ctx context.Context, root *os.Root, cwd string, scopes []string,
 		if err != nil {
 			return nil, err
 		}
-		err = fs.WalkDir(root.FS(), filepath.ToSlash(rel), func(p string, entry fs.DirEntry, err error) error {
+		// As in the grep and find walks, the named scope itself is searched
+		// even when .gitignore or the .git rule covers it; the rules judge
+		// only what lies below it.
+		walkBase := filepath.ToSlash(rel)
+		err = fs.WalkDir(root.FS(), walkBase, func(p string, entry fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -312,16 +316,16 @@ func astTargets(ctx context.Context, root *os.Root, cwd string, scopes []string,
 				return nil
 			}
 			if entry.IsDir() {
-				if entry.Name() == ".git" || (p != "." && ignore.excludedOrUnder(p, true)) {
+				if p != walkBase && (entry.Name() == ".git" || ignore.excluded(p, true)) {
 					return fs.SkipDir
 				}
 				return nil
 			}
-			if !entry.Type().IsRegular() || ignore.excludedOrUnder(p, false) || !matchGlobPattern(glob, searchRelative(filepath.ToSlash(rel), p)) {
+			if !entry.Type().IsRegular() || (p != walkBase && ignore.excluded(p, false)) || !matchGlobPattern(glob, searchRelative(walkBase, p)) {
 				return nil
 			}
 			if lang == "" && astLanguage(p) == "" {
-				if p == filepath.ToSlash(rel) {
+				if p == walkBase {
 					return fmt.Errorf("unknown language for %s; supply lang", p)
 				}
 				return nil

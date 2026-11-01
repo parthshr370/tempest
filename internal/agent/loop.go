@@ -498,7 +498,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			}
 			pendingMessages = nil
 			if prepareResume {
-				update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages})
+				update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages, Model: config.Model})
 				if err != nil {
 					return err
 				}
@@ -578,7 +578,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return nil
 				}
 				if config.PrepareNextTurnE != nil && isContextOverflow(message.ErrorCode+" "+message.ErrorMessage) {
-					update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages, Message: message, Overflow: true})
+					update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages, Message: message, Overflow: true, Model: config.Model})
 					if err != nil {
 						return err
 					}
@@ -639,6 +639,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				Context:     current,
 				NewMessages: run.messages,
 				Handoff:     handoff,
+				Model:       config.Model,
 			}
 			if config.PrepareNextTurnE != nil {
 				update, err := config.PrepareNextTurnE(ctx, turnContext)

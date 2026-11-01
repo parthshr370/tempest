@@ -2,8 +2,10 @@ package compaction
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/faux"
@@ -130,5 +132,49 @@ func TestCompactRejectsEmptySummary(t *testing.T) {
 
 	if _, err := Compact(context.Background(), f.StreamSimple, model, prep); err == nil {
 		t.Fatal("expected error for empty summary output")
+	}
+}
+
+// A conversation too large for one request to the model is summarized in
+// requests that each fit its window: a message longer than a request is cut
+// between characters, and each later request updates the summary so far.
+func TestSummaryInPiecesFitsTheModelsWindow(t *testing.T) {
+	const window, output, runes = 2000, 200, 6000
+	model := ptypes.Model{ID: "small", ContextWindow: window, MaxTokens: output}
+	messages := []ptypes.Message{userMsg(strings.Repeat("é", runes)), assistantMsg("done")}
+	var prompts []string
+	step := func(c ptypes.Context, opts *ptypes.StreamOptions, state faux.State, m ptypes.Model) (ptypes.AssistantMessage, error) {
+		prompt := userContentText(c.Messages[0].(ptypes.UserMessage).Content)
+		if size := EstimateContextTokens(c.Messages).Tokens + (len(c.SystemPrompt)+3)/4 + opts.MaxTokens; size > window {
+			t.Errorf("request %d needs %d estimated tokens, over the %d-token window", len(prompts), size, window)
+		}
+		if !utf8.ValidString(prompt) {
+			t.Errorf("request %d cut a character", len(prompts))
+		}
+		if len(prompts) > 0 && !strings.Contains(prompt, "<previous-summary>\nsummary "+strconv.Itoa(len(prompts))+"\n") {
+			t.Errorf("request %d does not update the summary so far", len(prompts))
+		}
+		prompts = append(prompts, prompt)
+		return faux.Respond(faux.Text("summary "+strconv.Itoa(len(prompts))))(c, opts, state, m)
+	}
+	f := faux.New(faux.Options{})
+	steps := make([]faux.ResponseStep, 32)
+	for i := range steps {
+		steps[i] = step
+	}
+	f.SetResponses(steps...)
+	result, err := Summarizer{Stream: f.StreamSimple}.Summary(context.Background(), model, DefaultCompactionSettings, messages, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prompts) < 2 || result.Text != "summary "+strconv.Itoa(len(prompts)) {
+		t.Fatalf("%d requests answered %q, want several, the last one's summary kept", len(prompts), result.Text)
+	}
+	conversation := ""
+	for _, prompt := range prompts {
+		conversation += prompt[:strings.Index(prompt, "\n</conversation>")]
+	}
+	if strings.Count(conversation, "é") != runes || !strings.Contains(conversation, "done") {
+		t.Fatal("the requests together do not carry the whole conversation")
 	}
 }

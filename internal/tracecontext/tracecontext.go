@@ -249,6 +249,17 @@ func Extract(header http.Header) (SpanContext, bool) {
 	return parent, ok
 }
 
+// ParseWithState parses trace context carried as two plain values rather
+// than headers, as in ACP's _meta: tracestate is read only beside a valid
+// traceparent, and a malformed one is dropped without affecting it.
+func ParseWithState(traceparent, tracestate string) (SpanContext, bool) {
+	parent, ok := Parse(traceparent)
+	if ok {
+		parent.TraceState = parseTraceState([]string{tracestate})
+	}
+	return parent, ok
+}
+
 // parseTraceState combines tracestate header fields into one list, as
 // RFC 7230 combines repeated fields, leaving out empty members. It returns
 // "" when a member is malformed, a key repeats or there are more than 32

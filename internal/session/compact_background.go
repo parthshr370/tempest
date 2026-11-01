@@ -89,14 +89,15 @@ func (r *compactionRunner) InvokeTask(ctx context.Context, task extension.Task, 
 	if epoch != capture.Epoch {
 		return extension.TaskDecision{Kind: "complete", Result: json.RawMessage(`{"stale":true}`)}, nil
 	}
-	if capture.Model != r.model.Provider+"/"+r.model.ID {
+	model, ok := r.routeNamed(capture.Model)
+	if !ok {
 		return extension.TaskDecision{}, fmt.Errorf("captured compaction model unavailable")
 	}
 	messages, err := r.store.ReadSnapshot("capture_"+capture.Source, capture.Source, capture.Snapshot)
 	if err != nil {
 		return extension.TaskDecision{}, err
 	}
-	replacement, changed, err := r.summarizeUsing(ctx, messages, true, false, capture.Settings)
+	replacement, changed, err := r.summarizeUsing(ctx, messages, true, false, capture.Settings, model)
 	if err != nil {
 		return extension.TaskDecision{}, err
 	}
@@ -144,8 +145,15 @@ func (r *compactionRunner) Start(id string) {
 	}()
 }
 
-// Request coalesces manual and automatic requests into one durable summary task.
+// Request coalesces manual and automatic requests into one durable summary
+// task. A request outside a run summarizes on the primary model.
 func (r *compactionRunner) Request(ctx context.Context, messages []types.Message) (extension.Task, error) {
+	return r.request(ctx, messages, r.model)
+}
+
+// request captures messages for a summary on model, the route of the run
+// asking (see route).
+func (r *compactionRunner) request(ctx context.Context, messages []types.Message, model types.Model) (extension.Task, error) {
 	b := r.background
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -200,10 +208,11 @@ func (r *compactionRunner) Request(ctx context.Context, messages []types.Message
 	if err != nil {
 		return extension.Task{}, err
 	}
+	_, settings := r.budget(model)
 	identity, err := stableHash(struct {
 		Epoch, Source, Model string
 		Settings             compaction.CompactionSettings
-	}{epoch, source, r.model.Provider + "/" + r.model.ID, r.settings})
+	}{epoch, source, compactionModelName(model), settings})
 	if err != nil {
 		return extension.Task{}, err
 	}
@@ -211,7 +220,7 @@ func (r *compactionRunner) Request(ctx context.Context, messages []types.Message
 	if err != nil {
 		return extension.Task{}, err
 	}
-	capture := compactionCapture{Epoch: epoch, Source: source, Snapshot: snapshot, Count: len(detached), Settings: r.settings, Model: r.model.Provider + "/" + r.model.ID}
+	capture := compactionCapture{Epoch: epoch, Source: source, Snapshot: snapshot, Count: len(detached), Settings: settings, Model: compactionModelName(model)}
 	raw, err := json.Marshal(capture)
 	if err != nil {
 		return extension.Task{}, err
@@ -358,13 +367,15 @@ func (r *compactionRunner) backgroundTurn(ctx context.Context, c agent.ShouldSto
 	active := b.active
 	b.mu.Unlock()
 	messages := c.Context.Messages
+	model := r.route(c.Model)
+	window, settings := r.budget(model)
 	if active != "" {
 		task, err := b.tasks.Get(active)
 		if err != nil {
 			return nil, false, err
 		}
 		r.Start(active)
-		hard := compaction.ShouldCompact(compaction.EstimateContextTokens(messages).Tokens, r.contextWindow, r.settings)
+		hard := compaction.ShouldCompact(compaction.EstimateContextTokens(messages).Tokens, window, settings)
 		if hard && !taskstate.Terminal(task) {
 			task, err = r.Wait(ctx, active)
 			if err != nil {
@@ -377,11 +388,11 @@ func (r *compactionRunner) backgroundTurn(ctx context.Context, c agent.ShouldSto
 		return messages, false, nil
 	}
 	tokens := compaction.EstimateContextTokens(messages).Tokens
-	soft, hard := compaction.Thresholds(r.contextWindow, r.settings)
-	if !r.settings.Enabled || tokens < soft {
+	soft, hard := compaction.Thresholds(window, settings)
+	if !settings.Enabled || tokens < soft {
 		return messages, false, nil
 	}
-	task, err := r.Request(ctx, messages)
+	task, err := r.request(ctx, messages, model)
 	if err != nil {
 		return nil, false, err
 	}
@@ -450,7 +461,7 @@ func (r *compactionRunner) Recover(ctx context.Context) error {
 	}
 }
 
-func (r *compactionRunner) recoverOverflow(ctx context.Context, messages []types.Message) ([]types.Message, bool, error) {
+func (r *compactionRunner) recoverOverflow(ctx context.Context, messages []types.Message, model types.Model) ([]types.Message, bool, error) {
 	if r.store == nil || !r.settings.Enabled {
 		return messages, false, nil
 	}
@@ -459,9 +470,9 @@ func (r *compactionRunner) recoverOverflow(ctx context.Context, messages []types
 		return messages, false, err
 	}
 	if r.background.tasks == nil {
-		return r.summarize(ctx, messages, true, true)
+		return r.summarize(ctx, messages, true, true, model)
 	}
-	task, err := r.Request(ctx, messages)
+	task, err := r.request(ctx, messages, model)
 	if err != nil {
 		return nil, false, err
 	}

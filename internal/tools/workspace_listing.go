@@ -205,6 +205,17 @@ func localRgFiles(ctx context.Context, rg string, cwd string, maxFiles int) (wor
 	rgReturned = true
 	beside := walk
 	mu.Unlock()
+	if beside != nil {
+		// The walk is stopped and joined, so none outlives the listing;
+		// one stuck in a filesystem call is left at the deadline.
+		defer func() {
+			stopWalk()
+			select {
+			case <-beside.done:
+			case <-ctx.Done():
+			}
+		}()
+	}
 	files := workspaceFiles{source: rgListingSource, paths: sortUnique(names.paths), more: names.more}
 	if rgCtx.Err() == nil {
 		// rg ran to its end or to maxFiles.
@@ -451,7 +462,15 @@ func startWorkspaceWalk(ctx context.Context, cwd string, maxFiles int) *workspac
 	return walk
 }
 
+// testHookWalkEntered, set only by tests, runs as the walk starts: it stands
+// in for a filesystem call that cancellation cannot interrupt. It is atomic
+// because walks of earlier tests may still be starting.
+var testHookWalkEntered atomic.Pointer[func()]
+
 func (walk *workspaceWalk) run(ctx context.Context, cwd string) error {
+	if entered := testHookWalkEntered.Load(); entered != nil {
+		(*entered)()
+	}
 	root, err := os.OpenRoot(cwd)
 	if err != nil {
 		return err

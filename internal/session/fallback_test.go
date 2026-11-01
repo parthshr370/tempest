@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/compaction"
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
@@ -693,5 +695,150 @@ func TestModelRequestHooksSkipARetryCancelledInItsBackoff(t *testing.T) {
 	inputs := readHookInputs(t, path)
 	if rig.primary.callCount() != 1 || len(inputs) != 2 || inputs[0]["hook_event_name"] != "PreModelRequest" || inputs[1]["status"] != "failed" {
 		t.Fatalf("provider calls = %d, hook inputs = %v", rig.primary.callCount(), inputs)
+	}
+}
+
+// After a run switches to a backup model, compaction between its turns
+// goes to that backup too: the run's model route sticks, so the summary
+// does not spend another retry chain on the unavailable primary.
+func TestCompactionUsesTheRunsBackupModel(t *testing.T) {
+	const (
+		// window is small enough that the file read below needs compaction.
+		window         = 1000
+		historyPadding = 6000
+		historyLine    = 79
+	)
+	primary, backup := newStatusProvider("primary", "p1", http.StatusServiceUnavailable), newStatusProvider("backup", "b1", 0)
+	policy := retry.DefaultConfig()
+	policy.MaxAttempts = fallbackAttempts
+	policy.Sleeper = noRetryDelay{}
+	primaryRetrier, err := retry.New(primary, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupRetrier, err := retry.New(backup, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryModel, backupModel := primary.faux.Model(), backup.faux.Model()
+	primaryModel.ContextWindow, backupModel.ContextWindow = window, window
+	chain, err := retry.NewFallback([]retry.Candidate{{Model: primaryModel, Stream: primaryRetrier}, {Model: backupModel, Stream: backupRetrier}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The run starts small; the file its first turn reads needs compaction.
+	cwd := t.TempDir()
+	line := strings.Repeat("a", historyLine) + "\n"
+	if err := os.WriteFile(filepath.Join(cwd, "big.txt"), []byte(strings.Repeat(line, historyPadding/historyLine)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary := faux.Respond(faux.Text("summary"))
+	backup.faux.SetResponses(faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"big.txt"}`), "read-1")), summary, summary, summary)
+	stack, err := BuildAgentStack(StackConfig{
+		Cwd: cwd, Model: primaryModel, StreamFn: chain.Stream, FallbackModels: []types.Model{backupModel},
+		Compaction: &compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stack.Agent.PromptText(context.Background(), "go")
+	if err != nil || result.Err != nil {
+		t.Fatalf("run err=%v result=%v", err, result.Err)
+	}
+	if strings.Contains(fmt.Sprint(stack.Agent.State().Messages), line) {
+		t.Fatal("the read was not compacted")
+	}
+	if calls := primary.callCount(); calls != fallbackAttempts {
+		t.Fatalf("primary called %d times, want only the run's %d attempts before its switch", calls, fallbackAttempts)
+	}
+}
+
+// A run that switched to a backup with a smaller context window compacts
+// against that window, not the primary's, and every summary request fits
+// it, even for history the primary's larger window held.
+func TestCompactionFitsTheRunsSmallerBackup(t *testing.T) {
+	const (
+		primaryWindow = 100000
+		backupWindow  = 4000
+		backupOutput  = 500
+		// history is far over the backup's window, well under the primary's.
+		turns, turnChars = 12, 4000
+	)
+	primary, backup := newStatusProvider("primary", "p1", http.StatusServiceUnavailable), newStatusProvider("backup", "b1", 0)
+	policy := retry.DefaultConfig()
+	policy.MaxAttempts = fallbackAttempts
+	policy.Sleeper = noRetryDelay{}
+	primaryRetrier, err := retry.New(primary, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupRetrier, err := retry.New(backup, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryModel, backupModel := primary.faux.Model(), backup.faux.Model()
+	primaryModel.ContextWindow = primaryWindow
+	backupModel.ContextWindow, backupModel.MaxTokens = backupWindow, backupOutput
+	chain, err := retry.NewFallback([]retry.Candidate{{Model: primaryModel, Stream: primaryRetrier}, {Model: backupModel, Stream: backupRetrier}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "small.txt"), []byte("small\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var history []types.Message
+	for turn := range turns {
+		history = append(history,
+			types.UserMessage{Content: types.StringContent(fmt.Sprintf("ask %d %s", turn, strings.Repeat("u", turnChars))), Timestamp: int64(2*turn + 1)},
+			types.AssistantMessage{Content: []types.ContentBlock{types.NewText(strings.Repeat("a", turnChars))}, StopReason: types.StopStop, Timestamp: int64(2*turn + 2)})
+	}
+	// Each summary request's estimated size: input and the output it allows.
+	var mu sync.Mutex
+	var summaryRequests []int
+	replies := 0
+	step := func(c types.Context, opts *types.StreamOptions, state faux.State, model types.Model) (types.AssistantMessage, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if c.SystemPrompt == compaction.SummarizationSystemPrompt {
+			size := compaction.EstimateContextTokens(c.Messages).Tokens + (len(c.SystemPrompt)+3)/4
+			if opts != nil {
+				size += opts.MaxTokens
+			}
+			summaryRequests = append(summaryRequests, size)
+			return faux.Respond(faux.Text("summary"))(c, opts, state, model)
+		}
+		replies++
+		if replies == 1 {
+			return faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"small.txt"}`), "read-1"))(c, opts, state, model)
+		}
+		return faux.Respond(faux.Text("done"))(c, opts, state, model)
+	}
+	steps := make([]faux.ResponseStep, 64)
+	for i := range steps {
+		steps[i] = step
+	}
+	backup.faux.SetResponses(steps...)
+	stack, err := BuildAgentStack(StackConfig{Cwd: cwd, Model: primaryModel, StreamFn: chain.Stream, FallbackModels: []types.Model{backupModel}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stack.Agent.SetMessages(history)
+	result, err := stack.Agent.PromptText(context.Background(), "go")
+	if err != nil || result.Err != nil {
+		t.Fatalf("run err=%v result=%v", err, result.Err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(summaryRequests) == 0 || strings.Contains(fmt.Sprint(stack.Agent.State().Messages), strings.Repeat("u", turnChars)) {
+		t.Fatalf("history over the backup's window was not compacted (%d summary requests)", len(summaryRequests))
+	}
+	for _, size := range summaryRequests {
+		if size > backupWindow {
+			t.Fatalf("summary requests of %v estimated tokens, want each within the backup's %d-token window", summaryRequests, backupWindow)
+		}
+	}
+	if calls := primary.callCount(); calls != fallbackAttempts {
+		t.Fatalf("primary called %d times, want only the run's %d attempts before its switch", calls, fallbackAttempts)
 	}
 }

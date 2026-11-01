@@ -14,23 +14,31 @@ import (
 	"go.harness.dev/harness/internal/compaction"
 	ptypes "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
+	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/extension"
 )
 
-// compactionSummaryTimeout bounds a single summarization turn so a stalled
-// provider call cannot wedge the build loop between turns.
+// compactionSummaryTimeout bounds a single summarization request so a
+// stalled provider call cannot wedge the build loop between turns.
 const compactionSummaryTimeout = 120 * time.Second
 
 // compactionRunner summarizes older turns when the estimated context approaches
 // the model's window. It is wired into the agent loop's between-turn hook so a
 // long, tool-heavy build never silently overflows the context window.
 type compactionRunner struct {
-	contextWindow    int
-	model            ptypes.Model
-	streamFn         agent.StreamFn
-	settings         compaction.CompactionSettings
+	// contextWindow and settings are the primary model's budget.
+	contextWindow int
+	model         ptypes.Model
+	// backups are the models behind streamFn after model, in chain order. A
+	// run that switched to one keeps it, and so does its compaction.
+	backups  []ptypes.Model
+	streamFn agent.StreamFn
+	settings compaction.CompactionSettings
+	// overridden marks settings given by the host rather than derived from
+	// the primary; they then apply on every route.
+	overridden       bool
 	store            *journal.Store
 	agt              *agent.Agent
 	parts            map[string]journal.CompactionPart
@@ -71,6 +79,47 @@ func (r *compactionRunner) configureJournal(store *journal.Store, loaded *journa
 	}
 }
 
+// route is the model a compaction for a run on model is sent to: the backup
+// the run switched to, or the primary for a run on it, or outside a run.
+func (r *compactionRunner) route(model ptypes.Model) ptypes.Model {
+	for _, backup := range r.backups {
+		if retry.SameModel(backup, model) {
+			return backup
+		}
+	}
+	return r.model
+}
+
+// routeNamed is the model a captured compaction named by modelName
+// ("provider/id"), false when it is no longer in the chain.
+func (r *compactionRunner) routeNamed(modelName string) (ptypes.Model, bool) {
+	for _, model := range append([]ptypes.Model{r.model}, r.backups...) {
+		if compactionModelName(model) == modelName {
+			return model, true
+		}
+	}
+	return ptypes.Model{}, false
+}
+
+func compactionModelName(model ptypes.Model) string { return model.Provider + "/" + model.ID }
+
+// budget is the context window and settings compaction works within for a
+// request to model, the route: the primary's for the primary, and for a
+// backup with a known window, that window with settings derived from it as
+// they are for the primary (or the host's, when it gave them). A backup's
+// smaller window then compacts sooner, and its summary fits it.
+func (r *compactionRunner) budget(model ptypes.Model) (int, compaction.CompactionSettings) {
+	if model.ContextWindow <= 0 || retry.SameModel(model, r.model) {
+		return r.contextWindow, r.settings
+	}
+	if r.overridden {
+		return model.ContextWindow, r.settings
+	}
+	settings := compaction.ModelSettings(model.ContextWindow, model.MaxTokens)
+	settings.Enabled = r.settings.Enabled
+	return model.ContextWindow, settings
+}
+
 func (r *compactionRunner) hookE(commit func([]ptypes.Message)) func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error) {
 	if r == nil {
 		return nil
@@ -79,12 +128,13 @@ func (r *compactionRunner) hookE(commit func([]ptypes.Message)) func(context.Con
 		var compacted []ptypes.Message
 		var changed bool
 		var err error
+		model := r.route(c.Model)
 		if c.Overflow {
-			compacted, changed, err = r.recoverOverflow(ctx, c.Context.Messages)
+			compacted, changed, err = r.recoverOverflow(ctx, c.Context.Messages, model)
 		} else if r.background.tasks != nil {
 			compacted, changed, err = r.backgroundTurn(ctx, c)
 		} else {
-			compacted, changed, err = r.compact(ctx, c.Context.Messages)
+			compacted, changed, err = r.compact(ctx, c.Context.Messages, model)
 		}
 		if err != nil {
 			return nil, err
@@ -110,23 +160,26 @@ func stableHash(value any) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Message) ([]ptypes.Message, bool, error) {
-	return r.summarize(ctx, messages, false, true)
+func (r *compactionRunner) compact(ctx context.Context, messages []ptypes.Message, model ptypes.Model) ([]ptypes.Message, bool, error) {
+	return r.summarize(ctx, messages, false, true, model)
 }
 
-func (r *compactionRunner) summarize(ctx context.Context, messages []ptypes.Message, force, persist bool) ([]ptypes.Message, bool, error) {
+func (r *compactionRunner) summarize(ctx context.Context, messages []ptypes.Message, force, persist bool, model ptypes.Model) ([]ptypes.Message, bool, error) {
 	if r == nil {
 		return messages, false, nil
 	}
-	return r.summarizeUsing(ctx, messages, force, persist, r.settings)
+	_, settings := r.budget(model)
+	return r.summarizeUsing(ctx, messages, force, persist, settings, model)
 }
 
-func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes.Message, force, persist bool, settings compaction.CompactionSettings) ([]ptypes.Message, bool, error) {
+// summarizeUsing summarizes messages on model, the route (see route), under
+// settings, unless they fit the route's budget and force is false.
+func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes.Message, force, persist bool, settings compaction.CompactionSettings, model ptypes.Model) ([]ptypes.Message, bool, error) {
 	if r == nil || len(messages) == 0 {
 		return messages, false, nil
 	}
 	tokens := compaction.EstimateContextTokens(messages).Tokens
-	if !force && !compaction.ShouldCompact(tokens, r.contextWindow, r.settings) {
+	if window, _ := r.budget(model); !force && !compaction.ShouldCompact(tokens, window, settings) {
 		return messages, false, nil
 	}
 	entries := messagesToEntries(messages)
@@ -153,7 +206,7 @@ func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes
 		Messages []ptypes.Message
 		Model    string
 		Settings compaction.CompactionSettings
-	}{epoch, messages, r.model.ID, settings})
+	}{epoch, messages, model.ID, settings})
 	if err != nil {
 		return nil, false, err
 	}
@@ -177,24 +230,37 @@ func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes
 			return nil, false, err
 		}
 	}
-	history := "No prior history."
+	summarizer := compaction.Summarizer{Stream: r.streamFn, Settings: func(backup ptypes.Model) compaction.CompactionSettings {
+		_, backupSettings := r.budget(backup)
+		return backupSettings
+	}}
+	history := compaction.SummaryResult{Text: "No prior history.", Model: model}
 	if len(prep.MessagesToSummarize) > 0 || !prep.IsSplitTurn {
-		history, err = r.phase(ctx, id, source, preparation, "history", func(callCtx context.Context) (compaction.SummaryResult, error) {
-			return compaction.GenerateSummaryResult(callCtx, r.streamFn, r.model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
+		history, err = r.phase(ctx, model, id, source, preparation, "history", func(callCtx context.Context, meter compaction.Meter) (compaction.SummaryResult, error) {
+			metered := summarizer
+			metered.Meter = meter
+			return metered.Summary(callCtx, model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
 		})
 		if err != nil {
 			return nil, false, err
 		}
 	}
-	summary := history
+	summary := history.Text
 	if prep.IsSplitTurn && len(prep.TurnPrefixMessages) > 0 {
-		prefix, err := r.phase(ctx, id, source, preparation, "prefix", func(callCtx context.Context) (compaction.SummaryResult, error) {
-			return compaction.GenerateTurnPrefixSummaryResult(callCtx, r.streamFn, r.model, prep.Settings, prep.TurnPrefixMessages)
+		// A switch to a backup during the history summary carries over.
+		prefixModel, prefixSettings := history.Model, prep.Settings
+		if !retry.SameModel(prefixModel, model) {
+			_, prefixSettings = r.budget(prefixModel)
+		}
+		prefix, err := r.phase(ctx, prefixModel, id, source, preparation, "prefix", func(callCtx context.Context, meter compaction.Meter) (compaction.SummaryResult, error) {
+			metered := summarizer
+			metered.Meter = meter
+			return metered.TurnPrefix(callCtx, prefixModel, prefixSettings, prep.TurnPrefixMessages)
 		})
 		if err != nil {
 			return nil, false, err
 		}
-		summary = history + "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefix
+		summary = history.Text + "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefix.Text
 	}
 	read, modified := compaction.ComputeFileLists(prep.FileOps)
 	summary += compaction.FormatFileOperations(read, modified)
@@ -264,34 +330,44 @@ func (r *compactionRunner) preCompactHook(ctx context.Context, source string) (h
 	})
 }
 
-func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, phase string, call func(context.Context) (compaction.SummaryResult, error)) (string, error) {
+// phase runs one summary phase ("history" or "prefix") of compaction id on
+// model, or returns its journaled outcome. call writes the summary, sending
+// every request through the meter it is given, which treats each request as
+// the agent loop treats a turn: admitted against the run's cost cap before
+// it is sent, and its receipt journaled and charged before the next can be
+// admitted. The cap therefore stops a summary of many requests before the
+// request that would spend past it.
+//
+// The phase's started fact is journaled with its first admitted request, so
+// a phase refused before any request leaves no trace. A finished fact
+// records the outcome, the summary or the error that ended it (a cost stop
+// included); it carries no usage, since each request's receipt is its own
+// usage record, named after the phase's source ref and the request's number.
+// A phase cut short by cancellation or a request timeout records no outcome.
+func (r *compactionRunner) phase(ctx context.Context, model ptypes.Model, id, source, preparation, phase string, call func(context.Context, compaction.Meter) (compaction.SummaryResult, error)) (compaction.SummaryResult, error) {
 	if r.parts == nil {
 		r.parts = map[string]journal.CompactionPart{}
 	}
 	key := source + ":" + phase
 	if part, ok := r.parts[key]; ok {
 		if part.Started == nil || part.Started.PreparationHash != preparation {
-			return "", fmt.Errorf("compaction preparation mismatch")
+			return compaction.SummaryResult{}, fmt.Errorf("compaction preparation mismatch")
 		}
 		if part.Finished == nil {
-			return "", fmt.Errorf("compaction outcome_unknown: %s", phase)
+			return compaction.SummaryResult{}, fmt.Errorf("compaction outcome_unknown: %s", phase)
 		}
 		if part.Finished.Status != "ok" {
-			return "", fmt.Errorf("compaction cached error: %s", part.Finished.Error)
+			return compaction.SummaryResult{}, fmt.Errorf("compaction cached error: %s", part.Finished.Error)
 		}
-		return part.Finished.Summary, nil
+		return compaction.SummaryResult{Text: part.Finished.Summary, Model: model}, nil
 	}
 	ownerRunID := ""
 	if _, native := ctx.Value(compactionTaskKey{}).(string); native && r.agt != nil {
 		ctx, ownerRunID = r.agt.BackgroundProviderContext(ctx)
 	}
-	release, err := agent.AdmitProvider(ctx, r.model)
-	defer release()
-	if err != nil {
-		return "", err
-	}
-	settings, _ := json.Marshal(r.settings)
-	start := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: r.model.ID, Settings: settings, PreparationHash: preparation}
+	_, routeSettings := r.budget(model)
+	settings, _ := json.Marshal(routeSettings)
+	start := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: model.ID, Settings: settings, PreparationHash: preparation}
 	runID := ""
 	if r.agt != nil {
 		runID = r.agt.RunState().RunID
@@ -312,58 +388,80 @@ func (r *compactionRunner) phase(ctx context.Context, id, source, preparation, p
 		}
 		return r.store.AppendWorkFact(context.WithoutCancel(ctx), work.Fact{Kind: string(kind), RunID: runID, Payload: raw})
 	}
-	if err := appendFact(journal.KindCompactionCallStarted, start); err != nil {
-		return "", err
-	}
-	r.parts[key] = journal.CompactionPart{Started: &start}
-	callCtx, cancel := context.WithTimeout(ctx, compactionSummaryTimeout)
-	result, callErr := call(callCtx)
-	interrupted := callCtx.Err() != nil || errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)
-	cancel()
-	finish := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: r.model.ID, Status: "ok", Summary: result.Text, Usage: result.Usage}
+	sourceRef := "compaction:" + source + ":" + phase
 	if r.store != nil {
-		finish.SourceRef = "compaction:" + r.store.ID() + ":" + id + ":" + phase
-	} else {
-		finish.SourceRef = "compaction:" + source + ":" + phase
+		sourceRef = "compaction:" + r.store.ID() + ":" + id + ":" + phase
 	}
-	if interrupted {
-		// The provider may have spent money, but this cut has no known outcome.
-		// Don't turn session suspension into a reusable failure receipt.
-		if r.store != nil && result.Usage != (ptypes.Usage{}) {
-			if err := r.store.Append(context.WithoutCancel(ctx), journal.UsageRecord{Meta: journal.Meta{RunID: runID}, Model: r.model.ID, SourceRef: finish.SourceRef, Usage: result.Usage}); err != nil {
-				return "", err
+	started, interrupted, requests := false, false, 0
+	meter := func(ctx context.Context, request ptypes.Model, send func(context.Context) (compaction.SummaryResult, error)) (compaction.SummaryResult, error) {
+		release, err := agent.AdmitProvider(ctx, request)
+		defer release()
+		if err != nil {
+			return compaction.SummaryResult{}, err
+		}
+		if !started {
+			if err := appendFact(journal.KindCompactionCallStarted, start); err != nil {
+				return compaction.SummaryResult{}, err
 			}
+			r.parts[key] = journal.CompactionPart{Started: &start}
+			started = true
 		}
-		if err := agent.AccountProviderUsage(context.WithoutCancel(ctx), finish.SourceRef, r.model.ID, result.Usage); err != nil {
-			return "", err
+		requests++
+		callCtx, cancel := context.WithTimeout(ctx, compactionSummaryTimeout)
+		result, sendErr := send(callCtx)
+		if sendErr != nil && (callCtx.Err() != nil || errors.Is(sendErr, context.Canceled) || errors.Is(sendErr, context.DeadlineExceeded)) {
+			interrupted = true
 		}
-		if r.background != nil && r.background.notifyUsage != nil {
-			r.background.notifyUsage(finish.SourceRef, r.model.ID, result.Usage)
+		cancel()
+		if err := r.chargeSummaryRequest(ctx, runID, sourceRef+":"+strconv.Itoa(requests), result); err != nil {
+			return result, errors.Join(sendErr, err)
 		}
-		if callErr != nil {
-			return "", callErr
-		}
-		return "", callCtx.Err()
+		return result, sendErr
 	}
+	result, callErr := call(ctx, meter)
+	if !started {
+		return compaction.SummaryResult{}, callErr
+	}
+	if interrupted || ctx.Err() != nil {
+		// The requests' receipts are journaled, but this cut has no known
+		// outcome. Don't turn suspension into a reusable failure receipt.
+		return compaction.SummaryResult{}, errors.Join(callErr, ctx.Err())
+	}
+	finish := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: model.ID, Status: "ok", Summary: result.Text, SourceRef: sourceRef}
 	if callErr != nil {
 		finish.Status = "error"
 		finish.Error = callErr.Error()
 		finish.Summary = ""
 	}
 	if err := appendFact(journal.KindCompactionCallFinished, finish); err != nil {
-		return "", err
+		return compaction.SummaryResult{}, errors.Join(callErr, err)
 	}
 	r.parts[key] = journal.CompactionPart{Started: &start, Finished: &finish}
-	if err := agent.AccountProviderUsage(context.WithoutCancel(ctx), finish.SourceRef, r.model.ID, result.Usage); err != nil {
-		return "", err
+	if callErr != nil {
+		return compaction.SummaryResult{}, callErr
+	}
+	return result, nil
+}
+
+// chargeSummaryRequest journals one summary request's usage as its receipt
+// under source, on the model that answered, then charges it to the run.
+func (r *compactionRunner) chargeSummaryRequest(ctx context.Context, runID, source string, result compaction.SummaryResult) error {
+	if result.Usage == (ptypes.Usage{}) {
+		return nil
+	}
+	ctx = context.WithoutCancel(ctx)
+	if r.store != nil {
+		if err := r.store.Append(ctx, journal.UsageRecord{Meta: journal.Meta{RunID: runID}, Model: result.Model.ID, SourceRef: source, Usage: result.Usage}); err != nil {
+			return err
+		}
+	}
+	if err := agent.AccountProviderUsage(ctx, source, result.Model.ID, result.Usage); err != nil {
+		return err
 	}
 	if r.background != nil && r.background.notifyUsage != nil {
-		r.background.notifyUsage(finish.SourceRef, r.model.ID, result.Usage)
+		r.background.notifyUsage(source, result.Model.ID, result.Usage)
 	}
-	if callErr != nil {
-		return "", callErr
-	}
-	return result.Text, nil
+	return nil
 }
 
 // hook returns a next-turn callback that compacts between turns. commit, when
@@ -375,7 +473,7 @@ func (r *compactionRunner) hook(commit func([]ptypes.Message)) func(agent.Should
 		return nil
 	}
 	return func(c agent.ShouldStopAfterTurnContext) *agent.AgentLoopTurnUpdate {
-		compacted, ok := r.maybeCompact(c.Context.Messages)
+		compacted, ok := r.maybeCompact(c.Context.Messages, r.route(c.Model))
 		if !ok {
 			return nil
 		}
@@ -393,8 +491,8 @@ func (r *compactionRunner) hook(commit func([]ptypes.Message)) func(agent.Should
 // input and false when compaction does not run: under budget, nothing to
 // summarize, or the summarizer failed. On failure the loop keeps the original
 // history rather than replaying an over-budget request blindly.
-func (r *compactionRunner) maybeCompact(messages []ptypes.Message) ([]ptypes.Message, bool) {
-	compacted, changed, err := r.compact(context.Background(), messages)
+func (r *compactionRunner) maybeCompact(messages []ptypes.Message, model ptypes.Model) ([]ptypes.Message, bool) {
+	compacted, changed, err := r.compact(context.Background(), messages, model)
 	if err != nil {
 		return messages, false
 	}

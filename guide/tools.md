@@ -229,7 +229,9 @@ source or arguments invalidate it. Operations run in order. Empty `out` deletes
 matches. Overlapping matches are refused. Narrow the pattern before retrying.
 Rewrite scopes are bounded to 256 files and 16 MiB of source per call.
 Search scans files independently and retains only the requested 50-match page;
-it does not inherit the rewrite snapshot limits. Gitignored directories are pruned.
+it does not inherit the rewrite snapshot limits. As with `grep` and `find`, the
+walk prunes gitignored entries and `.git` below a scope, but searches a scope
+named directly even when it is ignored.
 
 The binary reads source through stdin in a private directory. It never receives
 workspace paths or loads workspace parser configuration. Symlinks discovered
@@ -457,7 +459,7 @@ debug session is gone and requires an explicit new launch or attach.
 - `eval`: persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset. Requires `python3`, or `node`/`bun` for JS, only when called. See [Eval](eval.md).
 - `debug`: launch or attach a session-owned debugger, control execution and inspect state. Requires an installed adapter. Plan mode denies all actions.
 - `jobs`: page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
-- `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout. A job whose finished state `wait` returns gets no later completion notice.
+- `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout. A job `wait` returns settled (finished, its notice queued and its worktree cleaned up) gets no later completion notice, unless the loop had already taken that notice. Every other job it reports keeps its notice: one still running, and one whose state reads finished while it is still wrapping up, which a wait on several jobs can return beside the settled one.
 - `cancel`: cancel one task or background bash job, by id or name.
 - `logs`: page a background command's bounded output (stdout and stderr in write order) by byte offset, by id or name.
 - `write_stdin`: type into a running background job (text, Ctrl-C, end of input) and get back the output it printed since the last call, by id or name.

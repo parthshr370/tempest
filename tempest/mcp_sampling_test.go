@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -204,6 +205,24 @@ func TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded(t *testing.T) {
 	}
 	if spent.Input <= failed.Input || spent.Output <= failed.Output {
 		t.Fatalf("sampling receipt %+v leaves out the attempt the fallback discarded (%+v)", spent, failed)
+	}
+	// The receipt names the backup that answered, not the sampling model.
+	journaled, err := os.ReadFile(h.session.core.store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipts := 0
+	for line := range strings.Lines(string(journaled)) {
+		if !strings.Contains(line, `"mcp-sampling:fixture:`) {
+			continue
+		}
+		receipts++
+		if !strings.Contains(line, `"model":"backup-model"`) {
+			t.Fatalf("sampling receipt does not name the backup that answered: %s", line)
+		}
+	}
+	if receipts == 0 {
+		t.Fatal("no sampling receipt in the journal")
 	}
 }
 

@@ -139,11 +139,14 @@ background jobs and consumes their result follow-ups before completing.
 A result follow-up is a short host notice in the transcript: job id, kind, state,
 exit code or reason, a bounded output or result preview, artifact paths, and the
 `wait`/`logs` calls that return the full details. No detached next run is started
-automatically. A `wait` that returns a job's finished state withdraws that job's
-pending notice in the same journal commit that records the wait result, so the model
-never reads the same result twice and the run does not take an extra turn for it. A
-crash before that commit leaves the notice pending, and the resumed session delivers
-it. A wait outside a model tool call (for example through the Go API) withdraws nothing.
+automatically. A `wait` that returns a job settled (finished, its notice queued and
+its worktree cleaned up) withdraws that job's pending notice in the same journal
+commit that records the wait result, so the model does not read the same result
+twice and the run does not take an extra turn for it. The notice still arrives when
+the loop had already taken it, and a job whose state reads finished while it is still
+wrapping up, which a wait on several jobs can return beside the settled one, keeps
+its notice. A crash before that commit leaves the notice pending, and the resumed
+session delivers it. A wait outside a model tool call (for example through the Go API) withdraws nothing.
 
 ### Stop reasons
 
@@ -162,7 +165,9 @@ Every run ends with one of these:
 Budgets are checked at turn boundaries: after a turn's tools finish and before the
 next model call. A budget-stopped run therefore ends on a complete turn, and
 `-continue` picks the session up from there. One long turn can overrun
-`-max-wall-time`.
+`-max-wall-time`. `-max-cost` is also checked before each request of a compaction
+summary, so a summary written in many requests stops at the cap too (see
+[compaction](conversations.md#background-and-manual-compaction)).
 
 | Flag | Cap |
 |---|---|

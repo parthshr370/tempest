@@ -37,7 +37,8 @@ func TestMCPHTTPHeadersAndModes(t *testing.T) {
 		t.Run(version, func(t *testing.T) {
 			var initialized atomic.Bool
 			var deleted atomic.Bool
-			var callback atomic.Bool
+			callback := make(chan struct{})
+			var answered sync.Once
 			var notices atomic.Int64
 			var server *httptest.Server
 			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -96,11 +97,21 @@ func TestMCPHTTPHeadersAndModes(t *testing.T) {
 					}
 					writeRPC(t, w, message.ID, json.RawMessage(`{"tools":[]}`))
 				case "tools/call":
+					// The server waits for the answer to its own request
+					// before it answers the call.
 					w.Header().Set("Content-Type", "text/event-stream")
 					_, _ = fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"root_request\",\"method\":\"roots/list\",\"params\":{}}\n\n")
+					w.(http.Flusher).Flush()
+					select {
+					case <-callback:
+					case <-time.After(3 * time.Second):
+						t.Error("callback response not posted")
+					case <-r.Context().Done():
+						return
+					}
 					_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n", message.ID)
 				case "":
-					callback.Store(true)
+					answered.Do(func() { close(callback) })
 					w.WriteHeader(http.StatusAccepted)
 				default:
 					w.WriteHeader(http.StatusAccepted)
@@ -120,15 +131,11 @@ func TestMCPHTTPHeadersAndModes(t *testing.T) {
 			if _, err = client.Call(context.Background(), "tools/call", struct{}{}); err != nil {
 				t.Fatal(err)
 			}
-			// Close joins any callback response in flight.
-			deadline := time.After(3 * time.Second)
-			for !callback.Load() {
-				select {
-				case <-deadline:
-					t.Fatal("callback response not posted")
-				default:
-					time.Sleep(time.Millisecond)
-				}
+			// The call ended only after its callback response was posted.
+			select {
+			case <-callback:
+			default:
+				t.Fatal("callback response not posted")
 			}
 			closeWire(t, client)
 			if !deleted.Load() {
@@ -331,6 +338,212 @@ func TestMCPSSEResumeRefusedForAuthorizationIsNotRetryable(t *testing.T) {
 	}
 	if posts.Load() != 1 {
 		t.Fatalf("POST sent %d times", posts.Load())
+	}
+}
+
+// renewingAuth hands out its current token and refuses every rejection,
+// as a token that needs a login does; renew stands in for that login.
+type renewingAuth struct {
+	mu      sync.Mutex
+	token   string
+	renewed chan struct{}
+}
+
+func (a *renewingAuth) Token(context.Context) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.token, nil
+}
+func (a *renewingAuth) Rejected(context.Context, Rejection) error {
+	return errors.New("mcp_auth: login required")
+}
+func (a *renewingAuth) Renewed(refused string) <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.token != refused {
+		renewed := make(chan struct{})
+		close(renewed)
+		return renewed
+	}
+	return a.renewed
+}
+func (a *renewingAuth) renew(token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.token = token
+	close(a.renewed)
+	a.renewed = make(chan struct{})
+}
+
+// Tempest's answer to a server request that is refused for authorization
+// (the token died while the user answered) keeps the connection, like the
+// stream: the answer is posted once more after the next login, but only
+// within the answer's call timeout and while the server's request lasts,
+// which for a request on a call's stream is while that call does: not once
+// the server has answered the call or Tempest has cancelled it.
+func TestMCPHTTPReplyRefusedForAuthorizationKeepsTheConnection(t *testing.T) {
+	const (
+		callTimeout = time.Second
+		// settle is how long a reply that should not come is waited for.
+		settle = 100 * time.Millisecond
+	)
+	for _, ending := range []string{"renewed", "call answered", "call cancelled", "call timed out"} {
+		t.Run(ending, func(t *testing.T) {
+			server, replies, end := answerServer(t, "new")
+			auth := &renewingAuth{token: "old", renewed: make(chan struct{})}
+			client, err := Dial(context.Background(), mcpconfig.Server{Name: "auth", Transport: "http", URL: server.URL, CallTimeout: callTimeout.String()}, t.TempDir(), Handlers{Auth: auth})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closeWire(t, client)
+			defer end()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			called := make(chan error, 1)
+			go func() {
+				// Not tools/call: cancelling that closes the connection.
+				_, err := client.Call(ctx, "prompts/get", struct{}{})
+				called <- err
+			}()
+			if got := <-replies; got != "Bearer old" {
+				t.Fatalf("first answer carried %q", got)
+			}
+			switch ending {
+			case "renewed":
+				auth.renew("new")
+				select {
+				case got := <-replies:
+					if got != "Bearer new" {
+						t.Fatalf("answer after the login carried %q", got)
+					}
+				case <-time.After(3 * callTimeout):
+					t.Fatal("the answer was not posted again after the login")
+				}
+			case "call answered":
+				// The server gives up on its request and answers the call.
+				end()
+			case "call cancelled":
+				cancel()
+			case "call timed out":
+				// The call's timeout passes without a login.
+			}
+			if err := <-called; (err != nil) != (ending == "call cancelled" || ending == "call timed out") {
+				t.Fatalf("call = %v", err)
+			}
+			auth.renew("new")
+			if _, err := client.Call(context.Background(), "tools/list", struct{}{}); err != nil {
+				t.Fatalf("the answer's authorization failure closed the connection: %v", err)
+			}
+			select {
+			case got := <-replies:
+				t.Fatalf("answer posted again (%q) after its request ended or a second time", got)
+			case <-time.After(settle):
+			}
+		})
+	}
+}
+
+// answerServer is an MCP server whose tools/call and prompts/get ask Tempest
+// a ping on their response stream and, as a server waiting for the answer
+// does, hold the call open until an answer carrying "Bearer "+accept is
+// accepted or end is called. Every other answer is refused with 401. replies
+// receives each answer's Authorization.
+func answerServer(t *testing.T, accept string) (server *httptest.Server, replies <-chan string, end func()) {
+	t.Helper()
+	answers := make(chan string, 8)
+	answered, ended := make(chan struct{}), make(chan struct{})
+	var answerOnce, endOnce sync.Once
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case http.MethodGet:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var message httpMessage
+		_ = json.NewDecoder(r.Body).Decode(&message)
+		switch message.Method {
+		case "initialize":
+			writeRPC(t, w, message.ID, json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"auth","version":"1"}}`))
+		case "notifications/initialized", "notifications/cancelled":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call", "prompts/get":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"ask\",\"method\":\"ping\",\"params\":{}}\n\n")
+			w.(http.Flusher).Flush()
+			select {
+			case <-answered:
+			case <-ended:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[]}}\n\n", message.ID)
+		case "tools/list":
+			writeRPC(t, w, message.ID, json.RawMessage(`{"tools":[]}`))
+		case "":
+			authorization := r.Header.Get("Authorization")
+			answers <- authorization
+			if authorization != "Bearer "+accept {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			answerOnce.Do(func() { close(answered) })
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, answers, func() { endOnce.Do(func() { close(ended) }) }
+}
+
+// refreshingAuth is a renewingAuth whose token "new", once rejected, is
+// refreshed to "newer" without a user, as an OAuth refresh does; a
+// rejection of the retry that follows is final.
+type refreshingAuth struct{ renewingAuth }
+
+func (a *refreshingAuth) Rejected(_ context.Context, rejection Rejection) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rejection.Token == "new" && !rejection.Retried {
+		a.token = "newer"
+		return nil
+	}
+	return errors.New("mcp_auth: login required")
+}
+
+// The answer posted again after a login is that one POST: when the server
+// refuses it too, Tempest does not refresh and post it a third time.
+func TestMCPHTTPReplyRepostIsOnePost(t *testing.T) {
+	const settle = 200 * time.Millisecond
+	server, replies, end := answerServer(t, "newer")
+	auth := &refreshingAuth{renewingAuth{token: "old", renewed: make(chan struct{})}}
+	client, err := Dial(context.Background(), mcpconfig.Server{Name: "auth", Transport: "http", URL: server.URL, CallTimeout: "5s"}, t.TempDir(), Handlers{Auth: auth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeWire(t, client)
+	defer end()
+	called := make(chan error, 1)
+	go func() {
+		_, err := client.Call(context.Background(), "tools/call", struct{}{})
+		called <- err
+	}()
+	if got := <-replies; got != "Bearer old" {
+		t.Fatalf("first answer carried %q", got)
+	}
+	auth.renew("new")
+	if got := <-replies; got != "Bearer new" {
+		t.Fatalf("answer after the login carried %q", got)
+	}
+	select {
+	case got := <-replies:
+		t.Fatalf("one repost sent a second POST, carrying %q", got)
+	case <-time.After(settle):
+	}
+	end()
+	if err := <-called; err != nil {
+		t.Fatal(err)
 	}
 }
 func TestMCPHTTPNoCredentialRetry(t *testing.T) {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -164,6 +165,50 @@ func TestDoctorListsLoadedContextFiles(t *testing.T) {
 	}
 	text := output.String()
 	for _, want := range []string{"context files: ", "AGENTS.override.md (13 bytes)", "CLAUDE.md (11 bytes)"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("doctor output lacks %q:\n%s", want, text)
+		}
+	}
+}
+
+// When context_files.max_bytes cuts a file, its line shows the bytes it
+// spends of the cap, as the header does, not its length with the cut notice.
+func TestDoctorCountsACutContextFileAsTheHeaderDoes(t *testing.T) {
+	const (
+		maxBytes  = 20
+		userBytes = len("user override")
+	)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	agentDir := filepath.Join(home, "agent")
+	t.Setenv("HARNESS_AGENT_DIR", agentDir)
+	repo := filepath.Join(home, "repo")
+	settings := filepath.Join(home, ".config", "harness", "settings.json")
+	for _, dir := range []string{filepath.Join(repo, ".git"), agentDir, filepath.Dir(settings)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, body := range map[string]string{
+		filepath.Join(agentDir, "AGENTS.override.md"): "user override",
+		filepath.Join(repo, "CLAUDE.md"):              "repo claude, longer than the cap leaves",
+		settings:                                      fmt.Sprintf(`{"context_files":{"max_bytes":%d}}`, maxBytes),
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(repo)
+	var output, diagnostics bytes.Buffer
+	if code := runDoctor(nil, &output, &diagnostics); code != 0 {
+		t.Fatalf("doctor = %d: %s", code, diagnostics.String())
+	}
+	text := output.String()
+	for _, want := range []string{
+		fmt.Sprintf("context files: %d of %d bytes", maxBytes, maxBytes),
+		fmt.Sprintf("AGENTS.override.md (%d bytes)", userBytes),
+		fmt.Sprintf("CLAUDE.md (%d bytes, cut)", maxBytes-userBytes),
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("doctor output lacks %q:\n%s", want, text)
 		}

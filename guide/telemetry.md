@@ -53,7 +53,7 @@ environment input.
 | `otel.metrics_protocol` | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | `http/json` | Same rule, metrics only. |
 | `otel.headers` | `OTEL_EXPORTER_OTLP_HEADERS` | none | Request headers, such as an API key. The variable uses `key=value,key=value` with percent-encoded values. |
 | `otel.compression` | `OTEL_EXPORTER_OTLP_COMPRESSION` | `none` | `gzip` or `none`. |
-| `otel.timeout_ms` | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Per-request timeout in milliseconds. |
+| `otel.timeout_ms` | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | Timeout of one export in milliseconds, retries included. |
 | `otel.service_name` | `OTEL_SERVICE_NAME` | `tempest` | `service.name` resource attribute. |
 | `otel.resource_attributes` | `OTEL_RESOURCE_ATTRIBUTES` | none | Extra resource attributes, in `key=value,...` form. |
 | `otel.capture_message_content` | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `false` | Adds prompts, responses, tool arguments and tool results to spans. |
@@ -155,7 +155,8 @@ Tempest uses W3C Trace Context (`traceparent` and `tracestate`):
 
 - **Incoming.** A `traceparent` header on `serve` requests becomes the run's parent.
   This covers the `/acp` WebSocket upgrade, `/a2a`, and a prompt's
-  `_meta.traceparent` in ACP, which wins over the upgrade header. A `tracestate`
+  `_meta.traceparent` in ACP, which wins over the upgrade header, together with
+  its `_meta.tracestate`. A `tracestate`
   header that comes with a valid `traceparent` is kept with it; repeated
   `tracestate` headers are joined into one list. A malformed `tracestate` (a bad key
   or value, a repeated key, or more than 32 entries) is dropped, and the
@@ -208,7 +209,7 @@ metric `gen_ai.client.inference.time_to_first_chunk` and the cache-write attribu
 | `tempest.hook.runs` | `tempest_hook_runs_total` | counter | `{run}` | `tempest.hook.event`, `tempest.hook.outcome` (`success`, `blocked` for exit 2, `failed`, `error`, `timeout`) |
 | `tempest.sessions` | `tempest_sessions` | gauge | `{session}` | none; open root sessions |
 | `tempest.jobs` | `tempest_jobs` | gauge | `{job}` | none; background jobs not yet finished, across open sessions |
-| `tempest.telemetry.spans.lost` | `tempest_telemetry_spans_lost_total` | counter | `{span}` | `reason` (`queue_full`, `export_failed`); present only when traces are exported |
+| `tempest.telemetry.spans.lost` | `tempest_telemetry_spans_lost_total` | counter | `{span}` | `reason` (`queue_full`, `export_failed`, or `rejected` for spans a collector refused in an export it otherwise accepted); present only when traces are exported |
 
 The token and duration buckets are the boundaries the GenAI conventions recommend.
 Prometheus names follow the OpenTelemetry compatibility rules: dots become
@@ -241,7 +242,9 @@ scrape_configs:
 | Span queue | 2048 spans; when full, new spans are dropped and counted in `tempest.telemetry.spans.lost{reason="queue_full"}` |
 | Span batch | up to 512 spans, sent at least every 5 seconds |
 | Metric push | every `otel.metric_export_interval_ms` (60 s), plus a final push at exit |
-| Request timeout | `otel.timeout_ms` (10 s) |
+| Export timeout | `otel.timeout_ms` (10 s) for each export, retries included |
+| Retries | an answer of 429, 502, 503 or 504 is retried after about 1 s, doubling up to 5 s, with jitter, and never sooner than its `Retry-After`; when the next try would not fit in the export timeout, the export fails. Other failures are not retried |
+| Partial success | a collector that accepts an export but reports rejected spans or data points in `partialSuccess` is not sent them again; rejected spans count as lost, and the rejection is logged like a failure |
 | Exit flush | at most 5 seconds; anything still queued then is dropped |
 | Collector failures | the first failure is logged as a warning, later ones at debug level; a success logs recovery once |
 | Collector redirects | followed within the endpoint's scheme, host and port only, so configured headers never reach another origin; a redirect elsewhere fails the export |
