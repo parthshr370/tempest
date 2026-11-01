@@ -698,7 +698,7 @@ func TestOpenAIPresetRoutesReasoningModelsToResponses(t *testing.T) {
 // The gpt-6 family is in the catalog, so a run on it reports what it cost
 // instead of an unknown price, on either OpenAI route.
 func TestGPT6LunaRoutesCarryCatalogPrice(t *testing.T) {
-	want := types.ModelCost{Input: 0.10, Output: 0.50, CacheRead: 0.01, CacheWrite: 0.125}
+	want := types.ModelCost{Input: 0.10, Output: 0.50, CacheRead: 0.01, CacheWrite: 0.125, LongContext: types.LongContextCost{MinPromptTokens: 272000, Input: 0.20, Output: 0.75, CacheRead: 0.02, CacheWrite: 0.25}}
 	for _, spec := range []string{"openai:gpt-6-luna", "openai-responses:gpt-6-luna"} {
 		routed, err := resolveRoute(RoutingConfig{ModelID: spec}, func(string) string { return "" })
 		if err != nil {

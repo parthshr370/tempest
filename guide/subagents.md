@@ -96,8 +96,9 @@ it:
   and every call still passes the child's permission ceiling. Children get no MCP
   tools, so an `mcp__*` entry offers nothing today.
 - `default` (or no `model`) runs on the parent's default model. `smol` uses the
-  smol model and `smol_reasoning`; `plan` uses the plan model, with its own
-  endpoint and backup models, and `plan_reasoning`, or the default model when
+  smol model, its backup models and `smol_reasoning`; `plan` uses the plan
+  model, with its own endpoint and backup models (the plan role's backups even
+  when `plan_model` is unset), and `plan_reasoning`, or the default model when
   the host sets no plan model. A model spec is routed through the configured
   providers like a role model, behind the default role's backup models, and
   each request carries the credential of the model's own provider and

@@ -398,8 +398,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cfg.StreamFn = router.StreamFn
 		cfg.FallbackModels = router.Fallbacks
 		if sampling := &cfg.MCP.Sampling; sampling.StreamFn == nil && sampling.ModelSpec != "" && mcpSamplingEnabled(selectedMCP) {
-			provider.ModelID = sampling.ModelSpec
-			router, e := adapter.NewProviderRouter(provider)
+			// Routed like a role model: with the credentials of its own
+			// route, never the caller's key for the session model's, and
+			// without the session model's backups.
+			route := provider.ForModel(sampling.ModelSpec)
+			route.FallbackModels = nil
+			router, e := adapter.NewProviderRouter(route)
 			if e != nil {
 				return nil, fmt.Errorf("mcp_sampling_model: %w", e)
 			}

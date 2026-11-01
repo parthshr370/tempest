@@ -2,9 +2,12 @@ package catalog
 
 import (
 	"encoding/json"
+	"math"
 	"net/url"
 	"testing"
 	"time"
+
+	"go.harness.dev/harness/internal/engine/types"
 )
 
 // TestEmbeddedCatalogParses guards the invariant that a runtime call can
@@ -24,7 +27,7 @@ func TestEmbeddedCatalogParses(t *testing.T) {
 	}
 	var raw struct {
 		Models []struct {
-			Cost map[string]*float64 `json:"cost"`
+			Cost map[string]json.RawMessage `json:"cost"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(embedded, &raw); err != nil {
@@ -98,5 +101,27 @@ func TestLookup(t *testing.T) {
 	}
 	if _, ok := Lookup("mistral", "large"); ok {
 		t.Fatal("unknown provider resolved")
+	}
+}
+
+// The gpt-6 family charges a higher rate for a prompt of 272,000 tokens or
+// more; a request that size must be priced at it, so cost_usd and -max-cost
+// do not understate the spend.
+func TestGPT6LongContextPrompt(t *testing.T) {
+	m, ok := Lookup("openai", "gpt-6-luna")
+	if !ok {
+		t.Fatal("gpt-6-luna missing from catalog")
+	}
+	standard := types.Usage{Input: 271_000, Output: 1_000}
+	types.CalculateCost(m.Cost, &standard)
+	long := types.Usage{Input: 200_000, CacheRead: 72_000, Output: 1_000}
+	types.CalculateCost(m.Cost, &long)
+	// $0.10/$0.50 per million below the threshold; $0.20 input, $0.02 cache
+	// read and $0.75 output at or above it.
+	if want := 0.0271 + 0.0005; math.Abs(standard.Cost.Total-want) > 1e-12 {
+		t.Fatalf("271k prompt costs %v, want the standard rate %v", standard.Cost.Total, want)
+	}
+	if want := 0.04 + 0.00144 + 0.00075; math.Abs(long.Cost.Total-want) > 1e-12 {
+		t.Fatalf("272k prompt costs %v, want the long-context rate %v", long.Cost.Total, want)
 	}
 }

@@ -45,6 +45,27 @@ func TestCalculateCost(t *testing.T) {
 	})
 }
 
+// A prompt (input, cache reads and cache writes together) that reaches the
+// long-context threshold pays the long-context prices, its one-hour cache
+// writes included; one token less pays the standard prices.
+func TestCalculateCostLongContext(t *testing.T) {
+	standard := ModelCost{Input: 1, Output: 2, CacheRead: 0.1, CacheWrite: 1.25}
+	long := LongContextCost{MinPromptTokens: 1000, Input: 2, Output: 3, CacheRead: 0.2, CacheWrite: 2.5}
+	tiered := standard
+	tiered.LongContext = long
+	price := func(mc ModelCost, input int) (Cost, Cost) {
+		u := Usage{Input: input, CacheRead: 300, CacheWrite: 200, CacheWrite1h: new(100), Output: 1_000_000}
+		flat := u
+		return CalculateCost(tiered, &u), CalculateCost(mc, &flat)
+	}
+	if got, want := price(standard, 499); got != want {
+		t.Fatalf("999-token prompt cost %+v, want the standard prices %+v", got, want)
+	}
+	if got, want := price(ModelCost{Input: long.Input, Output: long.Output, CacheRead: long.CacheRead, CacheWrite: long.CacheWrite}, 500); got != want || got.Output != 3 {
+		t.Fatalf("1000-token prompt cost %+v, want the long-context prices %+v", got, want)
+	}
+}
+
 func TestUnknownCostAndUsageAdd(t *testing.T) {
 	usage := Usage{Input: 100, Output: 20, Cost: Cost{Total: 9}}
 	calculated := CalculateCost(ModelCost{Unknown: true, Input: 3}, &usage)

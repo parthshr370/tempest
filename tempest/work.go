@@ -512,11 +512,13 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 		}
 	case agentfiles.RolePlan:
 		// The plan role runs where the plan stack runs: on PlanModel with its
-		// whole route, endpoint included.
+		// whole route, endpoint included, and behind the plan role's backups,
+		// which it has even when it shares the default model.
 		switch {
-		case cfg.PlanModel.ID == "" || cfg.PlanModel.Provider == cfg.Model.Provider && cfg.PlanModel.ID == cfg.Model.ID && cfg.PlanModel.BaseURL == cfg.Model.BaseURL:
+		case cfg.PlanModel.ID == "":
 		case cfg.PlanStreamFn != nil:
 			cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.PlanModel, cfg.PlanStreamFn, cfg.PlanFallbackModels, "plan"
+		case cfg.PlanModel.Provider == cfg.Model.Provider && cfg.PlanModel.ID == cfg.Model.ID && cfg.PlanModel.BaseURL == cfg.Model.BaseURL:
 		case cfg.PlanModel.Provider == cfg.Model.Provider:
 			// The default stream binds each request's credential to the
 			// model's own route, as it does for the plan stack.

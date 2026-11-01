@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"go.harness.dev/harness/internal/engine/stream"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/provider/faux"
@@ -166,6 +169,99 @@ func TestSessionMCPSamplingModelOverride(t *testing.T) {
 	if calls := h.recorded(); len(calls) != 1 || calls[0].model != "sampling-model" || calls[0].maxTokens != 50 || smol.CallCount() != 0 {
 		t.Fatalf("calls %+v, smol calls %d", calls, smol.CallCount())
 	}
+}
+
+// TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded: a backup answers
+// after the sampling model failed part-way; the failed attempt's usage is
+// billed too, so it is part of the receipt, as a retried attempt's is.
+func TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded(t *testing.T) {
+	smol, backup := samplingModel("smol-model"), samplingModel("backup-model")
+	// The faux backup counts its own few tokens; the discarded attempt's
+	// are far more, so the receipt must hold at least them.
+	failed := types.Usage{Input: 1000, Output: 500}
+	chain := func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
+		out := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+		go func() {
+			out.Push(types.StreamEvent{Type: types.EvFallback, Err: &types.AssistantMessage{Model: model.ID, StopReason: types.StopError, Usage: failed}, Fallback: &types.ModelFallback{From: model, To: backup.Model(), Index: 1}})
+			for event := range backup.StreamSimple(ctx, backup.Model(), c, opts).Events() {
+				out.Push(event)
+			}
+		}()
+		return out
+	}
+	h := openSampling(t, smol, true, nil, func(stack *StackConfig) {
+		stack.MCP.Sampling = session.MCPSamplingSettings{Model: smol.Model(), StreamFn: chain, AllowHeadless: true}
+	})
+	backup.AppendResponses(faux.Respond(faux.Text("backup summary")))
+	if reply := h.sample(); !strings.Contains(reply, "backup summary") {
+		t.Fatalf("server got %q", reply)
+	}
+	var spent types.Usage
+	for name, usage := range h.session.core.store.UsageSources() {
+		if strings.HasPrefix(name, "mcp-sampling:fixture:") {
+			spent = usage
+		}
+	}
+	if spent.Input <= failed.Input || spent.Output <= failed.Output {
+		t.Fatalf("sampling receipt %+v leaves out the attempt the fallback discarded (%+v)", spent, failed)
+	}
+}
+
+// mcp_sampling_model is routed like a role model, as in a CLI run: the
+// session's backup models back the session's model, not it, and the key the
+// caller gave for the session model's endpoint does not follow it to
+// another endpoint.
+func TestSessionMCPSamplingModelRoutesOnItsOwn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	sample := func(t *testing.T, endpoint string) (types.AssistantMessage, []string) {
+		mu.Lock()
+		requests = nil
+		mu.Unlock()
+		stack := &StackConfig{MCP: session.MCPClientSettings{Sampling: session.MCPSamplingSettings{ModelSpec: "openai:sampler@" + server.URL + endpoint, AllowHeadless: true}}}
+		provider := ProviderConfig{ModelID: "openai:root@" + server.URL + "/root", APIKey: "root-key", FallbackModels: []string{"openai:backup@" + server.URL + "/backup"}, Env: func(string) string { return "" }}
+		mcp := MCPServerConfig{Name: "fixture", Transport: "stdio", Command: mcpFixtureServer, Permission: "allow", Sampling: true}
+		s, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{MCPServers: []MCPServerConfig{mcp}}, Stack: stack, Provider: provider})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(context.Background())
+		sampling := s.core.sampling
+		final, err := sampling.stream(t.Context(), sampling.model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{}).Result(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return *final, append([]string(nil), requests...)
+	}
+	t.Run("no session backups", func(t *testing.T) {
+		// The backup has no key for its endpoint, so a switch to it would
+		// end on its own credential error instead of the sampler's 503.
+		final, sent := sample(t, "/root")
+		if final.Model != "sampler" || len(sent) != 1 || sent[0] != "/root/chat/completions Bearer root-key" {
+			t.Fatalf("sampling ended on %s (%s) after %v, want the sampling model's own failure", final.Model, final.ErrorMessage, sent)
+		}
+	})
+	t.Run("session key stays on its endpoint", func(t *testing.T) {
+		final, sent := sample(t, "/sampling")
+		for _, request := range sent {
+			if strings.Contains(request, "root-key") {
+				t.Fatalf("the session model's key reached the sampling endpoint: %v", sent)
+			}
+		}
+		if final.Model != "sampler" || !strings.Contains(final.ErrorMessage, "missing API key") {
+			t.Fatalf("sampling ended on %s (%s), want the sampler's own missing key", final.Model, final.ErrorMessage)
+		}
+	})
 }
 
 func TestSessionMCPSamplingAsksOnFirstUse(t *testing.T) {
