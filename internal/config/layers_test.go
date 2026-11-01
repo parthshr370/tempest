@@ -336,7 +336,7 @@ func TestStrictConfigAndUnknownKeyWarnings(t *testing.T) {
 	w.flags.Overrides = StringsInput{Set: true, Values: []string{"enable_webb=true"}}
 	resolved := w.mustResolve()
 	warnings := strings.Join(resolved.Warnings(), "\n")
-	if len(resolved.Warnings()) != 2 || !strings.Contains(warnings, `"modle"`) || !strings.Contains(warnings, w.user) || !strings.Contains(warnings, `"enable_webb"`) || !strings.Contains(warnings, "-c") {
+	if len(resolved.Warnings()) != 3 || !strings.Contains(warnings, `"modle"`) || !strings.Contains(warnings, w.user) || !strings.Contains(warnings, `"enable_webb"`) || !strings.Contains(warnings, "-c") || !strings.Contains(warnings, `"mcp_servers[0].bogus"`) {
 		t.Fatalf("want one warning per unknown key naming its source, got %q", resolved.Warnings())
 	}
 
@@ -361,11 +361,13 @@ func TestStrictConfigAndUnknownKeyWarnings(t *testing.T) {
 		t.Fatalf("strict nested unknown field: %v", err)
 	}
 
+	// A wrong type is an error in an operator file; an untrusted project file
+	// with one is skipped (TestInvalidUntrustedProjectFileIsSkipped).
 	for _, strict := range []bool{false, true} {
 		w := newLayerWorkspace(t)
-		w.write(w.projectPath(), `{"max_tokens":"lots"}`)
+		w.write(w.user, `{"max_tokens":"lots"}`)
 		w.flags.StrictConfig = BoolInput{Value: strict, Set: true}
-		if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), w.projectPath()) || !strings.Contains(err.Error(), "max_tokens") {
+		if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), w.user) || !strings.Contains(err.Error(), "max_tokens") {
 			t.Fatalf("strict=%t wrong type: %v", strict, err)
 		}
 	}
@@ -493,6 +495,65 @@ func TestProfileSelection(t *testing.T) {
 	}
 }
 
+// A null profile definition unsets the same profile in lower files, and a
+// null profiles member unsets them all. In a repository file the unset
+// follows the trust rules: keys it could not set itself stay.
+func TestProfileUnset(t *testing.T) {
+	undefined := func(t *testing.T, w *layerWorkspace) {
+		t.Helper()
+		_, err := w.resolve()
+		var configErr *Error
+		if !errors.As(err, &configErr) || configErr.Field != "profile" || !strings.Contains(err.Error(), "review") {
+			t.Fatalf("selecting an unset profile: %v", err)
+		}
+	}
+	for name, project := range map[string]string{
+		"definition": `{"profiles":{"review":null}}`,
+		"all":        `{"profiles":null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile"}}}`)
+			w.write(w.projectPath(), project)
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+			undefined(t, w)
+		})
+	}
+	t.Run("-c", func(t *testing.T) {
+		for _, override := range []string{"profiles.review=null", "profiles=null"} {
+			w := newLayerWorkspace(t)
+			w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile"}}}`)
+			w.flags.Overrides = StringsInput{Set: true, Values: []string{override}}
+			w.flags.Profile = StringInput{Value: "review", Set: true}
+			undefined(t, w)
+		}
+	})
+	t.Run("redefined above the unset", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile"}}}`)
+		w.write(w.projectPath(), `{"profiles":{"review":null}}`)
+		w.write(w.localPath(), `{"profiles":{"review":{"enable_web":true}}}`)
+		w.flags.Profile = StringInput{Value: "review", Set: true}
+		resolved := w.mustResolve()
+		if resolved.Model() != defaultModel || !resolved.EnableWeb() {
+			t.Fatalf("model=%q enable_web=%t", resolved.Model(), resolved.EnableWeb())
+		}
+	})
+	t.Run("untrusted repository keeps gated keys", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile","permission_mode_default":"plan"}}}`)
+		w.write(w.projectPath(), `{"profiles":{"review":null}}`)
+		w.flags.Profile = StringInput{Value: "review", Set: true}
+		resolved := w.mustResolve()
+		if resolved.Model() != defaultModel || resolved.PermissionModeDefault() != "plan" {
+			t.Fatalf("model=%q mode=%q", resolved.Model(), resolved.PermissionModeDefault())
+		}
+		if warnings := strings.Join(resolved.Warnings(), "\n"); !strings.Contains(warnings, "permission_mode_default") || !strings.Contains(warnings, w.projectPath()) {
+			t.Fatalf("warnings %q do not name the kept key", warnings)
+		}
+	})
+}
+
 func TestOverrideValues(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -522,6 +583,15 @@ func TestOverrideValues(t *testing.T) {
 		_, err := w.resolve()
 		var configErr *Error
 		if !errors.As(err, &configErr) || configErr.Field != overrideSource {
+			t.Fatalf("%q: err = %v", malformed, err)
+		}
+	}
+	// A malformed override never echoes what was typed: it may be a credential.
+	for _, malformed := range []string{"providers.relay.api_key sk-dummykey123456789", ".sk-dummykey123456789=x", "sk-dummykey123456789"} {
+		w := newLayerWorkspace(t)
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{"model=anthropic:x", malformed}}
+		_, err := w.resolve()
+		if err == nil || strings.Contains(err.Error(), "dummykey") || !strings.Contains(err.Error(), "key.path=value") {
 			t.Fatalf("%q: err = %v", malformed, err)
 		}
 	}

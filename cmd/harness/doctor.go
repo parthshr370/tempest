@@ -167,16 +167,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  %s: %s (%s)\n", adapter.Name, status, adapter.Command)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintln(stderr, err)
-		return 1
-	}
-	hookSettings, skippedHooks, err := hooks.ResolveProject(opts.Config.Hooks(), cwd)
-	if err != nil {
-		fmt.Fprintf(stderr, "doctor hooks: %v\n", err)
-		return 1
-	}
+	// The resolved settings already hold this workspace's trusted project
+	// hooks; the WARN config lines above name any the trust rules dropped.
+	hookSettings := opts.Config.Hooks()
 	fmt.Fprintf(stdout, "hooks: disabled=%t\n", hookSettings.NoHooks)
 	for _, event := range hooks.Events {
 		for _, group := range hookSettings.Hooks[event] {
@@ -195,9 +188,6 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	}
 	for _, warning := range hookSettings.UnmatchedToolMatchers(toolNames) {
 		fmt.Fprintf(stdout, "  WARN %s (Tempest tool names are case-sensitive; MCP names require discovery)\n", warning)
-	}
-	for _, path := range skippedHooks {
-		fmt.Fprintf(stdout, "  UNTRUSTED %s (hooks not loaded)\n", path)
 	}
 	printPathCheck(stdout, "settings file", opts.Config.SettingsPath())
 	printRoleCredentialCheck(stdout, "default", roles.Default.Model.Provider, opts)

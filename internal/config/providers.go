@@ -27,7 +27,7 @@ func (c *ResolvedConfig) UntrustedProviderFiles() []string {
 }
 
 // resolveProviders validates the merged endpoint registry. Project entries
-// reach it only through the provider trust gate in resolveLayers.
+// reach it only through the provider trust gate of the settings resolver.
 func resolveProviders(settings fileSettings) (map[string]adapter.ProviderConfig, error) {
 	providers := maps.Clone(settings.Providers)
 	if providers == nil {

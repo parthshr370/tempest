@@ -20,6 +20,7 @@ import (
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/lsp"
 	"go.harness.dev/harness/internal/mcpconfig"
+	"go.harness.dev/harness/internal/obs"
 )
 
 const (
@@ -206,6 +207,15 @@ type ResolvedConfig struct {
 	environments           map[string]EnvironmentProcess
 	settings               []Setting
 	warnings               []string
+	workspace              *workspaceSettings
+}
+
+// workspaceSettings resolves another session workspace's settings on the
+// same operator layers.
+type workspaceSettings struct {
+	resolver *layerResolver
+	// root is the workspace whose project files this configuration holds.
+	root string
 }
 
 // Model returns the default model specification.
@@ -339,8 +349,9 @@ type Error struct {
 	Err   error
 }
 
-// Error returns a stable, field-qualified configuration failure.
-func (e *Error) Error() string { return fmt.Sprintf("config %s: %v", e.Field, e.Err) }
+// Error returns a stable, field-qualified configuration failure. Text that
+// looks like a credential is masked, whatever produced the error.
+func (e *Error) Error() string { return obs.Redact(fmt.Sprintf("config %s: %v", e.Field, e.Err)) }
 
 // Unwrap returns the underlying parsing or filesystem failure.
 func (e *Error) Unwrap() error { return e.Err }
@@ -442,10 +453,9 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, &Error{Field: "trust_project_providers", Err: err}
 	}
-	layered, err := resolveLayers(layerOptions{
+	resolver, err := newLayerResolver(layerOptions{
 		managedPath:    managedPath,
 		userPath:       settingsPath,
-		workingDir:     c.WorkingDir,
 		skipProject:    c.SkipProject,
 		profile:        flagOrEnvString(c.Flags.Profile, lookup("HARNESS_PROFILE")),
 		strict:         strict,
@@ -454,6 +464,14 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		flags:          c.Flags,
 		lookup:         lookup,
 	})
+	if err != nil {
+		return nil, err
+	}
+	root, err := resolver.workspaceRoot(c.WorkingDir)
+	if err != nil {
+		return nil, err
+	}
+	layered, err := resolver.resolve(root)
 	if err != nil {
 		return nil, err
 	}
@@ -495,9 +513,9 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if logFileMax <= 0 {
 		return nil, &Error{Field: "log_file_max_bytes", Err: errors.New("must be positive")}
 	}
-	hookSettings := hooks.Settings{Hooks: settings.Hooks, NoHooks: settingValue(settings.NoHooks), TrustProjectHooks: trustHooks, TrustedProjects: settings.TrustedHookProjects}
-	if err := hookSettings.Validate(); err != nil {
-		return nil, &Error{Field: "hooks", Err: err}
+	hookSettings, err := layered.hooks()
+	if err != nil {
+		return nil, err
 	}
 	retryMaxAttempts := settingValue(settings.RetryMaxAttempts)
 	if retryMaxAttempts < 1 {
@@ -565,7 +583,8 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		untrustedProviderFiles: layered.untrustedProviderFiles,
 		debugAdapters:          debugAdapters,
 		settings:               layered.list,
-		warnings:               layered.warnings,
+		warnings:               slices.Concat(resolver.operatorWarnings, layered.warnings),
+		workspace:              &workspaceSettings{resolver: resolver, root: root},
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,
@@ -640,8 +659,45 @@ func validateResolved(c *ResolvedConfig) error {
 	return nil
 }
 
-// Hooks returns an owned snapshot of the operator's hook settings.
+// Hooks returns an owned snapshot of the resolved hook settings, including a
+// trusted project's hooks for the resolved workspace.
 func (c *ResolvedConfig) Hooks() hooks.Settings { return c.hooks.Clone() }
+
+// WorkspaceHooks returns the hook settings for a session in cwd: the same
+// resolution as [Config.Resolve] with cwd's project files in place of the
+// resolved workspace's, so trust, -c overrides and managed requirements
+// apply alike. The warnings name the repository settings that resolution
+// ignored; they are empty when cwd is the resolved workspace.
+func (c *ResolvedConfig) WorkspaceHooks(cwd string) (hooks.Settings, []string, error) {
+	if c.workspace == nil {
+		return c.Hooks(), nil, nil
+	}
+	root, err := c.workspace.resolver.workspaceRoot(cwd)
+	if err != nil {
+		return hooks.Settings{}, nil, err
+	}
+	if root == c.workspace.root {
+		return c.Hooks(), nil, nil
+	}
+	layered, err := c.workspace.resolver.resolve(root)
+	if err != nil {
+		return hooks.Settings{}, nil, err
+	}
+	settings, err := layered.hooks()
+	if err != nil {
+		return hooks.Settings{}, nil, err
+	}
+	return settings, layered.warnings, nil
+}
+
+// hooks validates the merged hook settings.
+func (s *layeredSettings) hooks() (hooks.Settings, error) {
+	settings := hooks.Settings{Hooks: s.settings.Hooks, NoHooks: settingValue(s.settings.NoHooks)}
+	if err := settings.Validate(); err != nil {
+		return hooks.Settings{}, &Error{Field: "hooks", Err: err}
+	}
+	return settings, nil
+}
 
 // DebugAdapters returns an owned snapshot of trusted debugger definitions.
 func (c *ResolvedConfig) DebugAdapters() map[string]dap.Adapter {

@@ -1,0 +1,393 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"reflect"
+	"slices"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// sessionStartHook is a hooks value with one SessionStart command.
+func sessionStartHook(command string) string {
+	return fmt.Sprintf(`{"SessionStart":[{"hooks":[{"type":"command","command":%q}]}]}`, command)
+}
+
+// gatedSamples holds, for every key a repository needs trust (or the
+// operator) to set, a value that changes the resolved runtime configuration.
+var gatedSamples = map[string]string{
+	"mcp_config":                `"repo-mcp.json"`,
+	"mcp_servers":               `[{"name":"repo","transport":"stdio","command":"repo-server"}]`,
+	"lsp_config":                `"repo-lsp.json"`,
+	"debug_adapters":            `{"repo":{"command":"repo-adapter"}}`,
+	"cloud_policy":              `"repo-policy.json"`,
+	"permission_mode_default":   `"bypass"`,
+	"permission_allow_tools":    `["bash"]`,
+	"attach":                    `["/etc/hosts"]`,
+	"agent_dir":                 `"/tmp/repo-agent"`,
+	"session_dir":               `"/tmp/repo-sessions"`,
+	"log_file":                  `"/tmp/repo.log"`,
+	"faux_script":               `"/tmp/repo-faux.json"`,
+	"skill_paths":               `["/tmp/repo-private-skills"]`,
+	"enable_lsp":                `true`,
+	"providers":                 `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`,
+	"anthropic_base_url":        `"https://repo.example"`,
+	"openai_base_url":           `"https://repo.example/v1"`,
+	"web_search_url":            `"https://repo.example/search"`,
+	"no_hooks":                  `true`,
+	"trusted_hook_projects":     `["/"]`,
+	"trusted_provider_projects": `["/"]`,
+	"environment":               `"repo"`,
+	"environments":              `{"repo":{"argv":["repo-env"]}}`,
+	"hooks":                     sessionStartHook("printf repo > marker"),
+}
+
+// caseVariants are spellings encoding/json would match to key: other ASCII
+// cases and the Unicode folds of s (U+017F) and k (U+212A).
+func caseVariants(key string) []string {
+	variants := []string{strings.ToUpper(key), strings.ToUpper(key[:1]) + key[1:]}
+	if strings.Contains(key, "s") {
+		variants = append(variants, strings.Replace(key, "s", "\u017f", 1))
+	}
+	if strings.Contains(key, "k") {
+		variants = append(variants, strings.Replace(key, "k", "\u212a", 1))
+	}
+	return variants
+}
+
+// runtimeView is the part of a resolution the runtime consumes, without the
+// per-test user settings path.
+func runtimeView(c *ResolvedConfig) ResolvedConfig {
+	view := *c
+	view.settings, view.warnings, view.untrustedProviderFiles, view.workspace, view.settingsPath = nil, nil, nil, nil, ""
+	return view
+}
+
+// A key that differs from a settings key only by case or Unicode folding is
+// unknown everywhere: it never reaches decoding, whatever layer holds it.
+func TestCaseVariantKeysNeverReachDecoding(t *testing.T) {
+	keys := slices.Sorted(maps.Keys(projectGates))
+	for _, key := range keys {
+		if _, ok := gatedSamples[key]; !ok {
+			t.Fatalf("gated key %q has no sample value", key)
+		}
+	}
+	baseline := newLayerWorkspace(t)
+	baseline.flags.Profile = StringInput{Value: "review", Set: true}
+	baseline.write(baseline.user, `{"profiles":{"review":{}}}`)
+	want := runtimeView(baseline.mustResolve())
+
+	placements := map[string]func(w *layerWorkspace, member string){
+		"project":       func(w *layerWorkspace, member string) { w.write(w.projectPath(), "{"+member+"}") },
+		"project-local": func(w *layerWorkspace, member string) { w.write(w.localPath(), "{"+member+"}") },
+		"project profile": func(w *layerWorkspace, member string) {
+			w.write(w.projectPath(), `{"profiles":{"review":{`+member+`}}}`)
+		},
+		"user": func(w *layerWorkspace, member string) {
+			w.write(w.user, `{"profiles":{"review":{}},`+member+`}`)
+		},
+	}
+	for _, key := range keys {
+		for _, variant := range caseVariants(key) {
+			for placement, place := range placements {
+				t.Run(placement+"/"+variant, func(t *testing.T) {
+					w := newLayerWorkspace(t)
+					w.flags.Profile = StringInput{Value: "review", Set: true}
+					if placement != "user" {
+						w.write(w.user, `{"profiles":{"review":{}}}`)
+					}
+					place(w, fmt.Sprintf("%q:%s", variant, gatedSamples[key]))
+					resolved, err := w.resolve()
+					if err != nil {
+						t.Fatalf("resolve: %v", err)
+					}
+					if got := runtimeView(resolved); !reflect.DeepEqual(got, want) {
+						t.Fatalf("%q in %s changed the runtime configuration", variant, placement)
+					}
+					for _, setting := range resolved.Settings() {
+						if strings.EqualFold(strings.SplitN(setting.Key, ".", 2)[0], variant) && setting.Key != key {
+							t.Fatalf("config show lists %q", setting.Key)
+						}
+					}
+					if !strings.Contains(strings.Join(resolved.Warnings(), "\n"), variant) {
+						t.Fatalf("no unknown-setting warning names %q: %q", variant, resolved.Warnings())
+					}
+				})
+			}
+		}
+	}
+
+	t.Run("trusted project", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+		w.flags.TrustProjectProviders = BoolInput{Value: true, Set: true}
+		w.write(w.projectPath(), `{"PERMISSION_MODE_DEFAULT":"bypass","Hooks":`+sessionStartHook("exit 0")+`,"providers":{"openai":{"BASE_URL":"https://repo.example/v1"}}}`)
+		resolved := w.mustResolve()
+		if resolved.PermissionModeDefault() != defaultPermissionMode || len(resolved.Hooks().Hooks) != 0 || resolved.Providers()["openai"].BaseURL != "" {
+			t.Fatal("a case variant applied in a trusted project")
+		}
+	})
+}
+
+func TestProjectSkillPathsAndLSPNeedTrust(t *testing.T) {
+	outside := t.TempDir()
+	w := newLayerWorkspace(t)
+	w.write(w.projectPath(), fmt.Sprintf(`{"skill_paths":[%q],"enable_lsp":true}`, outside))
+	resolved := w.mustResolve()
+	if len(resolved.SkillPaths()) != 0 || resolved.LSP().Enabled {
+		t.Fatalf("untrusted project set skill_paths=%v enable_lsp=%t", resolved.SkillPaths(), resolved.LSP().Enabled)
+	}
+	warnings := strings.Join(resolved.Warnings(), "\n")
+	for _, key := range []string{"skill_paths", "enable_lsp", w.projectPath()} {
+		if !strings.Contains(warnings, key) {
+			t.Fatalf("trust warning %q does not name %s", warnings, key)
+		}
+	}
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+	resolved = w.mustResolve()
+	if !slices.Equal(resolved.SkillPaths(), []string{outside}) || !resolved.LSP().Enabled {
+		t.Fatal("trusted project skill_paths or enable_lsp not applied")
+	}
+}
+
+// resolvedHookCommands lists event's commands in run order.
+func resolvedHookCommands(c *ResolvedConfig, event string) []string {
+	var commands []string
+	for _, group := range c.Hooks().Hooks[event] {
+		for _, command := range group.Hooks {
+			commands = append(commands, command.Command)
+		}
+	}
+	return commands
+}
+
+// Project hooks are one more settings layer: trusted repository hooks append
+// to the operator's, higher layers and managed requirements apply to them,
+// and config show lists them.
+func TestProjectHooksResolveAsALayer(t *testing.T) {
+	trusted := func(w *layerWorkspace) { w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true} }
+
+	t.Run("append in file order and show", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		trusted(w)
+		w.write(w.user, `{"hooks":`+sessionStartHook("user")+`}`)
+		w.write(w.projectPath(), `{"hooks":`+sessionStartHook("project")+`}`)
+		w.write(w.localPath(), `{"hooks":`+sessionStartHook("local")+`}`)
+		resolved := w.mustResolve()
+		if got := resolvedHookCommands(resolved, "SessionStart"); !slices.Equal(got, []string{"user", "project", "local"}) {
+			t.Fatalf("SessionStart commands = %v", got)
+		}
+		shown := settingFor(t, resolved, "hooks.SessionStart")
+		if shown.Layer != LayerProjectLocal || shown.Source != w.localPath() || !strings.Contains(string(shown.Value), `"project"`) {
+			t.Fatalf("config show hooks = %+v", shown)
+		}
+	})
+
+	t.Run("untrusted hooks are dropped with a warning", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"hooks":`+sessionStartHook("user")+`}`)
+		w.write(w.projectPath(), `{"hooks":`+sessionStartHook("project")+`}`)
+		resolved := w.mustResolve()
+		if got := resolvedHookCommands(resolved, "SessionStart"); !slices.Equal(got, []string{"user"}) {
+			t.Fatalf("SessionStart commands = %v", got)
+		}
+		warnings := strings.Join(resolved.Warnings(), "\n")
+		if !strings.Contains(warnings, "hooks") || !strings.Contains(warnings, w.projectPath()) {
+			t.Fatalf("warnings %q do not name the dropped project hooks", warnings)
+		}
+	})
+
+	t.Run("a repository cannot remove operator hooks", func(t *testing.T) {
+		for _, project := range []string{`{"hooks":null}`, `{"hooks":{"SessionStart":null}}`, `{"hooks":{"SessionStart":[]}}`} {
+			w := newLayerWorkspace(t)
+			trusted(w)
+			w.write(w.user, `{"hooks":`+sessionStartHook("user")+`}`)
+			w.write(w.projectPath(), project)
+			if got := resolvedHookCommands(w.mustResolve(), "SessionStart"); !slices.Equal(got, []string{"user"}) {
+				t.Fatalf("%s: SessionStart commands = %v", project, got)
+			}
+		}
+	})
+
+	t.Run("-c hooks=null unsets project hooks", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		trusted(w)
+		w.write(w.projectPath(), `{"hooks":`+sessionStartHook("project")+`}`)
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{"hooks=null"}}
+		if hooks := w.mustResolve().Hooks().Hooks; len(hooks) != 0 {
+			t.Fatalf("hooks after -c hooks=null = %+v", hooks)
+		}
+	})
+
+	t.Run("managed requirements pin project hooks", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		trusted(w)
+		w.write(w.managed, `{"requirements":{"hooks":{"SessionStart":[]}}}`)
+		w.write(w.projectPath(), `{"hooks":`+sessionStartHook("project")+`}`)
+		_, err := w.resolve()
+		var configErr *Error
+		if !errors.As(err, &configErr) || configErr.Field != "hooks.SessionStart" {
+			t.Fatalf("err = %v, want a hooks.SessionStart requirement error", err)
+		}
+		for _, name := range []string{w.managed, w.projectPath()} {
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("error %q does not name %s", err, name)
+			}
+		}
+	})
+
+	t.Run("operator-only trust settings in a repository", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"hooks":`+sessionStartHook("user")+`}`)
+		w.write(w.projectPath(), fmt.Sprintf(`{"trusted_hook_projects":[%q],"no_hooks":true,"hooks":%s}`, w.root, sessionStartHook("project")))
+		resolved := w.mustResolve()
+		if resolved.Hooks().NoHooks || !slices.Equal(resolvedHookCommands(resolved, "SessionStart"), []string{"user"}) {
+			t.Fatalf("repository granted itself trust or disabled operator hooks: %+v", resolved.Hooks())
+		}
+	})
+}
+
+// An invalid project file the operator has not trusted is skipped with a
+// warning; operator files, trusted projects and strict mode stay fatal.
+func TestInvalidUntrustedProjectFileIsSkipped(t *testing.T) {
+	invalid := map[string]func(w *layerWorkspace){
+		"malformed json":        func(w *layerWorkspace) { w.write(w.projectPath(), `{ broken json`) },
+		"not an object":         func(w *layerWorkspace) { w.write(w.projectPath(), `[1]`) },
+		"wrong type":            func(w *layerWorkspace) { w.write(w.projectPath(), `{"model":"anthropic:project","max_tokens":"lots"}`) },
+		"profiles not settings": func(w *layerWorkspace) { w.write(w.projectPath(), `{"profiles":5}`) },
+		"directory": func(w *layerWorkspace) {
+			if err := os.Mkdir(w.projectPath(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"oversized": func(w *layerWorkspace) {
+			w.write(w.projectPath(), `{"model":"`+strings.Repeat("x", maxSettingsFileBytes)+`"}`)
+		},
+		"fifo": func(w *layerWorkspace) {
+			if err := syscall.Mkfifo(w.projectPath(), 0o600); err != nil {
+				t.Skip(err)
+			}
+		},
+	}
+	resolveWithin := func(t *testing.T, w *layerWorkspace) (*ResolvedConfig, error) {
+		t.Helper()
+		type result struct {
+			resolved *ResolvedConfig
+			err      error
+		}
+		done := make(chan result, 1)
+		go func() {
+			resolved, err := w.resolve()
+			done <- result{resolved, err}
+		}()
+		select {
+		case got := <-done:
+			return got.resolved, got.err
+		case <-time.After(10 * time.Second):
+			t.Fatal("resolution blocked reading a project settings file")
+			return nil, nil
+		}
+	}
+	for name, write := range invalid {
+		t.Run(name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, `{"model":"anthropic:user"}`)
+			write(w)
+			w.flags.Overrides = StringsInput{Set: true, Values: []string{"max_tokens=1000"}}
+			resolved, err := resolveWithin(t, w)
+			if err != nil {
+				t.Fatalf("untrusted invalid project file stopped resolution: %v", err)
+			}
+			if resolved.Model() != "anthropic:user" || resolved.MaxTokens() != 1000 {
+				t.Fatalf("operator settings lost: model=%q max_tokens=%d", resolved.Model(), resolved.MaxTokens())
+			}
+			if !strings.Contains(strings.Join(resolved.Warnings(), "\n"), w.projectPath()) {
+				t.Fatalf("warnings %q do not name the skipped file", resolved.Warnings())
+			}
+
+			for fatal, set := range map[string]func(*layerWorkspace){
+				"strict":  func(w *layerWorkspace) { w.flags.StrictConfig = BoolInput{Value: true, Set: true} },
+				"trusted": func(w *layerWorkspace) { w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true} },
+			} {
+				set(w)
+				if _, err := resolveWithin(t, w); err == nil || !strings.Contains(err.Error(), w.projectPath()) {
+					t.Fatalf("%s: err = %v, want an error naming the project file", fatal, err)
+				}
+				w.flags.StrictConfig, w.flags.TrustProjectHooks = BoolInput{}, BoolInput{}
+			}
+		})
+	}
+
+	t.Run("a dropped key of the wrong type is not an error", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.projectPath(), `{"model":"anthropic:project","mcp_servers":5}`)
+		resolved := w.mustResolve()
+		if resolved.Model() != "anthropic:project" {
+			t.Fatalf("model = %q", resolved.Model())
+		}
+	})
+
+	t.Run("operator files stay fatal", func(t *testing.T) {
+		for name, path := range map[string]func(w *layerWorkspace) string{
+			"user":    func(w *layerWorkspace) string { return w.user },
+			"managed": func(w *layerWorkspace) string { return w.managed },
+		} {
+			w := newLayerWorkspace(t)
+			w.write(path(w), `{ broken json`)
+			if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), path(w)) {
+				t.Fatalf("%s: err = %v", name, err)
+			}
+		}
+	})
+}
+
+// A session in another workspace (serve, ACP, the SDK) gets that workspace's
+// hooks from the same resolution: its trust, -c overrides and requirements.
+func TestWorkspaceHooksResolveAnotherWorkspace(t *testing.T) {
+	other := newLayerWorkspace(t)
+	other.write(other.projectPath(), `{"hooks":`+sessionStartHook("other project")+`}`)
+	resolveFor := func(t *testing.T, w *layerWorkspace) ([]string, []string, error) {
+		t.Helper()
+		resolved := w.mustResolve()
+		if settings, warnings, err := resolved.WorkspaceHooks(w.root); err != nil || warnings != nil || !reflect.DeepEqual(settings, resolved.Hooks()) {
+			t.Fatalf("own workspace: settings=%+v warnings=%q err=%v", settings, warnings, err)
+		}
+		settings, warnings, err := resolved.WorkspaceHooks(other.root)
+		var commands []string
+		for _, group := range settings.Hooks["SessionStart"] {
+			for _, command := range group.Hooks {
+				commands = append(commands, command.Command)
+			}
+		}
+		return commands, warnings, err
+	}
+
+	w := newLayerWorkspace(t)
+	w.write(w.user, `{"hooks":`+sessionStartHook("user")+`}`)
+	commands, warnings, err := resolveFor(t, w)
+	if err != nil || !slices.Equal(commands, []string{"user"}) || !strings.Contains(strings.Join(warnings, "\n"), other.projectPath()) {
+		t.Fatalf("untrusted: commands=%v warnings=%q err=%v", commands, warnings, err)
+	}
+
+	w.write(w.user, fmt.Sprintf(`{"trusted_hook_projects":[%q],"hooks":%s}`, other.root, sessionStartHook("user")))
+	if commands, _, err := resolveFor(t, w); err != nil || !slices.Equal(commands, []string{"user", "other project"}) {
+		t.Fatalf("trusted: commands=%v err=%v", commands, err)
+	}
+
+	w.flags.Overrides = StringsInput{Set: true, Values: []string{"hooks=null"}}
+	if commands, _, err := resolveFor(t, w); err != nil || len(commands) != 0 {
+		t.Fatalf("-c hooks=null: commands=%v err=%v", commands, err)
+	}
+
+	w.flags.Overrides = StringsInput{}
+	w.write(w.managed, `{"requirements":{"hooks":{"SessionStart":[]}}}`)
+	w.write(w.user, fmt.Sprintf(`{"trusted_hook_projects":[%q]}`, other.root))
+	if _, _, err := resolveFor(t, w); err == nil || !strings.Contains(err.Error(), other.projectPath()) {
+		t.Fatalf("pinned hooks: err=%v", err)
+	}
+}
