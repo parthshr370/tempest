@@ -22,18 +22,33 @@ its place: it replaces the standalone file of its own directory. At user level,
 do not apply there.
 
 Files load user first, then repository root down to the working directory.
-`@file` imports expand in every kind of context file, including `CLAUDE.md`.
-A repository context file is read through the repository root: one that is a
-symlink pointing outside the repository is skipped with a warning, and one that
-is not a regular file (a directory or FIFO named `AGENTS.md`) stops startup
-with an error instead of blocking.
+`@file` imports expand in every kind of context file, including `CLAUDE.md`,
+and in `RULES.md`. Each file and its imports are read inside one root:
+
+- **Repository files** (context files and `.harness/RULES.md`): the repository
+  root, the directory startup walks up to (the git root, else your home
+  directory when the working directory is under it, else the filesystem root).
+  A file that is a symlink pointing outside it is skipped with a warning. An
+  import that is a symlink pointing outside it, a `../` or absolute import
+  outside it, and a `~/` import stay literal. A repository file never pulls a
+  file from outside the repository into the prompt.
+- **Your own files** (`<agent-dir>/AGENTS.override.md`, `AGENTS.md` and
+  `RULES.md`): your home directory, or the agent dir itself when it is outside
+  home. `~/` imports resolve against home; an import outside the root stays
+  literal.
+
+A context file that is not a regular file (a directory or FIFO named
+`AGENTS.md`) stops startup with an error instead of blocking.
 
 The loaded files share one budget, `context_files.max_bytes` (default 65536
 bytes, counted after imports expand). The file that crosses it is cut and ends
 with a `[harness: context files exceed context_files.max_bytes ...]` notice that
 names the cut and every file left out, so the model knows its instructions are
-incomplete. `harness doctor` lists the files a run in the current directory
-would load, their sizes, and the notice if any.
+incomplete. The budget bounds the work as well: each context file is read only
+up to `context_files.max_bytes` bytes, and its imports only up to as many again,
+however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
+the files a run in the current directory would load, their sizes, and the
+notice if any.
 
 ```json
 {

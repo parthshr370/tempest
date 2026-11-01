@@ -32,7 +32,7 @@ Preset definitions are data, not executable project configuration. See
 An agent type can be a markdown file. At startup tempest reads, in order:
 
 1. `.harness/agents/*.md` at the repository root
-2. `.claude/agents/*.md` at the repository root (Claude Code subagents load unchanged)
+2. `.claude/agents/*.md` at the repository root (Claude Code's subagent format, limited to the keys below)
 3. `<agent-dir>/agents/*.md`
 
 The repository root is the nearest directory at or above the working directory
@@ -73,6 +73,15 @@ Review only the files named in the task. Report each finding with its path and l
 | `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string; an empty value is invalid. Used when the `task` call passes no `output_schema`. |
 
 The body below the header is the agent's instructions; it is required.
+
+Claude Code compatibility covers the file format, the body and the keys in the
+table: `name`, `description`, `tools` with Claude Code tool names, and `model`
+with Claude Code aliases. Every other key is ignored without a warning,
+including Claude Code's `disallowedTools`, `permissionMode`, `effort`,
+`maxTurns`, `skills`, `hooks` and `mcpServers`. A Claude Code agent that
+restricts itself with one of those loses the restriction here; restrict it with
+`tools`. Only `*.md` files directly in each directory load, and
+`~/.claude/agents` is not read.
 
 With `task` active, the `task` tool accepts each file agent's bare name as
 `subagent_type`, and the system prompt lists the agents once, beside `explore`

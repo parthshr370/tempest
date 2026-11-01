@@ -1,4 +1,4 @@
-// Package contextfile expands bounded @file references in trusted context files.
+// Package contextfile expands bounded @file references in context files.
 package contextfile
 
 import (
@@ -16,8 +16,11 @@ const MaxImportDepth = 5
 
 // ExpandOptions configures import expansion.
 type ExpandOptions struct {
-	HomeDir  string
-	MaxDepth int
+	// HomeDir resolves ~ imports; they must still lie inside the root.
+	// Empty leaves them literal.
+	HomeDir string
+	// MaxBytes bounds what all imports read together; negative is no limit.
+	MaxBytes int
 }
 
 // ErrorCode classifies context import errors.
@@ -43,36 +46,26 @@ func (e *Error) Is(target error) bool {
 	return ok && e.Code == other.Code
 }
 
-// Expand expands @file imports in content. Optional imports that cannot be read
-// stay literal; only invalid options, source failures, and cancellation fail.
-func Expand(ctx context.Context, filePath string, content []byte, options ExpandOptions) (string, error) {
-	if options.MaxDepth < 0 || options.MaxDepth > MaxImportDepth {
-		return "", &Error{Code: InvalidOptions, Path: filePath, Err: errors.New("max depth must be between 0 and 5")}
+// Expand expands @file imports of filePath, a file inside root. Every
+// import is opened through root, so neither a ../ or absolute path nor a
+// symlink reaches a file outside it. Imports read at most options.MaxBytes
+// bytes together; complete is false when they were cut there. Imports that
+// cannot be read stay literal; only invalid options, source failures and
+// cancellation fail.
+func Expand(ctx context.Context, root *os.Root, filePath string, content []byte, options ExpandOptions) (text string, complete bool, err error) {
+	if root == nil {
+		return "", false, &Error{Code: InvalidOptions, Path: filePath, Err: errors.New("a root is required")}
 	}
-	text, _, err := expandFrom(ctx, filePath, content, &expander{home: options.HomeDir, maxDepth: options.MaxDepth, budget: -1})
-	return text, err
-}
-
-// ExpandWithin expands imports of a file inside root, for repository files
-// that load without the user asking: every import is opened through root,
-// so neither a ../ path nor a symlink reaches a file outside it, and ~
-// imports stay literal. Imports read at most maxBytes bytes together;
-// complete is false when they were cut there.
-func ExpandWithin(ctx context.Context, root *os.Root, filePath string, content []byte, maxBytes int) (text string, complete bool, err error) {
-	if root == nil || maxBytes < 0 {
-		return "", false, &Error{Code: InvalidOptions, Path: filePath, Err: errors.New("a root and a non-negative byte limit are required")}
-	}
-	e := &expander{root: root, rootDir: filepath.Clean(root.Name()), budget: maxBytes}
+	e := &expander{home: options.HomeDir, root: root, rootDir: filepath.Clean(root.Name()), budget: options.MaxBytes}
 	text, e, err = expandFrom(ctx, filePath, content, e)
 	return text, e != nil && !e.truncated, err
 }
 
 // expander carries one expansion's limits and state through the import tree.
 type expander struct {
-	home     string
-	maxDepth int
-	visited  map[string]struct{}
-	// root confines imports when set; rootDir is its directory.
+	home    string
+	visited map[string]struct{}
+	// root confines imports; rootDir is its directory.
 	root    *os.Root
 	rootDir string
 	// budget is what imports may still read; negative is unbounded.
@@ -81,9 +74,6 @@ type expander struct {
 }
 
 func expandFrom(ctx context.Context, filePath string, content []byte, e *expander) (string, *expander, error) {
-	if e.maxDepth == 0 {
-		e.maxDepth = MaxImportDepth
-	}
 	absolute, err := filepath.Abs(filePath)
 	if err != nil {
 		return "", nil, &Error{Code: InvalidSource, Path: filePath, Err: err}
@@ -222,7 +212,7 @@ func (e *expander) importFile(ctx context.Context, source, target string, depth 
 	}
 	resolved := target
 	if resolved == "~" || strings.HasPrefix(resolved, "~/") {
-		if e.home == "" || e.root != nil {
+		if e.home == "" {
 			return "", false, nil
 		}
 		resolved = filepath.Join(e.home, strings.TrimPrefix(resolved[1:], "/"))
@@ -237,7 +227,7 @@ func (e *expander) importFile(ctx context.Context, source, target string, depth 
 	if _, exists := e.visited[key]; exists {
 		return "", false, nil
 	}
-	if depth >= e.maxDepth {
+	if depth >= MaxImportDepth {
 		return "", false, nil
 	}
 	data, ok := e.read(absolute)
@@ -255,20 +245,15 @@ func (e *expander) importFile(ctx context.Context, source, target string, depth 
 	return expanded, true, nil
 }
 
-// read returns a regular file's bytes, through the root when there is one,
-// and at most what the budget leaves; a cut read marks the expansion
-// incomplete. Opening only regular files keeps a FIFO from blocking.
+// read returns a regular file's bytes, opened through the root, and at most
+// what the budget leaves; a cut read marks the expansion incomplete. Opening
+// only regular files keeps a FIFO from blocking.
 func (e *expander) read(absolute string) ([]byte, bool) {
-	stat, open := os.Stat, func(name string) (*os.File, error) { return os.Open(name) }
-	name := absolute
-	if e.root != nil {
-		rel, err := filepath.Rel(e.rootDir, absolute)
-		if err != nil || !filepath.IsLocal(rel) {
-			return nil, false
-		}
-		name, stat, open = rel, e.root.Stat, e.root.Open
+	name, err := filepath.Rel(e.rootDir, absolute)
+	if err != nil || !filepath.IsLocal(name) {
+		return nil, false
 	}
-	info, err := stat(name)
+	info, err := e.root.Stat(name)
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, false
 	}
@@ -276,7 +261,7 @@ func (e *expander) read(absolute string) ([]byte, bool) {
 		e.truncated = true
 		return nil, false
 	}
-	file, err := open(name)
+	file, err := e.root.Open(name)
 	if err != nil {
 		return nil, false
 	}

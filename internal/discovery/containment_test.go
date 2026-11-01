@@ -133,6 +133,57 @@ func TestDiscoverRefusesProjectContextOutsideRepo(t *testing.T) {
 	}
 }
 
+// A repository context file or rule that imports a file outside the
+// repository, through a symlink or a ../ path, keeps the import literal:
+// startup may not show what read itself may not.
+func TestDiscoverKeepsStartupImportsInsideRepo(t *testing.T) {
+	root, sub := gitRepo(t)
+	secret := outsideFile(t, "secret.md", outsideMarker)
+	symlink(t, secret, filepath.Join(root, "leak.md"))
+	escape, err := filepath.Rel(sub, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAll(t, filepath.Join(root, "AGENTS.override.md"), "override @./leak.md")
+	writeAll(t, filepath.Join(sub, "AGENTS.md"), "sub @"+escape+" @"+secret)
+	writeAll(t, filepath.Join(root, ".harness", "RULES.md"), "rule @../leak.md")
+	inputs, err := Discover(context.Background(), Options{Cwd: sub, AgentDir: t.TempDir(), HomeDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded []string
+	for _, file := range inputs.ContextFiles {
+		loaded = append(loaded, file.Content)
+	}
+	loaded = append(loaded, inputs.GenericRules...)
+	want := []string{"override @./leak.md", "sub @" + escape + " @" + secret, "rule @../leak.md"}
+	if strings.Join(loaded, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("startup loaded %q, want the imports literal: %q", loaded, want)
+	}
+}
+
+// The user's own context file and rules are read inside the home
+// directory: a ~ import expands, an import outside home stays literal.
+func TestDiscoverUserImportsStayInsideHome(t *testing.T) {
+	home := t.TempDir()
+	agentDir := filepath.Join(home, ".tempest")
+	secret := outsideFile(t, "secret.md", outsideMarker)
+	writeAll(t, filepath.Join(home, "notes.md"), "NOTES")
+	writeAll(t, filepath.Join(agentDir, "AGENTS.md"), "user @~/notes.md @"+secret)
+	writeAll(t, filepath.Join(agentDir, "RULES.md"), "rules @~/notes.md")
+	root, _ := gitRepo(t)
+	inputs, err := Discover(context.Background(), Options{Cwd: root, AgentDir: agentDir, HomeDir: home})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inputs.ContextFiles) != 1 || inputs.ContextFiles[0].Content != "user NOTES @"+secret {
+		t.Fatalf("user context = %#v", inputs.ContextFiles)
+	}
+	if len(inputs.GenericRules) != 1 || inputs.GenericRules[0] != "rules NOTES" {
+		t.Fatalf("user rules = %q", inputs.GenericRules)
+	}
+}
+
 // Agent files come from the repository root, also when the session starts in
 // a subdirectory; one linked from outside the repository, or one that is not
 // a regular file, is skipped with a diagnostic instead of read.

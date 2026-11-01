@@ -220,7 +220,7 @@ func (n *Nested) render(ctx context.Context, root *os.Root, found nestedCandidat
 		return frameNested(rel, key, fmt.Sprintf("[harness: not loaded; context files already use context_files.max_bytes. Read %s directly if its rules matter; context files in other directories are no longer looked up.]", rel)), file, nil
 	}
 	absolute := filepath.Join(n.roots[0], found.rel)
-	content, complete, err := contextfile.ExpandWithin(ctx, root, absolute, found.data, limit+1)
+	content, complete, err := contextfile.Expand(ctx, root, absolute, found.data, contextfile.ExpandOptions{MaxBytes: limit + 1})
 	if err != nil {
 		return "", file, &Error{Code: ExpandContext, Op: "expand", Path: absolute, Err: err}
 	}

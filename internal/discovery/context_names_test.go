@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -117,6 +118,43 @@ func TestDiscoverCapsTotalBytesWithNotice(t *testing.T) {
 	}
 	if len(inputs.Diagnostics) == 0 || inputs.Diagnostics[len(inputs.Diagnostics)-1].Code != DiagnosticTruncated {
 		t.Fatalf("diagnostics = %#v", inputs.Diagnostics)
+	}
+}
+
+// The cap bounds startup work, not only what is kept: a context file far
+// larger than context_files.max_bytes, and an import as large, are read only
+// up to the cap.
+func TestDiscoverReadsContextOnlyUpToTheCap(t *testing.T) {
+	const (
+		capBytes = 64
+		huge     = 8 << 20
+		// Reading either huge file whole allocates far more than this.
+		allocBound = 1 << 20
+		rootBody   = "root @./big.md"
+	)
+	root, cwd, agentDir := contextRepo(t)
+	write(t, filepath.Join(root, "AGENTS.md"), rootBody)
+	write(t, filepath.Join(root, "big.md"), strings.Repeat("I", huge))
+	write(t, filepath.Join(cwd, "AGENTS.md"), strings.Repeat("F", huge))
+	options := Options{Cwd: cwd, AgentDir: agentDir, HomeDir: t.TempDir(), Files: config.ContextFileSettings{MaxBytes: capBytes}}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	inputs, err := Discover(context.Background(), options)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > allocBound {
+		t.Fatalf("startup discovery allocated %d bytes for a %d-byte cap", grew, capBytes)
+	}
+	prefix := "root " + strings.Repeat("I", capBytes-len("root "))
+	omitted := "omitted: " + filepath.ToSlash(filepath.Join(canonical(t, cwd), "AGENTS.md"))
+	if len(inputs.ContextFiles) != 1 || !strings.HasPrefix(inputs.ContextFiles[0].Content, prefix+"\n\n[harness: ") || !strings.Contains(inputs.ContextFiles[0].Content, omitted) {
+		t.Fatalf("contexts = %.300q", inputs.ContextFiles)
+	}
+	if inputs.ContextBytes != capBytes {
+		t.Fatalf("ContextBytes = %d, want %d", inputs.ContextBytes, capBytes)
 	}
 }
 

@@ -18,9 +18,9 @@ func openRoot(t *testing.T, dir string) *os.Root {
 	return root
 }
 
-// Imports of a repository file stay inside its root: an absolute path, a ../
-// path, a symlink out of the root and a ~ import all stay literal.
-func TestExpandWithinKeepsImportsInsideRoot(t *testing.T) {
+// Imports stay inside the root: an absolute path, a ../ path, a symlink out
+// of the root and a ~ import whose home is outside the root all stay literal.
+func TestExpandKeepsImportsInsideRoot(t *testing.T) {
 	const (
 		secret     = "SYNTHETIC_OUTSIDE_SECRET"
 		roomForAll = 1 << 20
@@ -37,7 +37,7 @@ func TestExpandWithinKeepsImportsInsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := "@./inside.md @" + filepath.Join(outside, "secret.md") + " @" + upward + " @./link.md @~/secret.md"
-	got, complete, err := ExpandWithin(context.Background(), openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte(source), roomForAll)
+	got, complete, err := Expand(context.Background(), openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte(source), ExpandOptions{HomeDir: outside, MaxBytes: roomForAll})
 	if err != nil || !complete {
 		t.Fatalf("expand: complete=%v err=%v", complete, err)
 	}
@@ -48,7 +48,7 @@ func TestExpandWithinKeepsImportsInsideRoot(t *testing.T) {
 
 // Imports read no more than the byte limit together; a cut import marks the
 // expansion incomplete and later imports are not opened.
-func TestExpandWithinBoundsImportBytes(t *testing.T) {
+func TestExpandBoundsImportBytes(t *testing.T) {
 	const (
 		limit     = 16
 		bigImport = 4 << 10
@@ -56,7 +56,7 @@ func TestExpandWithinBoundsImportBytes(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "big.md"), strings.Repeat("B", bigImport))
 	mustWrite(t, filepath.Join(dir, "late.md"), "LATE")
-	got, complete, err := ExpandWithin(context.Background(), openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte("@./big.md @./late.md"), limit)
+	got, complete, err := Expand(context.Background(), openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte("@./big.md @./late.md"), ExpandOptions{MaxBytes: limit})
 	if err != nil {
 		t.Fatal(err)
 	}
