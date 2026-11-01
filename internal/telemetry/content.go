@@ -253,9 +253,13 @@ func systemInstructions(prompt string) func() string {
 }
 
 // toolArguments captures gen_ai.tool.call.arguments: the arguments' JSON
-// text, cut to the capture limit.
+// text, or, when it is over the capture limit, a JSON string of its marked
+// prefix, so the attribute is always valid JSON.
 func toolArguments(raw json.RawMessage) string {
-	return newContentBudget().text(string(raw[:min(len(raw), maxCapturedContentBytes+1)]))
+	if len(raw) <= maxCapturedContentBytes {
+		return string(raw)
+	}
+	return string(newContentBudget().arguments(raw))
 }
 
 // toolResultText captures gen_ai.tool.call.result from a tool's final result.

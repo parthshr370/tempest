@@ -102,6 +102,7 @@ func TestCapturedContentIsBoundedValidJSON(t *testing.T) {
 	captures := map[string]func() string{
 		"input text":       inputMessages([]types.Message{types.UserMessage{Content: types.StringContent(huge)}}),
 		"input arguments":  inputMessages([]types.Message{types.AssistantMessage{Content: []types.ContentBlock{call}, StopReason: types.StopToolUse}}),
+		"tool arguments":   func() string { return toolArguments(hugeArguments) },
 		"many messages":    inputMessages(tiny),
 		"output":           outputMessages(types.AssistantMessage{Content: []types.ContentBlock{types.NewText(huge)}, StopReason: types.StopStop}),
 		"system":           systemInstructions(huge),
