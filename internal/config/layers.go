@@ -670,7 +670,7 @@ func namesModelEndpoint(value *settingsNode) bool {
 		return true
 	}
 	var spec string
-	return json.Unmarshal(value.scalar, &spec) == nil && (strings.Contains(spec, "@http://") || strings.Contains(spec, "@https://"))
+	return json.Unmarshal(value.scalar, &spec) == nil && adapter.HasModelBaseURL(spec)
 }
 
 // planModeNode is the strictest permission mode, which no lower mode is
