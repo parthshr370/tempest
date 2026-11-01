@@ -52,7 +52,14 @@ func TestConfigShowMatchesResolver(t *testing.T) {
 	}
 	for _, setting := range settings {
 		shown, ok := output.Settings[setting.Key]
-		if !ok || !bytes.Equal(shown.Value, setting.Value) || shown.Layer != setting.Layer || shown.Source != setting.Source {
+		// The -json output is indented, which re-indents nested array and object values.
+		var compact bytes.Buffer
+		if ok {
+			if err := json.Compact(&compact, shown.Value); err != nil {
+				t.Fatalf("%s: %v", setting.Key, err)
+			}
+		}
+		if !ok || !bytes.Equal(compact.Bytes(), setting.Value) || shown.Layer != setting.Layer || shown.Source != setting.Source {
 			t.Fatalf("%s: shown %+v, resolver %+v", setting.Key, shown, setting)
 		}
 	}
