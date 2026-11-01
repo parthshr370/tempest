@@ -77,6 +77,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 	var text strings.Builder
 	details := readBatchDetails{Files: make([]readBatchFile, 0, len(paths))}
 	failures := 0
+	var touched []agent.PathEvent
 	imageBytes, maxImageBytes := 0, base64.StdEncoding.EncodedLen(document.MaxInlineImageBytes)
 	for _, path := range paths {
 		if text.Len() > 0 {
@@ -98,6 +99,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 			continue
 		}
 		details.Files = append(details.Files, readBatchFile{Path: path, Details: result.Details})
+		touched = append(touched, result.Paths...)
 		for _, block := range result.Content {
 			if block.Type == types.BlockText {
 				budget.lines -= strings.Count(block.Text, "\n") + 1
@@ -126,6 +128,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 	}
 	result := textResult("", details)
 	result.Content = content
+	result.Paths = touched
 	return result, nil
 }
 
@@ -138,10 +141,10 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	}
 	var rootForRead *os.Root
 	if !refs.IsURL(request.path) {
-		var err error
-		rootForRead, err = reader.getRoot()
-		if err != nil {
-			return agent.AgentToolResult{}, err
+		var rootErr error
+		rootForRead, rootErr = reader.getRoot()
+		if rootErr != nil {
+			return agent.AgentToolResult{}, rootErr
 		}
 	}
 	selector, err := parseReadPathSelector(request.path)
@@ -161,6 +164,8 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	}
 	// Images that came with text (MCP resources) follow its rows.
 	result.Content = append(result.Content, source.images...)
+	// Only a read that renders successfully reports its workspace path.
+	result.Paths = source.paths()
 	return result, nil
 }
 

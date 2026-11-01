@@ -83,7 +83,7 @@ const (
 // entry. Records stay out of the parent chain.
 func isRecord(kind EntryType) bool {
 	switch kind {
-	case KindHook, KindModelFallback:
+	case KindHook, KindModelFallback, KindContextFile:
 		return true
 	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission,
 		KindQueueEnqueued, KindQueueCancelled, KindJobStarted, KindJobRunning, KindJobAttached,
@@ -344,7 +344,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 			return nil, err
 		}
 		wire.Payload = e.Payload
-	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord, HookRecord, ModelFallbackRecord:
+	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord, HookRecord, ModelFallbackRecord, ContextFileRecord:
 		payload, err := json.Marshal(e)
 		if err != nil {
 			return nil, fmt.Errorf("marshal %s record: %w", wire.Type, err)
@@ -448,6 +448,17 @@ func decodeRecord(kind EntryType, meta Meta, payload json.RawMessage) (Entry, er
 		}
 		if record.Event == "" || (record.Status != "started" && record.Status != "finished") {
 			return nil, fmt.Errorf("invalid hook record")
+		}
+		record.Meta = meta
+		return record, nil
+	}
+	if kind == KindContextFile {
+		var record ContextFileRecord
+		if err := json.Unmarshal(payload, &record); err != nil {
+			return nil, err
+		}
+		if record.Dir == "" || record.Path == "" || record.Bytes < 0 {
+			return nil, fmt.Errorf("invalid context_file record")
 		}
 		record.Meta = meta
 		return record, nil

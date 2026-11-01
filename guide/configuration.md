@@ -339,7 +339,7 @@ each flag and variable above, names the same setting. The main keys:
 | `otel` | OpenTelemetry export: endpoints, headers, service name, content capture. Each key also reads its standard `OTEL_*` variable. See [Telemetry](telemetry.md#settings). |
 | `skill_paths` | Extra skill directories; `-skill` flags replace the list. |
 | `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
-| `context_files` | Object: `fallback` file names tried after `AGENTS.md` (default `["CLAUDE.md"]`) and `max_bytes`, the total context file cap (default 65536). See [Skills and context](skills-and-context.md#context-discovery). |
+| `context_files` | Object: `fallback` file names tried after `AGENTS.md` (default `["CLAUDE.md"]`), `max_bytes`, the total context file cap (default 65536), `nested_max_bytes` per nested file (default 16384, at most `max_bytes`), and `nested` on-read discovery below the working directory (default `true`). See [Skills and context](skills-and-context.md#context-discovery). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 

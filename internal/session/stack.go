@@ -640,6 +640,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		QueueSource:      cfg.QueueSource,
 		Work:             cfg.Work,
 		BeforeToolCall:   beforeToolCall,
+		AfterToolCall:    nestedContextHook(cfg, cwd, local),
 		SessionID:        sessionID,
 		Hooks:            hookRunner,
 		Extensions:       extensionRuntime,

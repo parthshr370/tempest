@@ -35,10 +35,38 @@ would load, their sizes, and the notice if any.
 {
   "context_files": {
     "fallback": ["CLAUDE.md", "GEMINI.md"],
-    "max_bytes": 65536
+    "max_bytes": 65536,
+    "nested_max_bytes": 16384,
+    "nested": true
   }
 }
 ```
+
+### Nested context files
+
+Startup only covers the working directory and its ancestors. When `read` or `ls`
+succeeds on a path below the working directory, the agent checks each directory
+between the working directory and that path, shallowest first, and surfaces the
+first context file it finds there (same name order as above). Reading
+`a/b/x.go` shows `a/AGENTS.md`, then `a/b/CLAUDE.md`.
+
+- The file is appended after that tool result, inside a
+  `<repository_context path="a/AGENTS.md">` frame that marks it as repository
+  data: it refines shallower instructions for files under its directory, and the
+  user's requests win over it. The system prompt never changes, so the provider's
+  prompt cache keeps working.
+- Each directory surfaces once per session. The session journal records it
+  (a `context_file` record), so a resumed session neither shows it again nor
+  spends its bytes twice.
+- Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
+  and nested files count against `context_files.max_bytes` together with the
+  startup files. A cut file ends with a `[harness: cut at ...]` notice; once the
+  total is spent, a later file is named but not loaded.
+- `@file` imports expand; directories whose name starts with `.` are skipped;
+  reading a context file itself does not repeat it after the result.
+- Only `read` (files, directories, batches) and `ls` trigger it; `grep` and
+  `find` results do not. It runs only for a workspace on this host, not a remote
+  environment. Set `context_files.nested` to `false` to turn it off.
 
 ## Workspace listing
 
