@@ -8,7 +8,7 @@ These pages hold the command, tool, and protocol reference.
 | Page | What it covers |
 |---|---|
 | [Providers](providers.md) | Routes, the endpoint registry, presets, protocol adapters, credentials, caching, costs, and doctor |
-| [Configuration](configuration.md) | Flags, environment variables, settings, precedence, and model roles |
+| [Configuration](configuration.md) | Settings layers, profiles, `-c` overrides, managed requirements, `config show`, flags, environment variables, and model roles |
 | [Tools](tools.md) | Hashline patches, atomic edits, reads, search, tool inventory, and internal URLs |
 | [Sessions and durability](sessions-and-durability.md) | Journals, recovery, retries, budgets, stop reasons, structured output, and streaming |
 | [Conversations](conversations.md) | Pinned forks, background compaction, reset, handoff, and archive search |
