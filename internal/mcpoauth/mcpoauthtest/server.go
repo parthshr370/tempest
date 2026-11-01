@@ -148,6 +148,10 @@ func (s *Server) RevokeRefreshTokens() { s.mu.Lock(); s.refresh = map[string]iss
 // ExpireAccessTokens makes every access token invalid.
 func (s *Server) ExpireAccessTokens() { s.mu.Lock(); s.access = map[string]issued{}; s.mu.Unlock() }
 
+// ForgetClients drops every dynamic registration, as an authorization
+// server that expires unused clients does.
+func (s *Server) ForgetClients() { s.mu.Lock(); s.clients = map[string][]string{}; s.mu.Unlock() }
+
 func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/.well-known/oauth-authorization-server" + s.Options.IssuerPath, "/.well-known/openid-configuration" + s.Options.IssuerPath:
@@ -226,6 +230,10 @@ func (s *Server) token(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	s.tokenRequests = append(s.tokenRequests, form)
 	invalid := func() { writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_grant"}) }
+	if _, known := s.clients[form.Get("client_id")]; !known && (s.Options.StaticClient == "" || form.Get("client_id") != s.Options.StaticClient) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_client"})
+		return
+	}
 	if form.Get("resource") != s.URL {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_target"})
 		return

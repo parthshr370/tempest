@@ -118,6 +118,9 @@ in a `0700` directory, written atomically and locked across processes. They are
 bound to the configured URL and are never sent to a server whose URL changed. An
 expiring or rejected access token is refreshed without the user; a rotated refresh
 token replaces the old one, and a rejected refresh token clears the tokens. A
+dynamic registration is stored as soon as it exists, so a login nobody finishes
+does not register another client next time; one the authorization server no
+longer knows (`invalid_client`) is dropped and the next login registers again. A
 `403` with `insufficient_scope` asks for authorization again with the granted and
 challenged scopes together, then retries the request once.
 

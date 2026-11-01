@@ -152,7 +152,8 @@ func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 }
 
 // refreshLocked runs the refresh grant. A rotated refresh token replaces the
-// old one; a rejected refresh token clears the tokens so login is required.
+// old one; a rejected refresh token clears the tokens so login is required,
+// and a rejected dynamic client (invalid_client) is dropped with them.
 func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 	ctx = within(ctx, parseNetClass(r.ServerNetwork))
 	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {r.RefreshToken}}
@@ -167,6 +168,9 @@ func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 	}
 	if status == http.StatusBadRequest || status == http.StatusUnauthorized {
 		r.AccessToken, r.RefreshToken, r.ExpiresAt = "", "", time.Time{}
+		if token.Error == "invalid_client" && r.Registered {
+			forgetClient(r)
+		}
 		return false, c.store.Save(*r)
 	}
 	if err != nil || status != http.StatusOK || token.Error != "" {
@@ -412,7 +416,11 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	var token tokenResponse
 	status, err := c.postForm(ctx, metadata.TokenEndpoint, form, basic, &token)
 	if err != nil || status != http.StatusOK || token.Error != "" {
-		return Record{}, fmt.Errorf("mcp_auth: token exchange for server %s failed with HTTP %d %s %s%s", c.server, status, token.Error, token.ErrorDescription, errorSuffix(err))
+		failure := fmt.Errorf("mcp_auth: token exchange for server %s failed with HTTP %d %s %s%s", c.server, status, token.Error, token.ErrorDescription, errorSuffix(err))
+		if token.Error == "invalid_client" && client.registered {
+			return Record{}, errors.Join(failure, c.forgetRegistration(ctx, client.clientID))
+		}
+		return Record{}, failure
 	}
 	if err := token.validate(); err != nil {
 		return Record{}, fmt.Errorf("mcp_auth: token exchange for server %s: %w", c.server, err)
@@ -440,6 +448,34 @@ func errorSuffix(err error) string {
 		return ""
 	}
 	return ": " + err.Error()
+}
+
+// forgetClient drops a dynamic registration the authorization server no
+// longer knows (invalid_client) with the tokens issued to it, so the next
+// login registers again instead of sending the user to a dead client.
+func forgetClient(r *Record) {
+	r.AccessToken, r.RefreshToken, r.ExpiresAt = "", "", time.Time{}
+	r.ClientID, r.ClientSecret, r.TokenAuthMethod, r.Registered, r.RedirectURI = "", "", "", false, ""
+}
+
+func (c *Client) forgetRegistration(ctx context.Context, clientID string) error {
+	unlock, err := c.store.Lock(ctx, c.server)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	r, err := c.store.Load(c.server)
+	if missing(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !c.bound(r) || !r.Registered || r.ClientID != clientID {
+		return nil
+	}
+	forgetClient(&r)
+	return c.store.Save(r)
 }
 
 func (c *Client) loadLocked(ctx context.Context) (Record, error) {

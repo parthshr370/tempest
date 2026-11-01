@@ -212,6 +212,43 @@ func TestAbandonedStepUpKeepsTheSignedInClient(t *testing.T) {
 	}
 }
 
+// An authorization server that forgot the dynamic client answers the
+// refresh with invalid_client. The registration is dropped with the tokens,
+// so the next login registers again instead of reusing the dead client.
+func TestForgottenClientIsRegisteredAgainAfterRefresh(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	h.fixture.ForgetClients()
+	if token, err := h.flow.Token(t.Context()); err != nil || token != "" {
+		t.Fatalf("token after the server forgot the client = %q %v", token, err)
+	}
+	second := h.login(t)
+	if h.fixture.Registrations() != 2 || second.ClientID == first.ClientID {
+		t.Fatalf("registrations=%d first=%s second=%s", h.fixture.Registrations(), first.ClientID, second.ClientID)
+	}
+}
+
+// The same holds when the code exchange is what answers invalid_client.
+func TestForgottenClientIsRegisteredAgainAfterCodeExchange(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forget := func(ctx context.Context, authorizationURL string) error {
+		err := h.fixture.Browse(ctx, authorizationURL)
+		h.fixture.ForgetClients()
+		return err
+	}
+	if _, err := h.flow.Login(t.Context(), challenge, forget); err == nil || !strings.Contains(err.Error(), "invalid_client") {
+		t.Fatalf("exchange with a forgotten client = %v", err)
+	}
+	h.login(t)
+	if h.fixture.Registrations() != 2 {
+		t.Fatalf("registrations = %d, want a new one after invalid_client", h.fixture.Registrations())
+	}
+}
+
 func TestRefreshRotatesTokensAndRejectionRequiresLogin(t *testing.T) {
 	// A 30s lifetime is inside the refresh margin, so every Token call refreshes.
 	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
