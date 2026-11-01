@@ -77,7 +77,7 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 		description = "List durable session jobs, or explicitly clean up one terminal job's owned worktree. Cleanup never applies its patch."
 	case WaitTool:
 		parameters = schema.ObjectRequired(schema.JSON{"job_ids": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true}, "names": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "background bash job names, in place of or besides job_ids"}, "timeout": schema.Number()}, []string{})
-		description = "Wait for any requested job to settle. Pass job_ids, names (the name given to a background bash job) or both. Timeout stops waiting, not the jobs. A job whose finished state this returns sends no separate completion notice later; jobs still running keep theirs."
+		description = "Wait for any requested job to settle. Pass job_ids, names (the name given to a background bash job) or both. Timeout stops waiting, not the jobs. A job this returns settled sends no separate completion notice later, unless that notice is already on its way; every other job keeps its notice, including one that reads finished while it is still wrapping up."
 	case CancelTool:
 		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "a background bash job's name, in place of job_id"}}, []string{})
 		description = "Durably request cancellation of one session-owned job, by job_id or by background bash job name. Use wait for its joined terminal state."
