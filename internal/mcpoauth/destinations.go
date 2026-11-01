@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -348,7 +349,18 @@ func (d *destinations) connect(ctx context.Context, proxy *url.URL, target, host
 	reader := bufio.NewReader(io.LimitReader(tunnel, maxHeaders))
 	response, err := http.ReadResponse(reader, request)
 	if err != nil {
-		return fail(fmt.Errorf("mcp_auth: proxy %s answering CONNECT %s: %w", proxy.Host, target, err))
+		// The parser quotes what it could not parse, and a proxy can put the
+		// Proxy-Authorization it just received there; only say what failed.
+		cause := "a malformed answer"
+		switch {
+		case ctx.Err() != nil:
+			return fail(ctx.Err())
+		case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+			cause = "no complete answer"
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			cause = "no answer in time"
+		}
+		return fail(fmt.Errorf("mcp_auth: proxy %s gave %s to CONNECT %s", proxy.Host, cause, target))
 	}
 	if response.StatusCode != http.StatusOK {
 		return fail(fmt.Errorf("mcp_auth: proxy %s refused to tunnel to %s, the checked address of %s (HTTP %d); OAuth discovery reaches it through a proxy only at an address Tempest checked", proxy.Host, target, host, response.StatusCode))

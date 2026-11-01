@@ -17,6 +17,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/mcpconfig"
@@ -56,6 +58,9 @@ type Client struct {
 	dest     *destinations
 	http     *http.Client
 	now      func() time.Time
+	// mu guards kept, the tokens of a refresh the store did not save.
+	mu   sync.Mutex
+	kept *keptTokens
 }
 
 // New binds a client to a normalized HTTP server configuration. Requests
@@ -84,15 +89,19 @@ func (c *Client) expiring(r Record) bool {
 }
 
 // Token returns the access token for the next request, refreshing one that
-// is about to expire. It returns "" when no usable token is stored.
+// is about to expire; while it has not expired, a failed refresh keeps it.
+// A refresh that succeeded but could not be saved returns an error, and
+// later calls in this process use the new token. It returns "" when no
+// usable token is stored.
 func (c *Client) Token(ctx context.Context) (string, error) {
-	r, err := c.store.Load(c.server)
+	stored, err := c.store.Load(c.server)
 	if missing(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	r := c.current(stored)
 	if !c.bound(r) || r.AccessToken == "" {
 		return "", nil
 	}
@@ -104,20 +113,29 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer unlock()
-	r, err = c.store.Load(c.server)
+	stored, err = c.store.Load(c.server)
 	if missing(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	r = c.current(stored)
 	if !c.bound(r) || r.AccessToken == "" {
 		return "", nil
 	}
 	if !c.expiring(r) {
 		return r.AccessToken, nil
 	}
-	refreshed, err := c.refreshLocked(ctx, &r)
+	refreshed, err := c.refreshLocked(ctx, stored, &r)
+	if err != nil && !refreshed && r.AccessToken != "" && c.now().Before(r.ExpiresAt) {
+		// The refresh runs refreshMargin early; until the token really
+		// expires, an unreachable or failing authorization server leaves
+		// it usable and the MCP server judges it. A refresh that succeeded
+		// but was not saved is not a failed refresh: its error must reach
+		// the caller.
+		return r.AccessToken, nil
+	}
 	if err != nil || !refreshed {
 		return "", err
 	}
@@ -126,19 +144,22 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 
 // Refresh replaces an access token the server rejected. It reports true when
 // a different token is now stored, including one another process refreshed.
+// A refresh that succeeded but could not be saved reports true with the
+// error, and this process uses the new token.
 func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 	unlock, err := c.store.Lock(ctx, c.server)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
-	r, err := c.store.Load(c.server)
+	stored, err := c.store.Load(c.server)
 	if missing(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
+	r := c.current(stored)
 	if !c.bound(r) {
 		return false, nil
 	}
@@ -148,12 +169,15 @@ func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 	if r.RefreshToken == "" {
 		return false, nil
 	}
-	return c.refreshLocked(ctx, &r)
+	return c.refreshLocked(ctx, stored, &r)
 }
 
-// refreshLocked runs the refresh grant. A rotated refresh token replaces the
-// old one; a rejected refresh token clears the tokens so login is required.
-func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
+// refreshLocked runs the refresh grant for r, which is stored with any
+// tokens this process kept. A rotated refresh token replaces the old one; a
+// rejected refresh token clears the tokens so login is required, and a
+// rejected dynamic client (invalid_client) is dropped with them. It reports
+// true when the grant succeeded, even if saving the new tokens failed.
+func (c *Client) refreshLocked(ctx context.Context, stored Record, r *Record) (bool, error) {
 	ctx = within(ctx, parseNetClass(r.ServerNetwork))
 	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {r.RefreshToken}}
 	if r.TokenResource != "" {
@@ -167,7 +191,13 @@ func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 	}
 	if status == http.StatusBadRequest || status == http.StatusUnauthorized {
 		r.AccessToken, r.RefreshToken, r.ExpiresAt = "", "", time.Time{}
-		return false, c.store.Save(*r)
+		if token.Error == "invalid_client" && r.Registered {
+			forgetClient(r)
+		}
+		if err := c.save(stored, *r); err != nil {
+			return false, fmt.Errorf("mcp_auth: server %s refused the refresh token, and removing it from the credential store failed: %w", c.server, err)
+		}
+		return false, nil
 	}
 	if err != nil || status != http.StatusOK || token.Error != "" {
 		return false, fmt.Errorf("mcp_auth: server %s token refresh failed with HTTP %d %s", c.server, status, token.Error)
@@ -183,7 +213,49 @@ func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 	if token.Scope != "" {
 		r.Scope = token.Scope
 	}
-	return true, c.store.Save(*r)
+	if err := c.save(stored, *r); err != nil {
+		return true, fmt.Errorf("mcp_auth: server %s token refresh succeeded but the new token was not saved; this process keeps using it, while other processes and later runs still have the old one: %w", c.server, err)
+	}
+	return true, nil
+}
+
+// keptTokens are the tokens of a refresh the store refused to save. They
+// stand in for the stored tokens they replaced, so a rotated refresh token
+// is not lost while this process runs. Once the store holds other tokens (a
+// later save, a login, a logout, another process's refresh) they are dropped.
+type keptTokens struct {
+	replacedAccess, replacedRefresh string
+	record                          Record
+}
+
+// current returns stored with the tokens this process kept in its place.
+func (c *Client) current(stored Record) Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.kept
+	if kept == nil {
+		return stored
+	}
+	if stored.AccessToken != kept.replacedAccess || stored.RefreshToken != kept.replacedRefresh {
+		c.kept = nil
+		return stored
+	}
+	stored.AccessToken, stored.RefreshToken = kept.record.AccessToken, kept.record.RefreshToken
+	stored.ExpiresAt, stored.Scope = kept.record.ExpiresAt, kept.record.Scope
+	return stored
+}
+
+// save stores r, whose tokens replace those of stored. When the store
+// refuses, this process keeps r's tokens in memory.
+func (c *Client) save(stored, r Record) error {
+	err := c.store.Save(r)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kept = nil
+	if err != nil {
+		c.kept = &keptTokens{replacedAccess: stored.AccessToken, replacedRefresh: stored.RefreshToken, record: r}
+	}
+	return err
 }
 
 // NoteScope remembers a step-up scope no user could authorize, so the next
@@ -362,7 +434,21 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 		query.Set("scope", scope)
 	}
 	authorization.RawQuery = query.Encode()
-	callbacks := make(chan url.Values, 1)
+	// The first callback that carries this login's state decides it: a valid
+	// one carries the code, one that fails the issuer check or carries an
+	// OAuth error ends the login with its reason at once, also while present
+	// still waits for the user. A callback without the state is answered
+	// with an error page and changes nothing, since any local process or web
+	// page that finds the port can send one. Each answer is written before
+	// Login can return and close the listener.
+	type outcome struct {
+		values url.Values
+		err    error
+	}
+	callbacks := make(chan outcome, 1)
+	var decided atomic.Bool
+	presentCtx, stopPresent := context.WithCancelCause(ctx)
+	defer stopPresent(nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -371,37 +457,64 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		refuse := func(page string, refusal error) {
+			http.Error(w, page, http.StatusBadRequest)
+			_ = http.NewResponseController(w).Flush()
+			if decided.CompareAndSwap(false, true) {
+				callbacks <- outcome{err: refusal}
+				stopPresent(refusal)
+			}
+		}
+		refuseCallback := func(reason string) {
+			refuse(reason, fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason))
+		}
 		values := r.URL.Query()
 		if len(values["state"]) != 1 || subtle.ConstantTimeCompare([]byte(values.Get("state")), []byte(state)) != 1 {
 			http.Error(w, "Authorization state did not match", http.StatusBadRequest)
 			return
 		}
-		// RFC 9207: a returned issuer must be the one this request went to.
-		if iss := values.Get("iss"); iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
-			http.Error(w, "Authorization issuer did not match", http.StatusBadRequest)
+		// RFC 9207: a returned issuer must be the one this request went to,
+		// and a server that advertises the parameter must return it.
+		iss := values.Get("iss")
+		if iss == "" && metadata.IssParameterSupported {
+			refuseCallback("Authorization response lacks the issuer its server promised")
 			return
 		}
-		select {
-		case callbacks <- values:
-			fmt.Fprintln(w, "Authorization received. Return to Tempest.")
-		default:
-			http.Error(w, "Authorization callback already received", http.StatusConflict)
+		if iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
+			refuseCallback("Authorization issuer did not match")
+			return
 		}
+		if failure := values.Get("error"); failure != "" {
+			refuse("Authorization was refused. Return to Tempest.", fmt.Errorf("mcp_auth: authorization server refused server %s: %s %s", c.server, failure, values.Get("error_description")))
+			return
+		}
+		if !decided.CompareAndSwap(false, true) {
+			http.Error(w, "Authorization callback already received", http.StatusConflict)
+			return
+		}
+		fmt.Fprintln(w, "Authorization received. Return to Tempest.")
+		_ = http.NewResponseController(w).Flush()
+		callbacks <- outcome{values: values}
 	})
 	callbackServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	defer callbackServer.Close()
 	go func() { _ = callbackServer.Serve(listener) }()
-	if err := present(ctx, authorization.String()); err != nil {
+	if err := present(presentCtx, authorization.String()); err != nil {
+		if presentCtx.Err() != nil && ctx.Err() == nil {
+			// A refused callback cut the question short.
+			return Record{}, context.Cause(presentCtx)
+		}
 		return Record{}, err
 	}
 	var values url.Values
 	select {
-	case values = <-callbacks:
+	case callback := <-callbacks:
+		if callback.err != nil {
+			return Record{}, callback.err
+		}
+		values = callback.values
 	case <-ctx.Done():
 		return Record{}, fmt.Errorf("mcp_auth: authorization for server %s was not completed: %w", c.server, ctx.Err())
-	}
-	if failure := values.Get("error"); failure != "" {
-		return Record{}, fmt.Errorf("mcp_auth: authorization server refused server %s: %s %s", c.server, failure, values.Get("error_description"))
 	}
 	code := values.Get("code")
 	if code == "" || len(values["code"]) != 1 {
@@ -412,7 +525,11 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	var token tokenResponse
 	status, err := c.postForm(ctx, metadata.TokenEndpoint, form, basic, &token)
 	if err != nil || status != http.StatusOK || token.Error != "" {
-		return Record{}, fmt.Errorf("mcp_auth: token exchange for server %s failed with HTTP %d %s %s%s", c.server, status, token.Error, token.ErrorDescription, errorSuffix(err))
+		failure := fmt.Errorf("mcp_auth: token exchange for server %s failed with HTTP %d %s %s%s", c.server, status, token.Error, token.ErrorDescription, errorSuffix(err))
+		if token.Error == "invalid_client" && client.registered {
+			return Record{}, errors.Join(failure, c.forgetRegistration(ctx, client.clientID))
+		}
+		return Record{}, failure
 	}
 	if err := token.validate(); err != nil {
 		return Record{}, fmt.Errorf("mcp_auth: token exchange for server %s: %w", c.server, err)
@@ -440,6 +557,34 @@ func errorSuffix(err error) string {
 		return ""
 	}
 	return ": " + err.Error()
+}
+
+// forgetClient drops a dynamic registration the authorization server no
+// longer knows (invalid_client) with the tokens issued to it, so the next
+// login registers again instead of sending the user to a dead client.
+func forgetClient(r *Record) {
+	r.AccessToken, r.RefreshToken, r.ExpiresAt = "", "", time.Time{}
+	r.ClientID, r.ClientSecret, r.TokenAuthMethod, r.Registered, r.RedirectURI = "", "", "", false, ""
+}
+
+func (c *Client) forgetRegistration(ctx context.Context, clientID string) error {
+	unlock, err := c.store.Lock(ctx, c.server)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	r, err := c.store.Load(c.server)
+	if missing(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !c.bound(r) || !r.Registered || r.ClientID != clientID {
+		return nil
+	}
+	forgetClient(&r)
+	return c.store.Save(r)
 }
 
 func (c *Client) loadLocked(ctx context.Context) (Record, error) {
@@ -493,7 +638,40 @@ func (c *Client) prepareClient(ctx context.Context, metadata ServerMetadata, iss
 		listener.Close()
 		return nil, registration{}, err
 	}
+	if err := c.keepRegistration(ctx, metadata, issuer, client); err != nil {
+		listener.Close()
+		return nil, registration{}, err
+	}
 	return listener, client, nil
+}
+
+// keepRegistration stores a new dynamic registration before the user is
+// asked, so a login nobody finishes (declined, unattended, abandoned in the
+// browser) does not register yet another client at the authorization server
+// next time. A record that holds tokens keeps its client until a login
+// replaces both: its refresh token belongs to that client.
+func (c *Client) keepRegistration(ctx context.Context, metadata ServerMetadata, issuer string, client registration) error {
+	unlock, err := c.store.Lock(ctx, c.server)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	r, err := c.store.Load(c.server)
+	if err != nil && !missing(err) {
+		return err
+	}
+	if missing(err) || !c.bound(r) {
+		r = Record{Server: c.server, Resource: c.resource}
+	}
+	if r.AccessToken != "" || r.RefreshToken != "" {
+		return nil
+	}
+	if r.Issuer != issuer {
+		r.Scope = ""
+	}
+	r.Issuer, r.AuthorizationEndpoint, r.TokenEndpoint = issuer, metadata.AuthorizationEndpoint, metadata.TokenEndpoint
+	r.ClientID, r.ClientSecret, r.TokenAuthMethod, r.Registered, r.RedirectURI = client.clientID, client.secret, client.method, true, client.redirect
+	return c.store.Save(r)
 }
 
 func loopback(address string) (net.Listener, string, error) {
@@ -622,12 +800,17 @@ func (t tokenResponse) validate() error {
 	return nil
 }
 
-// expiry converts expires_in, a number or a quoted number of seconds; none
-// means the token's lifetime is unknown.
+// maxLifetime bounds a stated token lifetime; a longer one, which a
+// time.Duration may not even hold, is treated as unknown.
+const maxLifetime = 100 * 365 * 24 * time.Hour
+
+// expiry converts expires_in, a number or a quoted number of seconds; none,
+// or one that is not a positive number of at most maxLifetime, means the
+// token's lifetime is unknown and it is used until the server rejects it.
 func (t tokenResponse) expiry(now time.Time) time.Time {
 	raw := strings.Trim(string(bytes.TrimSpace(t.ExpiresIn)), `"`)
 	seconds, err := strconv.ParseFloat(raw, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || !(seconds > 0 && seconds <= maxLifetime.Seconds()) {
 		return time.Time{}
 	}
 	return now.Add(time.Duration(seconds * float64(time.Second)))

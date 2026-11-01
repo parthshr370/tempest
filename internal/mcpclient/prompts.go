@@ -122,9 +122,7 @@ func (m *Manager) ExpandPrompt(ctx context.Context, text string) (blocks []types
 	if err != nil {
 		return nil, true, err
 	}
-	callCtx, cancel := context.WithTimeout(ctx, peer.callTimeout)
-	defer cancel()
-	raw, err := peer.call(callCtx, client, "prompts/get", struct {
+	raw, err := peer.call(ctx, client, "prompts/get", struct {
 		Name      string            `json:"name"`
 		Arguments map[string]string `json:"arguments,omitempty"`
 	}{prompt.Name, arguments})

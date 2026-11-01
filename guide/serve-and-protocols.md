@@ -98,10 +98,14 @@ OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
    advertise PKCE `S256` is refused.
 3. The configured `oauth.clientId`, a stored dynamic registration, or a new RFC 7591
    registration as a public client.
-4. Authorization code with PKCE `S256`, a `state` check and the RFC 8707 `resource`
-   parameter in the authorization and token requests, returning to a loopback
-   listener on `127.0.0.1`. Scope is the challenge's `scope`, else `oauth.scopes`,
-   else the resource's `scopes_supported`.
+4. Authorization code with PKCE `S256`, a `state` check, the RFC 9207 `iss` check
+   (required when the authorization server advertises it) and the RFC 8707
+   `resource` parameter in the authorization and token requests, returning to a
+   loopback listener on `127.0.0.1`. A callback without the login's `state` gets an
+   error page and the login keeps waiting, since any local process or web page can
+   reach the port. A callback with the right `state` that fails the `iss` check or
+   carries an OAuth `error` ends the login at once with that reason. Scope is the
+   challenge's `scope`, else `oauth.scopes`, else the resource's `scopes_supported`.
 
 ```sh
 tempest mcp login docs          # opens the browser; -no-browser prints the URL
@@ -118,8 +122,18 @@ in a `0700` directory, written atomically and locked across processes. They are
 bound to the configured URL and are never sent to a server whose URL changed. An
 expiring or rejected access token is refreshed without the user; a rotated refresh
 token replaces the old one, and a rejected refresh token clears the tokens. A
+refresh that fails while the access token has not yet expired keeps using it. A
+refresh that succeeds but cannot be saved fails that request with an error saying
+the new token was not saved; the process keeps using the new tokens, and the next
+successful save stores them. A
+dynamic registration is stored as soon as it exists, so a login nobody finishes
+does not register another client next time; one the authorization server no
+longer knows (`invalid_client`) is dropped and the next login registers again. A
 `403` with `insufficient_scope` asks for authorization again with the granted and
-challenged scopes together, then retries the request once.
+challenged scopes together, then retries the request once. When the server refuses
+the token on its optional notification stream (the `GET`), only that stream stops:
+calls in flight keep running, and the stream reconnects once Tempest holds a new
+token from a login or refresh, without polling the server meanwhile.
 
 Every URL in discovery other than the server's own origin (`resource_metadata`,
 authorization servers and their endpoints) is named by the server, so Tempest

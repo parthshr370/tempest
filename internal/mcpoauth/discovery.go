@@ -30,6 +30,9 @@ type ServerMetadata struct {
 	ScopesSupported                   []string `json:"scopes_supported"`
 	CodeChallengeMethodsSupported     []string `json:"code_challenge_methods_supported"`
 	TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
+	// IssParameterSupported promises the RFC 9207 iss parameter in every
+	// authorization response.
+	IssParameterSupported bool `json:"authorization_response_iss_parameter_supported"`
 }
 
 // canonical is the RFC 8707 resource form of an MCP URL: lowercase scheme

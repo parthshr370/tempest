@@ -85,7 +85,7 @@ func Normalize(servers []Server) ([]Server, error) {
 		fail := func(reason string) ([]Server, error) {
 			return nil, fmt.Errorf("mcp_config: server %q: %s", s.Name, reason)
 		}
-		if !serverName.MatchString(s.Name) || strings.Contains(s.Name, "__") {
+		if !ValidName(s.Name) {
 			return fail(`invalid name: use 1-32 letters, digits, "_" or "-", starting with a letter, without "__"`)
 		}
 		if seen[s.Name] {

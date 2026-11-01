@@ -1,9 +1,11 @@
 package mcpoauth
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -280,5 +282,44 @@ func TestProxyTunnelKeepsTheHostsIdentity(t *testing.T) {
 	request := <-seen
 	if request.TLS == nil || request.TLS.ServerName != "example.com" || request.Host != fmt.Sprintf("example.com:%d", port) {
 		t.Fatalf("the tunnelled request named %q with TLS %+v, want example.com", request.Host, request.TLS)
+	}
+}
+
+// A proxy that copies the Proxy-Authorization it received into a malformed
+// CONNECT answer must not get the credential into Tempest's error text.
+func TestMalformedProxyAnswerDoesNotEchoProxyCredentials(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		request, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			return
+		}
+		credential := strings.TrimPrefix(request.Header.Get("Proxy-Authorization"), "Basic ")
+		io.WriteString(conn, "HTTP/1.1 "+credential+" Reflected\r\n\r\n")
+	}()
+	proxyURL := &url.URL{Scheme: "http", Host: listener.Addr().String(), User: url.UserPassword("tempest", "hunter2")}
+	target := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(target.Close)
+	c := policyClient(t, "https://mcp.example/mcp", target, func(*http.Request) (*url.URL, error) { return proxyURL, nil })
+	c.dest.lookup = func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("192.0.2.10")}, nil
+	}
+	var dst ResourceMetadata
+	_, err = c.firstJSON(t.Context(), []string{"https://auth.example/metadata"}, &dst)
+	if err == nil {
+		t.Fatal("a malformed CONNECT answer was accepted")
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("tempest:hunter2"))
+	if strings.Contains(err.Error(), encoded) || strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("error echoes the proxy credential: %v", err)
 	}
 }

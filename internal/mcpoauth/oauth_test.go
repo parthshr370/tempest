@@ -3,9 +3,12 @@ package mcpoauth_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -131,6 +134,149 @@ func TestLoginRefusesAuthorizationServerWithoutPKCE(t *testing.T) {
 	}
 }
 
+// RFC 9207 section 2.4: an authorization server that advertises the iss
+// response parameter must send it, so a response without it is refused.
+func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{OmitIss: true}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := h.flow.Login(ctx, challenge, h.fixture.Browse); err == nil || !strings.Contains(err.Error(), "lacks the issuer") {
+		t.Fatalf("login with the advertised iss missing = %v, want the callback refused", err)
+	}
+	if h.fixture.VerifiedCodes() != 0 {
+		t.Fatal("the code was exchanged although the response lacked iss")
+	}
+}
+
+// A callback with the login's state that fails the issuer check or carries
+// an OAuth error ends the login at once with its reason: after present
+// returned, as a terminal does once the user pressed Enter, and also while
+// present still waits for the user. The user does not wait out the login
+// timeout.
+func TestRefusedCallbackEndsTheLogin(t *testing.T) {
+	for name, test := range map[string]struct {
+		options mcpoauthtest.Options
+		tamper  func(url.Values)
+		waiting bool
+		want    string
+	}{
+		"missing iss":       {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
+		"wrong iss":         {tamper: func(values url.Values) { values.Set("iss", "https://other.example") }, want: "issuer did not match"},
+		"error":             {tamper: denied, want: "access_denied"},
+		"error while asked": {tamper: denied, waiting: true, want: "access_denied"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, test.options, nil)
+			challenge, _, err := h.flow.Probe(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			browsed := make(chan struct{})
+			present := func(ctx context.Context, authorizationURL string) error {
+				go func() { defer close(browsed); _ = browseWith(ctx, authorizationURL, test.tamper) }()
+				if test.waiting {
+					<-ctx.Done()
+					return ctx.Err()
+				}
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, err = h.flow.Login(ctx, challenge, present)
+			<-browsed
+			if err == nil || ctx.Err() != nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("login after a refused callback = %v (deadline: %v), want it ended with %q", err, ctx.Err(), test.want)
+			}
+			if h.fixture.VerifiedCodes() != 0 {
+				t.Fatal("a refused callback's code was exchanged")
+			}
+		})
+	}
+}
+
+func denied(values url.Values) {
+	values.Del("code")
+	values.Set("error", "access_denied")
+}
+
+// A callback without the login's state may come from any local process or
+// web page that found the port, so it gets an error page and neither ends
+// the login nor stops present; the real callback after it completes the
+// login.
+func TestWrongStateCallbackKeepsTheLoginWaiting(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := func(ctx context.Context, authorizationURL string) error {
+		authorization, err := url.Parse(authorizationURL)
+		if err != nil {
+			return err
+		}
+		forged := url.Values{"state": {"forged"}, "code": {"forged"}, "error": {"access_denied"}}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, authorization.Query().Get("redirect_uri")+"?"+forged.Encode(), nil)
+		if err != nil {
+			return err
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return err
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("wrong-state callback answered %d, want 400", response.StatusCode)
+		}
+		return h.fixture.Browse(ctx, authorizationURL)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	record, err := h.flow.Login(ctx, challenge, present)
+	if err != nil || record.AccessToken == "" {
+		t.Fatalf("login after a wrong-state callback = %v, want it completed by the real callback", err)
+	}
+	if h.fixture.VerifiedCodes() != 1 {
+		t.Fatalf("verified codes = %d, want the real callback's code exchanged", h.fixture.VerifiedCodes())
+	}
+}
+
+// browseWith approves the authorization URL like the fixture's Browse and
+// lets tamper change the callback's query before the browser follows it.
+func browseWith(ctx context.Context, authorizationURL string, tamper func(url.Values)) error {
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizationURL, nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	callback, err := url.Parse(response.Header.Get("Location"))
+	if err != nil {
+		return err
+	}
+	if tamper != nil {
+		query := callback.Query()
+		tamper(query)
+		callback.RawQuery = query.Encode()
+	}
+	request, err = http.NewRequestWithContext(ctx, http.MethodGet, callback.String(), nil)
+	if err != nil {
+		return err
+	}
+	answer, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	return answer.Body.Close()
+}
+
 func TestLoginUsesConfiguredClientWithoutRegistering(t *testing.T) {
 	h := newHarness(t, mcpoauthtest.Options{StaticClient: "preregistered"}, &mcpconfig.OAuthClient{ClientID: "preregistered"})
 	record := h.login(t)
@@ -151,6 +297,98 @@ func TestSecondLoginReusesDynamicRegistration(t *testing.T) {
 	second := h.login(t)
 	if h.fixture.Registrations() != 1 || second.ClientID != first.ClientID {
 		t.Fatalf("registrations=%d first=%s second=%s", h.fixture.Registrations(), first.ClientID, second.ClientID)
+	}
+}
+
+// A login the user never finishes (declined, no user, closed browser) keeps
+// its registration, so the next attempt does not register another client.
+func TestAbandonedLoginKeepsItsDynamicRegistration(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declined := errors.New("declined")
+	for range 2 {
+		if _, err := h.flow.Login(t.Context(), challenge, func(context.Context, string) error { return declined }); !errors.Is(err, declined) {
+			t.Fatalf("abandoned login = %v", err)
+		}
+	}
+	if status, err := h.flow.Status(); err != nil || status.SignedIn {
+		t.Fatalf("status after abandoned logins = %#v %v", status, err)
+	}
+	h.login(t)
+	if h.fixture.Registrations() != 1 {
+		t.Fatalf("registrations = %d after two abandoned logins and one finished, want 1", h.fixture.Registrations())
+	}
+}
+
+// A step-up whose stored redirect port is taken registers a new client, but
+// an abandoned step-up must not swap it in under the stored refresh token,
+// which belongs to the old client.
+func TestAbandonedStepUpKeepsTheSignedInClient(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	redirect, err := url.Parse(first.RedirectURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := net.Listen("tcp4", redirect.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declined := errors.New("declined")
+	if _, err := h.flow.Login(t.Context(), challenge, func(context.Context, string) error { return declined }); !errors.Is(err, declined) {
+		t.Fatalf("abandoned step-up = %v", err)
+	}
+	stored, err := h.store.Load("secure")
+	if err != nil || stored.ClientID != first.ClientID || stored.RefreshToken != first.RefreshToken {
+		t.Fatalf("stored client %q after abandoned step-up, want %q (%v)", stored.ClientID, first.ClientID, err)
+	}
+	if token, err := h.flow.Token(t.Context()); err != nil || token == "" || token == first.AccessToken {
+		t.Fatalf("refresh with the signed-in client = %q %v", token, err)
+	}
+}
+
+// An authorization server that forgot the dynamic client answers the
+// refresh with invalid_client. The registration is dropped with the tokens,
+// so the next login registers again instead of reusing the dead client.
+func TestForgottenClientIsRegisteredAgainAfterRefresh(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	h.fixture.ForgetClients()
+	if token, err := h.flow.Token(t.Context()); err != nil || token != "" {
+		t.Fatalf("token after the server forgot the client = %q %v", token, err)
+	}
+	second := h.login(t)
+	if h.fixture.Registrations() != 2 || second.ClientID == first.ClientID {
+		t.Fatalf("registrations=%d first=%s second=%s", h.fixture.Registrations(), first.ClientID, second.ClientID)
+	}
+}
+
+// The same holds when the code exchange is what answers invalid_client.
+func TestForgottenClientIsRegisteredAgainAfterCodeExchange(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forget := func(ctx context.Context, authorizationURL string) error {
+		err := h.fixture.Browse(ctx, authorizationURL)
+		h.fixture.ForgetClients()
+		return err
+	}
+	if _, err := h.flow.Login(t.Context(), challenge, forget); err == nil || !strings.Contains(err.Error(), "invalid_client") {
+		t.Fatalf("exchange with a forgotten client = %v", err)
+	}
+	h.login(t)
+	if h.fixture.Registrations() != 2 {
+		t.Fatalf("registrations = %d, want a new one after invalid_client", h.fixture.Registrations())
 	}
 }
 
@@ -189,6 +427,76 @@ func TestRefreshRotatesTokensAndRejectionRequiresLogin(t *testing.T) {
 	}
 	if status, err := h.flow.Status(); err != nil || status.SignedIn {
 		t.Fatalf("status after revoked refresh = %#v %v", status, err)
+	}
+}
+
+// Refreshing a minute early must not turn an unreachable authorization
+// server into an outage while the access token is still valid.
+func TestUnreachableRefreshKeepsTheUnexpiredToken(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	record := h.login(t)
+	h.fixture.AS.Close()
+	token, err := h.flow.Token(t.Context())
+	if err != nil || token != record.AccessToken {
+		t.Fatalf("token while the authorization server is down = %q %v, want the unexpired token", token, err)
+	}
+}
+
+// refuseRecordWrites leaves the stored record readable but makes its atomic
+// replacement fail, as a full or read-only disk would.
+func (h *harness) refuseRecordWrites(t *testing.T) {
+	t.Helper()
+	if err := os.Chmod(h.dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.dir, 0700) })
+}
+
+// A refresh the authorization server granted but the store could not save
+// is not a failed refresh: the caller must hear that it was not saved, and
+// this process must keep the rotated refresh token the server now expects.
+func TestUnsavedRefreshIsReportedAndKeptByThisProcess(t *testing.T) {
+	// A 30s lifetime is inside the refresh margin, so every Token call refreshes.
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	h.refuseRecordWrites(t)
+	token, err := h.flow.Token(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "not saved") || token != "" {
+		t.Fatalf("successful refresh swallowed credential save failure; returned token present=%v err=%v", token != "", err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.RefreshToken != first.RefreshToken {
+		t.Fatalf("store changed although saving failed: %v", err)
+	}
+	if err := os.Chmod(h.dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture rotated first.RefreshToken away; only the kept one refreshes.
+	token, err = h.flow.Token(t.Context())
+	if err != nil || token == "" {
+		t.Fatalf("token after the store recovered = %q %v, want a refresh with the kept refresh token", token, err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.AccessToken != token {
+		t.Fatalf("the refresh after recovery did not save its token: %v", err)
+	}
+}
+
+func TestUnsavedRefreshOfARejectedTokenIsUsedByThisProcess(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	first := h.login(t)
+	h.refuseRecordWrites(t)
+	refreshed, err := h.flow.Refresh(t.Context(), first.AccessToken)
+	if !refreshed || err == nil || !strings.Contains(err.Error(), "not saved") {
+		t.Fatalf("unsaved refresh = %v %v, want true with an error saying it was not saved", refreshed, err)
+	}
+	token, err := h.flow.Token(t.Context())
+	if err != nil || token == "" || token == first.AccessToken {
+		t.Fatalf("token after an unsaved refresh = %q %v, want the new token", token, err)
+	}
+	if refreshed, err := h.flow.Refresh(t.Context(), first.AccessToken); err != nil || !refreshed {
+		t.Fatalf("refresh of the replaced token = %v %v, want the kept token reported", refreshed, err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.AccessToken != first.AccessToken {
+		t.Fatalf("store changed although saving failed: %v", err)
 	}
 }
 

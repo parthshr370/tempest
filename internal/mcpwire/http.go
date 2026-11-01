@@ -146,15 +146,19 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 			}
 			rejection := Rejection{Status: response.StatusCode, Challenges: response.Header.Values("WWW-Authenticate"), Token: token, Retried: retried, Peer: h.peer(req, remote)}
 			if err := h.handlers.Auth.Rejected(ctx, rejection); err != nil {
-				return nil, &AuthError{Err: err}
+				return nil, &AuthError{Err: err, token: token}
 			}
 			if retried {
-				return nil, &AuthError{Err: errors.New("mcp_auth: server rejected a freshly refreshed token")}
+				return nil, &AuthError{Err: errors.New("mcp_auth: server rejected a freshly refreshed token"), token: token}
 			}
 			continue
 		case http.StatusNotFound:
 			response.Body.Close()
 			h.invalidate()
+			// Only a request that named a session can have outlived it.
+			if req.Header.Get("Mcp-Session-Id") == "" {
+				return nil, fmt.Errorf("mcp_protocol: MCP HTTP %s answered 404 Not Found; check the server URL", method)
+			}
 			return nil, errors.New("mcp_disconnected: HTTP session expired; remote outcome may be unknown")
 		}
 		return response, nil
@@ -433,6 +437,13 @@ func (h *httpTransport) readLogical(ctx context.Context, response *http.Response
 			return httpMessage{}, err
 		}
 		resumed, err := h.request(ctx, http.MethodGet, nil, false, cursor)
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			// The server already processed the POST; only reading its
+			// answer was refused, so this is no AuthError to retry after a
+			// login.
+			return httpMessage{}, fmt.Errorf("mcp_disconnected: resuming the response was refused: %v; remote outcome may be unknown", authErr.Err)
+		}
 		if err != nil {
 			return httpMessage{}, err
 		}
@@ -462,7 +473,26 @@ func (h *httpTransport) listen() {
 			if h.ctx.Err() != nil || !h.alive() {
 				return
 			}
-			if strings.Contains(err.Error(), "mcp_auth:") || strings.Contains(err.Error(), "mcp_protocol:") {
+			// The stream is optional, so a refused credential stops only it:
+			// calls in flight were authorized when sent and keep running. It
+			// resumes once Auth holds another token, after a login or a
+			// refresh; static headers never change, so it stays stopped.
+			var authErr *AuthError
+			if errors.As(err, &authErr) {
+				select {
+				case <-h.handlers.Auth.Renewed(authErr.token):
+				case <-h.ctx.Done():
+					return
+				}
+				if cursor == "" {
+					_ = h.serverMessage(h.ctx, httpMessage{JSONRPC: "2.0", Method: "notifications/tools/list_changed", Params: json.RawMessage(`{}`)})
+				}
+				continue
+			}
+			if strings.Contains(err.Error(), "mcp_auth:") {
+				return
+			}
+			if strings.Contains(err.Error(), "mcp_protocol:") {
 				h.invalidate()
 				return
 			}
