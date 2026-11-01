@@ -98,6 +98,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return runMCP(args[1:], stdout, stderr)
 		case "doctor":
 			return runDoctor(args[1:], stdout, stderr)
+		case "config":
+			return runConfig(args[1:], stdout, stderr)
 		case "login":
 			return runLogin(args[1:], stdout, stderr)
 		case "logout":
@@ -139,6 +141,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
+	logConfigWarnings(opts.Config)
 	if opts.Prompt == "" && opts.Resume == "" && !opts.Continue {
 		fmt.Fprintln(stderr, "usage: tempest -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION] (tempest -help lists flags and commands)")
 		return 1
@@ -440,34 +443,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 		}
 		fs.PrintDefaults()
 	}
-	fs.StringVar(&values.Model.Value, "model", "", "model ID")
-	fs.StringVar(&values.PlanModel.Value, "plan-model", "", "model ID for the read-only plan agent")
-	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
-	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
-	fs.StringVar(&values.PlanReasoning.Value, "plan-reasoning", "", "reasoning effort for the plan role (default: -reasoning)")
-	fs.StringVar(&values.SmolReasoning.Value, "smol-reasoning", "", "reasoning effort for the smol role (default: -reasoning)")
-	fs.IntVar(&values.MaxTokens.Value, "max-tokens", 0, "maximum model output tokens")
-	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "tool permission mode: default, plan, acceptEdits, bypass")
-	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default bash command timeout, e.g. 10m (default 10m)")
-	fs.StringVar(&values.LogLevel.Value, "log-level", "", "log level: debug, info, warn, error")
-	fs.StringVar(&values.LogFile.Value, "log-file", "", "diagnostic log file")
-	fs.IntVar(&values.LogFileMaxBytes.Value, "log-file-max-bytes", 0, "diagnostic log rotation size in bytes")
-	fs.BoolVar(&values.EnableTask.Value, "enable-task", false, "enable the delegated task tool with explore and general subagents")
-	fs.BoolVar(&values.Plan.Value, "plan", false, "run the read-only plan stack")
-	fs.Var(skillPathsFlag{input: &values.Attach}, "attach", "file to attach to the session (repeatable)")
-	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
-	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
-	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
-	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
-	addIntelligenceFlags(fs, &values)
-	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
-	fs.StringVar(&values.OpenAIBaseURL.Value, "openai-base-url", "", "OpenAI-compatible base URL")
-	fs.StringVar(&values.AnthropicAPIKey.Value, "anthropic-api-key", "", "Anthropic API key")
-	fs.StringVar(&values.AnthropicAuthToken.Value, "anthropic-auth-token", "", "authorization bearer token for an Anthropic-compatible proxy")
-	fs.StringVar(&values.FauxScript.Value, "faux-script", "", "path to a hermetic faux-provider response script")
-	fs.Var(skillPathsFlag{input: &values.SkillPaths}, "skill", "additional skill path (repeatable)")
-	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
-	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
+	addConfigFlags(fs, &values)
 	var prompt, printMode, outputFormat, excludeTools string
 	var version bool
 	var resume, requestID, extensionConfig string
@@ -497,62 +473,7 @@ func parseCommandOptions(command string, args []string, stderr io.Writer) (comma
 		fmt.Fprintln(stderr, err)
 		return commandOptions{}, err
 	}
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "model":
-			values.Model.Set = true
-		case "plan-model":
-			values.PlanModel.Set = true
-		case "smol-model":
-			values.SmolModel.Set = true
-		case "reasoning":
-			values.Reasoning.Set = true
-		case "plan-reasoning":
-			values.PlanReasoning.Set = true
-		case "smol-reasoning":
-			values.SmolReasoning.Set = true
-		case "max-tokens":
-			values.MaxTokens.Set = true
-		case "permission-mode":
-			values.PermissionMode.Set = true
-		case "bash-timeout":
-			values.BashTimeout.Set = true
-		case "log-level":
-			values.LogLevel.Set = true
-		case "log-file":
-			values.LogFile.Set = true
-		case "log-file-max-bytes":
-			values.LogFileMaxBytes.Set = true
-		case "enable-task":
-			values.EnableTask.Set = true
-		case "plan":
-			values.Plan.Set = true
-		case "attach":
-			values.Attach.Set = true
-		case "enable-web":
-			values.EnableWeb.Set = true
-		case "web-search-url":
-			values.WebSearchURL.Set = true
-		case "agent-dir":
-			values.AgentDir.Set = true
-		case "session-dir":
-			values.SessionDir.Set = true
-		case "mcp-config":
-			values.MCPConfig.Set = true
-		case "environment", "environment-command", "enable-lsp", "lsp-config", "cloud-policy", "no-hooks", "trust-project-hooks", "trust-project-providers":
-			markIntelligenceFlag(f.Name, &values)
-		case "anthropic-base-url":
-			values.AnthropicBaseURL.Set = true
-		case "openai-base-url":
-			values.OpenAIBaseURL.Set = true
-		case "anthropic-api-key":
-			values.AnthropicAPIKey.Set = true
-		case "anthropic-auth-token":
-			values.AnthropicAuthToken.Set = true
-		case "faux-script":
-			values.FauxScript.Set = true
-		}
-	})
+	fs.Visit(func(f *flag.Flag) { markConfigFlag(f.Name, &values) })
 	secrets := secretResolver(values)
 	return commandOptions{flags: values, Secrets: secrets, Prompt: prompt, PrintMode: printMode, OutputFormat: outputFormat, ExcludeTools: excludeTools, Version: version, Resume: resume, RequestID: requestID, ExtensionConfig: extensionConfig, Continue: continueRecent, Budget: budget, OutputSchemaPath: outputSchemaPath, ImagePaths: imagePaths.Values}, nil
 }
@@ -757,6 +678,7 @@ Commands:
   login     sign in with ChatGPT for the openai-chatgpt Responses route
   logout    revoke and clear a saved ChatGPT session
   auth      show signed-in account metadata with status or list
+  config    show every effective setting and the layer it came from: config show [-json] [-key k]
   version   print build version
 
 Run 'tempest <command> -help' for that command's flags.
@@ -807,7 +729,7 @@ func parseExitCode(err error) int {
 func unexpectedArgument(command, arg string) error {
 	switch command {
 	case "":
-		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, rewind, login, logout, auth, version); see 'tempest -help'", arg)}
+		return usageError{message: fmt.Sprintf("tempest: unexpected argument %q; pass the prompt with -p \"<prompt>\" or start with a command (serve, mcp, doctor, config, rewind, login, logout, auth, version); see 'tempest -help'", arg)}
 	case "version":
 		return usageError{message: fmt.Sprintf("tempest version: unexpected argument %q; version takes no arguments", arg)}
 	default:
@@ -827,7 +749,100 @@ func toolPolicy(stderr io.Writer, cfg *config.ResolvedConfig) permission.Policy 
 	return policy
 }
 
-// addIntelligenceFlags registers operator execution settings on every session-creating command.
+// addConfigFlags registers every configuration-bearing flag of the one-shot
+// CLI; doctor and config show share it so they see the same layers as a run.
+func addConfigFlags(fs *flag.FlagSet, values *config.FlagValues) {
+	fs.StringVar(&values.Model.Value, "model", "", "model ID")
+	fs.StringVar(&values.PlanModel.Value, "plan-model", "", "model ID for the read-only plan agent")
+	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
+	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
+	fs.StringVar(&values.PlanReasoning.Value, "plan-reasoning", "", "reasoning effort for the plan role (default: -reasoning)")
+	fs.StringVar(&values.SmolReasoning.Value, "smol-reasoning", "", "reasoning effort for the smol role (default: -reasoning)")
+	fs.IntVar(&values.MaxTokens.Value, "max-tokens", 0, "maximum model output tokens")
+	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "tool permission mode: default, plan, acceptEdits, bypass")
+	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default bash command timeout, e.g. 10m (default 10m)")
+	fs.StringVar(&values.LogLevel.Value, "log-level", "", "log level: debug, info, warn, error")
+	fs.StringVar(&values.LogFile.Value, "log-file", "", "diagnostic log file")
+	fs.IntVar(&values.LogFileMaxBytes.Value, "log-file-max-bytes", 0, "diagnostic log rotation size in bytes")
+	fs.BoolVar(&values.EnableTask.Value, "enable-task", false, "enable the delegated task tool with explore and general subagents")
+	fs.BoolVar(&values.Plan.Value, "plan", false, "run the read-only plan stack")
+	fs.Var(skillPathsFlag{input: &values.Attach}, "attach", "file to attach to the session (repeatable)")
+	fs.BoolVar(&values.EnableWeb.Value, "enable-web", false, "enable gated web_search and web_fetch tools")
+	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory")
+	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
+	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
+	addIntelligenceFlags(fs, values)
+	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
+	fs.StringVar(&values.OpenAIBaseURL.Value, "openai-base-url", "", "OpenAI-compatible base URL")
+	fs.StringVar(&values.AnthropicAPIKey.Value, "anthropic-api-key", "", "Anthropic API key")
+	fs.StringVar(&values.AnthropicAuthToken.Value, "anthropic-auth-token", "", "authorization bearer token for an Anthropic-compatible proxy")
+	fs.StringVar(&values.FauxScript.Value, "faux-script", "", "path to a hermetic faux-provider response script")
+	fs.Var(skillPathsFlag{input: &values.SkillPaths}, "skill", "additional skill path (repeatable)")
+	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
+	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
+}
+
+// markConfigFlag records that a flag from addConfigFlags was set, so an
+// explicit empty or false value still outranks lower settings layers.
+func markConfigFlag(name string, values *config.FlagValues) {
+	switch name {
+	case "model":
+		values.Model.Set = true
+	case "plan-model":
+		values.PlanModel.Set = true
+	case "smol-model":
+		values.SmolModel.Set = true
+	case "reasoning":
+		values.Reasoning.Set = true
+	case "plan-reasoning":
+		values.PlanReasoning.Set = true
+	case "smol-reasoning":
+		values.SmolReasoning.Set = true
+	case "max-tokens":
+		values.MaxTokens.Set = true
+	case "permission-mode":
+		values.PermissionMode.Set = true
+	case "bash-timeout":
+		values.BashTimeout.Set = true
+	case "log-level":
+		values.LogLevel.Set = true
+	case "log-file":
+		values.LogFile.Set = true
+	case "log-file-max-bytes":
+		values.LogFileMaxBytes.Set = true
+	case "enable-task":
+		values.EnableTask.Set = true
+	case "plan":
+		values.Plan.Set = true
+	case "attach":
+		values.Attach.Set = true
+	case "enable-web":
+		values.EnableWeb.Set = true
+	case "web-search-url":
+		values.WebSearchURL.Set = true
+	case "agent-dir":
+		values.AgentDir.Set = true
+	case "session-dir":
+		values.SessionDir.Set = true
+	case "mcp-config":
+		values.MCPConfig.Set = true
+	case "anthropic-base-url":
+		values.AnthropicBaseURL.Set = true
+	case "openai-base-url":
+		values.OpenAIBaseURL.Set = true
+	case "anthropic-api-key":
+		values.AnthropicAPIKey.Set = true
+	case "anthropic-auth-token":
+		values.AnthropicAuthToken.Set = true
+	case "faux-script":
+		values.FauxScript.Set = true
+	default:
+		markIntelligenceFlag(name, values)
+	}
+}
+
+// addIntelligenceFlags registers operator execution settings and the settings
+// layer controls on every session-creating command.
 func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.StringVar(&values.Environment.Value, "environment", "", "operator-configured environment name (empty uses the local workspace)")
 	fs.StringVar(&values.EnvironmentCommand.Value, "environment-command", "", "operator daemon argv as a JSON array; requires -environment")
@@ -835,8 +850,11 @@ func addIntelligenceFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.StringVar(&values.LSPConfig.Value, "lsp-config", "", `operator language-server JSON file {"servers":[...]} (empty selects the built-in gopls, yaml-language-server, terraform-ls and helm_ls definitions)`)
 	fs.StringVar(&values.CloudPolicy.Value, "cloud-policy", "", `operator kube-context policy JSON file {"rules":[{"tool":"kubectl","context":"dev","action":"allow_write"}]}`)
 	fs.BoolVar(&values.NoHooks.Value, "no-hooks", false, "disable all lifecycle command hooks")
-	fs.BoolVar(&values.TrustProjectHooks.Value, "trust-project-hooks", false, "explicitly trust hooks in this session's project settings")
+	fs.BoolVar(&values.TrustProjectHooks.Value, "trust-project-hooks", false, "trust hooks and other executable settings (MCP, LSP, debug adapters, permission widening) in this workspace's project settings")
 	fs.BoolVar(&values.TrustProjectProviders.Value, "trust-project-providers", false, "trust project endpoints with credentials and any environment variable named by api_key_env")
+	fs.StringVar(&values.Profile.Value, "profile", "", "settings profile: apply profiles.<name> from the settings files (not the ChatGPT account label of 'auth --profile')")
+	fs.BoolVar(&values.StrictConfig.Value, "strict-config", false, "fail on unknown settings keys instead of warning")
+	fs.Var(skillPathsFlag{input: &values.Overrides}, "c", "override one setting, highest precedence: key.path=value, value parsed as JSON else a string (repeatable)")
 }
 
 // markIntelligenceFlag records that an intelligence flag was set, so an
@@ -859,6 +877,18 @@ func markIntelligenceFlag(name string, values *config.FlagValues) {
 		values.LSPConfig.Set = true
 	case "cloud-policy":
 		values.CloudPolicy.Set = true
+	case "profile":
+		values.Profile.Set = true
+	case "strict-config":
+		values.StrictConfig.Set = true
+	}
+}
+
+// logConfigWarnings logs, once per resolution, settings problems that did not
+// stop startup: unknown keys and project settings the trust gate ignored.
+func logConfigWarnings(cfg *config.ResolvedConfig) {
+	for _, warning := range cfg.Warnings() {
+		slog.Warn("config: " + warning)
 	}
 }
 

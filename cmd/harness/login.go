@@ -24,7 +24,7 @@ func runLogout(args []string, stdout, stderr io.Writer) int {
 
 func runAuth(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "status" && args[0] != "list" {
-		fmt.Fprintln(stderr, "usage: tempest auth status|list [openai] [--profile label]")
+		fmt.Fprintln(stderr, "usage: tempest auth status|list [openai] [--profile account-label]")
 		return exitUsage
 	}
 	return runOpenAIAuth(args[0], args[1:], stdout, stderr)
@@ -36,7 +36,7 @@ func runOpenAIAuth(command string, args []string, stdout, stderr io.Writer) int 
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	profile := flags.String("profile", "", "saved account label (default: active account, or default on first use)")
+	profile := flags.String("profile", "", "saved ChatGPT account label (default: active account, or default on first use); not a settings profile, which run commands select with -profile")
 	noBrowser := flags.Bool("no-browser", false, "print the authorization URL without opening a browser")
 	consent := flags.Bool("consent", false, "ask again for ChatGPT plan usage permission")
 	issuer := flags.String("issuer", openaiauth.Issuer, "OpenAI authority; a loopback HTTP authority is allowed for local protocol tests")
@@ -47,7 +47,7 @@ func runOpenAIAuth(command string, args []string, stdout, stderr io.Writer) int 
 		return exitUsage
 	}
 	if flags.NArg() != 0 {
-		fmt.Fprintln(stderr, "usage: tempest "+command+" [openai] [--profile label]")
+		fmt.Fprintln(stderr, "usage: tempest "+command+" [openai] [--profile account-label]")
 		return exitUsage
 	}
 	authManager, err := openaiauth.Default()
