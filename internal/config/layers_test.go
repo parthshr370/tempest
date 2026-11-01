@@ -645,6 +645,10 @@ func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
 		{&Error{Field: "max_tokens", Err: errors.New("must be positive")}, "config max_tokens: must be positive"},
 		{&Error{Field: "mcp_sampling_max_tokens", Err: errors.New("must be positive")}, "config mcp_sampling_max_tokens: must be positive"},
 		{&Error{Field: "providers", Err: errors.New("relay: header Authorization: Bearer abcdefgh12345")}, "config providers: relay: header Authorization: [REDACTED]"},
+		// An unknown key or profile name is user text: a credential pasted
+		// into one is masked too.
+		{&Error{Field: "sk-abcdefgh12345", Err: errors.New("unknown setting")}, "config [REDACTED]: unknown setting"},
+		{&Error{Field: "profiles.Bearer abcdefgh12345", Err: errors.New("profile definition must be an object")}, "config profiles.[REDACTED]: profile definition must be an object"},
 	} {
 		if got := test.err.Error(); got != test.want {
 			t.Errorf("Error() = %q, want %q", got, test.want)
@@ -656,6 +660,13 @@ func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
 	w.write(w.projectPath(), `{"max_tokens": 0}`)
 	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "max_tokens: must be positive") {
 		t.Fatalf("err = %v", err)
+	}
+
+	strict := newLayerWorkspace(t)
+	strict.flags.StrictConfig = BoolInput{Value: true, Set: true}
+	strict.flags.Overrides = StringsInput{Set: true, Values: []string{"sk-abcdefgh12345=1"}}
+	if _, err := strict.resolve(); err == nil || strings.Contains(err.Error(), "abcdefgh12345") {
+		t.Fatalf("strict unknown key err = %v, want the key masked", err)
 	}
 }
 

@@ -420,12 +420,14 @@ type Error struct {
 	Err   error
 }
 
-// Error returns a stable, field-qualified configuration failure. Text in the
-// message that looks like a credential is masked, whatever produced it. The
-// field is a settings key, never a value, and stays outside the redactor: a
-// key such as max_tokens followed by ": " would otherwise mask the message.
+// Error returns a stable, field-qualified configuration failure. Text that
+// looks like a credential is masked, whatever produced it, in the message and
+// in the field, which can be user text such as an unknown key or a profile
+// name. The field is redacted on its own: in the joined line a key such as
+// max_tokens followed by ": " would read as a credential label and mask the
+// message.
 func (e *Error) Error() string {
-	return fmt.Sprintf("config %s: %s", e.Field, obs.Redact(e.Err.Error()))
+	return fmt.Sprintf("config %s: %s", obs.Redact(e.Field), obs.Redact(e.Err.Error()))
 }
 
 // Unwrap returns the underlying parsing or filesystem failure.
