@@ -268,7 +268,16 @@ func printContextFiles(stdout, stderr io.Writer, cwd string, opts commandOptions
 	}
 	files := opts.Config.ContextFiles()
 	fmt.Fprintf(stdout, "context files: %d of %d bytes (fallback=%s nested=%t)\n", inputs.ContextBytes, files.MaxBytes, strings.Join(files.Fallback, ","), !files.NestedDisabled)
-	for _, file := range inputs.ContextFiles {
+	cut := slices.ContainsFunc(inputs.Diagnostics, func(diagnostic discovery.Diagnostic) bool { return diagnostic.Code == discovery.DiagnosticTruncated })
+	// Each file shows the bytes it spends of the cap, as the header does. A
+	// cut file is the last one, and its cut notice is not counted.
+	spent := inputs.ContextBytes
+	for index, file := range inputs.ContextFiles {
+		if cut && index == len(inputs.ContextFiles)-1 {
+			fmt.Fprintf(stdout, "  %s (%d bytes, cut)\n", file.Path, spent)
+			break
+		}
+		spent -= len(file.Content)
 		fmt.Fprintf(stdout, "  %s (%d bytes)\n", file.Path, len(file.Content))
 	}
 	for _, diagnostic := range inputs.Diagnostics {
