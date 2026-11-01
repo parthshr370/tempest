@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -317,6 +318,117 @@ func TestCanonicalInvocationDuplicateRawIDs(t *testing.T) {
 			t.Fatal("colliding invocation", inv)
 		}
 		seen[inv.CallID] = true
+	}
+}
+
+// TestWaitWithdrawalFollowsCanonicalInvocation: two parallel calls in one
+// assistant message share the provider id "duplicate". A result withdraws only
+// the notices its own occurrence's wait marked, whatever order the calls
+// finish in. Results commit in source order, so the journal cut after the
+// first result must still hold the second wait's notice: a crash there has
+// neither that wait's result nor any other delivery of its job.
+func TestWaitWithdrawalFollowsCanonicalInvocation(t *testing.T) {
+	type call struct {
+		Name  string `json:"name"`
+		Wait  string `json:"wait,omitempty"`  // job whose notice this call marks
+		After string `json:"after,omitempty"` // call whose end must precede this one's
+		Fail  bool   `json:"fail,omitempty"`
+	}
+	for _, tc := range []struct {
+		name                   string
+		calls                  [2]call
+		pendingCut, pendingEnd []string
+	}{
+		{"source order finishes first", [2]call{{Name: "a", Wait: "job_A"}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_B"}, nil},
+		{"source order finishes last", [2]call{{Name: "a", Wait: "job_A", After: "b"}, {Name: "b", Wait: "job_B"}}, []string{"job_B"}, nil},
+		{"plain result first", [2]call{{Name: "a"}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_A", "job_B"}, []string{"job_A"}},
+		{"error result first", [2]call{{Name: "a", Wait: "job_A", Fail: true}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_A", "job_B"}, []string{"job_A"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := queueStore(t)
+			q := NewDurableQueues(s, nil, nil)
+			for _, job := range []string{"job_A", "job_B"} {
+				if _, err := q.Enqueue(ctx, work.QueueInput{Kind: work.FollowUp, Text: "job " + job + " completed", Key: "job:" + job + ":terminal", SourceJobID: job}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pending := func() []string {
+				t.Helper()
+				loaded, err := journal.Load(ctx, s.Path())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var jobs []string
+				for _, item := range loaded.Queued {
+					jobs = append(jobs, item.SourceJobID)
+				}
+				slices.Sort(jobs)
+				return jobs
+			}
+			var mu sync.Mutex
+			names := map[string]string{} // canonical call id -> call name
+			ended := map[string]chan struct{}{"a": make(chan struct{}), "b": make(chan struct{})}
+			tool := agent.AgentTool{Tool: types.Tool{Name: "wait", Parameters: json.RawMessage(`{"type":"object"}`)}, Execute: func(ctx context.Context, id string, args json.RawMessage, update agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+				var c call
+				if err := json.Unmarshal(args, &c); err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				inv, _ := work.InvocationFromContext(ctx)
+				mu.Lock()
+				names[inv.CallID] = c.Name
+				mu.Unlock()
+				if c.After != "" {
+					<-ended[c.After]
+				}
+				if c.Wait != "" {
+					q.WithdrawCompletion(ctx, c.Wait)
+				}
+				if c.Fail {
+					return agent.AgentToolResult{}, errors.New("wait failed")
+				}
+				return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(c.Name)}}, nil
+			}}
+			var blocks []types.ContentBlock
+			for _, c := range tc.calls {
+				args, _ := json.Marshal(c)
+				blocks = append(blocks, faux.ToolCall("wait", args, "duplicate"))
+			}
+			f := faux.New(faux.Options{})
+			f.SetResponses(faux.Respond(blocks...), faux.Respond(faux.Text("done")))
+			a := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: f.Model(), Tools: []agent.AgentTool{tool}}, StreamFn: f.StreamSimple, SessionID: s.ID()})
+			AttachJournalWithOptions(a, s, RecordOptions{Queues: q})
+			var cut []string
+			results := 0
+			a.Subscribe(func(ctx context.Context, ev agent.AgentEvent) error {
+				switch ev.Type {
+				case agent.EventToolExecutionEnd:
+					inv, _ := work.InvocationFromContext(ctx)
+					mu.Lock()
+					close(ended[names[inv.CallID]])
+					mu.Unlock()
+				case agent.EventMessageEnd:
+					// The recorder listens first, so this is the durable cut
+					// after the first result and before the second.
+					if _, ok := ev.Message.(types.ToolResultMessage); ok {
+						if results++; results == 1 {
+							cut = pending()
+						}
+					}
+				}
+				return nil
+			})
+			result, err := a.PromptText(ctx, "go")
+			if err != nil || result.Err != nil {
+				t.Fatal(result, err)
+			}
+			if !slices.Equal(cut, tc.pendingCut) {
+				t.Fatalf("pending after the first result = %v, want %v", cut, tc.pendingCut)
+			}
+			if got := pending(); !slices.Equal(got, tc.pendingEnd) {
+				t.Fatalf("pending after both results = %v, want %v", got, tc.pendingEnd)
+			}
+		})
 	}
 }
 

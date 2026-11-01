@@ -42,8 +42,9 @@ type DurableQueues struct {
 	cancelled map[string]bool
 	consumed  map[string]bool
 	claimed   map[string]bool
-	// withdrawals maps a tool call id to the jobs whose completion notices
-	// its result withdraws once that result commits.
+	// withdrawals maps a canonical call id (work.Invocation.CallID, never the
+	// reusable provider id) to the jobs whose completion notices its result
+	// withdraws once that result commits.
 	withdrawals map[string][]string
 	changed     chan struct{}
 }

@@ -228,7 +228,9 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		if streak := noteRepeatedFailure(ctx, currentContext.Messages, assistantMessage, messages, toolCalls[i], &message); streak >= RepeatedFailureLimit && repeated == nil {
 			repeated = repeatedFailureError(toolCalls[i], streak, message)
 		}
-		if err := emitToolResultMessage(ctx, message, safeEmit); err != nil {
+		// The result goes out under its own occurrence, so the recorder ties it
+		// to that canonical call even when provider ids repeat in the batch.
+		if err := emitToolResultMessage(callContexts[i], message, safeEmit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
 		finalizedCalls = append(finalizedCalls, finalized)

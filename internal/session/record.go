@@ -47,7 +47,7 @@ type RecordOptions struct {
 
 // AttachJournalWithOptions installs the durable recorder before public listeners.
 func AttachJournalWithOptions(agt *agent.Agent, store *journal.Store, opts RecordOptions) func() {
-	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, resultCalls: map[string]string{}, started: opts.Started, queues: opts.Queues, sources: map[string]ptypes.Usage{}, nextRunID: opts.NextRunID}
+	r := &recorder{agt: agt, store: store, toolStarts: map[string]time.Time{}, started: opts.Started, queues: opts.Queues, sources: map[string]ptypes.Usage{}, nextRunID: opts.NextRunID}
 	return agt.Subscribe(r.record)
 }
 
@@ -58,12 +58,9 @@ type recorder struct {
 	started    func(string)
 	queues     *DurableQueues
 	toolStarts map[string]time.Time
-	// resultCalls maps a finished call's provider id to its durable call id
-	// until its result message is recorded.
-	resultCalls map[string]string
-	sources     map[string]ptypes.Usage
-	nextRunID   func() string
-	handoff     *string
+	sources    map[string]ptypes.Usage
+	nextRunID  func() string
+	handoff    *string
 }
 
 func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
@@ -110,7 +107,6 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		}
 		r.runID = state.RunID
 		clear(r.toolStarts)
-		clear(r.resultCalls)
 		r.handoff = nil
 		meta.RunID = r.runID
 		model := r.agt.State().Model
@@ -131,9 +127,9 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			return err
 		}
 		if result, ok := ev.Message.(ptypes.ToolResultMessage); ok && r.queues != nil {
-			callID := r.resultCalls[result.ToolCallID]
-			delete(r.resultCalls, result.ToolCallID)
-			err = r.queues.commitResult(ctx, callID, !result.IsError, commit)
+			// The executor emits a result under its call's occurrence, so the
+			// canonical id names this result even when provider ids repeat.
+			err = r.queues.commitResult(ctx, invocation.CallID, !result.IsError, commit)
 		} else {
 			err = commit(nil)
 		}
@@ -211,9 +207,6 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			finished.Error = toolErrorText(ev.Result)
 		}
 		err = r.store.Append(ctx, finished)
-		if err == nil && invocation.CallID != "" {
-			r.resultCalls[ev.ToolCallID] = invocation.CallID
-		}
 	case agent.EventTurnEnd:
 		var head *journal.ContextHeadEntry
 		if r.handoff != nil {
@@ -225,7 +218,6 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		}
 	case agent.EventAgentEnd:
 		r.handoff = nil
-		clear(r.resultCalls)
 		if r.queues != nil {
 			r.queues.ReleaseClaims()
 		}
