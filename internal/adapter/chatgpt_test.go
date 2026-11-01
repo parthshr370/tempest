@@ -137,7 +137,7 @@ func TestChatGPTTokenErrorsDoNotFallbackToAPIKeys(t *testing.T) {
 		}
 		return ""
 	})
-	if err != nil || ordinary.API != OpenAICompletionsAPI || ordinary.APIKey != "paid-key" {
+	if err != nil || ordinary.Model.Provider != "openai" || ordinary.CredentialSource != nil || ordinary.APIKey != "paid-key" {
 		t.Fatal("existing API-key route changed")
 	}
 }

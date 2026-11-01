@@ -189,7 +189,11 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			delete(p.Query, "api-version")
 		}
 	}
+	// reasoningKnown records whether the catalog or settings say if the model
+	// reasons; an unlisted model leaves it to the endpoint's default.
+	reasoningKnown := false
 	if cm, ok := routeCatalogModel(prov, p.Protocol, spec.ModelID); ok {
+		reasoningKnown = true
 		model.ContextWindow = cm.ContextWindow
 		model.Cost = cm.Cost
 		model.OpenAICompat = cm.OpenAICompat
@@ -213,6 +217,7 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			}
 			if configured.Reasoning || p.modelFields[configured.ID]["reasoning"] {
 				model.Reasoning = configured.Reasoning
+				reasoningKnown = true
 			}
 			if configured.Input != nil {
 				model.Input = slices.Clone(configured.Input)
@@ -232,10 +237,23 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			break
 		}
 	}
+	endpoint, _ := url.Parse(model.BaseURL)
+	firstPartyOpenAI := endpoint != nil && endpoint.Hostname() == "api.openai.com"
+	// OpenAI's own endpoint accepts function tools for reasoning models only
+	// on the Responses API, so the openai preset speaks Responses there for
+	// every model that reasons. Current OpenAI models reason by default, so a
+	// model the catalog and settings don't describe is treated as one; a
+	// settings entry with "reasoning": false keeps Chat Completions.
+	// Compatible third-party endpoints and an explicit protocol keep their
+	// wire protocol.
+	if prov == "openai" && firstPartyOpenAI && cfg.Providers[prov].Protocol == "" && (model.Reasoning || !reasoningKnown) {
+		p.Protocol = "openai-responses"
+		model.API = protocolAPI(p.Protocol)
+		model.Reasoning = true
+	}
 	model.OpenAICompat = mergeOpenAICompat(p.Compatibility, model.OpenAICompat)
 	// Unknown compatible endpoints don't inherit OpenAI-only cache fields.
-	endpoint, _ := url.Parse(model.BaseURL)
-	if prov == "openai" && (endpoint == nil || endpoint.Hostname() != "api.openai.com") && model.OpenAICompat != nil {
+	if prov == "openai" && !firstPartyOpenAI && model.OpenAICompat != nil {
 		if explicit := cfg.Providers[prov].Compatibility; explicit == nil || explicit.SupportsPromptCacheKey == nil {
 			model.OpenAICompat.SupportsPromptCacheKey = new(false)
 		}

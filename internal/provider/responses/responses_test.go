@@ -127,6 +127,21 @@ func TestResponsesVendorCapabilities(t *testing.T) {
 	}
 }
 
+// A reasoning model with function tools reasons at the endpoint's default
+// unless the run sets an effort; tempest never invents one, "none" included.
+func TestReasoningModelWithToolsSendsOnlyTheConfiguredEffort(t *testing.T) {
+	model := types.Model{ID: "gpt-6-luna", API: "openai-responses", Provider: "openai", BaseURL: "https://api.openai.com/v1", Reasoning: true}
+	history := types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("run the tests")}}, Tools: []types.Tool{{Name: "bash", Description: "run a command", Parameters: json.RawMessage(`{"type":"object"}`)}}}
+	unset := params(model, history, &types.SimpleStreamOptions{})
+	if unset["tools"] == nil || unset["reasoning"] != nil || strings.Contains(mustJSON(t, unset), "reasoning_effort") {
+		t.Fatalf("payload without a configured effort: %s", mustJSON(t, unset))
+	}
+	high := params(model, history, &types.SimpleStreamOptions{Reasoning: "high"})
+	if effort, _ := high["reasoning"].(map[string]any); effort["effort"] != "high" || high["tools"] == nil {
+		t.Fatalf("payload with effort high: %s", mustJSON(t, high))
+	}
+}
+
 func TestStatelessReasoningAndCacheKey(t *testing.T) {
 	model := types.Model{ID: "reasoner", API: "openai-responses", Provider: "openai", Reasoning: true}
 	history := types.Context{Messages: []types.Message{types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, Content: []types.ContentBlock{
