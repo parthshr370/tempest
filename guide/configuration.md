@@ -57,8 +57,8 @@ credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
-| `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, `otel`, and a `model`, `plan_model`, `smol_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, `otel`, and a `model`, `plan_model`, `smol_model`, `mcp_sampling_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
@@ -310,6 +310,7 @@ problem.
 | `HARNESS_TRUST_PROJECT_PROVIDERS` | Trust provider settings in project files for this run. |
 | `HARNESS_PROFILE`, `HARNESS_STRICT_CONFIG` | Settings profile, and strict settings validation, as `-profile` and `-strict-config`. |
 | `HARNESS_MCP_CONFIG` | MCP server configuration file. An explicit empty path disables MCP. |
+| `HARNESS_MCP_SAMPLING_MODEL`, `HARNESS_MCP_SAMPLING_MAX_TOKENS`, `HARNESS_MCP_SAMPLING_ALLOW_HEADLESS` | MCP sampling model, output cap and headless approval (settings `mcp_sampling_model`, `mcp_sampling_max_tokens`, `mcp_sampling_allow_headless`). See [Sampling](serve-and-protocols.md#sampling). |
 | `HARNESS_FAUX_SCRIPT` | Scripted model for runs without a provider. |
 | `HARNESS_LOG_LEVEL`, `HARNESS_DEBUG`, `HARNESS_LOG_FILE`, `HARNESS_LOG_FILE_MAX_BYTES` | Logging controls. |
 
@@ -332,6 +333,7 @@ each flag and variable above, names the same setting. The main keys:
 | `cloud_policy` | Kube-context rule file. |
 | `hooks`, `no_hooks`, `trusted_hook_projects` | Hook commands, disable hooks, or trust specific project paths. |
 | `mcp_config`, `mcp_servers` | MCP configuration file or inline server array. A selected file replaces the array completely. |
+| `mcp_sampling_model`, `mcp_sampling_max_tokens`, `mcp_sampling_allow_headless` | Model for MCP server sampling (default: the `smol` role), the output cap of one request (default: `max_tokens`), and whether opted-in servers may sample when no user can approve (default `false`). |
 | `providers` | Endpoint registry keyed by route name. See [Providers](providers.md#endpoint-registry). |
 | `trusted_provider_projects` | Absolute canonical paths whose project provider settings are trusted. |
 | `otel` | OpenTelemetry export: endpoints, headers, service name, content capture. Each key also reads its standard `OTEL_*` variable. See [Telemetry](telemetry.md#settings). |

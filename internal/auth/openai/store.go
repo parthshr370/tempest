@@ -13,8 +13,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
+
+	"go.harness.dev/harness/internal/auth/credstore"
 )
 
 // Issuer is the production OpenAI OIDC authority.
@@ -113,16 +114,10 @@ func (m *Manager) profile(profile string) (string, error) {
 // Profile resolves the active label once so a running session cannot switch accounts.
 func (m *Manager) Profile(profile string) (string, error) { return m.profile(profile) }
 
+func (m *Manager) dir() credstore.Dir { return credstore.Dir{Path: m.Dir, Label: "OpenAI"} }
+
 func (m *Manager) read(profile string) (record, error) {
-	path := filepath.Join(m.Dir, profile+".json")
-	info, err := os.Lstat(path)
-	if err != nil {
-		return record{}, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return record{}, fmt.Errorf("OpenAI credential file must be a regular owner-only file (0600)")
-	}
-	data, err := os.ReadFile(path)
+	data, err := m.dir().Read(profile + ".json")
 	if err != nil {
 		return record{}, err
 	}
@@ -141,71 +136,10 @@ func (m *Manager) save(r record) error {
 	return m.atomic(r.Profile+".json", data)
 }
 
-func (m *Manager) atomic(name string, data []byte) error {
-	f, err := os.CreateTemp(m.Dir, ".credentials-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	defer f.Close()
-	if err = f.Chmod(0600); err == nil {
-		_, err = f.Write(data)
-	}
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err == nil {
-		err = os.Rename(f.Name(), filepath.Join(m.Dir, name))
-	}
-	if err != nil {
-		return err
-	}
-	dir, err := os.Open(m.Dir)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
-}
+func (m *Manager) atomic(name string, data []byte) error { return m.dir().Write(name, data) }
 
 func (m *Manager) lock(ctx context.Context, name string) (func(), error) {
-	if err := os.MkdirAll(m.Dir, 0700); err != nil {
-		return nil, err
-	}
-	info, err := os.Lstat(m.Dir)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
-		return nil, fmt.Errorf("OpenAI credential directory must be owner-only (0700)")
-	}
-	f, err := os.OpenFile(filepath.Join(m.Dir, name+".lock"), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		return nil, err
-	}
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); _ = f.Close() }, nil
-		}
-		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
-			f.Close()
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			f.Close()
-			return nil, ctx.Err()
-		case <-time.After(25 * time.Millisecond):
-		}
-	}
+	return m.dir().Lock(ctx, name)
 }
 
 func (m *Manager) host(ctx context.Context) (string, error) {

@@ -17,17 +17,20 @@ import (
 const terminalPollMicros = 100000
 const terminalAnswerLimit = 64 << 10
 
+// terminalSlot keeps ask questions and forwarded elicitations from
+// interleaving on the one controlling terminal.
+var terminalSlot = make(chan struct{}, 1)
+
 // Terminal returns nil unless both input and prompt output are terminals.
 func Terminal(input *os.File, output io.Writer) Handler {
 	promptOutput, ok := output.(*os.File)
 	if !ok || !isTerminal(input) || !isTerminal(promptOutput) {
 		return nil
 	}
-	promptSlot := make(chan struct{}, 1)
 	return func(ctx context.Context, request Request) ([]Answer, error) {
 		select {
-		case promptSlot <- struct{}{}:
-			defer func() { <-promptSlot }()
+		case terminalSlot <- struct{}{}:
+			defer func() { <-terminalSlot }()
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}

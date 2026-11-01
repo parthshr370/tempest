@@ -24,6 +24,7 @@ import (
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
+	"go.harness.dev/harness/internal/mcpoauth"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/prompt"
@@ -168,6 +169,36 @@ type StackConfig struct {
 	DebugAdapters map[string]dap.Adapter
 	// Compaction overrides the model's context maintenance budget.
 	Compaction *compaction.CompactionSettings
+	// MCP configures the MCP client beyond its server list.
+	MCP MCPClientSettings
+	// MCPResources serves read's mcp:// URLs; tempest.Open sets it to the
+	// session's MCP manager when servers are configured.
+	MCPResources tools.MCPResources
+}
+
+// MCPClientSettings are the session-wide MCP client options.
+type MCPClientSettings struct {
+	// CredentialDir stores OAuth tokens per server; empty disables OAuth.
+	CredentialDir string
+	// Sampling answers sampling/createMessage from servers configured with
+	// sampling: true.
+	Sampling MCPSamplingSettings
+}
+
+// MCPSamplingSettings choose the model and limits for MCP server sampling.
+type MCPSamplingSettings struct {
+	// Model and StreamFn answer sampling requests. A nil StreamFn uses
+	// ModelSpec routed like the default model, or the smol role when
+	// ModelSpec is empty.
+	Model     ptypes.Model
+	StreamFn  agent.StreamFn
+	ModelSpec string
+	// MaxTokens caps the output of one request; zero uses the model's
+	// own output limit.
+	MaxTokens int
+	// AllowHeadless lets opted-in servers sample without asking when the
+	// session has no user to ask; otherwise those requests are refused.
+	AllowHeadless bool
 }
 
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
@@ -191,6 +222,9 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 		ListingPolicy:        cfg.WorkspaceListing(),
+		MCP: MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir()), Sampling: MCPSamplingSettings{
+			ModelSpec: cfg.MCPSamplingModel(), MaxTokens: cfg.MCPSamplingMaxTokens(), AllowHeadless: cfg.MCPSamplingAllowHeadless(),
+		}},
 	}
 }
 
@@ -441,6 +475,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Sanitize:           cfg.Sanitize,
 		Skills:             cfg.Skills,
 		Refs:               refsResolver,
+		MCP:                cfg.MCPResources,
 		Work:               cfg.Controller,
 		Child:              cfg.Child,
 		Messenger:          cfg.Messenger,

@@ -110,7 +110,7 @@ func TestMCPHTTPHeadersAndModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if client.Version() != version || !client.HasTools() || !client.ListChanged() {
+			if caps := client.Capabilities(); client.Version() != version || !caps.Tools || !caps.ToolsListChanged {
 				t.Fatal("capabilities/version not negotiated")
 			}
 			if _, err = client.Call(context.Background(), "tools/list", struct{}{}); err != nil {

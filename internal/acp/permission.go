@@ -38,6 +38,7 @@ type Broker struct {
 	approvers map[string]map[*rpc.Conn]int
 	pending   map[string]map[string]*pendingAsk
 	forms     map[*rpc.Conn]bool
+	urls      map[*rpc.Conn]bool
 	timeout   time.Duration
 	clock     Clock
 }
@@ -50,7 +51,7 @@ func NewBroker(timeout time.Duration, clock Clock) *Broker {
 	if clock == nil {
 		clock = realClock{}
 	}
-	return &Broker{approvers: make(map[string]map[*rpc.Conn]int), pending: make(map[string]map[string]*pendingAsk), forms: make(map[*rpc.Conn]bool), timeout: timeout, clock: clock}
+	return &Broker{approvers: make(map[string]map[*rpc.Conn]int), pending: make(map[string]map[string]*pendingAsk), forms: make(map[*rpc.Conn]bool), urls: make(map[*rpc.Conn]bool), timeout: timeout, clock: clock}
 }
 
 func (b *Broker) add(id string, c *rpc.Conn) func() {
@@ -82,6 +83,16 @@ func (b *Broker) authorized(id string, c *rpc.Conn) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.approvers[id][c] > 0
+}
+
+var _ tempest.Attendance = (*Broker)(nil)
+
+// Attended implements tempest.Attendance: a session is attended while a
+// client that approves its asks is attached.
+func (b *Broker) Attended(sessionID string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.approvers[sessionID]) > 0
 }
 
 // Approve implements tempest.Prompter. Session owns the hub ask and final arbitration.

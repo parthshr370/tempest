@@ -165,6 +165,27 @@ func (a *Agent) BackgroundProviderContext(ctx context.Context) (context.Context,
 
 type durableProviderKey struct{}
 
+// JoinRun binds provider work that starts outside the loop, such as an MCP
+// server's sampling request, to the live run. The returned context carries
+// the run's cost gate and is cancelled when the run ends, and the run does not
+// end until done is called, so the work's receipt is journaled and charged
+// under this run even when the work outlives the tool call that caused it.
+// ok is false when no run is live or the live run is already ending.
+func (a *Agent) JoinRun(ctx context.Context) (joined context.Context, runID string, done func(), ok bool) {
+	a.bindings.mu.Lock()
+	accounting := a.bindings.accounting
+	runID = a.bindings.state.RunID
+	a.bindings.mu.Unlock()
+	if accounting == nil {
+		return ctx, "", func() {}, false
+	}
+	joined, done, ok = accounting.join(ctx)
+	if !ok {
+		return ctx, "", done, false
+	}
+	return context.WithValue(joined, accountingKey{}, accounting), runID, done, true
+}
+
 // AccountProviderUsage forwards an already durable compaction receipt exactly once.
 func AccountProviderUsage(ctx context.Context, source, model string, usage types.Usage) error {
 	a, _ := ctx.Value(accountingKey{}).(*runAccounting)

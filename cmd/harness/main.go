@@ -175,6 +175,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		DefaultFallbacks:   opts.Config.FallbackModels(config.RoleDefault),
 		PlanFallbacks:      opts.Config.FallbackModels(config.RolePlan),
 		SmolFallbacks:      opts.Config.FallbackModels(config.RoleSmol),
+		SamplingModel:      opts.Config.MCPSamplingModel(),
 		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
 		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
 		MaxTokens:          opts.Config.MaxTokens(),
@@ -286,6 +287,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.SmolStreamFn = roles.Smol.StreamFn
 	stack.FallbackModels = stackFallbacks
 	stack.SmolFallbackModels = smolFallbacks
+	stack.MCP.Sampling.Model, stack.MCP.Sampling.StreamFn = roles.Sampling.Model, roles.Sampling.StreamFn
 	stack.PermissionMode = permissionMode
 	stack.PermissionPolicy = permissionPolicy
 	stack.ExcludeTools = splitCSV(opts.ExcludeTools)
@@ -321,6 +323,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		Cwd:                cwd,
 		Stack:              &stack,
 		ExtensionProcesses: processes,
+		Elicitor:           question.TerminalElicitor(os.Stdin, stderr),
 		New: &tempest.NewSession{
 			Model:          selectedModel.ID,
 			Budget:         opts.Budget,
@@ -683,7 +686,9 @@ const topUsage = `Usage:
 Commands:
   serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
   env       serve an identified workspace daemon over dedicated stdio
-  mcp       run as a stdio MCP server that exposes the tempest_run tool
+  mcp       run as a stdio MCP server that exposes the tempest_run tool;
+            mcp login|logout <server> manages MCP OAuth, mcp list shows servers and sign-in state,
+            mcp prompts lists server prompts as /<server>:<prompt> commands
   fork      create a sibling from a safe durable transcript entry
   reset     start an empty context without deleting audit history or spend
   compact   summarize context through the durable native task scheduler

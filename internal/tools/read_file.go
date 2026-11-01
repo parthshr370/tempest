@@ -132,7 +132,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 // read returns one file's [path#TAG] section: its numbered rows within the
 // budget, an outline, or an image.
 func (reader fileReader) read(ctx context.Context, request readRequest) (agent.AgentToolResult, error) {
-	cwd, options, store := reader.cwd, reader.options, reader.options.Hashline
+	cwd, options := reader.cwd, reader.options
 	if err := ctx.Err(); err != nil {
 		return agent.AgentToolResult{}, errors.New("Operation aborted")
 	}
@@ -155,6 +155,19 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	if early != nil {
 		return *early, nil
 	}
+	result, err := reader.render(request, selector, source)
+	if err != nil {
+		return agent.AgentToolResult{}, err
+	}
+	// Images that came with text (MCP resources) follow its rows.
+	result.Content = append(result.Content, source.images...)
+	return result, nil
+}
+
+// render shows a loaded source's numbered rows within the request budget,
+// or an outline.
+func (reader fileReader) render(request readRequest, selector readPathSelector, source readSource) (agent.AgentToolResult, error) {
+	cwd, store := reader.cwd, reader.options.Hashline
 	data, absolutePath, displayPath, isResource := source.data, source.absolutePath, source.displayPath, source.isResource
 	header := fmt.Sprintf("[%s#%s]", displayPath, hashline.Tag(data))
 	// observe records the rows shown in full for workspace files, the
@@ -245,6 +258,14 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 		output = fmt.Sprintf("%s\n[%d: line is %s, exceeds %s limit. Use bash to read a bounded portion.]", header, startLine+1, firstLineSize, byteLimit)
 		if request.batch {
 			output = fmt.Sprintf("%s\n[%d: line is %s, more than %s. Read %s on its own, or use bash for a bounded portion.]", header, startLine+1, firstLineSize, room, displayPath)
+		}
+		// A resource without a file of its own (MCP) is saved so bash can.
+		if source.save != nil {
+			saved, err := source.save()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			output = fmt.Sprintf("%s\n[%d: line is %s, more than %s. The full content is saved at %s; use bash on that path to read a bounded portion.]", header, startLine+1, firstLineSize, room, saved)
 		}
 		details = &readToolDetails{Truncation: truncation}
 	} else if truncation.Truncated {

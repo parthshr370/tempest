@@ -28,6 +28,9 @@ type fileEntry struct {
 	StartupTimeout string            `json:"startupTimeout"`
 	CallTimeout    string            `json:"callTimeout"`
 	Permission     string            `json:"permission"`
+	Auth           string            `json:"auth"`
+	OAuth          *OAuthClient      `json:"oauth"`
+	Sampling       bool              `json:"sampling"`
 	Disabled       bool              `json:"disabled"`
 }
 
@@ -174,7 +177,7 @@ func (e fileEntry) server() (Server, bool, error) {
 		return Server{}, false, fmt.Errorf("unknown transport %q (use stdio or http)", transport)
 	}
 	return Server{Name: e.Name, Transport: transport, Command: e.Command, Args: e.Args, Env: e.Env, URL: e.URL, Headers: e.Headers,
-		StartupTimeout: e.StartupTimeout, CallTimeout: e.CallTimeout, Permission: e.Permission}, true, nil
+		StartupTimeout: e.StartupTimeout, CallTimeout: e.CallTimeout, Permission: e.Permission, Auth: e.Auth, OAuth: e.OAuth, Sampling: e.Sampling}, true, nil
 }
 
 // describeDecodeError turns encoding/json errors into operator wording without Go type names.
@@ -206,7 +209,7 @@ func describeDecodeError(err error) string {
 		return fmt.Sprintf("must be %s, not %s", want, typeErr.Value)
 	}
 	if message := err.Error(); strings.HasPrefix(message, "json: unknown field ") {
-		return fmt.Sprintf("unknown field %s (supported: name, command, args, env, url, headers, type, transport, permission, startupTimeout, callTimeout, disabled)", strings.TrimPrefix(message, "json: unknown field "))
+		return fmt.Sprintf("unknown field %s (supported: name, command, args, env, url, headers, type, transport, permission, startupTimeout, callTimeout, auth, oauth, sampling, disabled)", strings.TrimPrefix(message, "json: unknown field "))
 	}
 	return strings.TrimPrefix(err.Error(), "json: ")
 }

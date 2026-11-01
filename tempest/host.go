@@ -43,6 +43,7 @@ type HostOptions struct {
 	Stack               *StackConfig
 	Prompter            Prompter
 	Questioner          QuestionHandler
+	Elicitor            Elicitor
 	Logger              *slog.Logger
 	FauxScript          string
 	MCPServers          []MCPServerConfig
@@ -221,6 +222,9 @@ func (host *Host) sessionOptions() Options {
 	}
 	if host.options.Questioner != nil {
 		options.Questioner = host.options.Questioner
+	}
+	if host.options.Elicitor != nil {
+		options.Elicitor = host.options.Elicitor
 	}
 	if host.options.Logger != nil {
 		options.Logger = host.options.Logger

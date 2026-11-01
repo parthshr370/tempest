@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,7 +32,14 @@ type fixture struct {
 	initialized bool
 	active      map[string]context.CancelFunc
 	generation  atomic.Uint64
+	// resourceGeneration counts reads of fixture://bump, which adds a
+	// resource and announces it.
+	resourceGeneration atomic.Uint64
+	// clientCaps holds the capabilities the client declared at initialize.
+	clientCaps map[string]json.RawMessage
 }
+
+const pixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=="
 
 func main() {
 	mode := flag.String("mode", "normal", "fixture behavior")
@@ -76,6 +84,13 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 	f.record(method, "")
 	switch method {
 	case "initialize":
+		var hello struct {
+			Capabilities map[string]json.RawMessage `json:"capabilities"`
+		}
+		_ = json.Unmarshal(params, &hello)
+		f.mu.Lock()
+		f.clientCaps = hello.Capabilities
+		f.mu.Unlock()
 		version := mcpwire.PreferredVersion
 		if f.mode == "june" {
 			version = "2025-06-18"
@@ -83,7 +98,8 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 		if f.mode == "modern" {
 			version = "2026-07-28"
 		}
-		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]bool{"listChanged": true}}, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
+		capabilities := map[string]map[string]bool{"tools": {"listChanged": true}, "resources": {"listChanged": true}, "prompts": {"listChanged": true}}
+		return map[string]any{"protocolVersion": version, "capabilities": capabilities, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
 	case "notifications/initialized":
 		f.mu.Lock()
 		f.initialized = true
@@ -120,7 +136,7 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				Cursor string `json:"cursor"`
 			}
 			_ = json.Unmarshal(params, &page)
-			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change"}
+			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change", "elicit", "sample"}
 			if f.generation.Load() > 0 {
 				names = append(names, "added")
 			}
@@ -174,6 +190,9 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 			f.record("dispatch", call.Name)
 			if len(call.Meta.ProgressToken) > 0 {
 				_ = f.conn.Notify(callCtx, "notifications/progress", map[string]any{"progressToken": call.Meta.ProgressToken, "progress": 1, "message": "fixture working"})
+				if call.Name == "block" {
+					_ = f.conn.Notify(callCtx, "notifications/progress", map[string]any{"progressToken": call.Meta.ProgressToken, "progress": 2, "total": 3})
+				}
 			}
 			text := string(call.Arguments)
 			isError := false
@@ -194,14 +213,174 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 					_ = f.conn.Notify(callCtx, "notifications/tools/list_changed", struct{}{})
 				}
 				text = "changed"
+			case "elicit":
+				text = f.elicit(callCtx, call.Arguments)
+			case "sample":
+				text = f.sample(callCtx, call.Arguments)
 			case "mixed":
-				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==", "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
+				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": pixelPNG, "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
 			}
 			return map[string]any{"content": []map[string]string{{"type": "text", "text": text}}, "isError": isError}, nil
 		}), nil
+	case "resources/list":
+		var page struct {
+			Cursor string `json:"cursor"`
+		}
+		_ = json.Unmarshal(params, &page)
+		if page.Cursor == "" {
+			return map[string]any{"resources": []map[string]string{{"uri": "file:///notes.md", "name": "notes", "title": "Project notes", "mimeType": "text/markdown", "description": "fixture notes"}}, "nextCursor": "more"}, nil
+		}
+		resources := []map[string]string{{"uri": "fixture://pixel.png", "name": "pixel", "mimeType": "image/png"}, {"uri": "fixture://data.bin", "name": "data", "mimeType": "application/octet-stream"}}
+		if f.resourceGeneration.Load() > 0 {
+			resources = append(resources, map[string]string{"uri": "fixture://added.txt", "name": "added", "mimeType": "text/plain"})
+		}
+		if f.mode == "oversized" {
+			resources = append(resources, map[string]string{"uri": "fixture://long-line.txt", "name": "long-line", "mimeType": "text/plain"},
+				map[string]string{"uri": "fixture://big-with-image", "name": "big-with-image"},
+				map[string]string{"uri": "https://example/search?q=term", "name": "search", "mimeType": "text/plain"},
+				map[string]string{"uri": "fixture://data.json", "name": "data", "mimeType": "application/json"})
+		}
+		return map[string]any{"resources": resources}, nil
+	case "resources/templates/list":
+		return map[string]any{"resourceTemplates": []map[string]string{{"uriTemplate": "fixture://logs/{day}", "name": "logs", "mimeType": "text/plain", "description": "daily log"}}}, nil
+	case "resources/read":
+		var read struct {
+			URI string `json:"uri"`
+		}
+		_ = json.Unmarshal(params, &read)
+		return rpc.Deferred(func() (any, *rpc.Error) {
+			content := map[string]string{"uri": read.URI}
+			switch {
+			case read.URI == "file:///notes.md":
+				content["mimeType"], content["text"] = "text/markdown", "line one\nline two\nline three\n"
+			case read.URI == "fixture://pixel.png":
+				content["mimeType"], content["blob"] = "image/png", pixelPNG
+			case read.URI == "fixture://data.bin":
+				content["mimeType"], content["blob"] = "application/octet-stream", base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3})
+			case strings.HasPrefix(read.URI, "fixture://logs/"):
+				content["mimeType"], content["text"] = "text/plain", "log for "+strings.TrimPrefix(read.URI, "fixture://logs/")
+			case read.URI == "fixture://log":
+				_ = f.conn.Notify(ctx, "notifications/message", map[string]any{"level": "warning", "logger": "fixture-disk", "data": map[string]string{"note": "disk low"}})
+				_ = f.conn.Notify(ctx, "notifications/message", map[string]any{"level": "debug", "data": "debug detail"})
+				content["mimeType"], content["text"] = "text/plain", "logged"
+			case read.URI == "fixture://bump":
+				f.resourceGeneration.Add(1)
+				_ = f.conn.Notify(ctx, "notifications/resources/list_changed", struct{}{})
+				_ = f.conn.Notify(ctx, "notifications/prompts/list_changed", struct{}{})
+				content["mimeType"], content["text"] = "text/plain", "bumped"
+			case read.URI == "fixture://long-line.txt":
+				content["mimeType"], content["text"] = "text/plain", strings.Repeat("x", 100000)
+			case read.URI == "fixture://big-with-image":
+				text := map[string]string{"uri": "fixture://big-with-image/text", "mimeType": "text/plain", "text": strings.Repeat("row of resource text\n", 5000)}
+				image := map[string]string{"uri": "fixture://big-with-image/pixel", "mimeType": "image/png", "blob": pixelPNG}
+				return map[string]any{"contents": []map[string]string{text, image}}, nil
+			case read.URI == "https://example/search?q=term":
+				content["mimeType"], content["text"] = "text/plain", "results for term"
+			case read.URI == "fixture://data.json":
+				content["mimeType"], content["text"] = "application/json", `{"items":[{"name":"a"},{"name":"b"}]}`
+			default:
+				return nil, rpc.NewError(-32002, "not_found", "resource not found: "+read.URI)
+			}
+			return map[string]any{"contents": []map[string]string{content}}, nil
+		}), nil
+	case "prompts/list":
+		prompts := []map[string]any{
+			{"name": "review", "description": "Review a file", "arguments": []map[string]any{{"name": "path", "required": true}, {"name": "focus"}}},
+			{"name": "dialogue", "title": "Worked example"},
+		}
+		if f.resourceGeneration.Load() > 0 {
+			prompts = append(prompts, map[string]any{"name": "added"})
+		}
+		return map[string]any{"prompts": prompts}, nil
+	case "prompts/get":
+		var get struct {
+			Name      string            `json:"name"`
+			Arguments map[string]string `json:"arguments"`
+		}
+		_ = json.Unmarshal(params, &get)
+		type message struct {
+			Role    string         `json:"role"`
+			Content map[string]any `json:"content"`
+		}
+		var messages []message
+		switch get.Name {
+		case "review":
+			messages = []message{{"user", map[string]any{"type": "text", "text": "Review " + get.Arguments["path"] + " focusing on " + get.Arguments["focus"]}}, {"user", map[string]any{"type": "image", "data": pixelPNG, "mimeType": "image/png"}}}
+		case "dialogue":
+			messages = []message{{"user", map[string]any{"type": "text", "text": "What is 2+2?"}}, {"assistant", map[string]any{"type": "text", "text": "4"}}, {"user", map[string]any{"type": "text", "text": "Now explain."}}}
+		default:
+			return nil, rpc.NewError(-32602, "invalid_params", "unknown prompt")
+		}
+		return map[string]any{"messages": messages}, nil
 	default:
 		return nil, rpc.NewError(-32601, "method_not_found", "fixture doesn't implement method")
 	}
 }
 
 var _ io.ReadWriteCloser = stdio{}
+
+// elicit asks the client for input in the mode named by the call's value
+// and returns the client's raw reply, or why there is none.
+func (f *fixture) elicit(ctx context.Context, arguments json.RawMessage) string {
+	var args struct {
+		Value string `json:"value"`
+	}
+	_ = json.Unmarshal(arguments, &args)
+	f.mu.Lock()
+	declared := string(f.clientCaps["elicitation"])
+	f.mu.Unlock()
+	if declared == "" {
+		return "elicitation not declared"
+	}
+	request := map[string]any{"mode": "form", "message": "Pick a color", "requestedSchema": json.RawMessage(`{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}},"required":["color"]}`)}
+	switch args.Value {
+	case "url":
+		request = map[string]any{"mode": "url", "message": "Connect the fixture account", "url": "https://fixture.example/connect", "elicitationId": "fixture-1"}
+	case "nested":
+		request["requestedSchema"] = json.RawMessage(`{"type":"object","properties":{"address":{"type":"object","properties":{"city":{"type":"string"}}}}}`)
+	}
+	var reply json.RawMessage
+	if err := f.conn.Call(ctx, "elicitation/create", request, &reply); err != nil {
+		return "elicitation error: " + err.Error()
+	}
+	return string(reply)
+}
+
+// sample sends sampling/createMessage with the call's value as the request
+// params (a default request when empty) and returns the client's raw reply,
+// or why there is none. Value "async" sends the default request without
+// waiting for the reply.
+func (f *fixture) sample(ctx context.Context, arguments json.RawMessage) string {
+	var args struct {
+		Value string `json:"value"`
+	}
+	_ = json.Unmarshal(arguments, &args)
+	f.mu.Lock()
+	_, declared := f.clientCaps["sampling"]
+	f.mu.Unlock()
+	if !declared {
+		return "sampling not declared"
+	}
+	request := json.RawMessage(`{"messages":[{"role":"user","content":{"type":"text","text":"Summarize the fixture"}}],"systemPrompt":"You are terse.","includeContext":"allServers","maxTokens":100}`)
+	if args.Value == "async" {
+		// Ask without awaiting the answer: the tool result returns first.
+		go func() {
+			var reply json.RawMessage
+			err := f.conn.Call(context.WithoutCancel(ctx), "sampling/createMessage", request, &reply)
+			f.record("sample_async", fmt.Sprint(string(reply), err))
+		}()
+		return "sampling started"
+	}
+	if args.Value != "" && args.Value != "ok" {
+		request = json.RawMessage(args.Value)
+	}
+	var reply json.RawMessage
+	if err := f.conn.Call(ctx, "sampling/createMessage", request, &reply); err != nil {
+		var rpcErr *rpc.Error
+		if errors.As(err, &rpcErr) {
+			return fmt.Sprintf("sampling error: %d %s", rpcErr.Code, rpcErr.Message)
+		}
+		return "sampling error: " + err.Error()
+	}
+	return string(reply)
+}

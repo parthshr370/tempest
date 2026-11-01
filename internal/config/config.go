@@ -199,6 +199,9 @@ type ResolvedConfig struct {
 	permissionDenyTools    []string
 	retry                  RetrySettings
 	mcpServers             []mcpconfig.Server
+	mcpSamplingModel       string
+	mcpSamplingMaxTokens   int
+	mcpSamplingHeadless    bool
 	lsp                    lsp.Config
 	cloudRules             []cloudcmd.Rule
 	hooks                  hooks.Settings
@@ -420,6 +423,9 @@ type fileSettings struct {
 	RetryJitterMax          *float64                          `json:"retry_jitter_max"`
 	MCPConfig               *string                           `json:"mcp_config"`
 	MCPServers              []mcpconfig.Server                `json:"mcp_servers"`
+	MCPSamplingModel        *string                           `json:"mcp_sampling_model"`
+	MCPSamplingMaxTokens    *int                              `json:"mcp_sampling_max_tokens"`
+	MCPSamplingHeadless     *bool                             `json:"mcp_sampling_allow_headless"`
 	EnableLSP               *bool                             `json:"enable_lsp"`
 	LSPConfig               *string                           `json:"lsp_config"`
 	CloudPolicy             *string                           `json:"cloud_policy"`
@@ -532,6 +538,10 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if maxTokens <= 0 {
 		return nil, &Error{Field: "max_tokens", Err: errors.New("must be positive")}
 	}
+	samplingMaxTokens := settingValue(settings.MCPSamplingMaxTokens)
+	if samplingMaxTokens <= 0 {
+		return nil, &Error{Field: "mcp_sampling_max_tokens", Err: errors.New("must be positive")}
+	}
 	bashTimeout, err := time.ParseDuration(settingString(settings.BashTimeout))
 	if err != nil || bashTimeout <= 0 || bashTimeout > 2147483*time.Second {
 		if err == nil {
@@ -623,6 +633,9 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		permissionAllowTools:   slices.Clone(settings.PermissionAllowTools),
 		permissionDenyTools:    slices.Clone(settings.PermissionDenyTools),
 		mcpServers:             mcpServers,
+		mcpSamplingModel:       settingString(settings.MCPSamplingModel),
+		mcpSamplingMaxTokens:   samplingMaxTokens,
+		mcpSamplingHeadless:    settingValue(settings.MCPSamplingHeadless),
 		lsp:                    lspConfig,
 		cloudRules:             cloudRules,
 		hooks:                  hookSettings,
@@ -671,7 +684,7 @@ func settingValue[T any](value *T) T {
 // validateResolved catches values that are individually parsed but can't safely
 // enter the rest of the runtime after source precedence is applied.
 func validateResolved(c *ResolvedConfig) error {
-	for field, model := range map[string]string{"model": c.model, "plan_model": c.planModel, "smol_model": c.smolModel} {
+	for field, model := range map[string]string{"model": c.model, "plan_model": c.planModel, "smol_model": c.smolModel, "mcp_sampling_model": c.mcpSamplingModel} {
 		if strings.TrimSpace(model) == "" && field != "model" {
 			continue
 		}

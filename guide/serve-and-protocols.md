@@ -59,14 +59,17 @@ Claude Desktop and Cursor shape), or Tempest's array of named servers:
 | `startupTimeout` | Default `30s`. |
 | `callTimeout` | Default `2m`. |
 | `permission` | Tool permission for the server. |
+| `auth` | `"oauth"` lets `tempest mcp login` find the authorization server through well-known metadata even when the server answers without a 401. HTTP only. |
+| `oauth` | Pre-registered OAuth client: `{"clientId": "...", "clientSecret": "...", "scopes": ["..."]}`. Without it the client registers itself. HTTP only. |
+| `sampling` | `true` lets the server ask Tempest's model for completions; see [Sampling](#sampling). Default `false`. |
 
 Unknown fields are errors that list the supported ones. Every configured server
 must start: one that fails aborts startup with an error naming the server. Fix it,
 disable it, or pass `-mcp-config ""` to run without MCP.
 
 Both stdio and Streamable HTTP clients support MCP `2025-11-25` (preferred) and
-`2025-06-18`. The handshake-free `2026-07-28` era, legacy HTTP+SSE, OAuth, sampling,
-and resource browsing are not supported.
+`2025-06-18`. The handshake-free `2026-07-28` era and legacy HTTP+SSE are not
+supported.
 
 Discovered tools use names such as `mcp__issues__lookup`. They default to
 prompt/exec-tier regardless of read-only annotations; without an approver, headless
@@ -80,6 +83,171 @@ not interpolated or stored in the journal; resume must resupply runtime MCP
 configuration. Serve keeps its startup MCP defaults for resumes that omit endpoint
 overrides, including after idle reap or server restart. Unknown-outcome MCP calls
 are never automatically replayed.
+
+### OAuth for HTTP servers
+
+An HTTP server without a configured `Authorization` header that answers `401` gets
+OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
+
+1. Protected resource metadata (RFC 9728) from the `resource_metadata` URL in the
+   `WWW-Authenticate` challenge when it is on the server's own origin, else from
+   the well-known path-inserted and then root URI on that origin.
+2. Authorization server metadata (RFC 8414), trying the OAuth and OpenID Connect
+   well-known locations in the specification's order. A server that does not
+   advertise PKCE `S256` is refused.
+3. The configured `oauth.clientId`, a stored dynamic registration, or a new RFC 7591
+   registration as a public client.
+4. Authorization code with PKCE `S256`, a `state` check and the RFC 8707 `resource`
+   parameter in the authorization and token requests, returning to a loopback
+   listener on `127.0.0.1`. Scope is the challenge's `scope`, else `oauth.scopes`,
+   else the resource's `scopes_supported`.
+
+```sh
+tempest mcp login docs          # opens the browser; -no-browser prints the URL
+tempest mcp list                # servers, transports and sign-in state
+tempest mcp logout docs         # forget tokens, keep the client registration
+```
+
+Tokens are stored per server in `<agent-dir>/mcp-oauth/<server>.json`, mode `0600`
+in a `0700` directory, written atomically and locked across processes. They are
+bound to the configured URL and are never sent to a server whose URL changed. An
+expiring or rejected access token is refreshed without the user; a rotated refresh
+token replaces the old one, and a rejected refresh token clears the tokens. A
+`403` with `insufficient_scope` asks for authorization again with the granted and
+challenged scopes together, then retries the request once.
+
+Every URL in discovery other than the server's own origin (authorization servers
+and their endpoints) is named by the server, so Tempest limits where it goes, as
+the MCP security best practices on server-side request forgery advise. It must be
+HTTPS; plain HTTP is accepted only from a server on loopback to a loopback
+address. The address actually connected to must be public or in the network the
+configured server's own address is in (loopback, private or link-local), so a
+remote server cannot point Tempest at `169.254.169.254`, `localhost` or an
+internal host, also not through DNS that changes between lookups. With an
+`HTTPS_PROXY`, the host is resolved and checked before the proxy connects.
+Redirects are never followed, responses are limited to 1 MiB and requests to 30
+seconds.
+
+A server that needs authorization does not stop session startup. The first run
+authorizes it through the session's user: ACP clients that declare URL elicitation
+get an `elicitation/create` request in `url` mode, and one-shot runs on a terminal
+print the URL and wait for Enter. Headless runs, `serve` without such a client,
+and terminals that decline fail the run (or the tool call, for a step-up) with
+``mcp_auth: server docs needs authorization; run `tempest mcp login docs` ``. A
+step-up scope that no user could grant is remembered, and the next `tempest mcp
+login` requests it.
+
+### Resources
+
+`read` opens MCP resources by URL. The resource URI follows the server name
+verbatim:
+
+```text
+read mcp://                          servers and their resource counts
+read mcp://docs/                     docs' resources and resource templates
+read mcp://docs/file:///guide.md     one resource; line ranges and ?q= apply to text
+read mcp://docs/logs://2026-11-01    a URI built from a template such as logs://{day}
+```
+
+Text contents come back as numbered rows like a file, within the same output
+limit as a file read, also when the resource has images. A PNG, JPEG, GIF or WebP
+blob is passed to the model as an image after the text, up to 252 KiB of base64
+image data per read; any other blob, and images past that, are saved under the
+session's `local://mcp/` directory and the read names that file. A line too long for one
+read is saved there as well, and the read names the file for `bash`.
+
+The resource URI may contain its own `?q=`. A `?q=` JSON query is split off only
+when the URI before it is a resource the server lists and the whole string is not:
+with `https://example/search?q=term` listed, `read
+mcp://docs/https://example/search?q=term` asks the server for exactly that URI,
+and with `file:///data.json` listed, `read mcp://docs/file:///data.json?q=.items`
+queries it. Tempest reads
+the server's tools, resources, resource templates and prompts as one catalog at
+startup, and re-reads all of it when the server sends any `list_changed`
+notification.
+
+### Prompts
+
+Each server prompt is a slash command `/<server>:<prompt>`. A prompt sent as
+`/docs:summarize guide.md short` is replaced, before the run starts, by the
+messages `prompts/get` returns, and those messages become the user turn. Arguments
+follow the command, either all as `name=value` words or as words in the order the
+server declares, the last argument taking the rest of the line. A missing required
+argument fails the run with the command's usage. When the prompt also speaks as the
+assistant, each change of role is marked `[user]` or `[assistant]` in the turn.
+Text that names no known prompt is sent unchanged.
+
+ACP clients get the commands as an `available_commands_update` after
+`session/new`, `session/load` and `session/resume`, and again whenever a server's
+prompt list changes. On the command line:
+
+```sh
+tempest mcp prompts             # /docs:summarize <path> [style]  Summarize a file
+```
+
+### Elicitation from servers
+
+Tempest declares the `elicitation` capability in both modes. A server's
+`elicitation/create` goes to the session's user the same way an authorization URL
+does: ACP clients that declared that mode get `elicitation/create`, the client of a
+`tempest mcp` run gets it passed through, and a one-shot run on a terminal asks
+field by field. Every surface names the asking server. On a terminal the server's
+message, titles, descriptions, choice labels and URL are shown with control and
+format characters escaped (`\x1b[2J` appears as text), and the lines of a
+multi-line message are indented under the `MCP server <name>:` line, so a server
+cannot clear the screen, overwrite that attribution or pose as a Tempest prompt.
+`tempest mcp prompts` and `tempest mcp login` escape server text the same way. A form schema outside the
+flat primitive subset the specification allows is refused with `-32602` before
+anyone is asked. With no user to ask (headless runs, `serve` without such a
+client), the reply is `{"action":"decline"}`.
+
+### Sampling
+
+A server may use Tempest's model only when its entry sets `"sampling": true`.
+Tempest declares the `sampling` capability to that server alone, and without the
+`tools` or `context` sub-capabilities. Every other server's
+`sampling/createMessage` gets `-32601`.
+
+- **Model.** Requests go to the `smol` role model. Settings
+  `mcp_sampling_model` (or `HARNESS_MCP_SAMPLING_MODEL`) names another model for
+  sampling only. The server's `modelPreferences`, `temperature` and
+  `stopSequences` are ignored; reasoning effort is the smol role's.
+- **What the model sees.** The server's `systemPrompt` and `messages` (text and
+  images), nothing else. `includeContext` is treated as `none`, so no part of the
+  session's conversation is shared. A request with `tools`, `toolChoice`,
+  `tool_use` or `tool_result` content, or audio, gets `-32602`.
+- **Cap.** The server's `maxTokens` is lowered to `mcp_sampling_max_tokens`, which
+  defaults to `max_tokens`.
+- **Approval.** A server's first request asks the session's user through the same
+  prompter as tool permissions: an ACP `session/request_permission` whose title
+  names the server, the model and the capped limit, and whose `rawInput` holds the
+  messages. *Allow always* and *reject always* hold for that server until the
+  session closes; the once-choices ask again on the next request. With no user to
+  ask (one-shot runs, `serve` while no client that approves the session's asks is
+  attached) the request is refused at once unless `mcp_sampling_allow_headless`
+  is `true`, which lets it run without asking. A refusal reaches the server as
+  error `-1` with the reason, naming that setting when it applies.
+- **Spend.** Sampling is answered only while a run is in progress, normally
+  during the server's own tool call; at other times it is refused. A request
+  belongs to the run it arrived in: it is cancelled when that run ends, and the
+  run waits for its receipt before ending, also when the server returned its tool
+  result without awaiting the answer. The call is held to the run's cost budget
+  (`-max-cost`), and its usage is journaled as a receipt named
+  `mcp-sampling:<server>:<id>`, added to that run's and the session's usage, so it
+  survives resume and shows in `tempest/usage` updates with that `sourceRef`.
+
+```json
+{"mcpServers": {"notes": {"command": "notes-mcp", "sampling": true}}}
+```
+
+### Progress and server logs
+
+Each `tools/call` carries a progress token. A `notifications/progress` for it
+becomes a tool progress update: its `message`, or `progress N/TOTAL` when the
+server sends only numbers. A `notifications/message` goes to Tempest's diagnostic
+log, never to the model: `debug` at debug, `info` and `notice` at info, `warning`
+at warn, and `error` and above at error, with the server name, the server's
+`logger` and its `data`.
 
 ## MCP server
 

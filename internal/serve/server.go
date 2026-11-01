@@ -98,7 +98,7 @@ func New(opts Options) (*Server, error) {
 		cancel()
 		return nil, err
 	}
-	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
+	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, Elicitor: s.broker.Elicit, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
 	if err != nil {
 		cancel()
 		return nil, err

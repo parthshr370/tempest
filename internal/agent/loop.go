@@ -254,6 +254,10 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 			return body(ctx)
 		})
 	}
+	if run.root {
+		// Joined outside work must account before the run's total is final.
+		run.accounting.settle()
+	}
 	err = errors.Join(err, run.accounting.failure())
 	var budgetStop *providerBudgetStop
 	switch {

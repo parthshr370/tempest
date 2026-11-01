@@ -126,6 +126,7 @@ type sessionCore struct {
 	mcp              *mcpclient.Manager
 	mcpEnabled       bool
 	mcpServers       []MCPServerConfig
+	sampling         *mcpSampling
 	resumeExtensions func(context.Context) error
 	providerConfig   ProviderConfig
 	customStream     bool
@@ -396,6 +397,14 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cfg.Model = router.Model
 		cfg.StreamFn = router.StreamFn
 		cfg.FallbackModels = router.Fallbacks
+		if sampling := &cfg.MCP.Sampling; sampling.StreamFn == nil && sampling.ModelSpec != "" && mcpSamplingEnabled(selectedMCP) {
+			provider.ModelID = sampling.ModelSpec
+			router, e := adapter.NewProviderRouter(provider)
+			if e != nil {
+				return nil, fmt.Errorf("mcp_sampling_model: %w", e)
+			}
+			sampling.Model, sampling.StreamFn = router.Model, router.StreamFn
+		}
 	}
 	runtimeModel := cfg.Model
 	if cfg.Plan && cfg.PlanModel.ID != "" {
@@ -413,6 +422,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	}
 	if cfg.SmolModel.ID == "" {
 		cfg.SmolModel = cfg.Model
+	}
+	if sampling := &cfg.MCP.Sampling; sampling.StreamFn == nil {
+		if sampling.ModelSpec != "" && mcpSamplingEnabled(selectedMCP) {
+			return nil, errors.New("mcp_sampling_model needs StackConfig.MCP.Sampling.StreamFn when the stack supplies its own StreamFn")
+		}
+		sampling.Model, sampling.StreamFn = cfg.SmolModel, cfg.SmolStreamFn
 	}
 	if needsDiscovery {
 		skillPaths := cfg.SkillPaths
@@ -567,12 +582,20 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	c.permissionPolicy = &cfg.PermissionPolicy
 	// MCP spills sit with the session's other tool output, where read can open them.
 	cfg.AdmitProcess = o.admitProcess
-	c.mcp, err = mcpclient.Open(ctx, cwd, filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), selectedMCP, logger, o.admitProcess)
+	var sample mcpclient.Sampler
+	if mcpSamplingEnabled(selectedMCP) {
+		c.sampling = newMCPSampling(s, cfg)
+		sample = c.sampling.sample
+	}
+	c.mcp, err = mcpclient.Open(ctx, selectedMCP, mcpclient.Options{Cwd: cwd, SpillDir: filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), Logger: logger, AdmitProcess: o.admitProcess, CredentialDir: cfg.MCP.CredentialDir, Elicit: c.elicitor(o.Elicitor), OnPromptsChanged: c.announceCommands, Sample: sample})
 	if err != nil {
 		return nil, err
 	}
 	c.mcpEnabled = len(selectedMCP) != 0
 	c.mcpServers = selectedMCP
+	if c.mcpEnabled {
+		cfg.MCPResources = c.mcp
+	}
 	defer func() {
 		if err != nil {
 			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -664,6 +687,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		return nil, e
 	}
 	c.agent = stack.Agent
+	if c.sampling != nil {
+		c.sampling.agent.Store(stack.Agent)
+	}
 	c.checkpoints = stack.Checkpoints
 	c.compaction = stack.Compaction
 	if c.compaction != nil {
@@ -898,6 +924,10 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, schema *outputschem
 		r.result, r.err = c.agent.Continue(runCtx)
 		return
 	}
+	// /<server>:<prompt> becomes that MCP prompt's messages, as this turn.
+	if p, r.err = c.expandCommand(runCtx, p); r.err != nil {
+		return
+	}
 	if len(p.Media) == 0 && schema == nil {
 		r.result, r.err = c.agent.PromptText(runCtx, p.Text)
 		return
@@ -1089,26 +1119,33 @@ func (g gatePrompter) Approve(ctx context.Context, req permission.PromptRequest)
 		ask.Options = []Option{{OptionID: "allow_once", Name: "Allow once", Kind: "allow_once"}, {OptionID: "reject_once", Name: "Reject once", Kind: "reject_once"}}
 		ask.Title = "Child " + req.ChildSessionID + " (" + req.Cwd + "): " + title
 	}
-	a := &approval{result: make(chan approvalResult, 1), child: req.ChildSessionID != ""}
+	return s.ask(ctx, ask)
+}
+
+// ask publishes a pending approval and waits for the prompter or an Answer.
+// Child asks accept only once-choices.
+func (s *Session) ask(ctx context.Context, ask Ask) (Choice, error) {
+	c := s.core
+	a := &approval{result: make(chan approvalResult, 1), child: ask.ChildSessionID != ""}
 	c.mu.Lock()
-	if _, exists := c.pending[req.ToolCallID]; exists {
+	if _, exists := c.pending[ask.ToolCallID]; exists {
 		c.mu.Unlock()
-		return "", fmt.Errorf("duplicate pending tool call %q", req.ToolCallID)
+		return "", fmt.Errorf("duplicate pending tool call %q", ask.ToolCallID)
 	}
-	c.pending[req.ToolCallID] = a
+	c.pending[ask.ToolCallID] = a
 	c.hub.AddAsk(ask)
 	c.mu.Unlock()
 	promptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() {
 		choice, err := c.prompter.Approve(promptCtx, ask)
-		s.resolveApproval(req.ToolCallID, a, approvalResult{choice: choice, err: err})
+		s.resolveApproval(ask.ToolCallID, a, approvalResult{choice: choice, err: err})
 	}()
 	select {
 	case result := <-a.result:
 		return result.choice, result.err
 	case <-ctx.Done():
-		s.resolveApproval(req.ToolCallID, a, approvalResult{err: ctx.Err()})
+		s.resolveApproval(ask.ToolCallID, a, approvalResult{err: ctx.Err()})
 		result := <-a.result
 		return result.choice, result.err
 	}

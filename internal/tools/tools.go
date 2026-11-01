@@ -147,7 +147,10 @@ type ToolsOptions struct {
 	// Refs resolves skill://, job://, history:// and local:// for read,
 	// grep, write, edit and bash. A nil resolver reports each URL as
 	// unavailable.
-	Refs       *refs.Resolver
+	Refs *refs.Resolver
+	// MCP serves read's mcp:// URLs from the session's MCP servers; nil
+	// reports that the session has none.
+	MCP        MCPResources
 	EnableWeb  bool
 	HTTPClient *http.Client
 	ResolveIP  func(context.Context, string) ([]net.IP, error)
@@ -622,7 +625,7 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 		Tool: types.Tool{
 			Name: string(ReadTool),
 			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Reading a whole file returns all of it as numbered rows when it fits in %d lines and %dKB. A larger Go file returns a structural outline instead (one row per declaration with its path:START-END range, no bodies) so you can read just the range you need; any other larger file returns its first page with the offset to continue. mode=outline asks for the outline of a Go file of any size; mode=raw always pages numbered rows. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. "+
-				"To read several files, pass paths (up to %d entries, each with its own optional :START-END or :START+COUNT) instead of path: each file returns as its own [path#TAG] section, in order, and all share one %d-line/%dKB budget; offset and limit apply only to path. Read every file you already know you need in one call rather than one call per turn.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024, maxReadPaths, truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp,
+				"To read several files, pass paths (up to %d entries, each with its own optional :START-END or :START+COUNT) instead of path: each file returns as its own [path#TAG] section, in order, and all share one %d-line/%dKB budget; offset and limit apply only to path. Read every file you already know you need in one call rather than one call per turn.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024, maxReadPaths, truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + readSelectorsHelp + mcpHelp(options),
 			Parameters: schema.Object(schema.JSON{
 				"path":   schema.JSON{"type": "string", "description": "one file, directory or internal URL, with an optional :START-END or :START+COUNT selector"},
 				"paths":  schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": maxReadPaths, "description": "several files read in one call, each with an optional selector; use instead of path"},
@@ -657,6 +660,14 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 			return reader.read(ctx, readRequest{path: input.Path, offset: input.Offset, limit: input.Limit, mode: input.Mode, budget: defaultReadBudget})
 		},
 	}
+}
+
+// mcpHelp describes mcp:// only to sessions that have MCP servers.
+func mcpHelp(options ToolsOptions) string {
+	if options.MCP == nil {
+		return ""
+	}
+	return mcpReadHelp
 }
 
 // outlineResult renders a Go declaration outline under the file header,

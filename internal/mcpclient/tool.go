@@ -6,20 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/mcpoauth"
 	"go.harness.dev/harness/internal/mcpwire"
 	"go.harness.dev/harness/internal/rpc"
 )
 
 const maxCatalogPages = 128
-const maxServerTools = 2048
+const maxCatalogEntries = 2048
 const maxDefinitions = 4 << 20
 const retirementTimeout = 3 * time.Second
 const maxSchema = 64 << 10
@@ -118,76 +121,41 @@ func localReferences(raw json.RawMessage) error {
 	return nil
 }
 
-func (s *server) discover(ctx context.Context, client *mcpwire.Client) ([]agent.AgentTool, error) {
-	if client == nil {
-		return nil, errors.New("connection unavailable")
-	}
-	if !client.HasTools() {
-		return nil, nil
-	}
+// discoverTools turns a tools/list catalog into gated tools.
+func (s *server) discoverTools(ctx context.Context, client *mcpwire.Client) ([]agent.AgentTool, error) {
 	var tools []agent.AgentTool
-	cursor := ""
-	seenCursors := map[string]bool{}
 	seenNames := map[string]bool{}
-	totalBytes := 0
-	for range maxCatalogPages {
-		params := struct {
-			Cursor string `json:"cursor,omitempty"`
-		}{cursor}
-		raw, err := client.Call(ctx, "tools/list", params)
-		if err != nil {
-			return nil, err
+	err := paginate(ctx, client, "tools/list", "tools", func(definition json.RawMessage) error {
+		var remote toolDefinition
+		if json.Unmarshal(definition, &remote) != nil {
+			return errors.New("mcp_protocol: malformed tool definition")
 		}
-		var result struct {
-			Tools      []json.RawMessage `json:"tools"`
-			NextCursor string            `json:"nextCursor"`
+		if len(remote.Name) > maxModelName-len("mcp__")-len(s.config.Name)-len("__") || !remoteToolName.MatchString(remote.Name) {
+			return fmt.Errorf("mcp_tool_name: server %s has unrepresentable tool %q", s.config.Name, utf8Head(remote.Name, maxModelName))
 		}
-		if json.Unmarshal(raw, &result) != nil || result.Tools == nil {
-			return nil, errors.New("mcp_protocol: invalid tools/list result")
+		fullName := "mcp__" + s.config.Name + "__" + remote.Name
+		if seenNames[remote.Name] {
+			return fmt.Errorf("mcp_protocol: duplicate tool %q", remote.Name)
 		}
-		for _, definition := range result.Tools {
-			totalBytes += len(definition)
-			if totalBytes > maxDefinitions || len(tools) >= maxServerTools {
-				return nil, errors.New("mcp_catalog_limit: too many tool definitions")
-			}
-			var remote toolDefinition
-			if json.Unmarshal(definition, &remote) != nil {
-				return nil, errors.New("mcp_protocol: malformed tool definition")
-			}
-			if len(remote.Name) > maxModelName-len("mcp__")-len(s.config.Name)-len("__") || !remoteToolName.MatchString(remote.Name) {
-				return nil, fmt.Errorf("mcp_tool_name: server %s has unrepresentable tool %q", s.config.Name, utf8Head(remote.Name, maxModelName))
-			}
-			fullName := "mcp__" + s.config.Name + "__" + remote.Name
-			if seenNames[remote.Name] {
-				return nil, fmt.Errorf("mcp_protocol: duplicate tool %q", remote.Name)
-			}
-			seenNames[remote.Name] = true
-			if _, err = compileSchema(remote.InputSchema); err != nil {
-				return nil, fmt.Errorf("mcp_schema: tool %s input: %w", fullName, err)
-			}
-			var outputSchema *jsonschema.Schema
-			if len(remote.OutputSchema) > 0 {
-				outputSchema, err = compileSchema(remote.OutputSchema)
-				if err != nil {
-					return nil, fmt.Errorf("mcp_schema: tool %s output: %w", fullName, err)
-				}
-			}
-			label := remote.Title
-			if label == "" {
-				label = remote.Name
-			}
-			tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, OutputSchema: append(json.RawMessage(nil), remote.OutputSchema...), Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
+		seenNames[remote.Name] = true
+		if _, err := compileSchema(remote.InputSchema); err != nil {
+			return fmt.Errorf("mcp_schema: tool %s input: %w", fullName, err)
 		}
-		cursor = result.NextCursor
-		if cursor == "" {
-			return tools, nil
+		var outputSchema *jsonschema.Schema
+		if len(remote.OutputSchema) > 0 {
+			var err error
+			if outputSchema, err = compileSchema(remote.OutputSchema); err != nil {
+				return fmt.Errorf("mcp_schema: tool %s output: %w", fullName, err)
+			}
 		}
-		if seenCursors[cursor] {
-			return nil, errors.New("mcp_protocol: repeated tools/list cursor")
+		label := remote.Title
+		if label == "" {
+			label = remote.Name
 		}
-		seenCursors[cursor] = true
-	}
-	return nil, errors.New("mcp_catalog_limit: tools/list exceeds 128 pages")
+		tools = append(tools, agent.AgentTool{Tool: types.Tool{Name: fullName, Description: remote.Description, Parameters: append(json.RawMessage(nil), remote.InputSchema...)}, OutputSchema: append(json.RawMessage(nil), remote.OutputSchema...), Label: label, ExecutionMode: agent.ExecSequential, Execute: s.execution(remote.Name, outputSchema)})
+		return nil
+	})
+	return tools, err
 }
 
 func failedTool(message string) (agent.AgentToolResult, error) {
@@ -225,10 +193,9 @@ func (s *server) execution(remoteName string, outputSchema *jsonschema.Schema) f
 			} `json:"_meta"`
 		}{Name: remoteName, Arguments: args}
 		params.Meta.ProgressToken = progressToken
-		raw, err := client.Call(callCtx, "tools/call", params)
+		raw, err := s.call(ctx, client, "tools/call", params)
 		if err != nil {
-			var remoteErr *rpc.Error
-			if !errors.As(err, &remoteErr) {
+			if retirable(err) {
 				s.retire(client, err)
 			}
 			return failedTool(fmt.Sprintf("MCP server %s tools/call %s: %v", s.config.Name, remoteName, err))
@@ -244,6 +211,34 @@ func (s *server) execution(remoteName string, outputSchema *jsonschema.Schema) f
 	}
 }
 
+// call sends one request bounded by the server's call timeout. When the
+// server rejects it for authorization, the interactive login runs once and
+// the request is resent: the server refused it before processing it.
+func (s *server) call(ctx context.Context, client *mcpwire.Client, method string, params any) (json.RawMessage, error) {
+	var seen uint64
+	if s.auth != nil {
+		seen = s.auth.generation.Load()
+	}
+	raw, err := client.Call(ctx, method, params)
+	var login *mcpoauth.LoginRequired
+	if err == nil || s.auth == nil || !errors.As(err, &login) {
+		return raw, err
+	}
+	if err := s.authorize(ctx, login, seen); err != nil {
+		return nil, err
+	}
+	return client.Call(ctx, method, params)
+}
+
+// retirable reports a failure that leaves the connection in doubt; remote
+// JSON-RPC errors and authorization refusals do not.
+func retirable(err error) bool {
+	var remoteErr *rpc.Error
+	var authErr *mcpwire.AuthError
+	var login *mcpoauth.LoginRequired
+	return !errors.As(err, &remoteErr) && !errors.As(err, &authErr) && !errors.As(err, &login)
+}
+
 func (s *server) retire(client *mcpwire.Client, cause error) {
 	s.mu.Lock()
 	s.unavailable = cause
@@ -254,17 +249,21 @@ func (s *server) retire(client *mcpwire.Client, cause error) {
 }
 func (s *server) notification(method string, params json.RawMessage) {
 	switch method {
-	case "notifications/tools/list_changed":
+	case "notifications/tools/list_changed", "notifications/resources/list_changed", "notifications/prompts/list_changed":
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		if s.closed {
+		if s.closed || s.client == nil {
 			return
 		}
-		if s.client != nil && !s.client.ListChanged() {
+		caps := s.client.Capabilities()
+		negotiated := map[string]bool{"notifications/tools/list_changed": caps.ToolsListChanged, "notifications/resources/list_changed": caps.ResourcesListChanged, "notifications/prompts/list_changed": caps.PromptsListChanged}
+		if !negotiated[method] {
 			return
 		}
+		// One refresh re-reads the whole catalog: tools, resources,
+		// resource templates and prompts.
 		s.dirty = true
-		if !s.refreshing && s.client != nil {
+		if !s.refreshing {
 			s.startRefreshLocked(s.manager.ctx, false)
 		}
 	case "notifications/progress":
@@ -294,8 +293,52 @@ func (s *server) notification(method string, params json.RawMessage) {
 		call.seen = true
 		callback := call.update
 		s.mu.Unlock()
-		if callback != nil && progress.Message != "" {
-			callback(agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(utf8Head(progress.Message, maxProgressText))}})
+		if callback == nil {
+			return
 		}
+		text := utf8Head(progress.Message, maxProgressText)
+		if text == "" {
+			// A bare counter is still progress the user should see.
+			text = "progress " + strconv.FormatFloat(*progress.Progress, 'g', -1, 64)
+			if progress.Total != nil {
+				text += "/" + strconv.FormatFloat(*progress.Total, 'g', -1, 64)
+			}
+		}
+		callback(agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(text)}})
+	case "notifications/message":
+		s.log(params)
 	}
+}
+
+// log writes a server's notifications/message to the diagnostic log at the
+// matching level; the model never sees it.
+func (s *server) log(params json.RawMessage) {
+	var message struct {
+		Level  string          `json:"level"`
+		Logger string          `json:"logger"`
+		Data   json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(params, &message) != nil {
+		s.manager.logger.Debug("ignored malformed MCP log message", "server", s.config.Name)
+		return
+	}
+	level := slog.LevelInfo
+	switch message.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warning":
+		level = slog.LevelWarn
+	case "error", "critical", "alert", "emergency":
+		level = slog.LevelError
+	}
+	attrs := []any{"server", s.config.Name, "mcp_level", message.Level}
+	if message.Logger != "" {
+		attrs = append(attrs, "logger", utf8Head(message.Logger, 256))
+	}
+	var text string
+	if json.Unmarshal(message.Data, &text) != nil {
+		text = string(message.Data)
+	}
+	attrs = append(attrs, "data", utf8Head(text, maxProgressText))
+	s.manager.logger.Log(s.manager.ctx, level, "MCP server log", attrs...)
 }

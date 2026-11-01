@@ -41,7 +41,11 @@ type Options struct {
 	Prompter            Prompter
 	// Questioner handles non-sensitive ask tool requests; nil returns a headless error.
 	Questioner QuestionHandler
-	Logger     *slog.Logger
+	// Elicitor shows MCP server elicitations and MCP authorization URLs to the
+	// user; nil declines elicitations and makes authorization name the
+	// `tempest mcp login` command instead.
+	Elicitor Elicitor
+	Logger   *slog.Logger
 	// FauxScript selects a hermetic JSON response script instead of a network provider.
 	FauxScript string
 	// Stack optionally supplies resolved models, providers, discovery and tools.
@@ -204,6 +208,15 @@ type Prompter interface {
 	Approve(context.Context, Ask) (Choice, error)
 }
 
+// Attendance is implemented by a Prompter that knows whether anyone can
+// answer a session's asks right now, as serve's broker does: it reports false
+// while no approving client is attached. Requests that must not wait for a
+// user who may never come (MCP sampling) treat an unattended session as
+// headless. A Prompter without it is taken to have a user.
+type Attendance interface {
+	Attended(sessionID string) bool
+}
+
 // QuestionHandler presents a question and stops when its context is cancelled.
 type QuestionHandler = question.Handler
 
@@ -218,6 +231,15 @@ type QuestionOption = question.Option
 
 // QuestionAnswer preserves the user's selected labels and optional text.
 type QuestionAnswer = question.Answer
+
+// Elicitor presents an MCP elicitation or authorization URL to the user.
+type Elicitor = question.Elicitor
+
+// Elicit is one forwarded MCP elicitation or authorization URL.
+type Elicit = question.Elicit
+
+// ElicitResult is the user's accept, decline or cancel answer.
+type ElicitResult = question.ElicitResult
 
 // Choice is a permission option; an empty choice cancels the request.
 type Choice = permission.Choice

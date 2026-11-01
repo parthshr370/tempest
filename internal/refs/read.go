@@ -38,6 +38,11 @@ type Resource struct {
 	Dir     bool
 	Entries []Entry
 	Total   int
+	// Save, when set, writes Data to a session file and returns a path bash
+	// accepts (local://...). Readers call it when they cannot show the
+	// content in full through line ranges, as for MCP resources, which have
+	// no file of their own.
+	Save func() (string, error)
 }
 
 // Read resolves raw and loads it. Files must be regular and at most

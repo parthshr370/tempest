@@ -145,7 +145,7 @@ pages do not imply disk indexing or a bounded memory working set.
 
 - **ACP** over stdio or authenticated WebSocket, with snapshots and reconnectable progress.
 - **A2A 1.0** over HTTP for run-oriented tasks and discovery.
-- **MCP client tools** from explicitly configured, trusted servers.
+- **MCP client** for explicitly configured, trusted servers: tools, resources (`read mcp://`), prompts as `/<server>:<prompt>` commands, forwarded elicitation, progress and server logs, opt-in sampling on the smol model with user approval and charged to the run, and OAuth 2.1 sign-in (`tempest mcp login`) for HTTP servers.
 - **MCP server** over stdio, exposing `tempest_run` to other clients.
 - **OpenTelemetry** traces and metrics over OTLP/HTTP JSON, plus Prometheus text at `/metrics`.
 

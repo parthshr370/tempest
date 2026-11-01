@@ -34,6 +34,16 @@ type Handlers struct {
 	Request      func(context.Context, string, json.RawMessage) (any, *rpc.Error)
 	Notify       func(string, json.RawMessage)
 	AdmitProcess func(context.Context) (func(), error)
+	// Auth supplies OAuth bearer tokens over HTTP; nil sends only the
+	// configured headers.
+	Auth Auth
+	// Elicitation declares the elicitation capability (form and URL
+	// modes); Request must then answer elicitation/create.
+	Elicitation bool
+	// Sampling declares the sampling capability without its tools or
+	// context sub-capabilities; Request must then answer
+	// sampling/createMessage.
+	Sampling bool
 }
 
 type transport interface {
@@ -44,12 +54,19 @@ type transport interface {
 	alive() bool
 }
 
+// Capabilities are the server features negotiated at initialize.
+type Capabilities struct {
+	Tools, ToolsListChanged         bool
+	Resources, ResourcesListChanged bool
+	Prompts, PromptsListChanged     bool
+	Logging                         bool
+}
+
 // Client owns one negotiated MCP connection. Calls are never retried.
 type Client struct {
 	transport   transport
 	version     string
-	tools       bool
-	listChanged bool
+	caps        Capabilities
 	next        atomic.Uint64
 	callTimeout time.Duration
 	mu          sync.Mutex
@@ -60,11 +77,8 @@ type Client struct {
 // Version returns the negotiated protocol revision.
 func (c *Client) Version() string { return c.version }
 
-// HasTools reports whether the server advertised the tools capability.
-func (c *Client) HasTools() bool { return c.tools }
-
-// ListChanged reports whether tool-list notifications were negotiated.
-func (c *Client) ListChanged() bool { return c.listChanged }
+// Capabilities returns the features the server advertised.
+func (c *Client) Capabilities() Capabilities { return c.caps }
 
 // Alive reports whether the connection can accept future work.
 func (c *Client) Alive() bool {
@@ -134,18 +148,30 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 		_ = wire.close(closeCtx)
 		return nil, fmt.Errorf("mcp_startup: server %s initialize: %w", cfg.Name, cause)
 	}
+	type modes struct {
+		Form struct{} `json:"form"`
+		URL  struct{} `json:"url"`
+	}
 	params := struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		Capabilities    struct {
 			Roots struct {
 				ListChanged bool `json:"listChanged"`
 			} `json:"roots"`
+			Elicitation *modes    `json:"elicitation,omitempty"`
+			Sampling    *struct{} `json:"sampling,omitempty"`
 		} `json:"capabilities"`
 		ClientInfo struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"clientInfo"`
 	}{ProtocolVersion: PreferredVersion}
+	if handlers.Elicitation {
+		params.Capabilities.Elicitation = &modes{}
+	}
+	if handlers.Sampling {
+		params.Capabilities.Sampling = &struct{}{}
+	}
 	params.ClientInfo.Name = "tempest"
 	params.ClientInfo.Version = build.Current().Version
 	raw, err := wire.call(startupCtx, "mcp_1", "initialize", params)
@@ -173,18 +199,28 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 		return fail(fmt.Errorf("mcp_version: received %q; supported %s, %s", result.ProtocolVersion, SupportedVersions[0], SupportedVersions[1]))
 	}
 	client.version = result.ProtocolVersion
+	type listing struct {
+		ListChanged bool `json:"listChanged"`
+	}
 	var caps struct {
-		Tools *struct {
-			ListChanged bool `json:"listChanged"`
-		} `json:"tools"`
+		Tools     *listing  `json:"tools"`
+		Resources *listing  `json:"resources"`
+		Prompts   *listing  `json:"prompts"`
+		Logging   *struct{} `json:"logging"`
 	}
 	if json.Unmarshal(result.Capabilities, &caps) != nil {
 		return fail(errors.New("mcp_protocol: malformed capabilities"))
 	}
 	if caps.Tools != nil {
-		client.tools = true
-		client.listChanged = caps.Tools.ListChanged
+		client.caps.Tools, client.caps.ToolsListChanged = true, caps.Tools.ListChanged
 	}
+	if caps.Resources != nil {
+		client.caps.Resources, client.caps.ResourcesListChanged = true, caps.Resources.ListChanged
+	}
+	if caps.Prompts != nil {
+		client.caps.Prompts, client.caps.PromptsListChanged = true, caps.Prompts.ListChanged
+	}
+	client.caps.Logging = caps.Logging != nil
 	if httpWire, ok := wire.(*httpTransport); ok {
 		httpWire.setVersion(client.version)
 	}
@@ -230,6 +266,10 @@ func (c *Client) Call(ctx context.Context, method string, params any) (raw json.
 	var rpcErr *rpc.Error
 	if errors.As(err, &rpcErr) {
 		return nil, fmt.Errorf("%s: remote JSON-RPC code %d: %w", method, rpcErr.Code, rpcErr)
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		return nil, fmt.Errorf("%s: %w", method, err)
 	}
 	return nil, fmt.Errorf("mcp_disconnected: %s: %w; remote outcome may be unknown", method, err)
 }

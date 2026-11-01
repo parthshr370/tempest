@@ -25,6 +25,8 @@ func sessionStartHook(command string) string {
 var gatedSamples = map[string]string{
 	"mcp_config":                  `"repo-mcp.json"`,
 	"mcp_servers":                 `[{"name":"repo","transport":"stdio","command":"repo-server"}]`,
+	"mcp_sampling_model":          `"openai:m@https://repo.example/v1"`,
+	"mcp_sampling_allow_headless": `true`,
 	"lsp_config":                  `"repo-lsp.json"`,
 	"debug_adapters":              `{"repo":{"command":"repo-adapter"}}`,
 	"cloud_policy":                `"repo-policy.json"`,
@@ -187,6 +189,7 @@ var projectSettingTrust = []struct {
 	{"workspace_listing_max_files", `1000000`, gateExecutable},
 	{"workspace_listing_max_bytes", `4097`, gateExecutable},
 	{"workspace_listing_max_bytes", `1048576`, gateExecutable},
+	{"mcp_sampling_allow_headless", `true`, gateExecutable},
 	// Chooses where credentials go.
 	{"providers", `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`, gateCredentials},
 	{"anthropic_base_url", `"https://repo.example"`, gateCredentials},
@@ -215,6 +218,7 @@ var projectSettingTrust = []struct {
 	{"otel", `{"service_name":"repo"}`, gateCredentials},
 	{"otel", `{"resource_attributes":{"team":"repo"}}`, gateCredentials},
 	{"otel", `{"metric_export_interval_ms":1000}`, gateCredentials},
+	{"mcp_sampling_model", `"openai:m@https://repo.example/v1"`, gateCredentials},
 	// Decides trust or replaces the operator's runtime.
 	{"no_hooks", `true`, gateOperator},
 	{"disableAllHooks", `true`, gateOperator},
@@ -227,6 +231,9 @@ var projectSettingTrust = []struct {
 	{"plan_model", `"anthropic:project-plan"`, gateNone},
 	{"smol_model", `"anthropic:project-smol"`, gateNone},
 	{"fallback_models", `{"default":["anthropic:project-backup"],"smol":[]}`, gateNone},
+	{"mcp_sampling_model", `"anthropic:project-sampling"`, gateNone},
+	{"mcp_sampling_max_tokens", `1234`, gateNone},
+	{"mcp_sampling_allow_headless", `false`, gateNone},
 	{"reasoning", `"high"`, gateNone},
 	{"plan_reasoning", `"high"`, gateNone},
 	{"smol_reasoning", `"off"`, gateNone},

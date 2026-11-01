@@ -8,34 +8,48 @@ import (
 	"go.harness.dev/harness/internal/rpc"
 )
 
-func (b *Broker) setForm(connection *rpc.Conn, raw json.RawMessage) {
+// setElicitation records which elicitation modes a client declared.
+func (b *Broker) setElicitation(connection *rpc.Conn, raw json.RawMessage) {
 	if b == nil {
 		return
 	}
 	var modes map[string]json.RawMessage
-	var form map[string]json.RawMessage
-	supported := json.Unmarshal(raw, &modes) == nil && json.Unmarshal(modes["form"], &form) == nil && form != nil
+	_ = json.Unmarshal(raw, &modes)
+	declared := func(mode string) bool {
+		var settings map[string]json.RawMessage
+		return json.Unmarshal(modes[mode], &settings) == nil && settings != nil
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if supported {
-		b.forms[connection] = true
-	} else {
-		delete(b.forms, connection)
+	for mode, connections := range map[string]map[*rpc.Conn]bool{"form": b.forms, "url": b.urls} {
+		if declared(mode) {
+			connections[connection] = true
+		} else {
+			delete(connections, connection)
+		}
 	}
+}
+
+// connection picks a client authorized for the session that declared mode.
+func (b *Broker) connection(sessionID, mode string) *rpc.Conn {
+	supported := b.forms
+	if mode == "url" {
+		supported = b.urls
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for candidate, count := range b.approvers[sessionID] {
+		if count > 0 && supported[candidate] {
+			return candidate
+		}
+	}
+	return nil
 }
 
 // Question routes only to a capability-negotiated connection authorized for this session.
 // It never transfers a partially answered question to a reconnecting watcher.
 func (b *Broker) Question(ctx context.Context, request question.Request) ([]question.Answer, error) {
-	b.mu.Lock()
-	var connection *rpc.Conn
-	for candidate, count := range b.approvers[request.SessionID] {
-		if count > 0 && b.forms[candidate] {
-			connection = candidate
-			break
-		}
-	}
-	b.mu.Unlock()
+	connection := b.connection(request.SessionID, "form")
 	if connection == nil {
 		return nil, question.Unavailable
 	}
@@ -61,4 +75,26 @@ func (b *Broker) Question(ctx context.Context, request question.Request) ([]ques
 		answers = append(answers, answer)
 	}
 	return answers, nil
+}
+
+// Elicit forwards an MCP server's elicitation, or an authorization URL, to a
+// client of the session that declared the request's mode.
+func (b *Broker) Elicit(ctx context.Context, request question.Elicit) (question.ElicitResult, error) {
+	if err := request.Validate(); err != nil {
+		return question.ElicitResult{}, err
+	}
+	connection := b.connection(request.SessionID, request.Mode)
+	if connection == nil {
+		return question.ElicitResult{}, question.Unavailable
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+	var raw json.RawMessage
+	if err := connection.Call(ctx, "elicitation/create", request.Params(false), &raw); err != nil {
+		return question.ElicitResult{}, err
+	}
+	if !b.authorized(request.SessionID, connection) {
+		return question.ElicitResult{}, question.Unavailable
+	}
+	return question.DecodeResult(request, raw)
 }

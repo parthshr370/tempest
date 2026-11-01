@@ -86,7 +86,7 @@ func TestMCPListChangedDirtyRefresh(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":%s}`, message.ID, result)
 	}))
 	defer server.Close()
-	manager, err := Open(context.Background(), t.TempDir(), t.TempDir(), []mcpconfig.Server{{Name: "refresh", Transport: "http", URL: server.URL}}, nil, nil)
+	manager, err := Open(context.Background(), []mcpconfig.Server{{Name: "refresh", Transport: "http", URL: server.URL}}, Options{Cwd: t.TempDir(), SpillDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}

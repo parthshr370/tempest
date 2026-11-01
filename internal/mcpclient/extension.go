@@ -22,7 +22,7 @@ func (manager *Manager) Bundles() []extension.Definition {
 	bundles := make([]extension.Definition, 0, len(manager.servers))
 	for _, peer := range manager.servers {
 		peer.mu.Lock()
-		tools := append([]agent.AgentTool(nil), peer.tools...)
+		tools := append([]agent.AgentTool(nil), peer.catalog.tools...)
 		name := peer.config.Name
 		peer.mu.Unlock()
 		schemas := make([]types.Tool, 0, len(tools))
