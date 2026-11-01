@@ -85,7 +85,7 @@ func TestMaybeCompactUnderBudgetNoop(t *testing.T) {
 	r := &compactionRunner{contextWindow: 200000, model: f.Model(), streamFn: f.StreamSimple, settings: compaction.DefaultCompactionSettings}
 	msgs := []ptypes.Message{cUser("hi"), cAssistant("hello")}
 
-	out, ok := r.maybeCompact(msgs)
+	out, ok := r.maybeCompact(msgs, r.model)
 	if ok {
 		t.Fatal("should not compact well under the window")
 	}
@@ -111,7 +111,7 @@ func TestMaybeCompactSummarizesOverBudget(t *testing.T) {
 		cUser("keep this recent ask"),
 	}
 
-	out, ok := r.maybeCompact(msgs)
+	out, ok := r.maybeCompact(msgs, r.model)
 	if !ok {
 		t.Fatal("expected compaction over budget")
 	}
@@ -204,13 +204,13 @@ func TestExtensionCompactionHookOnlyRunsAtActualBoundary(t *testing.T) {
 	refused := errors.New("compaction refused")
 	calls := 0
 	runner := &compactionRunner{contextWindow: 200000, model: provider.Model(), streamFn: provider.StreamSimple, settings: compaction.DefaultCompactionSettings, beforeCompaction: func(context.Context, string) error { calls++; return refused }}
-	if _, changed, err := runner.compact(context.Background(), []ptypes.Message{cUser("short")}); err != nil || changed || calls != 0 {
+	if _, changed, err := runner.compact(context.Background(), []ptypes.Message{cUser("short")}, runner.model); err != nil || changed || calls != 0 {
 		t.Fatalf("hook ran without compaction: %t %d %v", changed, calls, err)
 	}
 	runner.contextWindow = 100
 	runner.settings = compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10}
 	messages := []ptypes.Message{cUser(strings.Repeat("A", 400)), cAssistant(strings.Repeat("B", 400)), cUser("recent")}
-	if _, _, err := runner.compact(context.Background(), messages); !errors.Is(err, refused) || calls != 1 || provider.CallCount() != 0 {
+	if _, _, err := runner.compact(context.Background(), messages, runner.model); !errors.Is(err, refused) || calls != 1 || provider.CallCount() != 0 {
 		t.Fatalf("unapproved summary sent: calls=%d provider=%d err=%v", calls, provider.CallCount(), err)
 	}
 }

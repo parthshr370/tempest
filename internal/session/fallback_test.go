@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/compaction"
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
@@ -693,5 +695,60 @@ func TestModelRequestHooksSkipARetryCancelledInItsBackoff(t *testing.T) {
 	inputs := readHookInputs(t, path)
 	if rig.primary.callCount() != 1 || len(inputs) != 2 || inputs[0]["hook_event_name"] != "PreModelRequest" || inputs[1]["status"] != "failed" {
 		t.Fatalf("provider calls = %d, hook inputs = %v", rig.primary.callCount(), inputs)
+	}
+}
+
+// After a run switches to a backup model, compaction between its turns
+// goes to that backup too: the run's model route sticks, so the summary
+// does not spend another retry chain on the unavailable primary.
+func TestCompactionUsesTheRunsBackupModel(t *testing.T) {
+	const (
+		// window is small enough that the file read below needs compaction.
+		window         = 1000
+		historyPadding = 6000
+		historyLine    = 79
+	)
+	primary, backup := newStatusProvider("primary", "p1", http.StatusServiceUnavailable), newStatusProvider("backup", "b1", 0)
+	policy := retry.DefaultConfig()
+	policy.MaxAttempts = fallbackAttempts
+	policy.Sleeper = noRetryDelay{}
+	primaryRetrier, err := retry.New(primary, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupRetrier, err := retry.New(backup, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryModel, backupModel := primary.faux.Model(), backup.faux.Model()
+	primaryModel.ContextWindow, backupModel.ContextWindow = window, window
+	chain, err := retry.NewFallback([]retry.Candidate{{Model: primaryModel, Stream: primaryRetrier}, {Model: backupModel, Stream: backupRetrier}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The run starts small; the file its first turn reads needs compaction.
+	cwd := t.TempDir()
+	line := strings.Repeat("a", historyLine) + "\n"
+	if err := os.WriteFile(filepath.Join(cwd, "big.txt"), []byte(strings.Repeat(line, historyPadding/historyLine)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary := faux.Respond(faux.Text("summary"))
+	backup.faux.SetResponses(faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"big.txt"}`), "read-1")), summary, summary, summary)
+	stack, err := BuildAgentStack(StackConfig{
+		Cwd: cwd, Model: primaryModel, StreamFn: chain.Stream, FallbackModels: []types.Model{backupModel},
+		Compaction: &compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := stack.Agent.PromptText(context.Background(), "go")
+	if err != nil || result.Err != nil {
+		t.Fatalf("run err=%v result=%v", err, result.Err)
+	}
+	if strings.Contains(fmt.Sprint(stack.Agent.State().Messages), line) {
+		t.Fatal("the read was not compacted")
+	}
+	if calls := primary.callCount(); calls != fallbackAttempts {
+		t.Fatalf("primary called %d times, want only the run's %d attempts before its switch", calls, fallbackAttempts)
 	}
 }

@@ -592,6 +592,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 			runner.settings = *cfg.Compaction
 		}
 		runner.hooks = hookRunner
+		runner.backups = cfg.FallbackModels
 		if cfg.Extensions != nil {
 			runner.beforeCompaction = cfg.Extensions.BeforeCompactionSource
 		}

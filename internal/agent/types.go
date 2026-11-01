@@ -161,6 +161,10 @@ type ShouldStopAfterTurnContext struct {
 	NewMessages []types.Message
 	Handoff     *string
 	Overflow    bool
+	// Model is the model the run is on: its primary, or the backup it
+	// switched to and keeps until it ends. Work between turns, such as
+	// compaction, goes to it.
+	Model types.Model
 }
 
 // AgentLoopTurnUpdate replaces selected state before the next provider request.

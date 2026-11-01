@@ -177,8 +177,10 @@ thinking signatures, encrypted reasoning and redacted thinking from the other mo
 are removed, its visible thinking becomes text, and tool-call IDs are normalized.
 
 A switch lasts for the rest of the run, the prompt and every turn it causes, because
-changing models again would restart the provider's prompt cache. The next prompt
-tries the primary again. Each switch is:
+changing models again would restart the provider's prompt cache. Compaction between
+the run's turns goes to the backup too, and its receipt names the backup. Compaction
+still budgets against the primary model's context window. The next prompt tries the
+primary again. Each switch is:
 
 - **Journaled** as a `model_fallback` record (`from`, `to`, `reason`, `attempts`,
   `fallback_index`) before the backup is called: the backup gets the request only

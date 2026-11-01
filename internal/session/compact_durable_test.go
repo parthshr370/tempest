@@ -34,7 +34,7 @@ func TestCompactionPaidPhaseReusedAndUnknownNeverRetried(t *testing.T) {
 		return compaction.SummaryResult{Text: "cached paid history", Usage: types.Usage{Input: 9, TotalTokens: 9}}, nil
 	}
 	source, preparation := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	text, err := r.phase(ctx, "cmp_reuse", source, preparation, "history", call)
+	text, err := r.phase(ctx, r.model, "cmp_reuse", source, preparation, "history", call)
 	if err != nil || text != "cached paid history" {
 		t.Fatal(text, err)
 	}
@@ -44,10 +44,10 @@ func TestCompactionPaidPhaseReusedAndUnknownNeverRetried(t *testing.T) {
 	}
 	resumed := newCompactionRunner(f.Model(), f.StreamSimple)
 	resumed.configureJournal(s, loaded, a)
-	if _, err := resumed.phase(ctx, "cmp_reuse", source, preparation, "history", call); err != nil || paid != 1 {
+	if _, err := resumed.phase(ctx, resumed.model, "cmp_reuse", source, preparation, "history", call); err != nil || paid != 1 {
 		t.Fatal("paid phase requested twice", paid, err)
 	}
-	if _, err := resumed.phase(ctx, "cmp_reuse", source, preparation, "prefix", call); err != nil || paid != 2 {
+	if _, err := resumed.phase(ctx, resumed.model, "cmp_reuse", source, preparation, "prefix", call); err != nil || paid != 2 {
 		t.Fatal("resume did not pay only missing prefix", paid, err)
 	}
 	source = strings.Repeat("c", 64)
@@ -61,7 +61,7 @@ func TestCompactionPaidPhaseReusedAndUnknownNeverRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	resumed.configureJournal(s, loaded, a)
-	if _, err := resumed.phase(ctx, "cmp_unknown", source, preparation, "prefix", call); err == nil || !strings.Contains(err.Error(), "outcome_unknown") || paid != 2 {
+	if _, err := resumed.phase(ctx, resumed.model, "cmp_unknown", source, preparation, "prefix", call); err == nil || !strings.Contains(err.Error(), "outcome_unknown") || paid != 2 {
 		t.Fatal("unknown phase retried", paid, err)
 	}
 	if loaded.UsageTotal.TotalTokens != 18 {
@@ -158,13 +158,13 @@ func TestExtensionCompactionDenySkipsWithoutCallingProvider(t *testing.T) {
 	runner.settings = compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10}
 	runner.beforeCompaction = func(context.Context, string) error { return extension.ErrDenied }
 	messages := []types.Message{cUser(strings.Repeat("a", 400)), cAssistant(strings.Repeat("b", 400)), cUser(strings.Repeat("c", 400)), cAssistant(strings.Repeat("d", 400)), cUser("keep recent")}
-	result, changed, err := runner.compact(context.Background(), messages)
+	result, changed, err := runner.compact(context.Background(), messages, runner.model)
 	if err != nil || changed || !reflect.DeepEqual(result, messages) || provider.CallCount() != 0 {
 		t.Fatalf("denied compaction changed run: changed=%t err=%v provider=%d", changed, err, provider.CallCount())
 	}
 	fault := errors.New("extension fault")
 	runner.beforeCompaction = func(context.Context, string) error { return fault }
-	if _, _, err := runner.compact(context.Background(), messages); !errors.Is(err, fault) {
+	if _, _, err := runner.compact(context.Background(), messages, runner.model); !errors.Is(err, fault) {
 		t.Fatalf("extension fault was suppressed: %v", err)
 	}
 }
