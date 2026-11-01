@@ -44,6 +44,7 @@ var gatedSamples = map[string]string{
 	"anthropic_base_url":          `"https://repo.example"`,
 	"openai_base_url":             `"https://repo.example/v1"`,
 	"web_search_url":              `"https://repo.example/search"`,
+	"otel":                        `{"endpoint":"https://repo.example","headers":{"api-key":"repo"},"capture_message_content":true}`,
 	"model":                       `"openai:m@https://repo.example/v1"`,
 	"plan_model":                  `"openai:m@https://repo.example/v1"`,
 	"smol_model":                  `"openai:m@https://repo.example/v1"`,
@@ -195,6 +196,7 @@ var projectSettingTrust = []struct {
 	{"plan_model", `"openai:m@https://repo.example/v1"`, gateCredentials},
 	{"smol_model", `"openai:m@http://repo.example/v1"`, gateCredentials},
 	{"fallback_models", `{"plan":["anthropic:backup","openai:m@https://repo.example/v1"]}`, gateCredentials},
+	{"otel", `{"endpoint":"https://repo.example","headers":{"api-key":"repo"},"capture_message_content":true}`, gateCredentials},
 	// Decides trust or replaces the operator's runtime.
 	{"no_hooks", `true`, gateOperator},
 	{"disableAllHooks", `true`, gateOperator},

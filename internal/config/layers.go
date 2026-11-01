@@ -311,6 +311,8 @@ const (
 	inputBool
 	inputFloat
 	inputList
+	// inputPairs is the OTEL_* key=value,key=value form; it becomes an object.
+	inputPairs
 )
 
 // flagInput is a flag value that knows whether the caller set it.
@@ -404,6 +406,20 @@ var settingInputs = []settingInput{
 	{key: "cloud_policy", env: "HARNESS_CLOUD_POLICY", flag: "cloud-policy", field: func(f *FlagValues) flagInput { return &f.CloudPolicy }},
 	{key: "no_hooks", env: "HARNESS_NO_HOOKS", flag: "no-hooks", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.NoHooks }},
 	{key: "environment", env: "HARNESS_ENVIRONMENT", flag: "environment", field: func(f *FlagValues) flagInput { return &f.Environment }},
+	{key: "otel.disabled", env: "OTEL_SDK_DISABLED", kind: inputBool},
+	{key: "otel.endpoint", env: "OTEL_EXPORTER_OTLP_ENDPOINT"},
+	{key: "otel.traces_endpoint", env: "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"},
+	{key: "otel.metrics_endpoint", env: "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"},
+	{key: "otel.protocol", env: "OTEL_EXPORTER_OTLP_PROTOCOL"},
+	{key: "otel.traces_protocol", env: "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"},
+	{key: "otel.metrics_protocol", env: "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"},
+	{key: "otel.headers", env: "OTEL_EXPORTER_OTLP_HEADERS", kind: inputPairs},
+	{key: "otel.compression", env: "OTEL_EXPORTER_OTLP_COMPRESSION"},
+	{key: "otel.timeout_ms", env: "OTEL_EXPORTER_OTLP_TIMEOUT", kind: inputInt},
+	{key: "otel.service_name", env: "OTEL_SERVICE_NAME"},
+	{key: "otel.resource_attributes", env: "OTEL_RESOURCE_ATTRIBUTES", kind: inputPairs},
+	{key: "otel.capture_message_content", env: "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", kind: inputBool},
+	{key: "otel.metric_export_interval_ms", env: "OTEL_METRIC_EXPORT_INTERVAL", kind: inputInt},
 }
 
 // parseEnvironmentValue converts a nonblank HARNESS_* value by kind.
@@ -438,6 +454,18 @@ func parseEnvironmentValue(kind inputKind, value string) (*settingsNode, error) 
 		return numberNode(strconv.FormatFloat(parsed, 'g', -1, 64)), nil
 	case inputList:
 		return stringsNode(splitCommaList(value))
+	case inputPairs:
+		pairs, err := parseKeyValuePairs(value)
+		if err != nil {
+			return nil, err
+		}
+		node := &settingsNode{object: make(map[string]*settingsNode, len(pairs))}
+		for key, text := range pairs {
+			if node.object[key], err = stringNode(text); err != nil {
+				return nil, err
+			}
+		}
+		return node, nil
 	}
 	return stringNode(value)
 }
@@ -462,6 +490,7 @@ func environmentLayer(lookup func(string) string) (*settingsLayer, map[string]er
 			invalid[input.key] = err
 			continue
 		}
+
 		setMember(layer.members, strings.Split(input.key, "."), node)
 		layer.origins[input.key] = input.env
 	}
@@ -598,6 +627,9 @@ var projectGates = map[string]trustGate{
 	"workspace_listing":           gateExecutable,
 	"workspace_listing_max_files": gateExecutable,
 	"workspace_listing_max_bytes": gateExecutable,
+	// otel chooses where spans, metrics and their headers (often an API
+	// key) are sent, and whether message content goes with them.
+	"otel": gateCredentials,
 }
 
 // projectGate classifies one repository setting. A model with an @http(s)
@@ -1380,6 +1412,11 @@ func isSecretPath(path []string) bool {
 			return true
 		}
 		if depth >= 2 && slices.ContainsFunc(secretContainers, func(container string) bool { return strings.EqualFold(segment, container) }) {
+			return true
+		}
+		// otel.headers is a top-level container: OTLP headers usually carry
+		// the collector's API key.
+		if depth == 1 && path[0] == "otel" && segment == "headers" {
 			return true
 		}
 	}
