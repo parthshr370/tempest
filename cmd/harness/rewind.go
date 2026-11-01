@@ -19,15 +19,18 @@ import (
 func runRewind(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("rewind", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var sessionID, dir, cwd, id, report string
+	var sessionID, cwd, id, report string
 	var force, list bool
+	var values config.FlagValues
 	fs.StringVar(&sessionID, "session", "", "session id or journal path; defaults to the most recent session")
-	fs.StringVar(&dir, "session-dir", "", "session storage directory")
 	fs.StringVar(&cwd, "cwd", "", "workspace directory (defaults to current directory)")
 	fs.StringVar(&id, "checkpoint", "", "checkpoint id (defaults to newest explicit, otherwise newest automatic)")
 	fs.StringVar(&report, "report", "", "findings retained in the rewound conversation")
 	fs.BoolVar(&force, "force", false, "allow losing outside workspace edits")
 	fs.BoolVar(&list, "list", false, "list retained checkpoints without rewinding")
+	// The settings layers, -profile and -c included, choose the session
+	// directory as they do for a run.
+	addConfigFlags(fs, &values)
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -38,6 +41,7 @@ func runRewind(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "rewind does not accept positional arguments")
 		return exitUsage
 	}
+	fs.Visit(func(f *flag.Flag) { markConfigFlag(f.Name, &values) })
 	ctx := context.Background()
 	err := func() error {
 		if cwd == "" {
@@ -52,13 +56,12 @@ func runRewind(args []string, stdout, stderr io.Writer) int {
 		if e != nil {
 			return e
 		}
-		if dir == "" {
-			cfg, e := (config.Config{}).Resolve()
-			if e != nil {
-				return e
-			}
-			dir = cfg.SessionDir()
+		cfg, e := (config.Config{WorkingDir: cwd, Flags: values}).Resolve()
+		if e != nil {
+			return e
 		}
+		logConfigWarnings(cfg)
+		dir := cfg.SessionDir()
 		path := sessionID
 		if path == "" {
 			path, e = journal.Recent(ctx, dir, cwd)

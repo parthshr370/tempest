@@ -193,6 +193,8 @@ func TestLayerMergeObjectsReplaceArraysAndUnsetWithNull(t *testing.T) {
 		"debug_adapters": {"node": {"command": "node", "args": ["user.js"]}},
 		"providers": {"gw": {"protocol": "openai-chat", "base_url": "https://user.example/v1", "api_key_env": "GW_KEY"}}
 	}`)
+	// Trusted, since an untrusted repository's null cannot unset an operator cap.
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
 	w.write(w.projectPath(), `{"max_tokens": null}`)
 	w.flags.Overrides = StringsInput{Set: true, Values: []string{
 		"providers.gw.base_url=https://override.example/v1",
@@ -552,6 +554,20 @@ func TestProfileUnset(t *testing.T) {
 			t.Fatalf("warnings %q do not name the kept key", warnings)
 		}
 	})
+	t.Run("an operator null drops what the repository's null kept", func(t *testing.T) {
+		w := newLayerWorkspace(t)
+		w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile","permission_mode_default":"plan"}}}`)
+		w.write(w.projectPath(), `{"profiles":{"review":null}}`)
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{"profiles=null", `profiles.review={"enable_task":true}`}}
+		w.flags.Profile = StringInput{Value: "review", Set: true}
+		resolved := w.mustResolve()
+		if resolved.PermissionModeDefault() == "plan" || !resolved.EnableTask() {
+			t.Fatalf("mode=%q enable_task=%t", resolved.PermissionModeDefault(), resolved.EnableTask())
+		}
+		if warnings := resolved.Warnings(); len(warnings) != 0 {
+			t.Fatalf("warnings = %q, want none for keys the operator's null dropped", warnings)
+		}
+	})
 }
 
 func TestOverrideValues(t *testing.T) {
@@ -643,15 +659,28 @@ func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
 		{&Error{Field: "max_tokens", Err: errors.New("must be positive")}, "config max_tokens: must be positive"},
 		{&Error{Field: "mcp_sampling_max_tokens", Err: errors.New("must be positive")}, "config mcp_sampling_max_tokens: must be positive"},
 		{&Error{Field: "providers", Err: errors.New("relay: header Authorization: Bearer abcdefgh12345")}, "config providers: relay: header Authorization: [REDACTED]"},
+		// An unknown key or profile name is user text: a credential pasted
+		// into one is masked too.
+		{&Error{Field: "sk-abcdefgh12345", Err: errors.New("unknown setting")}, "config [REDACTED]: unknown setting"},
+		{&Error{Field: "profiles.Bearer abcdefgh12345", Err: errors.New("profile definition must be an object")}, "config profiles.[REDACTED]: profile definition must be an object"},
 	} {
 		if got := test.err.Error(); got != test.want {
 			t.Errorf("Error() = %q, want %q", got, test.want)
 		}
 	}
 	w := newLayerWorkspace(t)
+	// An untrusted repository's invalid cap is dropped as above the operator's.
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
 	w.write(w.projectPath(), `{"max_tokens": 0}`)
 	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "max_tokens: must be positive") {
 		t.Fatalf("err = %v", err)
+	}
+
+	strict := newLayerWorkspace(t)
+	strict.flags.StrictConfig = BoolInput{Value: true, Set: true}
+	strict.flags.Overrides = StringsInput{Set: true, Values: []string{"sk-abcdefgh12345=1"}}
+	if _, err := strict.resolve(); err == nil || strings.Contains(err.Error(), "abcdefgh12345") {
+		t.Fatalf("strict unknown key err = %v, want the key masked", err)
 	}
 }
 
@@ -665,7 +694,10 @@ func TestInvalidValueNamesTheLayerThatSetIt(t *testing.T) {
 		field  string
 		source func(w *layerWorkspace) string
 	}{
-		{"project scalar", func(w *layerWorkspace) { w.write(w.projectPath(), `{"max_tokens": 0}`) }, "max_tokens", func(w *layerWorkspace) string { return "project " + w.projectPath() }},
+		{"project scalar", func(w *layerWorkspace) {
+			w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+			w.write(w.projectPath(), `{"max_tokens": 0}`)
+		}, "max_tokens", func(w *layerWorkspace) string { return "project " + w.projectPath() }},
 		{"project-local enum", func(w *layerWorkspace) { w.write(w.localPath(), `{"reasoning": "max"}`) }, "reasoning", func(w *layerWorkspace) string { return "project-local " + w.localPath() }},
 		{"user fallback entry", func(w *layerWorkspace) { w.write(w.user, `{"fallback_models": {"plan": ["nope:model"]}}`) }, "fallback_models.plan[0]", func(w *layerWorkspace) string { return "user " + w.user }},
 		{"environment", func(w *layerWorkspace) { w.env["HARNESS_BASH_TIMEOUT"] = "soon" }, "bash_timeout", func(*layerWorkspace) string { return "env HARNESS_BASH_TIMEOUT" }},

@@ -18,13 +18,15 @@ import (
 func runConversation(command string, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	var sessionID, sessionDir, cwd, fauxScript, entryID, note, requestID, query, cursor, newCwd string
+	var sessionID, cwd, entryID, note, requestID, query, cursor, newCwd string
 	var limit int
 	var precedingSafe bool
+	var values config.FlagValues
 	flags.StringVar(&sessionID, "session", "", "session id or journal path; defaults to the most recent session")
-	flags.StringVar(&sessionDir, "session-dir", "", "session storage directory")
 	flags.StringVar(&cwd, "cwd", "", "workspace used to find the session")
-	flags.StringVar(&fauxScript, "faux-script", "", "hermetic provider response script")
+	// The settings layers, -profile and -c included, choose the session
+	// directory and faux script as they do for a run.
+	addConfigFlags(flags, &values)
 	switch command {
 	case "fork":
 		flags.StringVar(&entryID, "entry", "", "durable transcript entry id")
@@ -48,6 +50,7 @@ func runConversation(command string, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, command+" does not accept positional arguments")
 		return exitUsage
 	}
+	flags.Visit(func(f *flag.Flag) { markConfigFlag(f.Name, &values) })
 	if command == "fork" && entryID == "" {
 		fmt.Fprintln(stderr, "fork requires -entry")
 		return exitUsage
@@ -70,17 +73,12 @@ func runConversation(command string, args []string, stdout, stderr io.Writer) in
 		if err != nil {
 			return err
 		}
-		resolved, err := (config.Config{WorkingDir: cwd}).Resolve()
+		resolved, err := (config.Config{WorkingDir: cwd, Flags: values}).Resolve()
 		if err != nil {
 			return err
 		}
 		logConfigWarnings(resolved)
-		if sessionDir == "" {
-			sessionDir = resolved.SessionDir()
-		}
-		if fauxScript == "" {
-			fauxScript = resolved.FauxScript()
-		}
+		sessionDir, fauxScript := resolved.SessionDir(), resolved.FauxScript()
 		if sessionID == "" || filepath.Ext(sessionID) == ".jsonl" || filepath.IsAbs(sessionID) {
 			path := sessionID
 			if path == "" {

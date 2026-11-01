@@ -52,6 +52,8 @@ func runAgents(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	// A project agent_dir the trust rules dropped is named, not silently unused.
+	printConfigWarnings(stderr, resolved)
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stderr, "cwd error: %v\n", err)

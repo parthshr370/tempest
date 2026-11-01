@@ -53,7 +53,11 @@ type adapterProcess struct {
 	thread        int
 	stopped       bool
 	terminated    bool
-	stateChanged  chan struct{}
+	// hasConfirmedAttach is set by the adapter's successful attach response:
+	// only then has the debugger stopped the target, so only then may
+	// cleanup continue it.
+	hasConfirmedAttach bool
+	stateChanged       chan struct{}
 }
 
 // New validates adapter settings but starts no processes.
@@ -173,10 +177,18 @@ func (process *adapterProcess) killPrograms() error {
 // (Go's preemption SIGURG, for one) wins that race, the SIGSTOP stays pending
 // and the kernel delivers it after detach, leaving the program stopped. SIGCONT
 // discards a pending stop and resumes a stopped one. A running program that
-// handles SIGCONT sees one extra delivery.
+// handles SIGCONT sees one extra delivery. A target the adapter never
+// confirmed attaching to was never stopped by it, and may be a process its
+// user stopped on purpose, so it gets no SIGCONT.
 func (process *adapterProcess) continueAttached() error {
 	if process.target == nil {
 		return nil
+	}
+	process.stateMu.Lock()
+	confirmed := process.hasConfirmedAttach
+	process.stateMu.Unlock()
+	if !confirmed {
+		return process.target.release()
 	}
 	return process.target.resume()
 }
@@ -233,6 +245,21 @@ func (process *adapterProcess) Write(chunk []byte) (int, error) {
 	}
 	return len(chunk), err
 }
+
+// observe records what the adapter reports: a confirmed attach, and the
+// program's events.
+func (process *adapterProcess) observe(reported message) {
+	if reported.Type == "response" {
+		if reported.Command == "attach" && reported.Success {
+			process.stateMu.Lock()
+			process.hasConfirmedAttach = true
+			process.stateMu.Unlock()
+		}
+		return
+	}
+	process.event(reported)
+}
+
 func (process *adapterProcess) event(event message) {
 	switch event.Event {
 	case "process":
@@ -492,7 +519,7 @@ func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, tar
 		}
 		reader, writer, process.transport = connection, connection, connection
 	}
-	process.client = newClient(reader, writer, process.event)
+	process.client = newClient(reader, writer, process.observe)
 	go func() {
 		<-process.exited
 		_ = process.cleanup()

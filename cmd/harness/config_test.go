@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"os"
@@ -218,5 +219,73 @@ func TestResumeResolvesTheSessionsWorkspaceSettings(t *testing.T) {
 	}
 	if deny := opts.Config.PermissionDenyTools(); !slices.Equal(deny, []string{"bash"}) {
 		t.Fatalf("resumed deny list = %v, want the session workspace's [bash]", deny)
+	}
+}
+
+// The session controls find the session through the same settings layers as
+// a run: -profile and -c choose the session directory.
+func TestSessionControlsSeeTheSettingsLayers(t *testing.T) {
+	for _, assignment := range os.Environ() {
+		key, _, _ := strings.Cut(assignment, "=")
+		if strings.HasPrefix(key, "HARNESS_") || strings.HasPrefix(key, "LYRA_") {
+			t.Setenv(key, "")
+		}
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sessionDir := t.TempDir()
+	userPath := filepath.Join(home, ".config", config.ConfigDirName, "settings.json")
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	profile := fmt.Sprintf(`{"profiles":{"elsewhere":{"session_dir":%q}}}`, sessionDir)
+	if err := os.WriteFile(userPath, []byte(profile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "provider.json")
+	if err := os.WriteFile(script, []byte(`[{"text":"done"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-session-dir", sessionDir, "-faux-script", script, "-p", "hi"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, &stderr)
+	}
+	for _, args := range [][]string{
+		{"history", "-profile", "elsewhere"},
+		{"history", "-c", "session_dir=" + sessionDir},
+		{"rewind", "-list", "-profile", "elsewhere"},
+		{"rewind", "-list", "-c", "session_dir=" + sessionDir},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := run(args, &stdout, &stderr); code != 0 {
+			t.Errorf("%q: exit=%d stderr=%s", args, code, &stderr)
+		}
+	}
+}
+
+// agents list names a project agent_dir the trust rules dropped instead of
+// listing without it silently.
+func TestAgentsListPrintsConfigWarnings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(root, config.ProjectConfigDirName, "settings.json")
+	if err := os.MkdirAll(filepath.Dir(projectPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(projectPath, []byte(fmt.Sprintf(`{"agent_dir":%q}`, t.TempDir())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"agents", "list"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("agents list exit %d: %s", code, &stderr)
+	}
+	if warning := stderr.String(); !strings.Contains(warning, "warning: ") || !strings.Contains(warning, "agent_dir") || !strings.Contains(warning, projectPath) {
+		t.Fatalf("stderr %q does not name the dropped agent_dir", warning)
 	}
 }

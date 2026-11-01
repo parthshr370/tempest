@@ -52,18 +52,18 @@ below every settings file.
 Repository files are untrusted. Settings in `.harness/settings.json`,
 `.harness/settings.local.json`, and the profiles defined in them that run code, read
 local files into the model context, write outside the repository, widen permissions,
-turn on web tools, raise the operator's workspace listing caps, or choose where
-credentials go apply only after the operator trusts the workspace:
+turn on web tools, raise the operator's workspace listing, cost or resource caps, or
+choose where credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `context_files`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `context_files`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`, `max_tokens`, `mcp_sampling_max_tokens`, `retry_enabled`, `retry_max_attempts`, `retry_max_delay_ms`, `bash_timeout` or `log_file_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, `otel`, and a `model`, `plan_model`, `smol_model`, `mcp_sampling_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
-dropped are named in one warning in the log, in `tempest doctor`, and in
-`config show`.
+dropped are named in one warning in the log, in `tempest doctor` and `config show`,
+and on stderr from the `mcp` commands and `agents list`.
 
 An untrusted repository can narrow permissions and capabilities and never widen
 them. Its `"permission_mode_default": "plan"`, `"plan": true` and
@@ -79,16 +79,23 @@ Allow lists, looser modes and `"plan": false` are dropped with the trust warning
 a trusted workspace these keys are a settings layer like the rest: the project's deny
 list replaces the user's and its `null` unsets it.
 
-The session-start [workspace listing](skills-and-context.md#workspace-listing)
-works the same way. An untrusted repository may turn it off
-(`"workspace_listing": false`) or lower `workspace_listing_max_files` and
-`workspace_listing_max_bytes` to any whole number from 1 up to the operator's value:
-the merged value of the managed, user, profile, environment, flag and `-c` layers,
-or the built-in default when none sets it. A larger value, `"workspace_listing":
-true` when the operator turned the listing off, and a `null` or invalid value, which
-would fall back to the default, are dropped with the trust warning. Trust lifts the
-ceiling. The caps bound prompt size and the work a session does before its first
-request, which is the operator's budget to set.
+The session-start [workspace listing](skills-and-context.md#workspace-listing) and
+the cost and resource caps work the same way. An untrusted repository may turn the
+listing or retries off (`"workspace_listing": false`, `"retry_enabled": false`) and
+lower `workspace_listing_max_files`, `workspace_listing_max_bytes`, `max_tokens`,
+`mcp_sampling_max_tokens`, `retry_max_attempts`, `retry_max_delay_ms` and
+`log_file_max_bytes` to any whole number from 1, and `bash_timeout` to any positive
+duration, up to the operator's value: the merged value of the managed, user,
+profile, environment, flag and `-c` layers, or the built-in default when none sets
+it. The ceiling for `mcp_sampling_max_tokens` is the operator's own sampling cap,
+else the operator's `max_tokens`, which sampling inherits. When the operator set
+`retry_max_delay_ms` to 0 or less (no limit), any whole number applies. A larger
+value, `true` for a switch the operator turned off, and a `null` or invalid value,
+which would fall back to the default, are dropped with the trust warning. Trust
+lifts the ceiling. The caps bound prompt size, output tokens, retries, waiting,
+command run time and log disk use, which are the operator's budget to set. A
+repository `max_tokens` still counts as an explicit output cap, which ChatGPT plan
+models refuse.
 
 Trusted project `hooks` add to the hooks below them instead of replacing them: each
 event's array from `settings.json`, then from `settings.local.json`, is appended to the
@@ -136,11 +143,15 @@ from every lower file, and `"profiles": null` unsets every profile below; a late
 or `-c` can define it again. A null in a project file follows the trust rules: keys
 of a user or managed definition that the project could not set, or set to `null`,
 itself stay (in an untrusted workspace, `plan` and `permission_deny_tools` among
-them), and the warning names them. Selecting a profile that no file defines, or that
-a higher file unsets, is an error.
+them), and the warning names them, unless an operator file or `-c` above unsets the
+profile again. Selecting a profile that no file defines, or that a higher file
+unsets, is an error.
 
 `-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
-different `--profile`: the label of a saved ChatGPT account.
+different `--profile`: the label of a saved ChatGPT account. The session controls
+`fork`, `reset`, `compact`, `history` and `rewind` take `-profile`, `-c` and the
+other settings flags too; there they choose the session directory and faux script,
+and the session they reopen resolves its own settings from its workspace.
 
 ## Overrides with `-c`
 

@@ -194,8 +194,10 @@ tries the primary again. Each switch is:
   or 404 that caused the switch) has no message: its record is the log line, the
   `PostModelRequest` hook and the switch's `model_fallback` record.
 
-A cost budget must be enforceable for every backup too. A backup with an unknown
-price is refused at startup, like the primary.
+A cost budget must be enforceable for every model the run can bill: the run's
+model, the plan and smol role models agents run on, the MCP sampling model, and
+every backup of each. A `tempest` run with `-max-cost` refuses an unknown price on
+any of them at startup, like the primary, rather than when a child first uses it.
 
 ## Endpoint registry
 

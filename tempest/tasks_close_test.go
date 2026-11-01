@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,84 @@ import (
 	"go.harness.dev/harness/tempest/durable"
 	"go.harness.dev/harness/tempest/extension"
 )
+
+// pausingTaskCreateStore holds the commit of one task's creation, after it is
+// durable, until the test releases it.
+type pausingTaskCreateStore struct {
+	durable.Store
+	taskID    string
+	committed chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *pausingTaskCreateStore) AcquireSession(ctx context.Context, id string) (func(), error) {
+	return s.Store.(durable.SessionLeaser).AcquireSession(ctx, id)
+}
+
+func (s *pausingTaskCreateStore) Commit(ctx context.Context, c durable.Commit) (durable.Receipt, error) {
+	receipt, err := s.Store.Commit(ctx, c)
+	if err == nil && strings.HasSuffix(c.ID, "task:create:"+s.taskID) {
+		s.once.Do(func() { close(s.committed); <-s.release })
+	}
+	return receipt, err
+}
+
+// A task whose creation committed before Close sealed the session exists and
+// resumes when the session reopens, so CreateTask reports it created. An
+// ErrClosed here would make a client that retries on it create the task twice.
+func TestCreateTaskCommittedDuringCloseSucceeds(t *testing.T) {
+	provider := faux.New(faux.Options{})
+	registry := extension.NewRegistry()
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+	definition := extension.TaskDefinition{Name: "flow", Version: 1, Initial: json.RawMessage(`{}`), InputSchema: json.RawMessage(`{"type":"object"}`), StateSchema: json.RawMessage(`{"type":"object"}`), Run: func(context.Context, extension.Task, extension.Invocation) (extension.TaskDecision, error) {
+		return extension.TaskDecision{Kind: "complete"}, nil
+	}}
+	if err := registry.Install(t.Context(), extension.Definition{ID: "tasks", Revision: "v1", Tasks: []extension.TaskDefinition{definition}}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &pausingTaskCreateStore{Store: durable.NewMemory(), taskID: "late", committed: make(chan struct{}), release: make(chan struct{})}
+	owner, err := Open(t.Context(), Options{Cwd: t.TempDir(), SessionDir: t.TempDir(), Store: backend, New: &NewSession{}, Registry: registry, Extensions: []extension.Selection{{ID: "tasks", Required: true}}, Stack: &StackConfig{Model: provider.Model(), StreamFn: provider.StreamSimple}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type created struct {
+		task Task
+		err  error
+	}
+	creating := make(chan created, 1)
+	go func() {
+		task, err := owner.CreateTask(context.Background(), TaskRequest{ID: "late", Definition: "tasks/flow", Input: json.RawMessage(`{}`), Background: true})
+		creating <- created{task, err}
+	}()
+	select {
+	case <-backend.committed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the task's creation never committed")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- owner.Close(context.Background()) }()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		owner.core.mu.Lock()
+		sealed := owner.core.closed
+		owner.core.mu.Unlock()
+		if sealed {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(backend.release)
+			t.Fatal("Close did not seal the session")
+		}
+	}
+	close(backend.release)
+	result := <-creating
+	if closeErr := <-closed; closeErr != nil {
+		t.Fatalf("Close = %v", closeErr)
+	}
+	if result.err != nil || result.task.ID != "late" {
+		t.Fatalf("CreateTask whose write committed returned %+v, %v; want the task and no error", result.task, result.err)
+	}
+}
 
 // openWithBackgroundTask opens a session holding one admitted, undrained
 // background task named "background".

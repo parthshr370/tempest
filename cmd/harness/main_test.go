@@ -563,6 +563,32 @@ func TestCLIRunLifecycle(t *testing.T) {
 		}
 	})
 
+	// Agents run on the plan and smol roles and MCP sampling on the smol role
+	// or its own model, all charged to the budget, so an unknown price on any
+	// of them or their backups is refused at startup, not when a child starts.
+	t.Run("cost budget is refused for an unknown-priced role model or backup", func(t *testing.T) {
+		const unknown = "openai:not-a-cataloged-model@http://127.0.0.1:1/v1"
+		for name, args := range map[string][]string{
+			"smol model":     {"-smol-model", unknown},
+			"smol backup":    {"-c", `fallback_models.smol=["` + unknown + `"]`},
+			"plan model":     {"-plan-model", unknown},
+			"plan backup":    {"-c", `fallback_models.plan=["` + unknown + `"]`},
+			"sampling model": {"-c", "mcp_sampling_model=" + unknown},
+		} {
+			sessionDir := filepath.Join(t.TempDir(), "sessions")
+			// The local endpoint keeps a run that is not refused off the network.
+			cmd := exec.Command(exe, append([]string{"-p", "go", "-model", "anthropic:claude-opus-4-8", "-anthropic-base-url", "http://127.0.0.1:1", "-c", "retry_enabled=false", "-max-cost", "1", "-session-dir", sessionDir}, args...)...)
+			cmd.Dir = tmp
+			out, err := cmd.CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "budget error") || !strings.Contains(string(out), "not-a-cataloged-model") {
+				t.Errorf("%s: output = %q, err = %v; want refusal before the run", name, out, err)
+			}
+			if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+				t.Errorf("%s: session directory created: %v", name, err)
+			}
+		}
+	})
+
 	t.Run("non-finite cost is refused before session creation", func(t *testing.T) {
 		for _, limit := range []string{"NaN", "+Inf", "-Inf"} {
 			sessionDir := filepath.Join(t.TempDir(), "sessions")
