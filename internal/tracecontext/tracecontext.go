@@ -169,6 +169,19 @@ func FromContext(ctx context.Context) SpanContext { return scopeFrom(ctx).span }
 // a root or remote span.
 func ParentFromContext(ctx context.Context) SpanContext { return scopeFrom(ctx).parent }
 
+// Inherit gives ctx the span of from, including from's own parent or an
+// untraced scope that shadows a span further up. Work that runs under a
+// longer-lived context than the call that started it, such as a background
+// job under its session's scope, uses it to stay under that call's span. A
+// from that never carried trace context leaves ctx unchanged.
+func Inherit(ctx, from context.Context) context.Context {
+	current, ok := from.Value(contextKey{}).(scope)
+	if !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, contextKey{}, current)
+}
+
 // StartRun begins an agent run's span. When traced is false the run and
 // everything below it is untraced, even under a remote parent. Otherwise the
 // run is a child of the current span (another run's tool call, or a serve

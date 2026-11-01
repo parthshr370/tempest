@@ -22,6 +22,7 @@ import (
 
 	"go.harness.dev/harness/internal/outputschema"
 	"go.harness.dev/harness/internal/taskstate"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/internal/worktree"
 )
@@ -387,7 +388,7 @@ func (manager *Manager) adopt(ctx context.Context, run work.RunInfo, record *ent
 			err = manager.append(ctx, "job_attached", run.RunID, payload)
 		}
 		if err == nil {
-			manager.launch(record, true)
+			manager.launch(record, true, ctx)
 		}
 		record.transition.Unlock()
 		return err
@@ -611,7 +612,7 @@ func (manager *Manager) StartTask(ctx context.Context, spec work.TaskSpec) (work
 		}
 		return work.Job{}, err
 	}
-	manager.launch(record, false)
+	manager.launch(record, false, ctx)
 	return cloneJob(job), nil
 }
 func (manager *Manager) existing(jobID, digest string) (work.Job, bool, error) {
@@ -702,13 +703,16 @@ func (manager *Manager) admitBash(ctx context.Context, spec work.BashSpec) (*ent
 		}
 		return nil, work.Job{}, err
 	}
-	manager.launch(record, false)
+	manager.launch(record, false, ctx)
 	return record, cloneJob(job), nil
 }
 
-func (manager *Manager) launch(record *entry, resume bool) {
+// launch runs the job under the run's scope, which outlives the tool call
+// that started it, and under caller's trace span: a task's child run and a
+// background command are children of the call that launched them.
+func (manager *Manager) launch(record *entry, resume bool, caller context.Context) {
 	manager.mu.Lock()
-	scope := manager.scope
+	scope := tracecontext.Inherit(manager.scope, caller)
 	jobCtx, cancel := context.WithCancel(scope)
 	if record.recovery.CancelRequested {
 		cancel()
