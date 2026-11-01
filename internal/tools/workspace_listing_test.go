@@ -217,8 +217,8 @@ func TestWorkspaceListingWalkSkipsNonRegularIgnoreFile(t *testing.T) {
 
 // rg opens every .ignore and .gitignore it meets, so a FIFO among them
 // blocks it before it prints a name. With no name by half the budget the
-// rg run is dropped and the walk, which never opens a FIFO, lists the
-// workspace in the time left.
+// walk, which never opens a FIFO, starts beside rg, finishes first and is the
+// listing.
 func TestWorkspaceListingWalksWhenRgListsNothingByHalfTheBudget(t *testing.T) {
 	if _, err := exec.LookPath("rg"); err != nil {
 		t.Skip("rg not installed")
@@ -242,6 +242,42 @@ func TestWorkspaceListingWalksWhenRgListsNothingByHalfTheBudget(t *testing.T) {
 				t.Fatalf("listed %q", got)
 			}
 		})
+	}
+}
+
+// An rg that works but names its first file only after half the budget keeps
+// its names: the walk starts beside it instead of replacing it. Here the
+// workspace is searchable but unreadable, so rg's fake can run in it while
+// the walk can't list it, standing in for a walk too slow to finish.
+func TestWorkspaceListingKeepsSlowRgBesideTheWalk(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads any directory")
+	}
+	rg := filepath.Join(t.TempDir(), "rg")
+	script := "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nsleep 2.5\nprintf 'slow.go\\0'\n"
+	if err := os.WriteFile(rg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// macOS assesses a new executable on its first run, which can take a
+	// second; take that before the timed listing.
+	if err := exec.Command(rg, "warm").Run(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o100); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	// rg names its file at 2.5 s: after half of the 4 s budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+
+	files, err := localRgFiles(ctx, rg, dir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files.source != rgListingSource || strings.Join(files.paths, ",") != "slow.go" || files.more {
+		t.Fatalf("listed %+v", files)
 	}
 }
 
@@ -459,6 +495,35 @@ func TestWorkspaceListingRemoteWalksNonGitWorkspace(t *testing.T) {
 	}
 	if got, want := strings.Join(listedLines(t, listing), ","), "main.py,pkg/.gitignore,pkg/public.py"; got != want {
 		t.Fatalf("listed %q, want %q", got, want)
+	}
+}
+
+// An environment that runs out of listing time still answers in time for the
+// session to use the names it found: here its rg names one file and then
+// never finishes, and git is not installed.
+func TestWorkspaceListingRemoteDeadlineKeepsPartialNames(t *testing.T) {
+	bin := t.TempDir()
+	rg := filepath.Join(bin, "rg")
+	script := "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nprintf 'a.go\\0'\nexec /bin/sleep 10\n"
+	if err := os.WriteFile(rg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// macOS assesses a new executable on its first run, which can take a
+	// second; take that before the timed listing.
+	if err := exec.Command(rg, "warm").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	workspace := t.TempDir()
+	writeListingFiles(t, workspace, map[string]string{"a.go": "package a\n"})
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
+
+	listing, err := WorkspaceListing(context.Background(), lease, t.TempDir(), config.WorkspaceListing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(listing, `<workspace_files source="rg --files" paths="1+">`) || !strings.HasPrefix(strings.Join(listedLines(t, listing), ","), "a.go,[truncated: ") {
+		t.Fatalf("remote listing:\n%s", listing)
 	}
 }
 

@@ -36,6 +36,13 @@ const workspaceListingTimeout = 2 * time.Second
 // remoteListingMaxBytes bounds the names one environment reply carries.
 const remoteListingMaxBytes = 64 << 10
 
+// remoteListingTransit is the part of workspaceListingTimeout an environment
+// leaves for its reply to reach the session. The session's budget starts
+// before it sends the request, so an environment that spent the whole budget
+// would answer after the session stopped waiting, and the names it found by
+// its deadline would be lost.
+const remoteListingTransit = 500 * time.Millisecond
+
 // workspaceListingOperation lists the workspace on the environment's host.
 const workspaceListingOperation = "workspace_listing"
 
@@ -160,41 +167,76 @@ func rgListArgs(rg string) []string {
 // localRgFiles lists cwd with rg. At the deadline it lists the names found
 // so far, as the walk does. rg opens every .ignore and .gitignore it meets,
 // and a FIFO among them blocks it until it is killed, in a small workspace
-// before any name reaches us; telling that apart beforehand would take the
-// walk itself. So an rg that has named nothing by half the time left is
-// stopped, and the walk, which never opens a FIFO, gets the other half.
+// before any name reaches us; telling that apart from a slow filesystem
+// beforehand would take the walk itself. So when rg has named nothing by half
+// the time left, the walk, which never opens a FIFO, starts beside it: the
+// first to finish is the listing, and at the deadline rg's names are, or the
+// walk's when rg has none. An rg that fails with the walk running leaves the
+// listing to the walk.
 func localRgFiles(ctx context.Context, rg string, cwd string, maxFiles int) (workspaceFiles, error) {
 	rgCtx, stopRg := context.WithCancel(ctx)
 	defer stopRg()
-	var named, quiet atomic.Bool
+	walkCtx, stopWalk := context.WithCancel(ctx)
+	defer stopWalk()
+	var named atomic.Bool
+	var mu sync.Mutex
+	var walk *workspaceWalk
+	rgReturned := false
 	if deadline, ok := ctx.Deadline(); ok {
 		timer := time.AfterFunc(time.Until(deadline)/2, func() {
-			if !named.Load() {
-				quiet.Store(true)
-				stopRg()
+			mu.Lock()
+			defer mu.Unlock()
+			if rgReturned || named.Load() {
+				return
 			}
+			beside := startWorkspaceWalk(walkCtx, cwd, maxFiles)
+			walk = beside
+			go func() {
+				// A finished walk is the whole listing; rg is not needed.
+				if <-beside.done; beside.err == nil {
+					stopRg()
+				}
+			}()
 		})
 		defer timer.Stop()
 	}
 	names, err := runNameCommand(rgCtx, cwd, nil, maxFiles, rgListArgs(rg), func() { named.Store(true) })
-	if quiet.Load() && ctx.Err() == nil {
-		return workspaceFiles{}, errors.New("rg --files: no name in half the listing time")
-	}
+	mu.Lock()
+	rgReturned = true
+	beside := walk
+	mu.Unlock()
 	files := workspaceFiles{source: rgListingSource, paths: sortUnique(names.paths), more: names.more}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		if len(files.paths) == 0 {
-			return workspaceFiles{}, fmt.Errorf("rg --files: %w", ctxErr)
+	if rgCtx.Err() == nil {
+		// rg ran to its end or to maxFiles.
+		if err == nil && names.exit != nil && !rgExitStillListed(names.exit, len(files.paths) > 0) {
+			err = names.exit
 		}
+		if err == nil {
+			return files, nil
+		}
+		if beside == nil {
+			return workspaceFiles{}, fmt.Errorf("rg --files: %w", err)
+		}
+		return beside.result(ctx, cwd)
+	}
+	// rg was stopped: by the walk finishing first, or by the deadline.
+	if beside != nil {
+		select {
+		case <-beside.done:
+			if beside.err == nil {
+				return beside.result(ctx, cwd)
+			}
+		default:
+		}
+	}
+	if len(files.paths) > 0 {
 		files.more = true
 		return files, nil
 	}
-	if err == nil && names.exit != nil && !rgExitStillListed(names.exit, len(files.paths) > 0) {
-		err = names.exit
+	if beside != nil {
+		return beside.result(ctx, cwd)
 	}
-	if err != nil {
-		return workspaceFiles{}, fmt.Errorf("rg --files: %w", err)
-	}
-	return files, nil
+	return workspaceFiles{}, fmt.Errorf("rg --files: %w", ctx.Err())
 }
 
 func rgExitStillListed(exit error, listedAny bool) bool {
@@ -328,7 +370,7 @@ func bindWorkspaceListing(local *envlocal.Local) {
 		if request.MaxFiles < 1 {
 			return nil, errors.New("workspace listing needs a positive file cap")
 		}
-		ctx, cancel := context.WithTimeout(ctx, workspaceListingTimeout)
+		ctx, cancel := context.WithTimeout(ctx, workspaceListingTimeout-remoteListingTransit)
 		defer cancel()
 		files, err := localWorkspaceFiles(ctx, root, request.MaxFiles)
 		if err != nil {
@@ -374,7 +416,12 @@ var walkIgnoreFiles = []string{".ignore", ".gitignore"}
 // caller returns the names found so far, and the walk stops at its next
 // entry or within its current ignore match (cancelPoll).
 func walkWorkspaceFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFiles, error) {
-	walk := startWorkspaceWalk(ctx, cwd, maxFiles)
+	return startWorkspaceWalk(ctx, cwd, maxFiles).result(ctx, cwd)
+}
+
+// result waits for the walk to finish or ctx to end and returns its listing:
+// all of it, or at the deadline the names found so far.
+func (walk *workspaceWalk) result(ctx context.Context, cwd string) (workspaceFiles, error) {
 	var walkErr error
 	select {
 	case <-walk.done:
