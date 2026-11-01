@@ -134,9 +134,11 @@ pages do not imply disk indexing or a bounded memory working set.
 ### Agents and automation
 
 - **Opt-in subagents** investigate read-only or code in detached worktrees when eligible.
+- **Agent types as files** in the repository's `.harness/agents` or `.claude/agents`, or `<agent-dir>/agents`, narrow a child's tools and pick its model role; loading is bounded and stays inside the repository; `tempest agents list` shows them.
 - **Explicit integration** merges child patches against their pinned base, with conflict reporting.
 - **Named jobs and services** support readiness checks, logs, cancellation, stdin, and PTYs.
 - **Trusted hooks and skills** add workflow rules without loading every skill body into the prompt.
+- **`AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md`** load one per directory under a byte cap, with `@file` imports; deeper ones surface once after the read that reaches them, outside the cached prompt, read only inside the workspace and journaled with the result that delivers them.
 - **Persistent eval kernels** keep per-language state across prompts, not across restart or rewind.
 
 [Subagents and jobs](guide/subagents.md) · [Hooks](guide/hooks.md) · [Skills](guide/skills-and-context.md) · [Eval](guide/eval.md)

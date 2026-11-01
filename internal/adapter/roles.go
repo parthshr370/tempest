@@ -57,15 +57,15 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error) {
 	planModel := firstNonEmpty(strings.TrimSpace(cfg.PlanModel), defaultModel)
 	smolModel := firstNonEmpty(strings.TrimSpace(cfg.SmolModel), defaultModel)
 
-	defaultRouter, err := newRoleRouter(defaultModel, cfg.DefaultFallbacks, cfg)
+	defaultRouter, err := RouteModel(defaultModel, cfg.DefaultFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
-	planRouter, err := newRoleRouter(planModel, cfg.PlanFallbacks, cfg)
+	planRouter, err := RouteModel(planModel, cfg.PlanFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
-	smolRouter, err := newRoleRouter(smolModel, cfg.SmolFallbacks, cfg)
+	smolRouter, err := RouteModel(smolModel, cfg.SmolFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
@@ -78,9 +78,10 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error) {
 	return RoleRouters{Default: defaultRouter, Plan: planRouter, Smol: smolRouter, Sampling: samplingRouter}, nil
 }
 
-// newRoleRouter routes one role model and its backups, each with the
-// credentials that match its own provider prefix.
-func newRoleRouter(model string, fallbacks []string, cfg RoleRoutingConfig) (ProviderRouter, error) {
+// RouteModel routes one model spec and its backups, each with the credentials
+// that match its own provider prefix. Role models and the model specs agent
+// files name are routed the same way.
+func RouteModel(model string, fallbacks []string, cfg RoleRoutingConfig) (ProviderRouter, error) {
 	primary, err := newRoleRoute(model, cfg)
 	if err != nil {
 		return ProviderRouter{}, err

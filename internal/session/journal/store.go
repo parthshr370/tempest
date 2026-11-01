@@ -55,6 +55,9 @@ type Store struct {
 	schemas        map[string]*outputschema.Schema
 	releaseOwner   func()
 	catalogLastRun *RunSummary
+	// stagedContext holds context files a tool result carries until the
+	// recorder commits it; see StageContextFiles.
+	stagedContext map[string][]ContextFileRecord
 }
 
 // Create opens a new journal for cwd under dir and writes its header.

@@ -1,14 +1,20 @@
-// Package discovery collects the fixed V1 sources of session context, rules, and skills.
+// Package discovery collects the fixed V1 sources of session context, rules, skills and agent files.
 package discovery
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
+	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/agentfiles"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/contextfile"
 	"go.harness.dev/harness/internal/prompt"
@@ -23,6 +29,12 @@ type Options struct {
 	HomeDir              string
 	SkillPaths           []string
 	IncludeDefaultSkills bool
+	// Files names context files and bounds their bytes; zero values take the
+	// built-in defaults.
+	Files config.ContextFileSettings
+	// Providers are the configured model routes an agent file's model spec
+	// may name.
+	Providers map[string]adapter.ProviderConfig
 }
 
 // DiagnosticCode classifies non-fatal discovery diagnostics.
@@ -32,6 +44,9 @@ const (
 	DiagnosticSkill     DiagnosticCode = "skill"
 	DiagnosticCollision DiagnosticCode = "collision"
 	DiagnosticImport    DiagnosticCode = "import"
+	DiagnosticTruncated DiagnosticCode = "truncated"
+	// DiagnosticAgent is an agent file skipped as invalid or shadowed.
+	DiagnosticAgent DiagnosticCode = "agent"
 )
 
 // Diagnostic is a non-fatal source warning.
@@ -49,6 +64,27 @@ type SessionInputs struct {
 	Skills       []skills.Skill
 	GenericRules []string
 	Diagnostics  []Diagnostic
+	// ContextBytes counts the context file bytes kept, so nested discovery
+	// spends only what the total cap leaves.
+	ContextBytes int
+	// Agents are the agent files of the workspace and the agent dir, first
+	// definition of a name first.
+	Agents []agentfiles.Agent
+}
+
+// UserContextNames are the user-level context files, first hit wins.
+var UserContextNames = []string{"AGENTS.override.md", "AGENTS.md"}
+
+// ContextNames is the per-directory lookup order: AGENTS.override.md, then
+// AGENTS.md, then the configured fallback names. Only the first hit loads.
+func ContextNames(fallback []string) []string {
+	names := slices.Clone(UserContextNames)
+	for _, name := range fallback {
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // ErrorCode classifies fatal discovery failures.
@@ -64,6 +100,7 @@ const (
 	ExpandContext   ErrorCode = "expand_context"
 	ExpandRule      ErrorCode = "expand_rule"
 	LoadSkills      ErrorCode = "load_skills"
+	LoadAgents      ErrorCode = "load_agents"
 )
 
 // Error is a typed discovery failure.
@@ -81,10 +118,46 @@ func (e *Error) Is(target error) bool {
 	return ok && e.Code == other.Code
 }
 
-// candidate keeps a source path with its bytes so expansion errors can name the file that supplied them.
+// source is where startup files come from: the root they and their imports
+// are read through, and the home dir their ~ imports resolve against. A
+// source whose directory does not exist has no root and no files.
+type source struct {
+	root *os.Root
+	home string
+}
+
+func openSource(dir, home string, code ErrorCode) (source, error) {
+	root, err := os.OpenRoot(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return source{}, nil
+	}
+	if err != nil {
+		return source{}, &Error{Code: code, Op: "open root", Path: dir, Err: err}
+	}
+	return source{root: root, home: home}, nil
+}
+
+func (s source) close() {
+	if s.root != nil {
+		s.root.Close()
+	}
+}
+
+// candidate keeps a source path with its bytes so expansion errors can name
+// the file that supplied them. whole is false when the read stopped at its
+// limit before the end of the file.
 type candidate struct {
 	path    string
 	content []byte
+	whole   bool
+	from    source
+}
+
+// loadedContext is a context file after import expansion; complete is
+// false when its read or its imports were cut at the byte limit.
+type loadedContext struct {
+	prompt.ContextFile
+	complete bool
 }
 
 // Discover collects context files, sticky rules, and canonical skills once at startup.
@@ -116,12 +189,34 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		return SessionInputs{}, &Error{Code: code, Op: "resolve root", Path: options.RepoRoot, Err: err}
 	}
 	inputs := SessionInputs{RepoRoot: repoRoot}
-
-	userContext, err := readCandidate(filepath.Join(agentDir, "AGENTS.md"), ReadContext)
+	files := options.Files.WithDefaults()
+	names := ContextNames(files.Fallback)
+	// Every startup file and its imports are read through the root of the
+	// place it comes from. Repository files: the repository root, with ~
+	// imports left literal, so a repository file never pulls in a file from
+	// outside the repository. The user's own files in the agent dir: the
+	// home directory, or the agent dir itself when it is outside home, so
+	// they may import ~/ files.
+	repo, err := openSource(repoRoot, "", ResolveRepoRoot)
 	if err != nil {
 		return SessionInputs{}, err
 	}
-	userRule, err := readCandidate(filepath.Join(agentDir, "RULES.md"), ReadRule)
+	defer repo.close()
+	userRootDir := agentDir
+	if home != "" && within(home, agentDir) {
+		userRootDir = home
+	}
+	user, err := openSource(userRootDir, home, ResolveAgentDir)
+	if err != nil {
+		return SessionInputs{}, err
+	}
+	defer user.close()
+
+	userContext, err := firstCandidate(user, agentDir, UserContextNames, files.MaxBytes)
+	if err != nil {
+		return SessionInputs{}, err
+	}
+	userRule, err := readCandidate(user, filepath.Join(agentDir, "RULES.md"), ReadRule, -1)
 	if err != nil {
 		return SessionInputs{}, err
 	}
@@ -132,13 +227,13 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		if err := ctx.Err(); err != nil {
 			return SessionInputs{}, err
 		}
-		nativeContext, err := readCandidate(filepath.Join(ancestor, config.ProjectConfigDirName, "AGENTS.md"), ReadContext)
+		nativeContext, err := readCandidate(repo, filepath.Join(ancestor, config.ProjectConfigDirName, "AGENTS.md"), ReadContext, files.MaxBytes)
 		if err != nil {
 			return SessionInputs{}, err
 		}
 		var standalone *candidate
 		if !strings.HasPrefix(filepath.Base(ancestor), ".") {
-			standalone, err = readCandidate(filepath.Join(ancestor, "AGENTS.md"), ReadContext)
+			standalone, err = firstCandidate(repo, ancestor, names, files.MaxBytes)
 		}
 		if err != nil {
 			return SessionInputs{}, err
@@ -151,7 +246,7 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 			projectContexts = append(projectContexts, *standalone)
 		}
 		if nativeRule == nil {
-			rule, err := readCandidate(filepath.Join(ancestor, config.ProjectConfigDirName, "RULES.md"), ReadRule)
+			rule, err := readCandidate(repo, filepath.Join(ancestor, config.ProjectConfigDirName, "RULES.md"), ReadRule, -1)
 			if err != nil {
 				return SessionInputs{}, err
 			}
@@ -160,44 +255,52 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 			}
 		}
 	}
+	var contexts []loadedContext
 	if userContext != nil {
-		item, err := expandContext(ctx, *userContext, home)
+		item, err := expandContext(ctx, *userContext, files.MaxBytes)
 		if err != nil {
 			return SessionInputs{}, err
 		}
-		inputs.ContextFiles = append(inputs.ContextFiles, item)
+		contexts = append(contexts, item)
 	}
 	// ancestors are cwd-first. Reversing yields the required root-first order.
 	seenPaths := map[string]struct{}{}
-	project := make([]prompt.ContextFile, 0, len(projectContexts))
+	project := make([]loadedContext, 0, len(projectContexts))
 	for index := len(projectContexts) - 1; index >= 0; index-- {
-		item, err := expandContext(ctx, projectContexts[index], home)
-		if err != nil {
-			return SessionInputs{}, err
-		}
 		real := canonicalPath(projectContexts[index].path)
 		if _, exists := seenPaths[real]; exists {
 			continue
 		}
 		seenPaths[real] = struct{}{}
+		item, err := expandContext(ctx, projectContexts[index], files.MaxBytes)
+		if err != nil {
+			return SessionInputs{}, err
+		}
 		project = append(project, item)
 	}
+	// Identical files collapse to the nearest one. Only files read whole
+	// compare: two cut files may share the bytes read and differ after them.
 	lastContent := make(map[string]int, len(project))
 	for index, item := range project {
-		lastContent[item.Content] = index
-	}
-	collapsed := make([]prompt.ContextFile, 0, len(project))
-	for index, item := range project {
-		if lastContent[item.Content] == index {
-			collapsed = append(collapsed, item)
+		if item.complete {
+			lastContent[item.Content] = index
 		}
 	}
-	inputs.ContextFiles = append(inputs.ContextFiles, collapsed...)
+	for index, item := range project {
+		if !item.complete || lastContent[item.Content] == index {
+			contexts = append(contexts, item)
+		}
+	}
+	var notice *Diagnostic
+	inputs.ContextFiles, inputs.ContextBytes, notice = capContextFiles(contexts, files.MaxBytes)
+	if notice != nil {
+		inputs.Diagnostics = append(inputs.Diagnostics, *notice)
+	}
 	for _, rule := range []*candidate{userRule, nativeRule} {
 		if rule == nil {
 			continue
 		}
-		body, err := expandRule(ctx, *rule, home)
+		body, err := expandRule(ctx, *rule)
 		if err != nil {
 			return SessionInputs{}, err
 		}
@@ -217,34 +320,148 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		}
 		inputs.Diagnostics = append(inputs.Diagnostics, Diagnostic{Code: code, Path: diagnostic.Path, Message: diagnostic.Message, Collision: diagnostic.Collision})
 	}
+	projectDir := repoRoot
+	if options.RepoRoot == "" {
+		projectDir = projectDirOf(cwd)
+	}
+	agents, agentDiagnostics, err := agentfiles.Load(ctx, agentfiles.Options{ProjectDir: projectDir, AgentDir: agentDir, Providers: options.Providers})
+	if err != nil {
+		return SessionInputs{}, &Error{Code: LoadAgents, Op: "load agents", Err: err}
+	}
+	inputs.Agents = agents
+	for _, diagnostic := range agentDiagnostics {
+		inputs.Diagnostics = append(inputs.Diagnostics, Diagnostic{Code: DiagnosticAgent, Path: diagnostic.Path, Message: diagnostic.Message})
+	}
 	return inputs, nil
 }
 
-// readCandidate treats missing and blank optional sources as absent, keeping discovery fallback selection simple.
-func readCandidate(path string, code ErrorCode) (*candidate, error) {
-	data, err := os.ReadFile(path)
+// readCandidate treats missing and blank optional sources as absent, keeping
+// discovery fallback selection simple. The file is opened through its
+// source's root, and one that leaves it through a symlink is skipped: a
+// repository file may not pull in a file from outside the repository. A
+// file that is not regular fails without being opened, so a FIFO cannot
+// block startup. At most limit bytes are read, plus one to tell a cut file
+// (negative reads the whole file); a cut file counts as nonblank.
+func readCandidate(from source, path string, code ErrorCode, limit int) (*candidate, error) {
+	if from.root == nil {
+		return nil, nil
+	}
+	name, err := filepath.Rel(from.root.Name(), path)
+	if err != nil || !filepath.IsLocal(name) {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: errors.New("outside its root " + from.root.Name())}
+	}
+	info, err := from.root.Stat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
+		if escapesRoot(from.root.Name(), path) {
+			slog.Warn("context file skipped: it links outside its root", "path", path, "root", from.root.Name())
+			return nil, nil
+		}
 		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
 	}
-	if strings.TrimSpace(string(data)) == "" {
+	if !info.Mode().IsRegular() {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: errors.New("not a regular file")}
+	}
+	file, err := from.root.Open(name)
+	if err != nil {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
+	}
+	defer file.Close()
+	var reader io.Reader = file
+	if limit >= 0 {
+		reader = io.LimitReader(file, int64(limit)+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, &Error{Code: code, Op: "read", Path: path, Err: err}
+	}
+	whole := limit < 0 || int64(len(data)) == info.Size()
+	if whole && strings.TrimSpace(string(data)) == "" {
 		return nil, nil
 	}
-	return &candidate{path: path, content: data}, nil
+	return &candidate{path: path, content: data, whole: whole, from: from}, nil
 }
 
-func expandContext(ctx context.Context, item candidate, home string) (prompt.ContextFile, error) {
-	content, err := contextfile.Expand(ctx, item.path, item.content, contextfile.ExpandOptions{HomeDir: home})
-	if err != nil {
-		return prompt.ContextFile{}, &Error{Code: ExpandContext, Op: "expand", Path: item.path, Err: err}
+// escapesRoot reports whether path resolves outside dir.
+func escapesRoot(dir, path string) bool {
+	resolved, err := filepath.EvalSymlinks(path)
+	return err == nil && !within(canonicalPath(dir), resolved)
+}
+
+// firstCandidate returns the first nonblank file of names in dir, so
+// AGENTS.override.md shadows AGENTS.md and both shadow fallback names.
+func firstCandidate(from source, dir string, names []string, limit int) (*candidate, error) {
+	for _, name := range names {
+		found, err := readCandidate(from, filepath.Join(dir, name), ReadContext, limit)
+		if err != nil || found != nil {
+			return found, err
+		}
 	}
-	return prompt.ContextFile{Path: filepath.ToSlash(item.path), Content: content}, nil
+	return nil, nil
 }
 
-func expandRule(ctx context.Context, item candidate, home string) (string, error) {
-	content, err := contextfile.Expand(ctx, item.path, item.content, contextfile.ExpandOptions{HomeDir: home})
+// capContextFiles keeps files in prompt order until maxBytes is spent. The
+// file that crosses the cap, or whose read or imports were already cut at
+// it, is cut at a UTF-8 boundary and carries a notice naming the cap and
+// every file left out, so the model knows the context is incomplete. It
+// returns the kept files, the bytes they spend (without the notice) and a
+// diagnostic when anything was cut.
+func capContextFiles(files []loadedContext, maxBytes int) ([]prompt.ContextFile, int, *Diagnostic) {
+	used := 0
+	kept := make([]prompt.ContextFile, 0, len(files))
+	for index, file := range files {
+		if file.complete && used+len(file.Content) <= maxBytes {
+			used += len(file.Content)
+			kept = append(kept, file.ContextFile)
+			continue
+		}
+		content := TruncateUTF8(file.Content, maxBytes-used)
+		omitted := make([]string, 0, len(files)-index-1)
+		for _, later := range files[index+1:] {
+			omitted = append(omitted, later.Path)
+		}
+		message := fmt.Sprintf("context files exceed context_files.max_bytes (%d bytes): %s was cut after %d bytes", maxBytes, file.Path, len(content))
+		if len(omitted) > 0 {
+			message += "; omitted: " + strings.Join(omitted, ", ")
+		}
+		file.Content = content + "\n\n[harness: " + message + "]"
+		return append(kept, file.ContextFile), used + len(content), &Diagnostic{Code: DiagnosticTruncated, Path: file.Path, Message: message}
+	}
+	return kept, used, nil
+}
+
+// TruncateUTF8 returns the longest prefix of s within limit bytes that does
+// not split a UTF-8 sequence.
+func TruncateUTF8(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// expandContext expands a context file's imports through its source's
+// root, reading at most maxBytes of imports.
+func expandContext(ctx context.Context, item candidate, maxBytes int) (loadedContext, error) {
+	content, complete, err := contextfile.Expand(ctx, item.from.root, item.path, item.content, contextfile.ExpandOptions{HomeDir: item.from.home, MaxBytes: maxBytes})
+	if err != nil {
+		return loadedContext{}, &Error{Code: ExpandContext, Op: "expand", Path: item.path, Err: err}
+	}
+	return loadedContext{ContextFile: prompt.ContextFile{Path: filepath.ToSlash(item.path), Content: content}, complete: complete && item.whole}, nil
+}
+
+// expandRule expands a RULES.md file's imports through its source's root.
+// Rules have no byte cap.
+func expandRule(ctx context.Context, item candidate) (string, error) {
+	content, _, err := contextfile.Expand(ctx, item.from.root, item.path, item.content, contextfile.ExpandOptions{HomeDir: item.from.home, MaxBytes: -1})
 	if err != nil {
 		return "", &Error{Code: ExpandRule, Op: "expand", Path: item.path, Err: err}
 	}
@@ -266,16 +483,7 @@ func resolveRoot(cwd, suppliedRoot, home string) (string, []string, error) {
 		}
 		boundary = root
 	} else {
-		for dir := cwd; ; dir = filepath.Dir(dir) {
-			if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-				boundary = dir
-				break
-			}
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-		}
+		boundary = gitRoot(cwd)
 		if boundary == "" && home != "" && within(home, cwd) {
 			boundary = home
 		}
@@ -292,6 +500,37 @@ func resolveRoot(cwd, suppliedRoot, home string) (string, []string, error) {
 		}
 	}
 	return boundary, ancestors, nil
+}
+
+// gitRoot is the nearest directory at or above dir that holds .git, or "".
+func gitRoot(dir string) string {
+	for ; ; dir = filepath.Dir(dir) {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
+		}
+		if filepath.Dir(dir) == dir {
+			return ""
+		}
+	}
+}
+
+// projectDirOf is where a session in cwd finds its repository's agent
+// files: the git work tree's root, or cwd outside git.
+func projectDirOf(cwd string) string {
+	if root := gitRoot(cwd); root != "" {
+		return root
+	}
+	return cwd
+}
+
+// ProjectDir is projectDirOf for a working directory given as the user
+// wrote it.
+func ProjectDir(cwd string) (string, error) {
+	dir, err := canonicalDir(cwd)
+	if err != nil {
+		return "", err
+	}
+	return projectDirOf(dir), nil
 }
 
 // canonicalDir resolves symlinks when possible but preserves a clean absolute path for an absent directory.

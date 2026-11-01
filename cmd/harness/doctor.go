@@ -16,6 +16,7 @@ import (
 	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/dap"
+	"go.harness.dev/harness/internal/discovery"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hooks"
 	"go.harness.dev/harness/internal/obs"
@@ -172,6 +173,14 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "  %s: %s (%s)\n", adapter.Name, status, adapter.Command)
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if !printContextFiles(stdout, stderr, cwd, opts) {
+		return 1
+	}
 	// The resolved settings already hold this workspace's trusted project
 	// hooks; the WARN config lines above name any the trust rules dropped.
 	hookSettings := opts.Config.Hooks()
@@ -247,6 +256,27 @@ func describeModel(model types.Model, reasoning string) string {
 		price = "unknown"
 	}
 	return fmt.Sprintf("model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s", model.ID, model.Provider, model.API, redactedURL(model.BaseURL), price, effectiveReasoning(reasoning, model), yesNo(model.SupportsVision()))
+}
+
+// printContextFiles lists the context files a run in cwd would load, in prompt
+// order, and any cap notice. It reports false after printing a discovery error.
+func printContextFiles(stdout, stderr io.Writer, cwd string, opts commandOptions) bool {
+	inputs, err := discovery.Discover(context.Background(), discovery.Options{Cwd: cwd, AgentDir: opts.Config.AgentDir(), Files: opts.Config.ContextFiles()})
+	if err != nil {
+		fmt.Fprintf(stderr, "doctor context files: %v\n", err)
+		return false
+	}
+	files := opts.Config.ContextFiles()
+	fmt.Fprintf(stdout, "context files: %d of %d bytes (fallback=%s nested=%t)\n", inputs.ContextBytes, files.MaxBytes, strings.Join(files.Fallback, ","), !files.NestedDisabled)
+	for _, file := range inputs.ContextFiles {
+		fmt.Fprintf(stdout, "  %s (%d bytes)\n", file.Path, len(file.Content))
+	}
+	for _, diagnostic := range inputs.Diagnostics {
+		if diagnostic.Code == discovery.DiagnosticTruncated {
+			fmt.Fprintf(stdout, "  WARN %s\n", diagnostic.Message)
+		}
+	}
+	return true
 }
 
 func printPathCheck(w io.Writer, name, path string) {

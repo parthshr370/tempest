@@ -9,10 +9,18 @@ import (
 	"testing"
 )
 
+// expandIn expands content as dir/AGENTS.md with dir as the root and no byte
+// limit on imports.
+func expandIn(ctx context.Context, t *testing.T, dir, content, home string) (string, error) {
+	t.Helper()
+	text, _, err := Expand(ctx, openRoot(t, dir), filepath.Join(dir, "AGENTS.md"), []byte(content), ExpandOptions{HomeDir: home, MaxBytes: -1})
+	return text, err
+}
+
 func TestExpandImportsAndCRLF(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "part.md"), "expanded")
-	got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("before @./part.md\r\nafter"), ExpandOptions{})
+	got, err := expandIn(context.Background(), t, dir, "before @./part.md\r\nafter", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +33,7 @@ func TestExpandLeavesProtectedAndRepeatedImportsLiteral(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "part.md"), "expanded")
 	content := "@./part.md @./part.md\n`@./part.md`\n```\n@./part.md\n```\ngit@host:x user@example.com"
-	got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte(content), ExpandOptions{})
+	got, err := expandIn(context.Background(), t, dir, content, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +48,7 @@ func TestExpandBoundsCycle(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "a.md"), "@./b.md")
 	mustWrite(t, filepath.Join(dir, "b.md"), "@./a.md")
-	got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@./a.md"), ExpandOptions{})
+	got, err := expandIn(context.Background(), t, dir, "@./a.md", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +64,8 @@ func mustWrite(t *testing.T, path, content string) {
 	}
 }
 
+// An absolute import and a ~ import inside the root expand; imports stop
+// after MaxImportDepth edges.
 func TestExpandAbsoluteHomePunctuationAndHopLimit(t *testing.T) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
@@ -65,7 +75,7 @@ func TestExpandAbsoluteHomePunctuationAndHopLimit(t *testing.T) {
 	absolute := filepath.Join(dir, "absolute.md")
 	mustWrite(t, absolute, "absolute")
 	mustWrite(t, filepath.Join(home, "home.md"), "home")
-	got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@"+absolute+", @~/home.md! @./missing.md"), ExpandOptions{HomeDir: home})
+	got, err := expandIn(context.Background(), t, dir, "@"+absolute+", @~/home.md! @./missing.md", home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +89,7 @@ func TestExpandAbsoluteHomePunctuationAndHopLimit(t *testing.T) {
 		}
 		mustWrite(t, filepath.Join(dir, "f"+string(rune('0'+index))+".md"), content)
 	}
-	got, err = Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@./f1.md"), ExpandOptions{})
+	got, err = expandIn(context.Background(), t, dir, "@./f1.md", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +112,7 @@ func TestExpandNormativeImportMatrix(t *testing.T) {
 	}
 
 	t.Run("relative paths follow each importer and preserve punctuation", func(t *testing.T) {
-		got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("a @./nested/one.md b @./part.md.,;:!?)]}\"'"), ExpandOptions{})
+		got, err := expandIn(context.Background(), t, dir, "a @./nested/one.md b @./part.md.,;:!?)]}\"'", "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -111,7 +121,7 @@ func TestExpandNormativeImportMatrix(t *testing.T) {
 		}
 	})
 	t.Run("multiple imports and bare home stay literal", func(t *testing.T) {
-		got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@./part.md @./part.md @~"), ExpandOptions{HomeDir: dir})
+		got, err := expandIn(context.Background(), t, dir, "@./part.md @./part.md @~", dir)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,7 +131,7 @@ func TestExpandNormativeImportMatrix(t *testing.T) {
 	})
 	t.Run("fences and multi backticks stay literal", func(t *testing.T) {
 		content := "~~~~\n@./part.md\n~~~~~\n````\n@./part.md\n`````\n``@./part.md`` `@./part.md`"
-		got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte(content), ExpandOptions{})
+		got, err := expandIn(context.Background(), t, dir, content, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -137,28 +147,28 @@ func TestExpandNormativeImportMatrix(t *testing.T) {
 			path string
 			want string
 		}{{"direct.md", "@./direct.md"}, {"a.md", "@./a.md"}} {
-			got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@./"+tc.path), ExpandOptions{})
+			got, err := expandIn(context.Background(), t, dir, "@./"+tc.path, "")
 			if err != nil || got != tc.want {
 				t.Fatalf("%s = %q, %v; want %q", tc.path, got, err, tc.want)
 			}
 		}
 	})
-	t.Run("invalid depth directory and cancellation", func(t *testing.T) {
-		if _, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("x"), ExpandOptions{MaxDepth: MaxImportDepth + 1}); err == nil {
-			t.Fatal("invalid MaxDepth succeeded")
+	t.Run("missing root directory and cancellation", func(t *testing.T) {
+		if _, _, err := Expand(context.Background(), nil, filepath.Join(dir, "AGENTS.md"), []byte("x"), ExpandOptions{}); err == nil {
+			t.Fatal("expansion without a root succeeded")
 		} else {
 			var importErr *Error
 			if !errors.As(err, &importErr) || importErr.Code != InvalidOptions {
-				t.Fatalf("invalid MaxDepth error = %v", err)
+				t.Fatalf("missing root error = %v", err)
 			}
 		}
-		got, err := Expand(context.Background(), filepath.Join(dir, "AGENTS.md"), []byte("@./directory"), ExpandOptions{})
+		got, err := expandIn(context.Background(), t, dir, "@./directory", "")
 		if err != nil || got != "@./directory" {
 			t.Fatalf("directory target = %q, %v", got, err)
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err = Expand(ctx, filepath.Join(dir, "AGENTS.md"), []byte("@./part.md"), ExpandOptions{})
+		_, err = expandIn(ctx, t, dir, "@./part.md", "")
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled expansion error = %v", err)
 		}

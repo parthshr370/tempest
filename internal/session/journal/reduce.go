@@ -84,6 +84,7 @@ func reduce(loaded *Loaded, entries []Entry) {
 	for _, entry := range entries {
 		switch e := entry.(type) {
 		case MessageEntry:
+			loaded.ContextFiles = append(loaded.ContextFiles, e.ContextFiles...)
 			replay := replayMessage{id: e.ID, runID: e.RunID, message: e.Message}
 			if assistant, ok := e.Message.(ptypes.AssistantMessage); ok {
 				clear(calls)

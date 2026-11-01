@@ -124,6 +124,10 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 	case agent.EventMessageEnd:
 		assistant, isAssistant := recordAssistant(ev.Message)
 		entry := journal.MessageEntry{Meta: meta, Message: ev.Message, QueueID: ev.QueueID, Metered: isAssistant}
+		if result, ok := ev.Message.(ptypes.ToolResultMessage); ok {
+			// The context files appended to this result commit with it.
+			entry.ContextFiles = r.store.TakeContextFiles(contextCallKey(ctx, result.ToolCallID))
+		}
 		var assigned journal.Meta
 		commit := func(withdraws []string) (err error) {
 			entry.Withdraws = withdraws

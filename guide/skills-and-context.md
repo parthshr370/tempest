@@ -2,11 +2,100 @@
 
 ## Context discovery
 
-At startup the agent walks `AGENTS.md` up from your working directory, loads a
-sticky `RULES.md` that survives compaction, expands safe `@file` imports, and
-registers skills from your agent directory, the project and `-skill` paths. Skill
-bodies load on demand through the `skill` tool or a `skill://` read, so nothing
-bloats the prompt until it is needed.
+At startup the agent walks up from your working directory to the repository root
+and loads one context file per directory, loads a sticky `RULES.md` that survives
+compaction, expands safe `@file` imports, and registers skills from your agent
+directory, the project and `-skill` paths. Skill bodies load on demand through the
+`skill` tool or a `skill://` read, so nothing bloats the prompt until it is needed.
+
+In each directory the first of these files that exists and is not blank loads:
+
+1. `AGENTS.override.md`
+2. `AGENTS.md`
+3. each name in `context_files.fallback`, by default `["CLAUDE.md"]`
+
+So a personal `AGENTS.override.md` shadows the checked-in `AGENTS.md`, and a
+repository that only has `CLAUDE.md` still gets its instructions. Directories
+whose name starts with `.` are skipped. The nearest `.harness/AGENTS.md` keeps
+its place: it replaces the standalone file of its own directory. At user level,
+`<agent-dir>/AGENTS.override.md` wins over `<agent-dir>/AGENTS.md`; fallback names
+do not apply there.
+
+Files load user first, then repository root down to the working directory.
+`@file` imports expand in every kind of context file, including `CLAUDE.md`,
+and in `RULES.md`. Each file and its imports are read inside one root:
+
+- **Repository files** (context files and `.harness/RULES.md`): the repository
+  root, the directory startup walks up to (the git root, else your home
+  directory when the working directory is under it, else the filesystem root).
+  A file that is a symlink pointing outside it is skipped with a warning. An
+  import that is a symlink pointing outside it, a `../` or absolute import
+  outside it, and a `~/` import stay literal. A repository file never pulls a
+  file from outside the repository into the prompt.
+- **Your own files** (`<agent-dir>/AGENTS.override.md`, `AGENTS.md` and
+  `RULES.md`): your home directory, or the agent dir itself when it is outside
+  home. `~/` imports resolve against home; an import outside the root stays
+  literal.
+
+A context file that is not a regular file (a directory or FIFO named
+`AGENTS.md`) stops startup with an error instead of blocking.
+
+The loaded files share one budget, `context_files.max_bytes` (default 65536
+bytes, counted after imports expand). The file that crosses it is cut and ends
+with a `[harness: context files exceed context_files.max_bytes ...]` notice that
+names the cut and every file left out, so the model knows its instructions are
+incomplete. The budget bounds the work as well: each context file is read only
+up to `context_files.max_bytes` bytes, and its imports only up to as many again,
+however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
+the files a run in the current directory would load, their sizes, and the
+notice if any.
+
+```json
+{
+  "context_files": {
+    "fallback": ["CLAUDE.md", "GEMINI.md"],
+    "max_bytes": 65536,
+    "nested_max_bytes": 16384,
+    "nested": true
+  }
+}
+```
+
+### Nested context files
+
+Startup only covers the working directory and its ancestors. When `read` or `ls`
+succeeds on a path below the working directory, the agent checks each directory
+between the working directory and that path, shallowest first, and surfaces the
+first context file it finds there (same name order as above). Reading
+`a/b/x.go` shows `a/AGENTS.md`, then `a/b/CLAUDE.md`.
+
+- The file is appended after that tool result, inside a
+  `<repository_context path="a/AGENTS.md">` frame that marks it as repository
+  data: it refines shallower instructions for files under its directory, and the
+  user's requests win over it. The system prompt never changes, so the provider's
+  prompt cache keeps working.
+- Each directory surfaces once per session. The record of it is written into
+  the same journal entry as the tool result that carries the file, so a resumed
+  session neither shows it again nor spends its bytes twice, and a crash before
+  that result was saved leaves no record: the resumed session shows it again.
+- Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
+  and nested files count against `context_files.max_bytes` together with the
+  startup files. A cut file ends with a `[harness: cut at ...]` notice. The work
+  follows the same budget: a file is read only up to the bytes it may keep, and
+  its imports only up to as many again. Once the total is spent, the next file
+  is named but not loaded, and no further directory is looked at.
+- Files are read inside the working directory, imports included. A context
+  file or an `@file` import that is a symlink pointing outside it, a `../` or
+  absolute import outside it, and a `~/` import stay unread, so a context file
+  never shows what `read` itself may not. Only regular files are opened; a FIFO
+  is skipped.
+- `@file` imports expand; directories whose name starts with `.` are skipped.
+  Reading a context file whole does not repeat it after the result; a read of
+  part of it (a line range, a limit, a page cut by the read budget), or of a
+  file whose imports the read did not expand, still surfaces the file.
+- Only `read` (files, directories, batches) and `ls` trigger it; `grep` and
+  `find` results do not. It runs only for a workspace on this host, not a remote
+  environment. Set `context_files.nested` to `false` to turn it off.
 
 ## Workspace listing
 

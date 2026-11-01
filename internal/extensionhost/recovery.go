@@ -261,8 +261,12 @@ func (r *Runtime) nested(ctx context.Context, parent, key, name string, args jso
 	return pending.result, err
 }
 
-// ResolvePresetContext uses the provider frame's generation rather than latest code.
+// ResolvePresetContext uses the provider frame's generation rather than latest
+// code. Agent-file presets are fixed for the session and resolve first.
 func (r *Runtime) ResolvePresetContext(ctx context.Context, id string) (extension.AgentPreset, error) {
+	if preset, ok := FilePreset(r.FilePresets, id); ok {
+		return preset, nil
+	}
 	req, err := requestFrom(ctx)
 	if err != nil {
 		return extension.AgentPreset{}, err

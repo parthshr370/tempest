@@ -147,9 +147,11 @@ Missing compatible code parks the call instead of silently using the latest code
 ## Named agent presets
 
 Bundles can declare versioned `AgentPreset` values. The task tool accepts the
-selected `<bundle>/<preset>` names alongside built-in `explore` and `general`.
-Preset instructions, model selection, and tool restrictions use the existing
-durable child runner. They do not create another scheduler or relax child
-permissions. Preset IDs and versions remain in the child admission record.
+selected `<bundle>/<preset>` names alongside built-in `explore` and `general`
+and the bare names of [agent files](subagents.md#agent-files).
+Preset instructions, model selection, reasoning, output schema and tool
+restrictions use the existing durable child runner. They do not create another
+scheduler or relax child permissions. Preset IDs and versions remain in the
+child admission record.
 
 [Guide index](README.md) · [Tempest](../README.md)

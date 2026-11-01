@@ -1345,8 +1345,11 @@ func newLsTool(cwd string) agent.AgentTool {
 				}
 				results = append(results, name)
 			}
+			listed := []agent.PathEvent{{Path: dirPath, Dir: true}}
 			if len(results) == 0 {
-				return textResult("(empty directory)", nil), nil
+				result := textResult("(empty directory)", nil)
+				result.Paths = listed
+				return result, nil
 			}
 			rawOutput := strings.Join(results, "\n")
 			truncation := truncate.Head(rawOutput, truncate.Options{MaxLines: truncate.Int(int(^uint(0) >> 1))})
@@ -1364,7 +1367,9 @@ func newLsTool(cwd string) agent.AgentTool {
 			if len(notices) > 0 {
 				output += "\n\n[" + strings.Join(notices, ". ") + "]"
 			}
-			return textResult(output, optionalMap(details)), nil
+			result := textResult(output, optionalMap(details))
+			result.Paths = listed
+			return result, nil
 		},
 	}
 }

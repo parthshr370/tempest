@@ -13,10 +13,12 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/agentfiles"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/subagent"
 	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/tempest/durable"
@@ -480,6 +482,8 @@ func intersectToolNames(available, selected []string) []string {
 	return result
 }
 
+// presetConfig applies a named preset to the child's stack: its model (a role
+// alias or a model spec), reasoning effort and instructions.
 func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackConfig, error) {
 	if spec.PresetID == "" {
 		return cfg, nil
@@ -494,22 +498,76 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 	if preset.Version != spec.PresetVersion {
 		return cfg, errors.New("recorded agent preset version unavailable")
 	}
-	if preset.Model != "" {
-		switch preset.Model {
-		case cfg.Model.ID:
-		case cfg.SmolModel.ID:
+	if spec.PresetDigest != "" && subagent.PresetDigest(preset) != spec.PresetDigest {
+		return cfg, errors.New("agent preset changed since the task started")
+	}
+	switch preset.Model {
+	case "", agentfiles.RoleDefault, cfg.Model.ID, modelSpec(cfg.Model):
+	case agentfiles.RoleSmol, cfg.SmolModel.ID, modelSpec(cfg.SmolModel):
+		if cfg.SmolModel.ID != "" && cfg.SmolStreamFn != nil {
 			cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.SmolModel, cfg.SmolStreamFn, cfg.SmolFallbackModels, "smol"
+		}
+		if cfg.SmolReasoning != "" {
+			cfg.Reasoning = cfg.SmolReasoning
+		}
+	case agentfiles.RolePlan:
+		// The plan role runs where the plan stack runs: on PlanModel with its
+		// whole route, endpoint included.
+		switch {
+		case cfg.PlanModel.ID == "" || cfg.PlanModel.Provider == cfg.Model.Provider && cfg.PlanModel.ID == cfg.Model.ID && cfg.PlanModel.BaseURL == cfg.Model.BaseURL:
+		case cfg.PlanStreamFn != nil:
+			cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.PlanModel, cfg.PlanStreamFn, cfg.PlanFallbackModels, "plan"
+		case cfg.PlanModel.Provider == cfg.Model.Provider:
+			// The default stream binds each request's credential to the
+			// model's own route, as it does for the plan stack.
+			cfg.Model, cfg.ModelRole = cfg.PlanModel, "plan"
 		default:
-			if c.customStream {
-				return cfg, errors.New("preset model unavailable from custom provider")
+			route := modelSpec(cfg.PlanModel)
+			if cfg.PlanModel.BaseURL != "" {
+				route += "@" + cfg.PlanModel.BaseURL
 			}
-			router, err := adapter.NewProviderRouter(c.providerConfig.ForModel(preset.Model))
-			if err != nil {
+			if cfg.Model, cfg.StreamFn, cfg.FallbackModels, err = c.routeModel(cfg, route); err != nil {
 				return cfg, err
 			}
-			cfg.Model, cfg.StreamFn, cfg.FallbackModels = router.Model, router.StreamFn, router.Fallbacks
+			cfg.ModelRole = "plan"
 		}
+		if cfg.PlanReasoning != "" {
+			cfg.Reasoning = cfg.PlanReasoning
+		}
+	default:
+		if cfg.Model, cfg.StreamFn, cfg.FallbackModels, err = c.routeModel(cfg, preset.Model); err != nil {
+			return cfg, err
+		}
+	}
+	if preset.Reasoning != "" {
+		cfg.Reasoning = preset.Reasoning
 	}
 	cfg.PromptAdditions = append(append([]string(nil), cfg.PromptAdditions...), preset.Instructions)
 	return cfg, nil
+}
+
+// routeModel streams a preset's model spec and its backups: through the
+// host's resolver when the host supplied its own stream, otherwise through
+// the session's provider router with the credentials scoped to that model's
+// own route.
+func (c *sessionCore) routeModel(cfg StackConfig, spec string) (types.Model, agent.StreamFn, []types.Model, error) {
+	if cfg.ResolveModel != nil {
+		return cfg.ResolveModel(spec)
+	}
+	if c.customStream {
+		return types.Model{}, nil, nil, fmt.Errorf("preset model %s unavailable from custom provider", spec)
+	}
+	router, err := adapter.NewProviderRouter(c.providerConfig.ForModel(spec))
+	if err != nil {
+		return types.Model{}, nil, nil, err
+	}
+	return router.Model, router.StreamFn, router.Fallbacks, nil
+}
+
+// modelSpec is a model's Provider:ID spec, or "" for an unset model.
+func modelSpec(model types.Model) string {
+	if model.ID == "" || model.Provider == "" {
+		return model.ID
+	}
+	return model.Provider + ":" + model.ID
 }

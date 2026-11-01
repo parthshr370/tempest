@@ -77,6 +77,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 	var text strings.Builder
 	details := readBatchDetails{Files: make([]readBatchFile, 0, len(paths))}
 	failures := 0
+	var touched []agent.PathEvent
 	imageBytes, maxImageBytes := 0, base64.StdEncoding.EncodedLen(document.MaxInlineImageBytes)
 	for _, path := range paths {
 		if text.Len() > 0 {
@@ -98,6 +99,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 			continue
 		}
 		details.Files = append(details.Files, readBatchFile{Path: path, Details: result.Details})
+		touched = append(touched, result.Paths...)
 		for _, block := range result.Content {
 			if block.Type == types.BlockText {
 				budget.lines -= strings.Count(block.Text, "\n") + 1
@@ -126,6 +128,7 @@ func (reader fileReader) readBatch(ctx context.Context, paths []string, mode str
 	}
 	result := textResult("", details)
 	result.Content = content
+	result.Paths = touched
 	return result, nil
 }
 
@@ -138,10 +141,10 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 	}
 	var rootForRead *os.Root
 	if !refs.IsURL(request.path) {
-		var err error
-		rootForRead, err = reader.getRoot()
-		if err != nil {
-			return agent.AgentToolResult{}, err
+		var rootErr error
+		rootForRead, rootErr = reader.getRoot()
+		if rootErr != nil {
+			return agent.AgentToolResult{}, rootErr
 		}
 	}
 	selector, err := parseReadPathSelector(request.path)
@@ -165,9 +168,19 @@ func (reader fileReader) read(ctx context.Context, request readRequest) (agent.A
 }
 
 // render shows a loaded source's numbered rows within the request budget,
-// or an outline.
-func (reader fileReader) render(request readRequest, selector readPathSelector, source readSource) (agent.AgentToolResult, error) {
+// or an outline. A rendered read reports its workspace path, and whether it
+// showed the whole file.
+func (reader fileReader) render(request readRequest, selector readPathSelector, source readSource) (result agent.AgentToolResult, err error) {
 	cwd, store := reader.cwd, reader.options.Hashline
+	whole := false
+	defer func() {
+		if err == nil {
+			result.Paths = source.paths()
+			for i := range result.Paths {
+				result.Paths[i].Whole = whole && !result.Paths[i].Dir
+			}
+		}
+	}()
 	data, absolutePath, displayPath, isResource := source.data, source.absolutePath, source.displayPath, source.isResource
 	header := fmt.Sprintf("[%s#%s]", displayPath, hashline.Tag(data))
 	// observe records the rows shown in full for workspace files, the
@@ -200,6 +213,7 @@ func (reader fileReader) render(request readRequest, selector readPathSelector, 
 	allLines := splitReadLines(string(data))
 	if len(allLines) == 0 {
 		observe(nil)
+		whole = true
 		return textResult(header, nil), nil
 	}
 	startLine := 0
@@ -297,5 +311,6 @@ func (reader fileReader) render(request readRequest, selector readPathSelector, 
 		}
 		observe(displayed)
 	}
+	whole = startLine == 0 && endLine == len(allLines) && !truncation.Truncated && !truncation.FirstLineExceedsLimit
 	return textResult(output, details), nil
 }

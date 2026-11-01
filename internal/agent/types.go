@@ -57,6 +57,19 @@ type AgentToolResult struct {
 	// IsError preserves protocol-level failures without discarding their content.
 	IsError   bool
 	Terminate bool
+	// Paths are the workspace files and directories this call read or listed
+	// successfully. Nested context discovery consumes them; they are never
+	// sent to the model or journaled with the result.
+	Paths []PathEvent
+}
+
+// PathEvent is a file tool's normalized "path read or listed" fact: an
+// absolute host path, whether it is a listed directory, and whether the
+// call showed the whole file (not a range, a cut page or an outline).
+type PathEvent struct {
+	Path  string
+	Dir   bool
+	Whole bool
 }
 
 // AgentToolUpdateCallback streams partial tool results while Execute runs.

@@ -177,23 +177,25 @@ Error codes: `invalid_uri`, `unknown_skill`, `invalid_path`, `path_escape`, `not
 ### Context import expansion
 
 ```go
-// internal/contextfile/imports.go:14
+// internal/contextfile/imports.go
 const MaxImportDepth = 5
 
-// internal/contextfile/imports.go:16-20
 type ExpandOptions struct {
-    HomeDir  string // tilde resolution; empty = leave ~ literal
-    MaxDepth int    // 0 defaults to MaxImportDepth; 1..5 accepted
+    HomeDir  string // tilde resolution, still inside the root; empty = leave ~ literal
+    MaxBytes int    // bytes all imports may read together; negative = no limit
 }
 
-// internal/contextfile/imports.go:47
-func Expand(ctx context.Context, filePath string, content []byte, options ExpandOptions) (string, error)
+func Expand(ctx context.Context, root *os.Root, filePath string, content []byte, options ExpandOptions) (text string, complete bool, err error)
 ```
 
 - `filePath` is made absolute once. Relative imports resolve against the importing file's directory at each level.
+- Every import is opened through `root`: a `../` or absolute path outside it, or a symlink out of it, leaves the token literal.
 - `~` and `~/...` resolve against `HomeDir`. Missing `HomeDir` leaves the token literal.
+- Imports stop reading at `MaxBytes`; `complete` is false when they were cut.
 - Cycle detection is global per expansion (same file skipped everywhere, not just on one branch).
 - Missing/unreadable/directory targets leave the `@token` literal; they don't fail discovery.
+
+Startup uses the repository root for repository files (no `HomeDir`, so `~` stays literal) and the home directory, or the agent dir when it is outside home, for the user's own files. Nested discovery uses the working directory.
 
 ### Session discovery
 
@@ -337,9 +339,9 @@ Resolution:
 - Absolute → used as-is
 - Anything else → resolved against the importing file's directory
 
-Each resolved path is canonicalized (`filepath.EvalSymlinks` or `filepath.Clean`), checked against a global visited set, and depth-limited (`MaxImportDepth = 5`). At the depth limit, the file is read but its own imports stay literal : giving exactly five import edges from the root.
+The resolved path must lie inside the root and is opened through it, so a symlink cannot lead outside. Each resolved path is canonicalized (`filepath.EvalSymlinks` or `filepath.Clean`), checked against a global visited set, and depth-limited (`MaxImportDepth = 5`). At the depth limit, the file is read but its own imports stay literal : giving exactly five import edges from the root.
 
-Missing files, directories, and unreadable targets leave the original `@token` literal. Cycles and repeated includes also leave the literal. Only invalid options, source read failures, and cancellation return errors.
+Missing files, directories, files outside the root, and unreadable targets leave the original `@token` literal, as do imports past the byte budget. Cycles and repeated includes also leave the literal. Only a missing root, source failures, and cancellation return errors.
 
 ### Sticky rule lifecycle
 

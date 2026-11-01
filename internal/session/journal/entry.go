@@ -114,6 +114,9 @@ type MessageEntry struct {
 	Withdraws       []string
 	Metered         bool
 	CallOccurrences []string
+	// ContextFiles are the nested context files a tool result delivers,
+	// committed in the same line as the text that carries them.
+	ContextFiles []ContextFileRecord
 }
 
 func (MessageEntry) kind() EntryType            { return KindMessage }
@@ -252,29 +255,30 @@ func (e PermissionRecord) withMeta(meta Meta) Entry { e.Meta = meta; return e }
 // wireEntry is the one JSONL envelope for entries and records. Message bodies
 // and record payloads stay raw until the kind says how to decode them.
 type wireEntry struct {
-	Type            EntryType       `json:"type"`
-	Seq             uint64          `json:"seq,omitempty"`
-	ID              string          `json:"id,omitempty"`
-	ParentID        string          `json:"parent_id,omitempty"`
-	Timestamp       time.Time       `json:"timestamp"`
-	Lane            string          `json:"lane,omitempty"`
-	RunID           string          `json:"run_id,omitempty"`
-	EventSeq        uint64          `json:"event_seq,omitempty"`
-	Message         json.RawMessage `json:"message,omitempty"`
-	Model           string          `json:"model,omitempty"`
-	Role            string          `json:"role,omitempty"`
-	Summary         string          `json:"summary,omitempty"`
-	FirstKeptID     string          `json:"first_kept_id,omitempty"`
-	TokensBefore    int             `json:"tokens_before,omitempty"`
-	Payload         json.RawMessage `json:"payload,omitempty"`
-	QueueID         string          `json:"queue_id,omitempty"`
-	Withdraws       []string        `json:"withdraws,omitempty"`
-	Metered         bool            `json:"metered,omitempty"`
-	CallOccurrences []string        `json:"call_occurrences,omitempty"`
-	SourceHash      string          `json:"source_hash,omitempty"`
-	CompactionID    string          `json:"compaction_id,omitempty"`
-	Snapshot        *work.Artifact  `json:"snapshot,omitempty"`
-	CompactionTask  string          `json:"compaction_task,omitempty"`
+	Type            EntryType           `json:"type"`
+	Seq             uint64              `json:"seq,omitempty"`
+	ID              string              `json:"id,omitempty"`
+	ParentID        string              `json:"parent_id,omitempty"`
+	Timestamp       time.Time           `json:"timestamp"`
+	Lane            string              `json:"lane,omitempty"`
+	RunID           string              `json:"run_id,omitempty"`
+	EventSeq        uint64              `json:"event_seq,omitempty"`
+	Message         json.RawMessage     `json:"message,omitempty"`
+	Model           string              `json:"model,omitempty"`
+	Role            string              `json:"role,omitempty"`
+	Summary         string              `json:"summary,omitempty"`
+	FirstKeptID     string              `json:"first_kept_id,omitempty"`
+	TokensBefore    int                 `json:"tokens_before,omitempty"`
+	Payload         json.RawMessage     `json:"payload,omitempty"`
+	QueueID         string              `json:"queue_id,omitempty"`
+	Withdraws       []string            `json:"withdraws,omitempty"`
+	Metered         bool                `json:"metered,omitempty"`
+	CallOccurrences []string            `json:"call_occurrences,omitempty"`
+	ContextFiles    []ContextFileRecord `json:"context_files,omitempty"`
+	SourceHash      string              `json:"source_hash,omitempty"`
+	CompactionID    string              `json:"compaction_id,omitempty"`
+	Snapshot        *work.Artifact      `json:"snapshot,omitempty"`
+	CompactionTask  string              `json:"compaction_task,omitempty"`
 }
 
 // unknownEntryError lets [Load] retain a forward-compatible journal tail as a
@@ -315,7 +319,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 			return nil, fmt.Errorf("marshal message entry: %w", err)
 		}
 		wire.Message = message
-		wire.QueueID, wire.Withdraws, wire.Metered, wire.CallOccurrences = e.QueueID, e.Withdraws, e.Metered, e.CallOccurrences
+		wire.QueueID, wire.Withdraws, wire.Metered, wire.CallOccurrences, wire.ContextFiles = e.QueueID, e.Withdraws, e.Metered, e.CallOccurrences, e.ContextFiles
 	case ModelChangeEntry:
 		wire.Model, wire.Role = e.Model, e.Role
 	case CompactionEntry:
@@ -415,7 +419,12 @@ func decodeEntry(raw []byte) (Entry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode journal message: %w", err)
 		}
-		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Withdraws: wire.Withdraws, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences}, nil
+		for _, file := range wire.ContextFiles {
+			if file.Dir == "" || file.Path == "" || file.Bytes < 0 {
+				return nil, fmt.Errorf("decode journal message: invalid context file %+v", file)
+			}
+		}
+		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Withdraws: wire.Withdraws, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences, ContextFiles: wire.ContextFiles}, nil
 	case KindModelChange:
 		return ModelChangeEntry{Meta: meta, Model: wire.Model, Role: wire.Role}, nil
 	case KindCompaction:

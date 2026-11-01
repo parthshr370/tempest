@@ -81,6 +81,18 @@ type readSource struct {
 	images []types.ContentBlock
 	// save writes data where bash can read it, for a resource with no file.
 	save func() (string, error)
+	// workspace is the workspace file or directory the read touched; zero for
+	// URLs and session artifacts. It survives derived views such as archive
+	// members, which still read a workspace file.
+	workspace agent.PathEvent
+}
+
+// paths reports the workspace path a successful read touched.
+func (src readSource) paths() []agent.PathEvent {
+	if src.workspace.Path == "" {
+		return nil
+	}
+	return []agent.PathEvent{src.workspace}
 }
 
 // loadReadSource resolves a read path (workspace file, session artifact or
@@ -134,8 +146,10 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 		absolutePath := pathutil.ResolveReadPath(target.path, cwd)
 		displayPath := readDisplayPath(cwd, absolutePath, target.path)
 		var data []byte
+		var workspace agent.PathEvent
 		relPath, err := rootRelPath(cwd, absolutePath)
 		if err == nil {
+			touched := agent.PathEvent{Path: absolutePath}
 			info, statErr := statInRoot(root, relPath)
 			switch {
 			case statErr == nil && info.IsDir():
@@ -143,7 +157,7 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 				if listErr != nil {
 					return readSource{}, nil, listErr
 				}
-				data, listing = text, true
+				data, listing, touched.Dir = text, true, true
 			case statErr == nil && archiveKind(relPath) != "" && info.Size() > maxArchiveBytes:
 				return readSource{}, nil, fmt.Errorf("archive %s is %d bytes, over the %d MiB read limit; use bash (unzip -l, tar -tf)", displayPath, info.Size(), maxArchiveBytes>>20)
 			case statErr == nil && (sqlitePath(relPath) || strings.EqualFold(filepath.Ext(relPath), ".pdf")) && info.Size() > document.MaxCodingInput:
@@ -155,13 +169,14 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 					data, err = readFileInRoot(root, relPath)
 				}
 			}
+			workspace = touched
 		} else if artifact, ok := sessionArtifactName(options.SessionDataDir, absolutePath); ok && errors.Is(err, ErrOutsideRoot) {
 			data, err = readSessionArtifact(options.SessionDataDir, artifact)
 		}
 		if err != nil {
 			return readSource{}, nil, err
 		}
-		src = readSource{data: data, displayPath: displayPath, isResource: listing}
+		src = readSource{data: data, displayPath: displayPath, isResource: listing, workspace: workspace}
 		if !listing {
 			src.absolutePath = absolutePath
 		}
@@ -178,7 +193,7 @@ func loadReadSource(ctx context.Context, cwd string, root *os.Root, options Tool
 			if len(src.data) > document.MaxInlineImageBytes {
 				return readSource{}, nil, fmt.Errorf("image %s is %d bytes; inline image reads are limited to %d bytes", src.displayPath, len(src.data), document.MaxInlineImageBytes)
 			}
-			result := agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("Read image file [" + mimeType + "]"), types.NewImage(base64.StdEncoding.EncodeToString(src.data), mimeType)}}
+			result := agent.AgentToolResult{Content: []types.ContentBlock{types.NewText("Read image file [" + mimeType + "]"), types.NewImage(base64.StdEncoding.EncodeToString(src.data), mimeType)}, Paths: src.paths()}
 			return readSource{}, &result, nil
 		}
 	}

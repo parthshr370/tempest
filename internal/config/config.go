@@ -137,6 +137,42 @@ type RetrySettings struct {
 	JitterMax    float64
 }
 
+// Built-in context file limits; see guide/skills-and-context.md.
+const (
+	DefaultContextMaxBytes       = 64 << 10
+	DefaultContextNestedMaxBytes = 16 << 10
+)
+
+// DefaultContextFallback is the file name tried in a directory with neither
+// AGENTS.override.md nor AGENTS.md.
+var DefaultContextFallback = []string{"CLAUDE.md"}
+
+// ContextFileSettings bound and name the context files read at startup and
+// on nested reads. A nil Fallback or zero byte cap means the built-in default;
+// an empty non-nil Fallback disables fallback names.
+type ContextFileSettings struct {
+	Fallback       []string
+	MaxBytes       int
+	NestedMaxBytes int
+	// NestedDisabled is context_files.nested set to false.
+	NestedDisabled bool
+}
+
+// WithDefaults fills unset limits so library callers without settings get the
+// documented behavior.
+func (s ContextFileSettings) WithDefaults() ContextFileSettings {
+	if s.Fallback == nil {
+		s.Fallback = slices.Clone(DefaultContextFallback)
+	}
+	if s.MaxBytes <= 0 {
+		s.MaxBytes = DefaultContextMaxBytes
+	}
+	if s.NestedMaxBytes <= 0 {
+		s.NestedMaxBytes = DefaultContextNestedMaxBytes
+	}
+	return s
+}
+
 // SecretResolver supplies provider credentials at process startup. Resolved
 // configuration retains neither this resolver nor the values it returns.
 type SecretResolver interface {
@@ -198,6 +234,7 @@ type ResolvedConfig struct {
 	permissionAllowTools   []string
 	permissionDenyTools    []string
 	retry                  RetrySettings
+	contextFiles           ContextFileSettings
 	mcpServers             []mcpconfig.Server
 	mcpSamplingModel       string
 	mcpSamplingMaxTokens   int
@@ -332,6 +369,13 @@ func (c *ResolvedConfig) Settings() []Setting {
 // log them once.
 func (c *ResolvedConfig) Warnings() []string { return slices.Clone(c.warnings) }
 
+// ContextFiles returns the context file names and byte budgets.
+func (c *ResolvedConfig) ContextFiles() ContextFileSettings {
+	settings := c.contextFiles
+	settings.Fallback = slices.Clone(settings.Fallback)
+	return settings
+}
+
 // SkillPaths returns a defensive copy of explicit skill locations.
 func (c *ResolvedConfig) SkillPaths() []string {
 	return append([]string(nil), c.skillPaths...)
@@ -442,6 +486,16 @@ type fileSettings struct {
 	ListingMaxFiles         *int                              `json:"workspace_listing_max_files"`
 	ListingMaxBytes         *int                              `json:"workspace_listing_max_bytes"`
 	OTel                    *otelFileSettings                 `json:"otel"`
+	ContextFiles            *contextFilesSettings             `json:"context_files"`
+}
+
+// contextFilesSettings is the context_files object; built-in defaults fill
+// every member a layer leaves unset.
+type contextFilesSettings struct {
+	Fallback       []string `json:"fallback"`
+	MaxBytes       *int     `json:"max_bytes"`
+	NestedMaxBytes *int     `json:"nested_max_bytes"`
+	Nested         *bool    `json:"nested"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -589,6 +643,10 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if listingMaxBytes <= 0 {
 		return nil, &Error{Field: "workspace_listing_max_bytes", Err: errors.New("must be positive")}
 	}
+	contextFiles, err := resolveContextFiles(settings.ContextFiles)
+	if err != nil {
+		return nil, err
+	}
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
@@ -647,6 +705,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 		warnings:               slices.Concat(resolver.operatorWarnings, layered.warnings),
 		workspace:              &workspaceSettings{resolver: resolver, root: root},
 		workspaceListing:       WorkspaceListing{Disabled: !settingValue(settings.WorkspaceListing), MaxFiles: listingMaxFiles, MaxBytes: listingMaxBytes},
+		contextFiles:           contextFiles,
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,
@@ -660,6 +719,39 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err := validateResolved(resolved); err != nil {
 		return nil, err
 	}
+	return resolved, nil
+}
+
+// resolveContextFiles validates context_files after defaults filled it.
+// Fallback entries are bare file names looked up in each directory.
+func resolveContextFiles(raw *contextFilesSettings) (ContextFileSettings, error) {
+	if raw == nil {
+		raw = &contextFilesSettings{}
+	}
+	resolved := ContextFileSettings{
+		Fallback:       make([]string, 0, len(raw.Fallback)),
+		MaxBytes:       settingValue(raw.MaxBytes),
+		NestedMaxBytes: settingValue(raw.NestedMaxBytes),
+		NestedDisabled: raw.Nested != nil && !*raw.Nested,
+	}
+	for _, name := range raw.Fallback {
+		name = strings.TrimSpace(name)
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+			return ContextFileSettings{}, &Error{Field: "context_files.fallback", Err: fmt.Errorf("%q must be a file name without a directory", name)}
+		}
+		if !slices.Contains(resolved.Fallback, name) {
+			resolved.Fallback = append(resolved.Fallback, name)
+		}
+	}
+	if resolved.MaxBytes <= 0 {
+		return ContextFileSettings{}, &Error{Field: "context_files.max_bytes", Err: errors.New("must be positive")}
+	}
+	if resolved.NestedMaxBytes <= 0 {
+		return ContextFileSettings{}, &Error{Field: "context_files.nested_max_bytes", Err: errors.New("must be positive")}
+	}
+	// Nested files count against the total cap, so a smaller total also
+	// bounds each nested file.
+	resolved.NestedMaxBytes = min(resolved.NestedMaxBytes, resolved.MaxBytes)
 	return resolved, nil
 }
 

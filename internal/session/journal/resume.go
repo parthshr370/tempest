@@ -67,8 +67,11 @@ type Loaded struct {
 	HookRuns        map[string]HookState
 	// EvalLanguages survives transcript compaction; process state doesn't.
 	EvalLanguages map[string]bool
-	snapshots     map[string][]ptypes.Message
-	prefixes      map[string][]ptypes.Message
+	// ContextFiles are the nested context files already surfaced, in order;
+	// like EvalLanguages they survive transcript compaction.
+	ContextFiles []ContextFileRecord
+	snapshots    map[string][]ptypes.Message
+	prefixes     map[string][]ptypes.Message
 
 	// lastSeq is where a resumed store continues numbering lines.
 	lastSeq uint64
