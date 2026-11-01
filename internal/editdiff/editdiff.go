@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/pmezard/go-difflib/difflib"
 	"golang.org/x/text/unicode/norm"
@@ -70,7 +71,9 @@ type Edit struct {
 	OldText string `json:"old_text"`
 	// NewText is the replacement text.
 	NewText string `json:"new_text"`
-	// Anchor is the optional full 64-character SHA-256 hexadecimal digest emitted by the read tool.
+	// Anchor optionally guards the edit against stale content: the [path#TAG]
+	// header read displays, its 4-hex tag, or a full 64-character SHA-256
+	// content digest. The edit tool checks it; this package ignores it.
 	Anchor string `json:"anchor,omitempty"`
 }
 
@@ -233,13 +236,8 @@ func ApplyEditsToNormalizedContent(normalizedContent string, edits []Edit, path 
 		if !match.Found {
 			return AppliedEditsResult{}, getNotFoundError(path, i, len(normalizedEdits))
 		}
-		needle := edit.OldText
-		if usedFuzzyMatch {
-			needle = NormalizeForFuzzyMatch(needle)
-		}
-		occurrences := countOccurrences(replacementBaseContent, needle)
-		if occurrences > 1 {
-			return AppliedEditsResult{}, getDuplicateError(path, i, len(normalizedEdits), occurrences)
+		if starts := occurrenceLines(replacementBaseContent, edit.OldText); len(starts) > 1 {
+			return AppliedEditsResult{}, getDuplicateError(path, i, len(normalizedEdits), normalizedContent, edit.OldText, starts)
 		}
 		matched = append(matched, matchedEdit{editIndex: i, textReplacement: textReplacement{matchIndex: match.Index, matchLength: match.MatchLength, newText: edit.NewText}})
 	}
@@ -512,11 +510,27 @@ func applyReplacements(content string, replacements []textReplacement, offset in
 	return result
 }
 
-// countOccurrences counts fuzzy-normalized occurrences of oldText in content.
-func countOccurrences(content string, oldText string) int {
-	fuzzyContent := NormalizeForFuzzyMatch(content)
-	fuzzyOldText := NormalizeForFuzzyMatch(oldText)
-	return strings.Count(fuzzyContent, fuzzyOldText)
+// occurrenceLines returns the 1-based line on which each fuzzy-normalized,
+// non-overlapping occurrence of oldText in content starts. Normalization
+// keeps line breaks, so the numbers are lines of content.
+func occurrenceLines(content string, oldText string) []int {
+	haystack, needle := NormalizeForFuzzyMatch(content), NormalizeForFuzzyMatch(oldText)
+	if needle == "" {
+		// Whitespace-only text normalizes away; count it as written.
+		haystack, needle = content, oldText
+	}
+	var starts []int
+	line, scanned := 1, 0
+	for {
+		index := strings.Index(haystack[scanned:], needle)
+		if index < 0 {
+			return starts
+		}
+		line += strings.Count(haystack[scanned:scanned+index], "\n")
+		starts = append(starts, line)
+		line += strings.Count(needle, "\n")
+		scanned += index + len(needle)
+	}
 }
 
 func getNotFoundError(path string, editIndex int, totalEdits int) error {
@@ -526,11 +540,64 @@ func getNotFoundError(path string, editIndex int, totalEdits int) error {
 	return fmt.Errorf("Could not find edits[%d] in %s. The old_text must match exactly including all whitespace and newlines.", editIndex, path)
 }
 
-func getDuplicateError(path string, editIndex int, totalEdits int, occurrences int) error {
-	if totalEdits == 1 {
-		return fmt.Errorf("Found %d occurrences of the text in %s. The text must be unique. Please provide more context to make it unique.", occurrences, path)
+const (
+	// maxListedOccurrences bounds how many matches an ambiguity error shows.
+	maxListedOccurrences = 10
+	// maxListedLineBytes clips each line an ambiguity error shows.
+	maxListedLineBytes = 200
+)
+
+// getDuplicateError rejects an old_text that matches more than once and
+// lists where, as LINE:TEXT rows with one line of context around each
+// match, so a single retry can pick unique old_text for each occurrence.
+func getDuplicateError(path string, editIndex int, totalEdits int, content string, oldText string, starts []int) error {
+	subject := "the text"
+	if totalEdits > 1 {
+		subject = fmt.Sprintf("edits[%d]", editIndex)
 	}
-	return fmt.Errorf("Found %d occurrences of edits[%d] in %s. Each old_text must be unique. Please provide more context to make it unique.", occurrences, editIndex, path)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Found %d occurrences of %s in %s; old_text must match exactly one place. To change one of them, extend old_text with text from its line or a neighboring line until it is unique; to change several, send one edit per occurrence, each unique. Occurrences (LINE:TEXT, with one line of context):", len(starts), subject, path)
+	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
+	span := strings.Count(strings.TrimSuffix(oldText, "\n"), "\n")
+	row := func(line int) {
+		if line >= 1 && line <= len(lines) {
+			fmt.Fprintf(&b, "\n%d:%s", line, clipLine(lines[line-1]))
+		}
+	}
+	for i, start := range starts {
+		if i == maxListedOccurrences {
+			fmt.Fprintf(&b, "\n… %d more", len(starts)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteString("\n--")
+		}
+		end := start + span
+		row(start - 1)
+		if span <= 2 {
+			for line := start; line <= end; line++ {
+				row(line)
+			}
+		} else {
+			row(start)
+			b.WriteString("\n…")
+			row(end)
+		}
+		row(end + 1)
+	}
+	return errors.New(b.String())
+}
+
+// clipLine bounds one displayed line on a rune boundary.
+func clipLine(line string) string {
+	if len(line) <= maxListedLineBytes {
+		return line
+	}
+	cut := maxListedLineBytes
+	for cut > 0 && !utf8.RuneStart(line[cut]) {
+		cut--
+	}
+	return line[:cut] + "…"
 }
 
 func getEmptyOldTextError(path string, editIndex int, totalEdits int) error {

@@ -73,6 +73,11 @@ the file being edited (`./a.go` and `a.go` are the same file); a header of anoth
 file is rejected with both paths named, and a stale tag is rejected as for
 `hashline`. Any other anchor text is rejected, never ignored.
 
+Each `old_text` must match exactly one place. When it matches several, nothing is
+written and the error lists every match (up to ten) as `LINE:TEXT` rows with one line
+of context on each side, so one retry can give each occurrence its own edit with
+unique text. There is no implicit replace-all.
+
 ## Atomic writes and rollback
 
 Every write is **atomic**. `write`, `edit` and `hashline` stage the new bytes in a

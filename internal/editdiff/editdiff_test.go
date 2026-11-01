@@ -98,7 +98,7 @@ func TestApplyEditsToNormalizedContentErrors(t *testing.T) {
 	}{
 		{"empty", "abc", []Edit{{OldText: "", NewText: "x"}}, "old_text must not be empty in file.txt."},
 		{"missing", "abc", []Edit{{OldText: "z", NewText: "x"}}, "Could not find the exact text in file.txt. The old text must match exactly including all whitespace and newlines."},
-		{"duplicate", "abc abc", []Edit{{OldText: "abc", NewText: "x"}}, "Found 2 occurrences of the text in file.txt. The text must be unique. Please provide more context to make it unique."},
+		{"duplicate", "abc abc", []Edit{{OldText: "abc", NewText: "x"}}, "Found 2 occurrences of the text in file.txt; old_text must match exactly one place. To change one of them, extend old_text with text from its line or a neighboring line until it is unique; to change several, send one edit per occurrence, each unique. Occurrences (LINE:TEXT, with one line of context):\n1:abc abc\n--\n1:abc abc"},
 		{"overlap", "abcdef", []Edit{{OldText: "abc", NewText: "x"}, {OldText: "bcd", NewText: "y"}}, "edits[0] and edits[1] overlap in file.txt. Merge them into one edit or target disjoint regions."},
 		{"nochange", "abc", []Edit{{OldText: "abc", NewText: "abc"}}, "No changes made to file.txt. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."},
 	}
@@ -120,6 +120,32 @@ func TestApplyEditsToNormalizedContentRejectsMixedFuzzyDuplicate(t *testing.T) {
 	}, "file.txt")
 	if err == nil || !strings.Contains(err.Error(), "Found 2 occurrences") {
 		t.Fatalf("mixed fuzzy duplicate err = %v", err)
+	}
+}
+
+// TestAmbiguousEditListsOccurrences checks that an old_text matching
+// several places is rejected with every match's line number and its
+// neighbors, which is enough to write unique edits in one retry.
+func TestAmbiguousEditListsOccurrences(t *testing.T) {
+	content := "package orders\n\n// ComputeTotal returns the total.\nfunc ComputeTotal(lines []Line) int {\n\treturn sum(lines)\n}\n\nfunc twice() {\n\tx()\n\ty()\n}\n\nfunc again() {\n\tx()\n\ty()\n}\n"
+	_, err := ApplyEditsToNormalizedContent(content, []Edit{{OldText: "ComputeTotal", NewText: "SumValues"}}, "orders/sum.go")
+	want := "\n2:\n3:// ComputeTotal returns the total.\n4:func ComputeTotal(lines []Line) int {\n--\n3:// ComputeTotal returns the total.\n4:func ComputeTotal(lines []Line) int {\n5:\treturn sum(lines)"
+	if err == nil || !strings.HasPrefix(err.Error(), "Found 2 occurrences of the text in orders/sum.go") || !strings.HasSuffix(err.Error(), want) {
+		t.Fatalf("ambiguous err = %v", err)
+	}
+	// A multi-line old_text: later matches are numbered past earlier ones.
+	_, err = ApplyEditsToNormalizedContent(content, []Edit{{OldText: "\tx()\n\ty()\n", NewText: "\tz()\n"}}, "orders/sum.go")
+	want = "\n8:func twice() {\n9:\tx()\n10:\ty()\n11:}\n--\n13:func again() {\n14:\tx()\n15:\ty()\n16:}"
+	if err == nil || !strings.HasSuffix(err.Error(), want) {
+		t.Fatalf("multi-line ambiguous err = %v", err)
+	}
+	// One retry built from the listed lines succeeds.
+	got, err := ApplyEditsToNormalizedContent(content, []Edit{
+		{OldText: "// ComputeTotal returns", NewText: "// SumValues returns"},
+		{OldText: "func ComputeTotal(", NewText: "func SumValues("},
+	}, "orders/sum.go")
+	if err != nil || strings.Contains(got.NewContent, "ComputeTotal") {
+		t.Fatalf("retry = %q, %v", got.NewContent, err)
 	}
 }
 
