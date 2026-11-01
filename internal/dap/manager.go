@@ -39,7 +39,7 @@ type adapterProcess struct {
 	transport     io.Closer
 	exited        chan struct{}
 	attached      bool
-	attachedPID   int
+	target        *attachTarget
 	release       func()
 	cleanupOnce   sync.Once
 	cleanupErr    error
@@ -140,17 +140,13 @@ func (process *adapterProcess) killPrograms() error {
 // target first, and debugserver halts by sending SIGSTOP; when another signal
 // (Go's preemption SIGURG, for one) wins that race, the SIGSTOP stays pending
 // and the kernel delivers it after detach, leaving the program stopped. SIGCONT
-// discards a pending stop and resumes a stopped one, and a running program
-// ignores it, so an attached program is always left running.
+// discards a pending stop and resumes a stopped one. A running program that
+// handles SIGCONT sees one extra delivery.
 func (process *adapterProcess) continueAttached() error {
-	if !process.attached || process.attachedPID <= 0 {
+	if process.target == nil {
 		return nil
 	}
-	err := syscall.Kill(process.attachedPID, syscall.SIGCONT)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
-	}
-	return err
+	return process.target.resume()
 }
 
 func (process *adapterProcess) releaseWhenGone() {
@@ -290,16 +286,15 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	for key, value := range arguments {
 		merged[key] = value
 	}
-	var attachedPID int
+	var target *attachTarget
 	if action == "attach" {
-		// A local attach names its pid; cleanup leaves that program running.
-		// Read it before the adapter, and with it the exit observer that runs
-		// cleanup, exists.
-		_ = json.Unmarshal(merged["processId"], &attachedPID)
+		// Pin the named process before the adapter, and with it the exit
+		// observer that runs cleanup, exists.
+		target = pinAttachTarget(merged["processId"])
 	}
-	process, err := m.spawn(ctx, adapter, action == "attach", attachedPID)
+	process, err := m.spawn(ctx, adapter, action == "attach", target)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, target.release())
 	}
 	m.active = process
 	success := false
@@ -385,9 +380,9 @@ waitInitialized:
 	return body, nil
 }
 
-// spawn starts the adapter. An attached pid is stored before the exit
+// spawn starts the adapter. An attach target is stored before the exit
 // observer that runs cleanup starts, so cleanup always sees it.
-func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, attachedPID int) (*adapterProcess, error) {
+func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, target *attachTarget) (*adapterProcess, error) {
 	release := func() {}
 	if m.admit != nil {
 		var err error
@@ -396,7 +391,7 @@ func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, att
 			return nil, err
 		}
 	}
-	process := &adapterProcess{attached: attached, attachedPID: attachedPID, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
+	process := &adapterProcess{attached: attached, target: target, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
 	args := append([]string(nil), adapter.Args...)
 	var listener net.Listener
 	if adapter.Transport == "reverse_tcp" {

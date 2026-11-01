@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -67,4 +68,64 @@ func TestDAPAttachTargetPinnedBeforeAdapterCanExit(t *testing.T) {
 	waitDAPCondition(t, "attach target didn't get SIGCONT after its adapter exited", func() bool {
 		return strings.Contains(recorder.signals(), "cont")
 	})
+}
+
+// A reused pid names a different process; the attach target pinned at attach
+// time must not signal it.
+func TestDAPAttachTargetSkipsChangedIdentity(t *testing.T) {
+	recorder := startSignalRecorder(t)
+	processID := json.RawMessage(strconv.Itoa(recorder.command.Process.Pid))
+	reused := pinAttachTarget(processID)
+	if reused == nil {
+		t.Fatal("couldn't pin the identity of a live process")
+	}
+	// Model pid reuse: the pid now belongs to a process that started at
+	// another time.
+	reused.start[0]++
+	if err := reused.resume(); err != nil {
+		t.Fatal(err)
+	}
+	// Signals pend in the kernel as kill returns, and the shell runs every
+	// pending trap together, so a SIGCONT from resume would be recorded no
+	// later than this sentinel.
+	if err := recorder.command.Process.Signal(syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	waitDAPCondition(t, "recorder didn't record the sentinel signal", func() bool {
+		return strings.Contains(recorder.signals(), "usr1")
+	})
+	if strings.Contains(recorder.signals(), "cont") {
+		t.Fatalf("SIGCONT reached a process with a different start identity: %q", recorder.signals())
+	}
+
+	same := pinAttachTarget(processID)
+	if same == nil {
+		t.Fatal("couldn't pin the identity of a live process")
+	}
+	if err := same.resume(); err != nil {
+		t.Fatal(err)
+	}
+	waitDAPCondition(t, "SIGCONT didn't reach the pinned process", func() bool {
+		return strings.Contains(recorder.signals(), "cont")
+	})
+}
+
+func TestDAPAttachTargetToleratesExitedProcess(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "exec sleep 30")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	target := pinAttachTarget(json.RawMessage(strconv.Itoa(command.Process.Pid)))
+	if target == nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatal("couldn't pin the identity of a live process")
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = command.Wait()
+	if err := target.resume(); err != nil {
+		t.Fatalf("resuming a reaped attach target: %v", err)
+	}
 }
