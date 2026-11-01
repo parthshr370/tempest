@@ -452,6 +452,110 @@ func TestMCPHTTPReplyRefusedForAuthorizationKeepsTheConnection(t *testing.T) {
 		})
 	}
 }
+
+// answerServer is an MCP server whose tools/call asks Tempest a ping on its
+// response stream and, as a server waiting for the answer does, holds the
+// call open until an answer carrying "Bearer "+accept is accepted or end is
+// called. Every other answer is refused with 401. replies receives each
+// answer's Authorization.
+func answerServer(t *testing.T, accept string) (server *httptest.Server, replies <-chan string, end func()) {
+	t.Helper()
+	answers := make(chan string, 8)
+	answered, ended := make(chan struct{}), make(chan struct{})
+	var answerOnce, endOnce sync.Once
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case http.MethodGet:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var message httpMessage
+		_ = json.NewDecoder(r.Body).Decode(&message)
+		switch message.Method {
+		case "initialize":
+			writeRPC(t, w, message.ID, json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"auth","version":"1"}}`))
+		case "notifications/initialized", "notifications/cancelled":
+			w.WriteHeader(http.StatusAccepted)
+		case "tools/call":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "data: {\"jsonrpc\":\"2.0\",\"id\":\"ask\",\"method\":\"ping\",\"params\":{}}\n\n")
+			w.(http.Flusher).Flush()
+			select {
+			case <-answered:
+			case <-ended:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = fmt.Fprintf(w, "data: {\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"content\":[]}}\n\n", message.ID)
+		case "tools/list":
+			writeRPC(t, w, message.ID, json.RawMessage(`{"tools":[]}`))
+		case "":
+			authorization := r.Header.Get("Authorization")
+			answers <- authorization
+			if authorization != "Bearer "+accept {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			answerOnce.Do(func() { close(answered) })
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, answers, func() { endOnce.Do(func() { close(ended) }) }
+}
+
+// refreshingAuth is a renewingAuth whose token "new", once rejected, is
+// refreshed to "newer" without a user, as an OAuth refresh does; a
+// rejection of the retry that follows is final.
+type refreshingAuth struct{ renewingAuth }
+
+func (a *refreshingAuth) Rejected(_ context.Context, rejection Rejection) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rejection.Token == "new" && !rejection.Retried {
+		a.token = "newer"
+		return nil
+	}
+	return errors.New("mcp_auth: login required")
+}
+
+// The answer posted again after a login is that one POST: when the server
+// refuses it too, Tempest does not refresh and post it a third time.
+func TestMCPHTTPReplyRepostIsOnePost(t *testing.T) {
+	const settle = 200 * time.Millisecond
+	server, replies, end := answerServer(t, "newer")
+	auth := &refreshingAuth{renewingAuth{token: "old", renewed: make(chan struct{})}}
+	client, err := Dial(context.Background(), mcpconfig.Server{Name: "auth", Transport: "http", URL: server.URL, CallTimeout: "5s"}, t.TempDir(), Handlers{Auth: auth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeWire(t, client)
+	defer end()
+	called := make(chan error, 1)
+	go func() {
+		_, err := client.Call(context.Background(), "tools/call", struct{}{})
+		called <- err
+	}()
+	if got := <-replies; got != "Bearer old" {
+		t.Fatalf("first answer carried %q", got)
+	}
+	auth.renew("new")
+	if got := <-replies; got != "Bearer new" {
+		t.Fatalf("answer after the login carried %q", got)
+	}
+	select {
+	case got := <-replies:
+		t.Fatalf("one repost sent a second POST, carrying %q", got)
+	case <-time.After(settle):
+	}
+	end()
+	if err := <-called; err != nil {
+		t.Fatal(err)
+	}
+}
 func TestMCPHTTPNoCredentialRetry(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTemporaryRedirect} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
