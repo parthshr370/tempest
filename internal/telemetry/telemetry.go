@@ -22,7 +22,8 @@ type Options struct {
 	Settings config.OTelSettings
 	// Version is reported as service.version.
 	Version string
-	// HTTPClient sends OTLP requests; nil uses a client on the default transport.
+	// HTTPClient sends OTLP requests; nil uses a client on the default
+	// transport. Its redirect policy is replaced by sameOriginRedirect.
 	HTTPClient *http.Client
 	// SpanQueueSize, SpanBatchSize and SpanBatchInterval override the batch
 	// span processor defaults; zero keeps the default.
@@ -51,10 +52,12 @@ func New(opts Options) *Telemetry {
 	if opts.Settings.Disabled {
 		return nil
 	}
-	httpClient := opts.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Transport: http.DefaultTransport}
+	httpClient := &http.Client{Transport: http.DefaultTransport}
+	if opts.HTTPClient != nil {
+		copied := *opts.HTTPClient
+		httpClient = &copied
 	}
+	httpClient.CheckRedirect = sameOriginRedirect
 	userAgent := "tempest-otlp"
 	if opts.Version != "" {
 		userAgent += "/" + opts.Version

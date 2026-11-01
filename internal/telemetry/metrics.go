@@ -12,9 +12,21 @@ import (
 
 // Metrics are aggregated in memory with cumulative temporality and read two
 // ways: pushed over OTLP every metric export interval, and scraped as
-// Prometheus text from `serve -listen` at /metrics. Recording is a short
-// critical section on the turn loop's goroutine; collection, encoding and
-// network I/O run on the exporter or the scraping request.
+// Prometheus text from `serve -listen` at /metrics. Recording on the turn
+// loop's goroutine locks only the one series it updates (and its instrument
+// briefly to find that series); collection copies one series at a time, so
+// a scrape or push never holds a lock across the whole set. Each instrument
+// keeps at most maxSeriesPerInstrument attribute sets, so memory and
+// collection work stay bounded however long the process lives.
+
+// maxSeriesPerInstrument is the OpenTelemetry SDK's default cardinality
+// limit. Measurements with an attribute set beyond it are aggregated into one
+// overflow series carrying only otel.metric.overflow=true, as the SDK does.
+const maxSeriesPerInstrument = 2000
+
+// overflowAttribute marks the overflow series. Its text is the Prometheus
+// label value.
+var overflowAttribute = attribute{key: "otel.metric.overflow", kind: valueBool, flag: true, text: "true"}
 
 type instrumentKind int
 
@@ -44,9 +56,14 @@ type instrument struct {
 	description string
 	kind        instrumentKind
 	bounds      []float64
-	series      map[string]*series
-	order       []string
 	observe     func() []observation
+
+	// mu guards series, order and overflow. Recording holds it only to find
+	// or add a series, collection only to copy order.
+	mu       sync.RWMutex
+	series   map[string]*liveSeries
+	order    []*liveSeries
+	overflow *liveSeries
 }
 
 // observation is one point read from live state at collection time.
@@ -55,6 +72,7 @@ type observation struct {
 	value      int64
 }
 
+// series is one attribute set's aggregate, as collection copies it.
 type series struct {
 	attributes []attribute
 	count      uint64
@@ -65,9 +83,16 @@ type series struct {
 	value      int64
 }
 
+// liveSeries is a series being recorded into; mu guards data.
+type liveSeries struct {
+	mu   sync.Mutex
+	data series
+}
+
 // metricSet is the process's instruments. Metric attributes are always
 // strings, which keeps series keys and Prometheus labels simple.
 type metricSet struct {
+	// mu guards instruments, which only grows while the set is built.
 	mu          sync.Mutex
 	start       time.Time
 	instruments []*instrument
@@ -98,7 +123,7 @@ func newMetricSet(start time.Time) *metricSet {
 }
 
 func (s *metricSet) add(inst *instrument) *instrument {
-	inst.series = map[string]*series{}
+	inst.series = map[string]*liveSeries{}
 	s.instruments = append(s.instruments, inst)
 	return inst
 }
@@ -129,33 +154,58 @@ func seriesKey(attrs []attribute) string {
 	return key.String()
 }
 
-func (s *metricSet) seriesFor(inst *instrument, attrs []attribute) *series {
+// seriesFor returns the live series for attrs, adding it while the
+// instrument is under its cardinality limit and returning the overflow
+// series after.
+func (inst *instrument) seriesFor(attrs []attribute) *liveSeries {
 	key := seriesKey(attrs)
-	entry, ok := inst.series[key]
-	if !ok {
-		entry = &series{attributes: attrs}
-		if inst.kind == kindHistogram {
-			entry.buckets = make([]uint64, len(inst.bounds)+1)
+	inst.mu.RLock()
+	entry := inst.series[key]
+	inst.mu.RUnlock()
+	if entry != nil {
+		return entry
+	}
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if entry = inst.series[key]; entry != nil {
+		return entry
+	}
+	if len(inst.series) >= maxSeriesPerInstrument {
+		if inst.overflow == nil {
+			inst.overflow = inst.newSeries([]attribute{overflowAttribute})
+			inst.order = append(inst.order, inst.overflow)
 		}
-		inst.series[key] = entry
-		inst.order = append(inst.order, key)
+		return inst.overflow
+	}
+	entry = inst.newSeries(attrs)
+	inst.series[key] = entry
+	inst.order = append(inst.order, entry)
+	return entry
+}
+
+func (inst *instrument) newSeries(attrs []attribute) *liveSeries {
+	entry := &liveSeries{data: series{attributes: attrs}}
+	if inst.kind == kindHistogram {
+		entry.data.buckets = make([]uint64, len(inst.bounds)+1)
 	}
 	return entry
 }
 
 func (s *metricSet) increment(inst *instrument, attrs ...attribute) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.seriesFor(inst, attrs).value++
+	entry := inst.seriesFor(attrs)
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	entry.data.value++
 }
 
 func (s *metricSet) observe(inst *instrument, value float64, attrs ...attribute) {
 	if math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry := s.seriesFor(inst, attrs)
+	live := inst.seriesFor(attrs)
+	live.mu.Lock()
+	defer live.mu.Unlock()
+	entry := &live.data
 	if entry.count == 0 || value < entry.min {
 		entry.min = value
 	}
@@ -168,7 +218,9 @@ func (s *metricSet) observe(inst *instrument, value float64, attrs ...attribute)
 	entry.buckets[bucket]++
 }
 
-// snapshot is a consistent copy of every instrument for one export or scrape.
+// snapshot is a copy of every instrument for one export or scrape. Each
+// series is copied whole under its own lock, so its count, sum and buckets
+// agree; series are copied one after another, not at one instant.
 type snapshot struct {
 	at          time.Time
 	start       time.Time
@@ -187,27 +239,28 @@ type instrumentSnapshot struct {
 func (s *metricSet) collect(now time.Time) snapshot {
 	s.mu.Lock()
 	instruments := slices.Clone(s.instruments)
+	s.mu.Unlock()
 	result := snapshot{at: now, start: s.start, instruments: make([]instrumentSnapshot, 0, len(instruments))}
-	var observedIndexes []int
 	for _, inst := range instruments {
 		copied := instrumentSnapshot{name: inst.name, unit: inst.unit, description: inst.description, kind: inst.kind, bounds: inst.bounds}
-		for _, key := range inst.order {
-			entry := *inst.series[key]
-			entry.buckets = slices.Clone(entry.buckets)
-			copied.series = append(copied.series, entry)
+		inst.mu.RLock()
+		live := slices.Clone(inst.order)
+		inst.mu.RUnlock()
+		copied.series = make([]series, 0, len(live))
+		for _, entry := range live {
+			entry.mu.Lock()
+			data := entry.data
+			data.buckets = slices.Clone(data.buckets)
+			entry.mu.Unlock()
+			copied.series = append(copied.series, data)
 		}
+		// Observers read other components' state under no metrics lock.
 		if inst.observe != nil {
-			observedIndexes = append(observedIndexes, len(result.instruments))
+			for _, point := range inst.observe() {
+				copied.series = append(copied.series, series{attributes: point.attributes, value: point.value})
+			}
 		}
 		result.instruments = append(result.instruments, copied)
-	}
-	s.mu.Unlock()
-	// Observers read other components' state; they run outside the lock so a
-	// slow observer never delays recording.
-	for _, index := range observedIndexes {
-		for _, point := range instruments[index].observe() {
-			result.instruments[index].series = append(result.instruments[index].series, series{attributes: point.attributes, value: point.value})
-		}
 	}
 	return result
 }

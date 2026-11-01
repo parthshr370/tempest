@@ -22,8 +22,16 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
 Traces go to `<endpoint>/v1/traces` and metrics to `<endpoint>/v1/metrics`. An OTel
-Collector or Jaeger (`jaegertracing/all-in-one`, OTLP/HTTP on port 4318) both accept
-this directly.
+Collector with an OTLP/HTTP receiver accepts both.
+
+Jaeger (`jaegertracing/all-in-one`, OTLP/HTTP on port 4318) accepts traces only and
+answers `404` to `/v1/metrics`. Give it the traces endpoint alone, and scrape metrics
+from `/metrics` or send them to a collector that takes metrics:
+
+```sh
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:4318/v1/traces
+./bin/tempest -p "summarize README.md"
+```
 
 A one-shot run with no endpoint exports nothing and keeps no metrics.
 `serve -listen` always keeps metrics for `/metrics` unless telemetry is disabled.
@@ -51,15 +59,18 @@ environment input.
 | `otel.capture_message_content` | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `false` | Adds prompts, responses, tool arguments and tool results to spans. |
 | `otel.metric_export_interval_ms` | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | How often metrics are pushed over OTLP. |
 
-Endpoints must be absolute `http` or `https` URLs. An error message shows the URL
-with its userinfo and query removed.
+Endpoints must be absolute `http` or `https` URLs. An error message or log line shows
+the URL with its userinfo and query removed, both at startup and when an export
+fails.
 
 A project `.harness/settings.json` can send spans, header credentials and message
-content to a server of its choosing. For that reason, project `otel` settings apply
-only under provider trust: `-trust-project-providers`,
+content to a server of its choosing. For that reason, every project `otel` setting
+applies only under provider trust: `-trust-project-providers`,
 `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the project path in user
 `trusted_provider_projects`. User settings, environment variables and flags always
-apply.
+apply. A key is matched by its exact spelling: `OTel`, `otel.Headers` or any other
+case variant is an unknown setting, ignored with a warning, in every file and in
+`-c`.
 
 ## Span tree
 
@@ -82,7 +93,10 @@ its retries.
 
 The run span carries the run totals as `gen_ai.aggregated_usage.*`. Request spans
 carry `gen_ai.usage.*`. The two namespaces are kept apart, so summing
-`gen_ai.usage.*` over a trace counts each request once.
+`gen_ai.usage.*` over a trace counts each request once. As the GenAI conventions
+define it, `input_tokens` counts every input token, cached ones included;
+`cache_read.input_tokens` and `cache_creation.input_tokens` say how many of them were
+read from or written to the provider's cache.
 
 ### Attributes
 
@@ -90,7 +104,7 @@ carry `gen_ai.usage.*`. The two namespaces are kept apart, so summing
 |---|---|
 | `invoke_agent` | `gen_ai.operation.name`, `gen_ai.agent.name` (`tempest`, or the subagent type), `gen_ai.conversation.id` (session id), `gen_ai.agent.call.id` (run id), `tempest.run.stop_reason`, `tempest.run.turns`, `gen_ai.aggregated_usage.{input_tokens,output_tokens,cache_read.input_tokens,cache_creation.input_tokens}`, `tempest.cost.usd` or `tempest.cost.unknown`, and `error.type` when the run ends in `error`, `output_invalid` or `repeated_failure`. |
 | `chat` (request) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `tempest.request.reasoning`, `server.address`, `server.port`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, `gen_ai.usage.{input_tokens,output_tokens,cache_read.input_tokens,cache_creation.input_tokens}`, `tempest.cost.usd` or `tempest.cost.unknown`, and `error.type` on failure (`incomplete` when the run ended mid-request). |
-| `chat` (failed attempt) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt`, and `tempest.attempt.outcome` (`retry`). |
+| `chat` (failed attempt) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt`, `tempest.attempt.outcome` (`retry`), and the usage and cost the attempt reported before it failed. |
 | `execute_tool` | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `tempest.permission.decision` (`allow`, `deny`), `tempest.permission.source`, `tempest.tool.outcome` (`success`, `error`), and `error.type` (`tool_error`, or `incomplete` when the run ended first). |
 
 Failed spans have status `ERROR`. Their status message is redacted and cut to 1024
@@ -100,10 +114,15 @@ characters.
 
 Content capture is off by default. With `otel.capture_message_content`, request spans
 also carry `gen_ai.system_instructions`, `gen_ai.input.messages` and
-`gen_ai.output.messages`, in the GenAI conventions' JSON message format. Tool spans
-also carry `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`. Each value is
-cut at 64 KiB, and redacted reasoning blocks are left out. Content is encoded only
-when a span is exported, not on the turn loop.
+`gen_ai.output.messages`, in the GenAI conventions' JSON formats. Tool spans also
+carry `gen_ai.tool.call.arguments` and `gen_ai.tool.call.result`. Redacted reasoning
+blocks are left out.
+
+Each value keeps at most 64 KiB of text, copied when the event arrives, so a span
+waiting for a slow collector never holds the whole history. Messages are kept in
+order until the limit; the last kept text ends in `…[truncated]`. Tool arguments cut
+at the limit become a JSON string. The JSON is encoded when the span is exported, off
+the turn loop, and is always valid JSON.
 
 ## Context propagation
 
@@ -115,7 +134,10 @@ Tempest uses W3C Trace Context (`traceparent`):
 - **Outgoing.** Provider HTTP requests and MCP Streamable HTTP requests send the
   current request span as their `traceparent` header.
 - **Subprocesses.** Hook commands and `bash` tool commands get `TRACEPARENT` in their
-  environment.
+  environment: foreground, background, named and `pty` commands alike, each with the
+  span of the `bash` call that started it.
+- **Subagents.** A `task` call's child run starts under that call's `execute_tool
+  task` span, though it runs as a background job.
 
 When a remote parent arrives with the sampled flag off, context is still propagated,
 but its spans are not exported.
@@ -126,12 +148,19 @@ Metrics are aggregated in memory with cumulative temporality. They are pushed ov
 OTLP every `otel.metric_export_interval_ms`, flushed once more at exit, and served at
 `/metrics`. Attribute values are always strings.
 
+Each instrument keeps at most 2000 attribute sets, the OpenTelemetry SDK's default
+cardinality limit. Measurements with a new attribute set beyond that, such as a
+model-invented tool name in a long-running server, are added to one overflow series
+labelled `otel.metric.overflow="true"`. Recording locks only the series it updates,
+and a scrape or push copies one series at a time, so a collection never stalls the
+turn loop.
+
 | OTLP name | Prometheus name | Type | Unit | Attributes |
 |---|---|---|---|---|
-| `gen_ai.client.token.usage` | `gen_ai_client_token_usage` | histogram | `{token}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.token.type` (`input`, `output`) |
+| `gen_ai.client.token.usage` | `gen_ai_client_token_usage` | histogram | `{token}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.token.type` (`input` with cached input included, `output`); a retried attempt's reported usage is recorded too |
 | `gen_ai.client.operation.duration` | `gen_ai_client_operation_duration_seconds` | histogram | `s` | as above without `gen_ai.token.type`, plus `error.type` on failure; retries included |
-| `gen_ai.client.operation.time_to_first_chunk` | `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | `s` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model` |
-| `gen_ai.client.operation.cost` | `gen_ai_client_operation_cost_usd` | histogram | `USD` | as for duration; requests with an unknown price are not recorded |
+| `gen_ai.client.operation.time_to_first_chunk` | `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | `s` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`; from sending an attempt to its first text, reasoning or tool-call output, not to an empty block start |
+| `gen_ai.client.operation.cost` | `gen_ai_client_operation_cost_usd` | histogram | `USD` | as for token usage without `gen_ai.token.type`; requests with an unknown price are not recorded, while a retried attempt's known cost is recorded |
 | `tempest.agent.runs` | `tempest_agent_runs_total` | counter | `{run}` | `gen_ai.agent.name`, `tempest.run.stop_reason` |
 | `tempest.tool.calls` | `tempest_tool_calls_total` | counter | `{call}` | `gen_ai.tool.name`, `tempest.tool.outcome` |
 | `tempest.model.failed_attempts` | `tempest_model_failed_attempts_total` | counter | `{attempt}` | `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt.outcome` (`retry`) |
@@ -175,6 +204,7 @@ scrape_configs:
 | Request timeout | `otel.timeout_ms` (10 s) |
 | Exit flush | at most 5 seconds; anything still queued then is dropped |
 | Collector failures | the first failure is logged as a warning, later ones at debug level; a success logs recovery once |
+| Collector redirects | followed within the endpoint's scheme, host and port only, so configured headers never reach another origin; a redirect elsewhere fails the export |
 
 ## Limits
 

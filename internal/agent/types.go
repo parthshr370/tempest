@@ -305,9 +305,11 @@ const (
 	// Request describes it. The message events of its response follow.
 	EventModelRequest AgentEventType = "model_request"
 	// EventModelRetry reports a failed attempt that is sent again after
-	// RetryDelay: Message is the discarded attempt (its error and any usage)
-	// and Attempt its 1-based ordinal. When the attempt had opened a message,
-	// that message's message_end follows this event.
+	// RetryDelay: Message is the discarded attempt (its error and any usage),
+	// Attempt its 1-based ordinal and FailedAt when the retrying stream saw it
+	// fail, which is RetryDelay before the next attempt is sent. When the
+	// attempt had opened a message, that message's message_end follows this
+	// event.
 	EventModelRetry AgentEventType = "model_retry"
 )
 
@@ -350,6 +352,7 @@ type AgentEvent struct {
 	Request               *ModelRequest
 	Attempt               int
 	RetryDelay            time.Duration
+	FailedAt              time.Time
 	QueueID               string
 	UsageSource           string
 	ChildSessionID        string

@@ -197,7 +197,13 @@ func TestFauxRunSpanTree(t *testing.T) {
 			t.Fatal("message content captured without OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
 		}
 	}
-	if run.attr("gen_ai.aggregated_usage.input_tokens") != "260" || run.attr("gen_ai.aggregated_usage.output_tokens") != "12" || run.attr("gen_ai.aggregated_usage.cache_read.input_tokens") != "30" {
+	for _, request := range requests {
+		// gen_ai.usage.input_tokens includes the cached input (120 + 30).
+		if request.attr("gen_ai.response.id") == "resp-1" && (request.attr("gen_ai.usage.input_tokens") != "150" || request.attr("gen_ai.usage.cache_read.input_tokens") != "30") {
+			t.Fatalf("tool call request usage = %+v", request.Attributes)
+		}
+	}
+	if run.attr("gen_ai.aggregated_usage.input_tokens") != "290" || run.attr("gen_ai.aggregated_usage.output_tokens") != "12" || run.attr("gen_ai.aggregated_usage.cache_read.input_tokens") != "30" {
 		t.Fatalf("run totals = %+v", run.Attributes)
 	}
 	if run.has("gen_ai.usage.input_tokens") || run.attr("gen_ai.conversation.id") != "session-1" || run.attr("tempest.cost.usd") != "0.003" {

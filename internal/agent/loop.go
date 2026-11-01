@@ -971,7 +971,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			}
 			if event.Type == types.EvRetry {
 				slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
-				if err := emit(ctx, AgentEvent{Type: EventModelRetry, Message: attempt, Attempt: event.Attempt, RetryDelay: event.RetryDelay}); err != nil {
+				if err := emit(ctx, AgentEvent{Type: EventModelRetry, Message: attempt, Attempt: event.Attempt, RetryDelay: event.RetryDelay, FailedAt: event.FailedAt}); err != nil {
 					return attempt, err
 				}
 			}

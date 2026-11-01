@@ -88,15 +88,16 @@ type toolTrace struct {
 	span *span
 }
 
-// attemptFailure is one abandoned request attempt: a retry announced by the
-// retrying stream, or a switch to a backup model.
+// attemptFailure is one abandoned request attempt, announced by the retrying
+// stream.
 type attemptFailure struct {
+	// at is when the attempt failed, on the retrying stream's side.
 	at      time.Time
 	kind    string
 	attempt int
-	model   string
 	message types.AssistantMessage
-	// nextStart is when the next attempt begins (after any backoff).
+	// nextStart is when the next attempt is sent: the retrying stream sleeps
+	// the backoff from at, so this holds however late the event is handled.
 	nextStart time.Time
 }
 
@@ -114,7 +115,11 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 		l.chunk(event)
 	case agent.EventModelRetry:
 		failed, _ := assistantMessage(event.Message)
-		l.attemptFailed(attemptFailure{at: event.At, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: event.At.Add(event.RetryDelay)})
+		at := event.FailedAt
+		if at.IsZero() {
+			at = event.At
+		}
+		l.attemptFailed(attemptFailure{at: at, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: at.Add(event.RetryDelay)})
 	case agent.EventMessageEnd:
 		l.messageEnd(event)
 	case agent.EventToolPermission, agent.EventToolExecutionStart:
@@ -229,14 +234,32 @@ func serverAttributes(baseURL string) []attribute {
 	return attrs
 }
 
-// chunk notes the response's first content event for time-to-first-chunk.
+// chunk notes the response's first output for time-to-first-chunk.
 func (l *agentListener) chunk(event agent.AgentEvent) {
 	request := l.request()
-	if request == nil || request.firstChunk || event.AssistantMessageEvent == nil {
+	if request == nil || request.firstChunk || !carriesOutput(event.AssistantMessageEvent) {
 		return
 	}
 	request.firstChunk = true
 	l.telemetry.recordFirstChunk(request.request.Model, event.At.Sub(request.attemptStart))
+}
+
+// carriesOutput reports whether a stream event delivers response content:
+// text, reasoning or a tool call. The GenAI time-to-first-chunk excludes
+// events that only open or close an empty block.
+func carriesOutput(event *types.StreamEvent) bool {
+	if event == nil {
+		return false
+	}
+	switch event.Type {
+	case types.EvTextDelta, types.EvThinkingDelta, types.EvToolCallDelta:
+		return event.Delta != ""
+	case types.EvTextEnd, types.EvThinkingEnd:
+		return event.Content != ""
+	case types.EvToolCallStart, types.EvToolCallEnd:
+		return event.ToolCall != nil
+	}
+	return false
 }
 
 // attemptFailed closes one abandoned attempt as a child span of its request
@@ -272,8 +295,10 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 		attemptSpan.attributes = append(attemptSpan.attributes, intAttribute("tempest.attempt", int64(failure.attempt)))
 	}
 	attemptSpan.attributes = append(attemptSpan.attributes, usageAttributes("gen_ai.usage.", failure.message.Usage)...)
+	attemptSpan.attributes = append(attemptSpan.attributes, costAttributes(failure.message.Usage.Cost)...)
 	l.telemetry.record(attemptSpan, l.run.sampled && request.span.spanID != tracecontext.SpanID{})
 	l.telemetry.recordAttemptFailure(failure.kind, request.request.Model, errorType(failure.message))
+	l.telemetry.recordDiscardedUsage(request.request.Model, failure.message)
 	request.discardNextEnd = request.messageOpen
 	request.messageOpen = false
 	request.firstChunk = false
@@ -345,9 +370,12 @@ func errorType(message types.AssistantMessage) string {
 	return "error"
 }
 
+// usageAttributes reports usage in GenAI terms: input_tokens counts every
+// input token, cached ones included, and the cache counts say how many of
+// them were read from or written to the provider's cache.
 func usageAttributes(prefix string, usage types.Usage) []attribute {
 	return []attribute{
-		intAttribute(prefix+"input_tokens", int64(usage.Input)),
+		intAttribute(prefix+"input_tokens", int64(inputTokens(usage))),
 		intAttribute(prefix+"output_tokens", int64(usage.Output)),
 		intAttribute(prefix+"cache_read.input_tokens", int64(usage.CacheRead)),
 		intAttribute(prefix+"cache_creation.input_tokens", int64(usage.CacheWrite)),
@@ -387,8 +415,8 @@ func (l *agentListener) tool(ctx context.Context, event agent.AgentEvent) {
 		l.telemetry.recordPermission(event.ToolName, decision, event.Permission.Source)
 	}
 	if event.Type == agent.EventToolExecutionStart && !event.Preparing && l.telemetry.settings.CaptureMessageContent {
-		if arguments := argumentsText(event.Args); arguments != "" {
-			call.span.attributes = append(call.span.attributes, stringAttribute("gen_ai.tool.call.arguments", truncateContent(arguments)))
+		if arguments := toolCallArguments(event.Args); len(arguments) != 0 {
+			call.span.attributes = append(call.span.attributes, stringAttribute("gen_ai.tool.call.arguments", toolArguments(arguments)))
 		}
 	}
 }
@@ -400,13 +428,11 @@ func permissionDecision(outcome *agent.PermissionOutcome) string {
 	return "deny"
 }
 
-// argumentsText reads a tool call's arguments: the loop passes the validated
-// JSON bytes the tool receives.
-func argumentsText(args any) string {
-	if raw, ok := args.(json.RawMessage); ok {
-		return string(raw)
-	}
-	return ""
+// toolCallArguments reads a tool call's arguments: the loop passes the
+// validated JSON bytes the tool receives as the event's untyped Args.
+func toolCallArguments(args any) json.RawMessage {
+	raw, _ := args.(json.RawMessage)
+	return raw
 }
 
 func (l *agentListener) endTool(ctx context.Context, event agent.AgentEvent) {
@@ -428,7 +454,7 @@ func (l *agentListener) endTool(ctx context.Context, event agent.AgentEvent) {
 	}
 	call.span.attributes = append(call.span.attributes, stringAttribute("tempest.tool.outcome", outcome))
 	if result, ok := event.Result.(agent.AgentToolResult); ok && l.telemetry.settings.CaptureMessageContent {
-		call.span.attributes = append(call.span.attributes, deferredAttribute("gen_ai.tool.call.result", toolResultText(result)))
+		call.span.attributes = append(call.span.attributes, stringAttribute("gen_ai.tool.call.result", toolResultText(result)))
 	}
 	l.telemetry.record(call.span, l.run.sampled)
 	l.telemetry.recordToolCall(event.ToolName, outcome)

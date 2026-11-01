@@ -87,6 +87,13 @@ func requestAttributes(model types.Model) []attribute {
 	}
 }
 
+// inputTokens is gen_ai.usage.input_tokens: every input token, cached ones
+// included, as the GenAI conventions define it. Tempest's Usage.Input counts
+// only the uncached part, with cache reads and writes beside it.
+func inputTokens(usage types.Usage) int {
+	return usage.Input + usage.CacheRead + usage.CacheWrite
+}
+
 // recordRequest measures one finished model request: its tokens, duration
 // (retries included) and cost.
 func (t *Telemetry) recordRequest(model types.Model, responseModel string, message types.AssistantMessage, duration time.Duration) {
@@ -96,10 +103,29 @@ func (t *Telemetry) recordRequest(model types.Model, responseModel string, messa
 		durationAttrs = append(slices.Clone(attrs), stringAttribute("error.type", errorType(message)))
 	}
 	t.metrics.observe(t.metrics.duration, duration.Seconds(), durationAttrs...)
-	t.metrics.observe(t.metrics.tokenUsage, float64(message.Usage.Input), append(slices.Clone(attrs), stringAttribute("gen_ai.token.type", "input"))...)
-	t.metrics.observe(t.metrics.tokenUsage, float64(message.Usage.Output), append(slices.Clone(attrs), stringAttribute("gen_ai.token.type", "output"))...)
-	if !message.Usage.Cost.Unknown {
-		t.metrics.observe(t.metrics.cost, message.Usage.Cost.Total, attrs...)
+	t.recordUsage(attrs, message.Usage)
+}
+
+// recordDiscardedUsage measures what a failed attempt that was sent again
+// consumed, as run accounting counts it. An attempt that failed before the
+// provider reported usage consumed nothing measurable and is not recorded.
+func (t *Telemetry) recordDiscardedUsage(model types.Model, message types.AssistantMessage) {
+	usage := message.Usage
+	if inputTokens(usage) == 0 && usage.Output == 0 {
+		return
+	}
+	responseModel := message.ResponseModel
+	if responseModel == "" {
+		responseModel = message.Model
+	}
+	t.recordUsage(append(requestAttributes(model), stringAttribute("gen_ai.response.model", responseModel)), usage)
+}
+
+func (t *Telemetry) recordUsage(attrs []attribute, usage types.Usage) {
+	t.metrics.observe(t.metrics.tokenUsage, float64(inputTokens(usage)), append(slices.Clone(attrs), stringAttribute("gen_ai.token.type", "input"))...)
+	t.metrics.observe(t.metrics.tokenUsage, float64(usage.Output), append(slices.Clone(attrs), stringAttribute("gen_ai.token.type", "output"))...)
+	if !usage.Cost.Unknown {
+		t.metrics.observe(t.metrics.cost, usage.Cost.Total, attrs...)
 	}
 }
 

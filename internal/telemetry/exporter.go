@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,7 +56,7 @@ func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return fmt.Errorf("OTLP endpoint %s: invalid URL", redactEndpoint(endpoint))
 	}
 	for key, value := range c.headers {
 		request.Header.Set(key, value)
@@ -65,7 +68,7 @@ func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) err
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
-		return err
+		return redactRequestError(err, endpoint)
 	}
 	defer response.Body.Close()
 	// Draining lets the transport reuse the connection; a short read only
@@ -78,6 +81,66 @@ func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) err
 		slog.Debug("otlp response drain failed", "error", drainErr)
 	}
 	return nil
+}
+
+// redactEndpoint drops userinfo, query and fragment from an endpoint shown in
+// an error or log line: collectors take credentials in any of them, under
+// names no generic redactor knows.
+func redactEndpoint(endpoint string) string {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "[unparsable endpoint]"
+	}
+	return redactURL(parsed)
+}
+
+func redactURL(parsed *url.URL) string {
+	redacted := *parsed
+	redacted.User, redacted.RawQuery, redacted.ForceQuery, redacted.Fragment, redacted.RawFragment = nil, "", false, "", ""
+	return redacted.String()
+}
+
+// redactRequestError replaces the URL net/http puts in a request error,
+// which keeps the endpoint's query (and a redirect target's), with the
+// redacted endpoint.
+func redactRequestError(err error, endpoint string) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	return &url.Error{Op: urlErr.Op, URL: redactEndpoint(endpoint), Err: urlErr.Err}
+}
+
+// maxCollectorRedirects is net/http's default redirect limit.
+const maxCollectorRedirects = 10
+
+// sameOriginRedirect is the OTLP client's redirect policy: a collector may
+// redirect within the configured endpoint's origin only. net/http copies
+// custom headers, such as a collector API key, to any origin a redirect
+// names, and the operator configured them for this origin alone.
+func sameOriginRedirect(request *http.Request, via []*http.Request) error {
+	if len(via) >= maxCollectorRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxCollectorRedirects)
+	}
+	if origin(request.URL) != origin(via[0].URL) {
+		return fmt.Errorf("collector redirected to another origin, %s; OTLP export follows redirects within the endpoint's origin only", redactURL(request.URL))
+	}
+	return nil
+}
+
+// origin is a URL's scheme, host and port, with the scheme's default port
+// filled in.
+func origin(target *url.URL) string {
+	port := target.Port()
+	if port == "" {
+		switch target.Scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return strings.ToLower(target.Scheme) + "://" + strings.ToLower(target.Hostname()) + ":" + port
 }
 
 // exportHealth logs an exporter's first failure as a warning and later ones
@@ -210,8 +273,11 @@ func (b *spanBatcher) drain(ctx context.Context, batch []*span) error {
 	}
 }
 
+// send exports batch and then clears it, so the reused batch array does not
+// keep exported spans, and the content they captured, reachable.
 func (b *spanBatcher) send(ctx context.Context, batch []*span) error {
 	err := b.export(ctx, batch)
+	clear(batch)
 	b.health.record(err, len(batch))
 	return err
 }
