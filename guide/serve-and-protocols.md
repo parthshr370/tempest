@@ -153,6 +153,15 @@ flat primitive subset the specification allows is refused with `-32602` before
 anyone is asked. With no user to ask (headless runs, `serve` without such a
 client), the reply is `{"action":"decline"}`.
 
+### Progress and server logs
+
+Each `tools/call` carries a progress token. A `notifications/progress` for it
+becomes a tool progress update: its `message`, or `progress N/TOTAL` when the
+server sends only numbers. A `notifications/message` goes to Tempest's diagnostic
+log, never to the model: `debug` at debug, `info` and `notice` at info, `warning`
+at warn, and `error` and above at error, with the server name, the server's
+`logger` and its `data`.
+
 ## MCP server
 
 ```sh

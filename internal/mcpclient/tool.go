@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -291,8 +293,52 @@ func (s *server) notification(method string, params json.RawMessage) {
 		call.seen = true
 		callback := call.update
 		s.mu.Unlock()
-		if callback != nil && progress.Message != "" {
-			callback(agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(utf8Head(progress.Message, maxProgressText))}})
+		if callback == nil {
+			return
 		}
+		text := utf8Head(progress.Message, maxProgressText)
+		if text == "" {
+			// A bare counter is still progress the user should see.
+			text = "progress " + strconv.FormatFloat(*progress.Progress, 'g', -1, 64)
+			if progress.Total != nil {
+				text += "/" + strconv.FormatFloat(*progress.Total, 'g', -1, 64)
+			}
+		}
+		callback(agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(text)}})
+	case "notifications/message":
+		s.log(params)
 	}
+}
+
+// log writes a server's notifications/message to the diagnostic log at the
+// matching level; the model never sees it.
+func (s *server) log(params json.RawMessage) {
+	var message struct {
+		Level  string          `json:"level"`
+		Logger string          `json:"logger"`
+		Data   json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(params, &message) != nil {
+		s.manager.logger.Debug("ignored malformed MCP log message", "server", s.config.Name)
+		return
+	}
+	level := slog.LevelInfo
+	switch message.Level {
+	case "debug":
+		level = slog.LevelDebug
+	case "warning":
+		level = slog.LevelWarn
+	case "error", "critical", "alert", "emergency":
+		level = slog.LevelError
+	}
+	attrs := []any{"server", s.config.Name, "mcp_level", message.Level}
+	if message.Logger != "" {
+		attrs = append(attrs, "logger", utf8Head(message.Logger, 256))
+	}
+	var text string
+	if json.Unmarshal(message.Data, &text) != nil {
+		text = string(message.Data)
+	}
+	attrs = append(attrs, "data", utf8Head(text, maxProgressText))
+	s.manager.logger.Log(s.manager.ctx, level, "MCP server log", attrs...)
 }

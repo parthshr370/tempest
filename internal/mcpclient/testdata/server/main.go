@@ -188,6 +188,9 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 			f.record("dispatch", call.Name)
 			if len(call.Meta.ProgressToken) > 0 {
 				_ = f.conn.Notify(callCtx, "notifications/progress", map[string]any{"progressToken": call.Meta.ProgressToken, "progress": 1, "message": "fixture working"})
+				if call.Name == "block" {
+					_ = f.conn.Notify(callCtx, "notifications/progress", map[string]any{"progressToken": call.Meta.ProgressToken, "progress": 2, "total": 3})
+				}
 			}
 			text := string(call.Arguments)
 			isError := false
@@ -246,6 +249,10 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				content["mimeType"], content["blob"] = "application/octet-stream", base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3})
 			case strings.HasPrefix(read.URI, "fixture://logs/"):
 				content["mimeType"], content["text"] = "text/plain", "log for "+strings.TrimPrefix(read.URI, "fixture://logs/")
+			case read.URI == "fixture://log":
+				_ = f.conn.Notify(ctx, "notifications/message", map[string]any{"level": "warning", "logger": "fixture-disk", "data": map[string]string{"note": "disk low"}})
+				_ = f.conn.Notify(ctx, "notifications/message", map[string]any{"level": "debug", "data": "debug detail"})
+				content["mimeType"], content["text"] = "text/plain", "logged"
 			case read.URI == "fixture://bump":
 				f.resourceGeneration.Add(1)
 				_ = f.conn.Notify(ctx, "notifications/resources/list_changed", struct{}{})
