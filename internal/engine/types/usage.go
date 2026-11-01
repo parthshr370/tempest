@@ -11,6 +11,20 @@ type ModelCost struct {
 	Output     float64 `json:"output"`     // $/million tokens
 	CacheRead  float64 `json:"cacheRead"`  // $/million tokens
 	CacheWrite float64 `json:"cacheWrite"` // $/million tokens
+	// LongContext replaces all four prices for a request whose prompt has
+	// at least its MinPromptTokens; zero means one price for every size.
+	LongContext LongContextCost `json:"longContext,omitzero"`
+}
+
+// LongContextCost is the price list a model charges for a long prompt: one
+// whose input, cache-read and cache-write tokens together reach
+// MinPromptTokens.
+type LongContextCost struct {
+	MinPromptTokens int     `json:"minPromptTokens"`
+	Input           float64 `json:"input"`
+	Output          float64 `json:"output"`
+	CacheRead       float64 `json:"cacheRead"`
+	CacheWrite      float64 `json:"cacheWrite"`
 }
 
 // Cost is the USD cost of a Usage. Total is authoritative. The components are
@@ -79,14 +93,18 @@ func (u *Usage) Add(other Usage) {
 	u.Cost.Total += other.Cost.Total
 }
 
-// CalculateCost fills u.Cost from the model's per-million pricing. One-hour
-// cache writes are billed at 2× the base input rate (not a separate
-// cache-write price); short writes use the cacheWrite rate. Mutates u in place
-// and returns the computed cost.
+// CalculateCost fills u.Cost from the model's per-million pricing, for one
+// request: a prompt that reaches mc.LongContext.MinPromptTokens is priced
+// at the long-context rates. One-hour cache writes are billed at 2× the
+// input rate (not a separate cache-write price); short writes use the
+// cacheWrite rate. Mutates u in place and returns the computed cost.
 func CalculateCost(mc ModelCost, u *Usage) Cost {
 	if mc.Unknown {
 		u.Cost = Cost{Unknown: true}
 		return u.Cost
+	}
+	if long := mc.LongContext; long.MinPromptTokens > 0 && u.Input+u.CacheRead+u.CacheWrite >= long.MinPromptTokens {
+		mc.Input, mc.Output, mc.CacheRead, mc.CacheWrite = long.Input, long.Output, long.CacheRead, long.CacheWrite
 	}
 	longWrite := 0
 	if u.CacheWrite1h != nil {

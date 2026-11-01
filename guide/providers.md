@@ -85,11 +85,11 @@ catalog) gets Responses without it: `-reasoning` is ignored with a warning and t
 model reasons, or not, at OpenAI's default. The catalog lists the gpt-6 family
 (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`, their `-pro` variants, `gpt-6.1-sol`,
 `gpt-6.1-terra` and their `-pro` variants) with reasoning, a 1,050,000-token context
-and per-token prices, so runs on them report `cost_usd`. Those prices are the
-standard tier. The catalog has one price per model, so the higher rate published for
-prompts of 272,000 tokens or more (twice the input and cache prices, 1.5 times the
-output price) is not modeled: for such a request, `cost_usd` and a `-max-cost`
-budget count the standard rate and understate the spend.
+and per-token prices, so runs on them report `cost_usd`. Each entry also carries the
+higher rate published for a prompt of 272,000 tokens or more (twice the input and
+cache prices, 1.5 times the output price), and a request whose input, cache-read and
+cache-write tokens reach that size is priced at it, in `cost_usd` and against a
+`-max-cost` budget alike.
 
 Tempest never adds a reasoning effort on its own. With `-reasoning` unset or `off`,
 no effort is sent and the model reasons at OpenAI's default; it does not quietly
@@ -223,7 +223,7 @@ keyed by lowercase route name:
 | `auth_prefix` | Prefix before the key. Defaults to `Bearer ` (with the space); an explicit empty string sends the raw key. |
 | `no_auth` | Skips credential lookup. |
 | `compatibility` | Endpoint quirks, in camelCase. See [Compatibility keys](#compatibility-keys). |
-| `models` | Per-model metadata: `id`, `name`, `contextWindow`, `maxTokens`, `reasoning`, `input`, and `cost` (`input`, `output`, `cacheRead`, `cacheWrite`). Only supplied fields override catalog defaults. A model's `maxTokens` caps the startup limit, even when a larger default is in effect. An absent cost preserves a catalog price, or stays unknown when none exists. JSON can explicitly set a zero-dollar cost; an all-zero Go model literal without JSON field presence does not declare a free model. |
+| `models` | Per-model metadata: `id`, `name`, `contextWindow`, `maxTokens`, `reasoning`, `input`, and `cost` (`input`, `output`, `cacheRead`, `cacheWrite`, and optional `longContext`: `{"minPromptTokens": N, "input": …, "output": …, "cacheRead": …, "cacheWrite": …}`, the prices for a request whose prompt reaches N tokens). Only supplied fields override catalog defaults. A model's `maxTokens` caps the startup limit, even when a larger default is in effect. An absent cost preserves a catalog price, or stays unknown when none exists. JSON can explicitly set a zero-dollar cost; an all-zero Go model literal without JSON field presence does not declare a free model. |
 
 A preset supplies defaults for its fields. A registry entry may override one field
 or add a new route. A new route needs a `protocol` and, for protocols that need one,

@@ -568,7 +568,8 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "longContext": {"minPromptTokens": 272000, "input": 0.2, "output": 0.75, "cacheRead": 0.02, "cacheWrite": 0.25}
       },
       "capabilities": [
         "thinking",
@@ -592,7 +593,8 @@
         "input": 0.1,
         "output": 0.5,
         "cacheRead": 0.01,
-        "cacheWrite": 0.125
+        "cacheWrite": 0.125,
+        "longContext": {"minPromptTokens": 272000, "input": 0.2, "output": 0.75, "cacheRead": 0.02, "cacheWrite": 0.25}
       },
       "capabilities": [
         "thinking",
@@ -616,7 +618,8 @@
         "input": 2.0,
         "output": 10.0,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "longContext": {"minPromptTokens": 272000, "input": 4.0, "output": 15.0, "cacheRead": 0.4, "cacheWrite": 5.0}
       },
       "capabilities": [
         "thinking",
@@ -640,7 +643,8 @@
         "input": 2.0,
         "output": 10.0,
         "cacheRead": 0.2,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "longContext": {"minPromptTokens": 272000, "input": 4.0, "output": 15.0, "cacheRead": 0.4, "cacheWrite": 5.0}
       },
       "capabilities": [
         "thinking",
@@ -664,7 +668,8 @@
         "input": 10.0,
         "output": 50.0,
         "cacheRead": 1.0,
-        "cacheWrite": 12.5
+        "cacheWrite": 12.5,
+        "longContext": {"minPromptTokens": 272000, "input": 20.0, "output": 75.0, "cacheRead": 2.0, "cacheWrite": 25.0}
       },
       "capabilities": [
         "thinking",
@@ -685,7 +690,8 @@
         "input": 10.0,
         "output": 50.0,
         "cacheRead": 1.0,
-        "cacheWrite": 12.5
+        "cacheWrite": 12.5,
+        "longContext": {"minPromptTokens": 272000, "input": 20.0, "output": 75.0, "cacheRead": 2.0, "cacheWrite": 25.0}
       },
       "capabilities": [
         "thinking",
@@ -706,7 +712,8 @@
         "input": 2.0,
         "output": 10.0,
         "cacheRead": 0.1,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "longContext": {"minPromptTokens": 272000, "input": 4.0, "output": 15.0, "cacheRead": 0.2, "cacheWrite": 5.0}
       },
       "capabilities": [
         "thinking",
@@ -727,7 +734,8 @@
         "input": 2.0,
         "output": 10.0,
         "cacheRead": 0.1,
-        "cacheWrite": 2.5
+        "cacheWrite": 2.5,
+        "longContext": {"minPromptTokens": 272000, "input": 4.0, "output": 15.0, "cacheRead": 0.2, "cacheWrite": 5.0}
       },
       "capabilities": [
         "thinking",
@@ -748,7 +756,8 @@
         "input": 1.0,
         "output": 5.0,
         "cacheRead": 0.05,
-        "cacheWrite": 1.25
+        "cacheWrite": 1.25,
+        "longContext": {"minPromptTokens": 272000, "input": 2.0, "output": 7.5, "cacheRead": 0.1, "cacheWrite": 2.5}
       },
       "capabilities": [
         "thinking",
@@ -772,7 +781,8 @@
         "input": 1.0,
         "output": 5.0,
         "cacheRead": 0.05,
-        "cacheWrite": 1.25
+        "cacheWrite": 1.25,
+        "longContext": {"minPromptTokens": 272000, "input": 2.0, "output": 7.5, "cacheRead": 0.1, "cacheWrite": 2.5}
       },
       "capabilities": [
         "thinking",
