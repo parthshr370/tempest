@@ -12,8 +12,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 
 	"go.harness.dev/harness/internal/refs"
 )
@@ -314,20 +314,40 @@ func TestGitHubCheckoutCleansFailedWorktreeAndParentsRealGit(t *testing.T) {
 func TestGitHubCheckoutCancellationCleansRealGit(t *testing.T) {
 	fixture := newGitHubCheckoutFixture(t)
 	t.Setenv("REAL_GIT", fixture.git)
+	// The fake git announces the partial locked worktree through a FIFO, and the
+	// test cancels only after reading it. A fixed deadline raced the spawn latency
+	// of the freshly written fake git and gh, which on macOS alone can take
+	// seconds before worktree add starts.
 	started := filepath.Join(t.TempDir(), "checkout-started")
+	if err := syscall.Mkfifo(started, 0600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CHECKOUT_STARTED", started)
 	codingFakeBinary(t, fixture.bin, "git", `case "$*" in
  *'worktree add --detach'*) "$REAL_GIT" "$@"; printf initializing > "$PWD/.git/worktrees/review/locked"; printf ready > "$CHECKOUT_STARTED"; while :; do :; done;;
  *) exec "$REAL_GIT" "$@";;esac`)
 	tool, _ := NewTool(GHCheckoutTool, fixture.cwd, ToolsOptions{})
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	ready := make(chan string, 1)
+	go func() {
+		content, _ := os.ReadFile(started) // blocks until the fake git opens the FIFO
+		ready <- string(content)
+		cancel()
+	}()
 	_, err := tool.Execute(ctx, "cancel", json.RawMessage(`{"repo":"owner/repo","number":"7","path":"created/review"}`), nil)
+	select {
+	case content := <-ready:
+		if content != "ready" {
+			t.Fatalf("partial worktree marker: %q", content)
+		}
+	default:
+		// Rendezvous with the blocked reader so it exits, then report the early return.
+		_ = os.WriteFile(started, nil, 0)
+		t.Fatalf("checkout returned before reaching a partial locked worktree: %v", err)
+	}
 	if err == nil || ctx.Err() == nil {
 		t.Fatalf("checkout ignored cancellation: %v", err)
-	}
-	if content, err := os.ReadFile(started); err != nil || string(content) != "ready" {
-		t.Fatalf("test never reached a partial locked worktree: %q %v", content, err)
 	}
 	if _, err := os.Stat(filepath.Join(fixture.cwd, "created")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("canceled destination remains: %v", err)
