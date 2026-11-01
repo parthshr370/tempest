@@ -152,7 +152,8 @@ func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
 	}
 }
 
-// A refused callback ends the login at once with its reason: after present
+// A callback with the login's state that fails the issuer check or carries
+// an OAuth error ends the login at once with its reason: after present
 // returned, as a terminal does once the user pressed Enter, and also while
 // present still waits for the user. The user does not wait out the login
 // timeout.
@@ -163,9 +164,10 @@ func TestRefusedCallbackEndsTheLogin(t *testing.T) {
 		waiting bool
 		want    string
 	}{
-		"missing iss":             {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
-		"wrong state":             {tamper: func(values url.Values) { values.Set("state", "forged") }, want: "state did not match"},
-		"wrong state while asked": {tamper: func(values url.Values) { values.Set("state", "forged") }, waiting: true, want: "state did not match"},
+		"missing iss":       {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
+		"wrong iss":         {tamper: func(values url.Values) { values.Set("iss", "https://other.example") }, want: "issuer did not match"},
+		"error":             {tamper: denied, want: "access_denied"},
+		"error while asked": {tamper: denied, waiting: true, want: "access_denied"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, test.options, nil)
@@ -193,6 +195,52 @@ func TestRefusedCallbackEndsTheLogin(t *testing.T) {
 				t.Fatal("a refused callback's code was exchanged")
 			}
 		})
+	}
+}
+
+func denied(values url.Values) {
+	values.Del("code")
+	values.Set("error", "access_denied")
+}
+
+// A callback without the login's state may come from any local process or
+// web page that found the port, so it gets an error page and neither ends
+// the login nor stops present; the real callback after it completes the
+// login.
+func TestWrongStateCallbackKeepsTheLoginWaiting(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	present := func(ctx context.Context, authorizationURL string) error {
+		authorization, err := url.Parse(authorizationURL)
+		if err != nil {
+			return err
+		}
+		forged := url.Values{"state": {"forged"}, "code": {"forged"}, "error": {"access_denied"}}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, authorization.Query().Get("redirect_uri")+"?"+forged.Encode(), nil)
+		if err != nil {
+			return err
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			return err
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Errorf("wrong-state callback answered %d, want 400", response.StatusCode)
+		}
+		return h.fixture.Browse(ctx, authorizationURL)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	record, err := h.flow.Login(ctx, challenge, present)
+	if err != nil || record.AccessToken == "" {
+		t.Fatalf("login after a wrong-state callback = %v, want it completed by the real callback", err)
+	}
+	if h.fixture.VerifiedCodes() != 1 {
+		t.Fatalf("verified codes = %d, want the real callback's code exchanged", h.fixture.VerifiedCodes())
 	}
 }
 

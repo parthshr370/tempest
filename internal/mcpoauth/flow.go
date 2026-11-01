@@ -374,10 +374,13 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 		query.Set("scope", scope)
 	}
 	authorization.RawQuery = query.Encode()
-	// The first callback decides the login: a valid one carries the code,
-	// a refused one ends the login with its reason at once, also while
-	// present still waits for the user. Each answer is written before Login
-	// can return and close the listener.
+	// The first callback that carries this login's state decides it: a valid
+	// one carries the code, one that fails the issuer check or carries an
+	// OAuth error ends the login with its reason at once, also while present
+	// still waits for the user. A callback without the state is answered
+	// with an error page and changes nothing, since any local process or web
+	// page that finds the port can send one. Each answer is written before
+	// Login can return and close the listener.
 	type outcome struct {
 		values url.Values
 		err    error
@@ -394,29 +397,35 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		refuse := func(reason string) {
-			http.Error(w, reason, http.StatusBadRequest)
+		refuse := func(page string, refusal error) {
+			http.Error(w, page, http.StatusBadRequest)
 			_ = http.NewResponseController(w).Flush()
 			if decided.CompareAndSwap(false, true) {
-				refusal := fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason)
 				callbacks <- outcome{err: refusal}
 				stopPresent(refusal)
 			}
 		}
+		refuseCallback := func(reason string) {
+			refuse(reason, fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason))
+		}
 		values := r.URL.Query()
 		if len(values["state"]) != 1 || subtle.ConstantTimeCompare([]byte(values.Get("state")), []byte(state)) != 1 {
-			refuse("Authorization state did not match")
+			http.Error(w, "Authorization state did not match", http.StatusBadRequest)
 			return
 		}
 		// RFC 9207: a returned issuer must be the one this request went to,
 		// and a server that advertises the parameter must return it.
 		iss := values.Get("iss")
 		if iss == "" && metadata.IssParameterSupported {
-			refuse("Authorization response lacks the issuer its server promised")
+			refuseCallback("Authorization response lacks the issuer its server promised")
 			return
 		}
 		if iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
-			refuse("Authorization issuer did not match")
+			refuseCallback("Authorization issuer did not match")
+			return
+		}
+		if failure := values.Get("error"); failure != "" {
+			refuse("Authorization was refused. Return to Tempest.", fmt.Errorf("mcp_auth: authorization server refused server %s: %s %s", c.server, failure, values.Get("error_description")))
 			return
 		}
 		if !decided.CompareAndSwap(false, true) {
@@ -446,9 +455,6 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 		values = callback.values
 	case <-ctx.Done():
 		return Record{}, fmt.Errorf("mcp_auth: authorization for server %s was not completed: %w", c.server, ctx.Err())
-	}
-	if failure := values.Get("error"); failure != "" {
-		return Record{}, fmt.Errorf("mcp_auth: authorization server refused server %s: %s %s", c.server, failure, values.Get("error_description"))
 	}
 	code := values.Get("code")
 	if code == "" || len(values["code"]) != 1 {
