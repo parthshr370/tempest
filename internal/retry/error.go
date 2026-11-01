@@ -25,6 +25,10 @@ const (
 	CodeProviderFailure    Code = "provider_failure"
 	CodeAttemptsExhausted  Code = "attempts_exhausted"
 	CodeRetryDelayExceeded Code = "retry_delay_exceeded"
+	// CodeModelNotFound is a request for a model the endpoint does not serve.
+	// It is terminal for the model but not a configuration error of the
+	// request, so a fallback chain moves past it.
+	CodeModelNotFound Code = "model_not_found"
 )
 
 var (
@@ -122,6 +126,9 @@ func Classify(f Failure, now time.Time) *Error {
 	if isContextOverflow(combined) {
 		return result(CodeContextOverflow, false)
 	}
+	if isModelNotFound(f.Status, combined) {
+		return result(CodeModelNotFound, false)
+	}
 	if strings.HasPrefix(providerCode, "subscription_sharing_") && (f.Status == 429 || providerCode == "subscription_sharing_usage_limit_exceeded") {
 		return result(Code(providerCode), false)
 	}
@@ -211,6 +218,20 @@ func retryAfterOrZero(headers map[string]string, now time.Time) time.Duration {
 // isContextOverflow reports whether provider details name an input-limit failure, which must win before generic retryable failures.
 func isContextOverflow(value string) bool {
 	return containsAny(value, "context_length_exceeded", "prompt_too_long", "maximum context length", "too many input tokens") || (strings.Contains(value, "context window") && strings.Contains(value, "exceeded"))
+}
+
+// isModelNotFound recognizes an unknown model id: OpenAI's model_not_found
+// code (sent with 404 on Chat Completions and 400 on Responses) or its "The
+// model ... does not exist" message, or a 404 whose body names a model
+// (Anthropic not_found_error "model: ...", Google "models/... is not found").
+// A 404 that names no model is an endpoint or path error and stays an invalid
+// request; 401 and 403 are always authentication failures.
+func isModelNotFound(status int, value string) bool {
+	if status == 401 || status == 403 {
+		return false
+	}
+	namesModel := strings.Contains(value, "model")
+	return strings.Contains(value, "model_not_found") || namesModel && strings.Contains(value, "does not exist") || status == 404 && namesModel
 }
 
 func containsAny(value string, patterns ...string) bool {

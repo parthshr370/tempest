@@ -50,6 +50,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		DefaultModel:       opts.Config.Model(),
 		PlanModel:          opts.Config.PlanModel(),
 		SmolModel:          opts.Config.SmolModel(),
+		DefaultFallbacks:   opts.Config.FallbackModels(config.RoleDefault),
+		PlanFallbacks:      opts.Config.FallbackModels(config.RolePlan),
+		SmolFallbacks:      opts.Config.FallbackModels(config.RoleSmol),
 		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
 		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
 		MaxTokens:          opts.Config.MaxTokens(),
@@ -228,13 +231,20 @@ func effectiveReasoning(level string, model types.Model) string {
 }
 
 func printRole(w io.Writer, name string, router adapter.ProviderRouter, reasoning string) {
+	fmt.Fprintf(w, "  %s: %s\n", name, describeModel(router.Model, reasoning))
+	for i, backup := range router.Fallbacks {
+		fmt.Fprintf(w, "    fallback %d: %s\n", i+1, describeModel(backup, reasoning))
+	}
+}
+
+func describeModel(model types.Model, reasoning string) string {
 	price := "known"
-	if router.Model.ReportsBilledCost() {
+	if model.ReportsBilledCost() {
 		price = "billed"
-	} else if router.Model.Cost.Unknown {
+	} else if model.Cost.Unknown {
 		price = "unknown"
 	}
-	fmt.Fprintf(w, "  %s: model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s\n", name, router.Model.ID, router.Model.Provider, router.Model.API, redactedURL(router.Model.BaseURL), price, effectiveReasoning(reasoning, router.Model), yesNo(router.Model.SupportsVision()))
+	return fmt.Sprintf("model=%s provider=%s api=%s base_url=%s cost=%s reasoning=%s images=%s", model.ID, model.Provider, model.API, redactedURL(model.BaseURL), price, effectiveReasoning(reasoning, model), yesNo(model.SupportsVision()))
 }
 
 func printPathCheck(w io.Writer, name, path string) {

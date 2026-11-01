@@ -23,7 +23,9 @@ import (
 )
 
 // Events is the supported command-hook lifecycle, in display order.
-var Events = []string{"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "PreCompact", "Notification"}
+// PreModelRequest and PostModelRequest are observation-only: they run off the
+// request path and their output is logged, never interpreted.
+var Events = []string{"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SubagentStop", "SessionStart", "SessionEnd", "PreCompact", "Notification", "PreModelRequest", "PostModelRequest"}
 
 // Command is a synchronous shell hook. Timeout is in seconds; zero selects the event default.
 type Command struct {
@@ -121,9 +123,72 @@ type Input struct {
 	Message              string `json:"message,omitempty"`
 	StopHookActive       bool   `json:"stop_hook_active"`
 	LastAssistantMessage string `json:"last_assistant_message,omitempty"`
+	TurnID               string `json:"turn_id,omitempty"`
+	Model                string `json:"model,omitempty"`
 	AgentID              string `json:"agent_id,omitempty"`
 	AgentType            string `json:"agent_type,omitempty"`
 	AgentTranscriptPath  string `json:"agent_transcript_path,omitempty"`
+	// ModelRequest carries the PreModelRequest and PostModelRequest fields.
+	ModelRequest *ModelRequest `json:"-"`
+}
+
+// ModelRequest describes one model request attempt. Role is the model role
+// (default, plan or smol), Attempt counts from 1 per model, and
+// FallbackIndex is the model's position in the role's fallback chain (0 is
+// the primary). Status, Error and TokenUsage are set on PostModelRequest
+// only: Status is completed, failed or cancelled, Error is set when it
+// failed, and TokenUsage when it completed.
+type ModelRequest struct {
+	Role          string
+	Attempt       int
+	FallbackIndex int
+	Status        string
+	Error         string
+	TokenUsage    *TokenUsage
+}
+
+// TokenUsage is a completed request's token counts in the Codex hook shape.
+type TokenUsage struct {
+	InputTokens           int `json:"input_tokens"`
+	CachedInputTokens     int `json:"cached_input_tokens"`
+	CacheWriteInputTokens int `json:"cache_write_input_tokens"`
+	OutputTokens          int `json:"output_tokens"`
+	ReasoningOutputTokens int `json:"reasoning_output_tokens"`
+	TotalTokens           int `json:"total_tokens"`
+}
+
+// MarshalJSON writes the model-request fields on model-request events. On
+// PostModelRequest, error and token_usage are always present and null when
+// they don't apply, as in Codex.
+func (in Input) MarshalJSON() ([]byte, error) {
+	type wire Input
+	request := in.ModelRequest
+	if request == nil {
+		return json.Marshal(wire(in))
+	}
+	type requestFields struct {
+		Role          string `json:"role"`
+		Attempt       int    `json:"attempt"`
+		FallbackIndex int    `json:"fallback_index"`
+	}
+	fields := requestFields{Role: request.Role, Attempt: request.Attempt, FallbackIndex: request.FallbackIndex}
+	if in.Event != "PostModelRequest" {
+		return json.Marshal(struct {
+			wire
+			requestFields
+		}{wire(in), fields})
+	}
+	var errorText *string
+	if request.Error != "" {
+		errorText = &request.Error
+	}
+	return json.Marshal(struct {
+		wire
+		requestFields
+		Status     string      `json:"status"`
+		Error      *string     `json:"error"`
+		TokenUsage *TokenUsage `json:"token_usage"`
+	}{wire(in), fields, request.Status, errorText, request.TokenUsage})
 }
 
 // Result is the combined decision. Deny wins over ask, which wins over allow.
@@ -159,6 +224,8 @@ type Runner struct {
 	base    Input
 	started atomic.Bool
 	ended   atomic.Bool
+	// observations runs observation-only hooks off the caller's path.
+	observations observationQueue
 	// PermissionMode reads the host's live mode; set it before starting the runner.
 	PermissionMode func() string
 	// Once journals keyed lifecycle effects before execution and reuses settled results.
@@ -200,9 +267,14 @@ func (r *Runner) MarkResumed() {
 	}
 }
 
-// End runs once when the live session closes.
+// End flushes queued observation hooks, then runs SessionEnd once when the
+// live session closes.
 func (r *Runner) End(ctx context.Context) error {
-	if r == nil || !r.started.Load() || !r.ended.CompareAndSwap(false, true) {
+	if r == nil {
+		return nil
+	}
+	r.FlushObservations(ctx)
+	if !r.started.Load() || !r.ended.CompareAndSwap(false, true) {
 		return nil
 	}
 	budget, cancel := context.WithTimeout(ctx, DefaultTimeout("SessionEnd"))
@@ -259,15 +331,7 @@ func (r *Runner) run(ctx context.Context, input Input) (Result, error) {
 	if r == nil {
 		return result, nil
 	}
-	input.SessionID, input.Cwd = r.base.SessionID, r.base.Cwd
-	input.TranscriptPath = r.base.TranscriptPath
-	input.AgentID, input.AgentType, input.AgentTranscriptPath = r.base.AgentID, r.base.AgentType, r.base.AgentTranscriptPath
-	if r.PermissionMode != nil {
-		input.PermissionMode = r.PermissionMode()
-		if input.PermissionMode == "bypass" {
-			input.PermissionMode = "bypassPermissions"
-		}
-	}
+	input = r.withSession(input)
 	match := input.ToolName
 	switch input.Event {
 	case "SessionStart":
@@ -383,6 +447,20 @@ func (r *Runner) run(ctx context.Context, input Input) (Result, error) {
 		}
 	}
 	return result, nil
+}
+
+// withSession fills the session-wide fields every hook input carries.
+func (r *Runner) withSession(input Input) Input {
+	input.SessionID, input.Cwd = r.base.SessionID, r.base.Cwd
+	input.TranscriptPath = r.base.TranscriptPath
+	input.AgentID, input.AgentType, input.AgentTranscriptPath = r.base.AgentID, r.base.AgentType, r.base.AgentTranscriptPath
+	if r.PermissionMode != nil {
+		input.PermissionMode = r.PermissionMode()
+		if input.PermissionMode == "bypass" {
+			input.PermissionMode = "bypassPermissions"
+		}
+	}
+	return input
 }
 
 func canBlock(event string) bool {

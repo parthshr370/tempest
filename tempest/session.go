@@ -365,6 +365,9 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			if provider.Providers == nil {
 				provider.Providers = defaults.Providers()
 			}
+			if provider.FallbackModels == nil {
+				provider.FallbackModels = defaults.FallbackModels(config.RoleDefault)
+			}
 		}
 		if modelSpec != "" {
 			provider.ModelID = modelSpec
@@ -380,16 +383,21 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		}
 		cfg.Model = router.Model
 		cfg.StreamFn = router.StreamFn
+		cfg.FallbackModels = router.Fallbacks
 	}
 	runtimeModel := cfg.Model
 	if cfg.Plan && cfg.PlanModel.ID != "" {
 		runtimeModel = cfg.PlanModel
 	}
-	if err = budget.Validate(runtimeModel); err != nil {
-		return nil, err
+	// A backup model can answer any turn, so the budget must hold for it too.
+	for _, model := range append([]types.Model{runtimeModel}, cfg.FallbackModels...) {
+		if err = budget.Validate(model); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.SmolStreamFn == nil {
 		cfg.SmolStreamFn = cfg.StreamFn
+		cfg.SmolFallbackModels = cfg.FallbackModels
 	}
 	if cfg.SmolModel.ID == "" {
 		cfg.SmolModel = cfg.Model

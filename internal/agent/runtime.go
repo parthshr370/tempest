@@ -85,6 +85,11 @@ type AgentOptions struct {
 	TransformContext func(ctx context.Context, msgs []types.Message) []types.Message
 	// StreamFn is the provider entry point. Required for Prompt/Continue.
 	StreamFn StreamFn
+	// FallbackModels are StreamFn's backup models in chain order; a cost
+	// budget must be enforceable for each of them.
+	FallbackModels []types.Model
+	// ModelRole is the model role this agent runs on: default, plan or smol.
+	ModelRole string
 	// GetApiKey resolves a provider-specific API key; overrides the ambient key.
 	GetApiKey      func(provider string) string
 	BeforeToolCall func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
@@ -164,6 +169,8 @@ type Agent struct {
 	ConvertToLlm               func([]types.Message) []types.Message
 	TransformContext           func(ctx context.Context, msgs []types.Message) []types.Message
 	StreamFn                   StreamFn
+	FallbackModels             []types.Model
+	ModelRole                  string
 	GetApiKey                  func(provider string) string
 	BeforeToolCall             func(ctx context.Context, c BeforeToolCallContext) *BeforeToolCallResult
 	AfterToolCall              func(ctx context.Context, c AfterToolCallContext) *AfterToolCallResult
@@ -254,6 +261,8 @@ func NewAgent(opts AgentOptions) *Agent {
 		ConvertToLlm:               convertToLlm,
 		TransformContext:           opts.TransformContext,
 		StreamFn:                   opts.StreamFn,
+		FallbackModels:             append([]types.Model(nil), opts.FallbackModels...),
+		ModelRole:                  opts.ModelRole,
 		GetApiKey:                  opts.GetApiKey,
 		BeforeToolCall:             opts.BeforeToolCall,
 		AfterToolCall:              opts.AfterToolCall,
@@ -573,7 +582,16 @@ func (a *Agent) startableLocked() error {
 	if a.StreamFn == nil {
 		return errors.New("Agent streamFn is nil")
 	}
-	return a.budget.Validate(a.state.Model)
+	if err := a.budget.Validate(a.state.Model); err != nil {
+		return err
+	}
+	// A backup model can answer any turn, so the budget must hold for it too.
+	for _, model := range a.FallbackModels {
+		if err := a.budget.Validate(model); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // runBody runs the loop for one run under the claimed run slot.
@@ -622,6 +640,8 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 	config := AgentLoopConfig{
 		Budget:           a.budget,
 		Model:            a.state.Model,
+		FallbackModels:   a.FallbackModels,
+		ModelRole:        a.ModelRole,
 		ToolExecution:    toolExecution,
 		BeforeToolCall:   a.BeforeToolCall,
 		AfterToolCall:    a.AfterToolCall,

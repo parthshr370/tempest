@@ -20,10 +20,15 @@ import (
 
 // RoleRoutingConfig contains the resolved model settings shared by the three
 // agent roles. SecretLookup keeps credential material out of durable config.
+// The fallback lists are the backup models of each role, tried in order when
+// the role's model is unavailable; config resolves role inheritance.
 type RoleRoutingConfig struct {
 	DefaultModel       string
 	PlanModel          string
 	SmolModel          string
+	DefaultFallbacks   []string
+	PlanFallbacks      []string
+	SmolFallbacks      []string
 	AnthropicBaseURL   string
 	OpenAIBaseURL      string
 	MaxTokens          int
@@ -47,23 +52,41 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error) {
 	planModel := firstNonEmpty(strings.TrimSpace(cfg.PlanModel), defaultModel)
 	smolModel := firstNonEmpty(strings.TrimSpace(cfg.SmolModel), defaultModel)
 
-	defaultRouter, err := newRoleRouter(defaultModel, cfg)
+	defaultRouter, err := newRoleRouter(defaultModel, cfg.DefaultFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
-	planRouter, err := newRoleRouter(planModel, cfg)
+	planRouter, err := newRoleRouter(planModel, cfg.PlanFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
-	smolRouter, err := newRoleRouter(smolModel, cfg)
+	smolRouter, err := newRoleRouter(smolModel, cfg.SmolFallbacks, cfg)
 	if err != nil {
 		return RoleRouters{}, err
 	}
 	return RoleRouters{Default: defaultRouter, Plan: planRouter, Smol: smolRouter}, nil
 }
 
-// newRoleRouter resolves one role with the credentials that match its provider prefix.
-func newRoleRouter(model string, cfg RoleRoutingConfig) (ProviderRouter, error) {
+// newRoleRouter routes one role model and its backups, each with the
+// credentials that match its own provider prefix.
+func newRoleRouter(model string, fallbacks []string, cfg RoleRoutingConfig) (ProviderRouter, error) {
+	primary, err := newRoleRoute(model, cfg)
+	if err != nil {
+		return ProviderRouter{}, err
+	}
+	backups := make([]ProviderRouter, 0, len(fallbacks))
+	for _, spec := range fallbacks {
+		backup, err := newRoleRoute(spec, cfg)
+		if err != nil {
+			return ProviderRouter{}, fmt.Errorf("fallback model %q: %w", spec, err)
+		}
+		backups = append(backups, backup)
+	}
+	return chainRouters(primary, backups)
+}
+
+// newRoleRoute resolves one model with the credentials that match its provider prefix.
+func newRoleRoute(model string, cfg RoleRoutingConfig) (ProviderRouter, error) {
 	providers, err := Providers(cfg.Providers)
 	if err != nil {
 		return ProviderRouter{}, err

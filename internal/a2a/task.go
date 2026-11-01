@@ -242,6 +242,26 @@ func (t *task) consume(u tempest.Update) {
 		t.statusLocked()
 		return
 	}
+	if u.Kind == "tempest/model_fallback" {
+		var fallback struct {
+			From   string `json:"from"`
+			To     string `json:"to"`
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal(u.Update, &fallback) != nil {
+			return
+		}
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if t.value.Status.State != model.TaskStateWorking {
+			return
+		}
+		// A model switch is rare and changes who answers, so it is not throttled.
+		t.lastProgress = u.At
+		t.value.Status.Message = t.message("model_fallback", fmt.Sprintf("Model %s is unavailable (%s); continuing on backup model %s", fallback.From, fallback.Reason, fallback.To))
+		t.statusLocked()
+		return
+	}
 	if u.Kind == "agent_message_chunk" && p.Content.Text != "" {
 		t.mu.Lock()
 		defer t.mu.Unlock()

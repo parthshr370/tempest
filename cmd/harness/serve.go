@@ -74,6 +74,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.Var(skillPathsFlag{input: &values.PermissionAllowTools}, "allow-tool", "tool to always allow (repeatable)")
 	fs.Var(skillPathsFlag{input: &values.PermissionDenyTools}, "deny-tool", "tool to always deny (repeatable)")
 	fs.StringVar(&values.Model.Value, "model", "", "default model")
+	fs.Var(skillPathsFlag{input: &values.FallbackModels}, "fallback-model", "backup model, tried in order when the session model is unavailable (repeatable)")
 	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
 	fs.StringVar(&values.PermissionMode.Value, "permission-mode", "", "default permission mode")
 	fs.StringVar(&values.BashTimeout.Value, "bash-timeout", "", "default shell command timeout")
@@ -244,8 +245,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 }
 
 func serverProvider(cfg *config.ResolvedConfig) tempest.ProviderConfig {
-	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers()}
-	for _, model := range []string{cfg.Model(), cfg.PlanModel(), cfg.SmolModel()} {
+	provider := tempest.ProviderConfig{AnthropicBaseURL: cfg.AnthropicBaseURL(), OpenAIBaseURL: cfg.OpenAIBaseURL(), Providers: cfg.Providers(), FallbackModels: cfg.FallbackModels(config.RoleDefault)}
+	for _, model := range append([]string{cfg.Model(), cfg.PlanModel(), cfg.SmolModel()}, provider.FallbackModels...) {
 		if strings.HasPrefix(strings.TrimSpace(model), "openai-chatgpt:") {
 			provider.ChatGPTCredentials = tempest.OpenAIChatGPTCredentials("")
 			break

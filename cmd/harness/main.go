@@ -170,6 +170,9 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		DefaultModel:       opts.Config.Model(),
 		PlanModel:          opts.Config.PlanModel(),
 		SmolModel:          opts.Config.SmolModel(),
+		DefaultFallbacks:   opts.Config.FallbackModels(config.RoleDefault),
+		PlanFallbacks:      opts.Config.FallbackModels(config.RolePlan),
+		SmolFallbacks:      opts.Config.FallbackModels(config.RoleSmol),
 		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
 		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
 		MaxTokens:          opts.Config.MaxTokens(),
@@ -187,6 +190,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	planSelected := roles.Plan.Model
 	stackModel := roles.Default.Model
 	stackStreamFn := roles.Default.StreamFn
+	stackFallbacks := roles.Default.Fallbacks
+	smolFallbacks := roles.Smol.Fallbacks
 	if opts.Config.FauxScript() != "" {
 		fauxProvider, fauxModel, err := loadFauxScript(opts.Config.FauxScript())
 		if err != nil {
@@ -198,6 +203,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
 		stackStreamFn = streamFn
+		stackFallbacks = nil
 	} else if provider := configuredProvider(selectedModel.Provider, opts); selectedModel.Provider != "openai-chatgpt" && !provider.CredentialPresent(opts.Secrets.Resolve) && !provider.UsesCredentialChain() {
 		fmt.Fprintf(stderr, "warning: no %s credential resolved; set %s or providers.%s.api_key\n", selectedModel.Provider, provider.APIKeyEnv, selectedModel.Provider)
 	}
@@ -206,16 +212,20 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		// plan role, not just the plan-agent model.
 		stackModel = roles.Plan.Model
 		stackStreamFn = roles.Plan.StreamFn
+		stackFallbacks = roles.Plan.Fallbacks
 	}
 	prompt, err := buildOneShotPrompt(opts, stackModel)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	// Refuse an unenforceable budget before anything is written to disk.
-	if err := opts.Budget.Validate(stackModel); err != nil {
-		fmt.Fprintf(stderr, "budget error: %v\n", err)
-		return 1
+	// Refuse an unenforceable budget before anything is written to disk. A
+	// backup model can answer any turn, so its price must be known too.
+	for _, model := range append([]ptypes.Model{stackModel}, stackFallbacks...) {
+		if err := opts.Budget.Validate(model); err != nil {
+			fmt.Fprintf(stderr, "budget error: %v\n", err)
+			return 1
+		}
 	}
 
 	stack := session.StackConfigFromConfig(opts.Config)
@@ -271,6 +281,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.SmolModel = roles.Smol.Model
 	stack.StreamFn = stackStreamFn
 	stack.SmolStreamFn = roles.Smol.StreamFn
+	stack.FallbackModels = stackFallbacks
+	stack.SmolFallbackModels = smolFallbacks
 	stack.PermissionMode = permissionMode
 	stack.PermissionPolicy = permissionPolicy
 	stack.ExcludeTools = splitCSV(opts.ExcludeTools)
@@ -755,6 +767,7 @@ func addConfigFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.StringVar(&values.Model.Value, "model", "", "model ID")
 	fs.StringVar(&values.PlanModel.Value, "plan-model", "", "model ID for the read-only plan agent")
 	fs.StringVar(&values.SmolModel.Value, "smol-model", "", "model ID for the small helper agent")
+	fs.Var(skillPathsFlag{input: &values.FallbackModels}, "fallback-model", "backup model for the default role, tried in order when the model is unavailable (repeatable)")
 	fs.StringVar(&values.Reasoning.Value, "reasoning", "", "reasoning effort: off, minimal, low, medium, high (default: provider default)")
 	fs.StringVar(&values.PlanReasoning.Value, "plan-reasoning", "", "reasoning effort for the plan role (default: -reasoning)")
 	fs.StringVar(&values.SmolReasoning.Value, "smol-reasoning", "", "reasoning effort for the smol role (default: -reasoning)")

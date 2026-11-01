@@ -73,14 +73,22 @@ type RoutingConfig struct {
 	Providers          map[string]ProviderConfig
 	// ChatGPTCredentials is explicit so SDK users never inherit ambient sign-in.
 	ChatGPTCredentials func(context.Context) (RequestCredential, error)
+	// FallbackModels are backup model specs tried in order when ModelID is
+	// unavailable. A backup on another provider drops BaseURL, APIKey and
+	// AuthToken, which belong to the primary's endpoint, and resolves its own
+	// credential from Env.
+	FallbackModels []string
 }
 
 // ProviderRouter bundles the resolved provider registry, the default model,
-// and the stream function that wires the agent loop to the base.
+// and the stream function that wires the agent loop to the base. With
+// backups, StreamFn is the fallback chain and Fallbacks lists the backup
+// models in order.
 type ProviderRouter struct {
-	Registry *base.Registry
-	Model    types.Model
-	StreamFn agent.StreamFn
+	Registry  *base.Registry
+	Model     types.Model
+	StreamFn  agent.StreamFn
+	Fallbacks []types.Model
 }
 
 // NewProviderRouter resolves the provider configuration from the given config
@@ -122,7 +130,58 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 		}
 		r.StreamFn = agent.StreamFn(retrier.Stream)
 	}
-	return r, nil
+	backups := make([]ProviderRouter, 0, len(cfg.FallbackModels))
+	for _, spec := range cfg.FallbackModels {
+		backup, err := NewProviderRouter(cfg.fallbackRoute(r.Model, spec))
+		if err != nil {
+			return ProviderRouter{}, fmt.Errorf("fallback model %q: %w", spec, err)
+		}
+		backups = append(backups, backup)
+	}
+	return chainRouters(r, backups)
+}
+
+// fallbackRoute derives a backup model's routing from the primary's. Endpoint
+// and credential overrides were given for the primary's provider, so a backup
+// on another provider resolves its own from the provider registry and Env.
+func (cfg RoutingConfig) fallbackRoute(primary types.Model, spec string) RoutingConfig {
+	backup := cfg
+	backup.ModelID = spec
+	backup.FallbackModels = nil
+	provider := firstNonEmpty(parseModelSpec(spec).Provider, "anthropic")
+	if provider != primary.Provider {
+		backup.BaseURL, backup.APIKey, backup.AuthToken = "", "", ""
+	}
+	if provider == "openai-chatgpt" {
+		backup.MaxTokens = 0
+	}
+	return backup
+}
+
+// chainRouters puts a primary route and its backups behind one fallback
+// stream. A backup that repeats an earlier model in the chain is dropped:
+// it would only resend a request that model already failed.
+func chainRouters(primary ProviderRouter, backups []ProviderRouter) (ProviderRouter, error) {
+	chain := []retry.Candidate{{Model: primary.Model, Stream: retry.StreamFunc(primary.StreamFn)}}
+	for _, backup := range backups {
+		repeated := false
+		for _, candidate := range chain {
+			repeated = repeated || retry.SameModel(candidate.Model, backup.Model)
+		}
+		if !repeated {
+			chain = append(chain, retry.Candidate{Model: backup.Model, Stream: retry.StreamFunc(backup.StreamFn)})
+		}
+	}
+	if len(chain) == 1 {
+		return primary, nil
+	}
+	fallback, err := retry.NewFallback(chain)
+	if err != nil {
+		return ProviderRouter{}, err
+	}
+	primary.StreamFn = agent.StreamFn(fallback.Stream)
+	primary.Fallbacks = fallback.Models()[1:]
+	return primary, nil
 }
 
 // withStream binds the resolved provider's StreamSimple to StreamFn, filling the

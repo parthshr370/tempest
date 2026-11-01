@@ -84,6 +84,7 @@ type FlagValues struct {
 	Model                 StringInput
 	PlanModel             StringInput
 	SmolModel             StringInput
+	FallbackModels        StringsInput
 	Reasoning             StringInput
 	PlanReasoning         StringInput
 	SmolReasoning         StringInput
@@ -171,6 +172,7 @@ type ResolvedConfig struct {
 	model                  string
 	planModel              string
 	smolModel              string
+	fallbackModels         map[string][]string
 	reasoning              string
 	planReasoning          string
 	smolReasoning          string
@@ -363,6 +365,7 @@ type fileSettings struct {
 	Model                   *string                           `json:"model"`
 	PlanModel               *string                           `json:"plan_model"`
 	SmolModel               *string                           `json:"smol_model"`
+	FallbackModels          map[string][]string               `json:"fallback_models"`
 	Reasoning               *string                           `json:"reasoning"`
 	PlanReasoning           *string                           `json:"plan_reasoning"`
 	SmolReasoning           *string                           `json:"smol_reasoning"`
@@ -545,12 +548,17 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
 	}
+	fallbackModels, err := resolveFallbackModels(settings.FallbackModels)
+	if err != nil {
+		return nil, err
+	}
 	resolved := &ResolvedConfig{
 		environment:            environmentName,
 		environments:           environments,
 		model:                  settingString(settings.Model),
 		planModel:              settingString(settings.PlanModel),
 		smolModel:              settingString(settings.SmolModel),
+		fallbackModels:         fallbackModels,
 		reasoning:              strings.ToLower(settingString(settings.Reasoning)),
 		planReasoning:          strings.ToLower(settingString(settings.PlanReasoning)),
 		smolReasoning:          strings.ToLower(settingString(settings.SmolReasoning)),
@@ -656,7 +664,7 @@ func validateResolved(c *ResolvedConfig) error {
 	default:
 		return &Error{Field: "log_level", Err: fmt.Errorf("unknown level %q", c.logLevel)}
 	}
-	return nil
+	return validateFallbackModels(c)
 }
 
 // Hooks returns an owned snapshot of the resolved hook settings, including a

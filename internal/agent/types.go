@@ -163,7 +163,13 @@ type AgentLoopTurnUpdate struct {
 type AgentLoopConfig struct {
 	types.SimpleStreamOptions
 	Budget
-	Model         types.Model
+	Model types.Model
+	// FallbackModels are the backup models behind the stream function, in
+	// chain order. The loop uses them to keep a recorded switch on resume.
+	FallbackModels []types.Model
+	// ModelRole names the model role the loop runs on (default, plan or
+	// smol) for model-request hooks; empty means default.
+	ModelRole     string
 	ToolExecution ToolExecutionMode
 	Hooks         *hooks.Runner
 	Child         bool
@@ -289,6 +295,10 @@ const (
 	EventUsage AgentEventType = "usage"
 	EventWork  AgentEventType = "work"
 	EventHook  AgentEventType = "hook"
+	// EventModelFallback reports that the run switched to a backup model
+	// because the model it was using is unavailable. The run stays on the
+	// backup until it ends.
+	EventModelFallback AgentEventType = "model_fallback"
 )
 
 // AgentEvent is a tagged struct over the event union. Only fields relevant to
@@ -315,6 +325,7 @@ type AgentEvent struct {
 	Work                  *work.Event
 	Definition            ToolDefinition
 	Hook                  *hooks.Report
+	Fallback              *types.ModelFallback
 	QueueID               string
 	UsageSource           string
 	ChildSessionID        string

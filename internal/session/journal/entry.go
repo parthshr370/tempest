@@ -83,7 +83,7 @@ const (
 // entry. Records stay out of the parent chain.
 func isRecord(kind EntryType) bool {
 	switch kind {
-	case KindHook:
+	case KindHook, KindModelFallback:
 		return true
 	case KindRunStarted, KindToolStarted, KindToolFinished, KindUsage, KindRunFinished, KindPermission,
 		KindQueueEnqueued, KindQueueCancelled, KindJobStarted, KindJobRunning, KindJobAttached,
@@ -344,7 +344,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 			return nil, err
 		}
 		wire.Payload = e.Payload
-	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord, HookRecord:
+	case RunStartedRecord, ToolStartedRecord, ToolFinishedRecord, UsageRecord, RunFinishedRecord, PermissionRecord, HookRecord, ModelFallbackRecord:
 		payload, err := json.Marshal(e)
 		if err != nil {
 			return nil, fmt.Errorf("marshal %s record: %w", wire.Type, err)
@@ -493,6 +493,13 @@ func decodeRecord(kind EntryType, meta Meta, payload json.RawMessage) (Entry, er
 	case KindRunFinished:
 		var r RunFinishedRecord
 		err = json.Unmarshal(payload, &r)
+		record = r
+	case KindModelFallback:
+		var r ModelFallbackRecord
+		err = json.Unmarshal(payload, &r)
+		if err == nil && (r.From == "" || r.To == "" || r.FallbackIndex < 1) {
+			err = fmt.Errorf("missing model or fallback_index")
+		}
 		record = r
 	}
 	if err != nil {

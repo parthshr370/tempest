@@ -24,7 +24,24 @@ const (
 	// the request started is discarded; the events that follow belong to the
 	// next attempt.
 	EvRetry StreamEventType = "retry"
+	// EvFallback reports that the model streamed so far is unavailable and the
+	// same request goes to the next model in the fallback chain. Like EvRetry,
+	// everything streamed since the request started is discarded; the events
+	// that follow belong to the backup model named in Fallback.To.
+	EvFallback StreamEventType = "fallback"
 )
+
+// ModelFallback describes one switch to a backup model: the model that failed,
+// the model that gets the request next, the availability failure that caused
+// the switch, how many attempts the failed model got, and the backup's
+// position in the chain (0 is the primary).
+type ModelFallback struct {
+	From     Model
+	To       Model
+	Reason   string
+	Attempts int
+	Index    int
+}
 
 // StreamEvent is one streaming event. Content arms carry Partial (a live
 // pointer to the builder's message — read-only until the next event).
@@ -32,7 +49,8 @@ const (
 // message. `*_end` text/thinking events carry the full Content, while
 // toolcall_end carries the assembled ToolCall. A retry carries the discarded
 // attempt in Err (its partial content, usage and error), its ordinal in
-// Attempt and the wait before the next attempt in RetryDelay.
+// Attempt and the wait before the next attempt in RetryDelay. A fallback
+// carries the discarded attempt in Err and the model switch in Fallback.
 type StreamEvent struct {
 	Type         StreamEventType
 	ContentIndex int
@@ -42,9 +60,10 @@ type StreamEvent struct {
 	Reason       StopReason        // done / error
 	Partial      *AssistantMessage // content arms
 	Message      *AssistantMessage // done
-	Err          *AssistantMessage // error / retry (the discarded attempt)
+	Err          *AssistantMessage // error / retry / fallback (the discarded attempt)
 	Attempt      int               // retry: 1-based ordinal of the failed attempt
 	RetryDelay   time.Duration     // retry: wait before the next attempt
+	Fallback     *ModelFallback    // fallback: the switch to the next model
 }
 
 // AssistantBuilder folds a stream of StreamEvents into an AssistantMessage. The
@@ -113,6 +132,12 @@ func (b *AssistantBuilder) Fold(ev StreamEvent) {
 		}
 	case EvRetry:
 		b.msg = AssistantMessage{API: b.msg.API, Provider: b.msg.Provider, Model: b.msg.Model}
+	case EvFallback:
+		b.msg = AssistantMessage{API: b.msg.API, Provider: b.msg.Provider, Model: b.msg.Model}
+		if ev.Fallback != nil {
+			to := ev.Fallback.To
+			b.msg = AssistantMessage{API: to.API, Provider: to.Provider, Model: to.ID}
+		}
 	}
 }
 

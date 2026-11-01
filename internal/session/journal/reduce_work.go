@@ -42,6 +42,9 @@ type RunDetail struct {
 	ElapsedMS      int64
 	Usage          types.Usage
 	History        []RunMessage
+	// Fallback is the run's last switch to a backup model, nil when it stayed
+	// on its primary model.
+	Fallback *ModelFallbackRecord
 }
 
 func assistantBlocks(m types.Message) []types.ContentBlock {
@@ -149,6 +152,11 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 			}
 			runs[e.RunID] = len(l.Runs)
 			l.Runs = append(l.Runs, RunDetail{SessionID: l.Header.ID, RunID: e.RunID, LogicalRunID: logical, ContinuationOf: e.ContinuationOf, StartedAt: e.Timestamp, Model: e.Model, Provider: e.Provider, Interrupted: true, Recoverable: true})
+		case ModelFallbackRecord:
+			if i, ok := runs[e.RunID]; ok {
+				record := e
+				l.Runs[i].Fallback = &record
+			}
 		case RunFinishedRecord:
 			if i, ok := runs[e.RunID]; ok {
 				r := &l.Runs[i]
