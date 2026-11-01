@@ -9,10 +9,10 @@ func TestSignalProcessGroupSkipsReapedDaemon(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	called := false
-	err := signalProcessGroupUnlessDone(done, 123, syscall.SIGTERM, func(pid int, signal syscall.Signal) error {
+	err := signalProcessGroupUnlessDone(done, 123, syscall.SIGTERM, func(pgid int, signal syscall.Signal) error {
 		called = true
-		if pid != -123 || signal != syscall.SIGTERM {
-			t.Fatalf("signal target = (%d, %v), want (-123, SIGTERM)", pid, signal)
+		if pgid != 123 || signal != syscall.SIGTERM {
+			t.Fatalf("signal target = (%d, %v), want (123, SIGTERM)", pgid, signal)
 		}
 		return nil
 	})

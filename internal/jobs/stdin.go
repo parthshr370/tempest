@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -174,7 +175,7 @@ func (input *jobInput) send(jobID string, request work.StdinRequest) error {
 		var err error
 		switch {
 		case !input.pty && request.Text == interruptText:
-			err = syscall.Kill(-input.pid, syscall.SIGINT)
+			err = procgroup.Signal(input.pid, syscall.SIGINT)
 		case !input.stdin:
 			return fmt.Errorf("%w: job %s reads its stdin from /dev/null, so it takes no input; start the command with bash stdin: true (or pty: true for a terminal) to write to it (text exactly \\u0003 still sends Ctrl-C)", ErrInvalidInput, jobID)
 		default:
@@ -223,7 +224,7 @@ func (input *jobInput) write(jobID string, text []byte) error {
 // isProcessGone reports a write or signal that failed because the process,
 // or the descriptor the worker closed after it exited, is gone.
 func isProcessGone(err error) bool {
-	return errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ESRCH)
+	return errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.EIO) || errors.Is(err, os.ErrProcessDone)
 }
 
 // awaitQuiet waits until output newer than the cursor has paused for

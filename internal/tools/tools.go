@@ -40,6 +40,7 @@ import (
 	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/irc"
 	"go.harness.dev/harness/internal/lsp"
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/progress"
 	"go.harness.dev/harness/internal/question"
 	"go.harness.dev/harness/internal/refs"
@@ -940,13 +941,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if runtime.GOOS != "windows" {
 				cmd.WaitDelay = 2 * time.Second
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-				cmd.Cancel = func() error {
-					err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-					if errors.Is(err, syscall.ESRCH) {
-						return os.ErrProcessDone
-					}
-					return err
-				}
+				cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 			}
 			if options.AdmitProcess != nil {
 				release, err := options.AdmitProcess(execCtx)

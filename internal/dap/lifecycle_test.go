@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"go.harness.dev/harness/internal/procgroup"
 )
 
 func debugpyAdapter(t *testing.T) string {
@@ -71,7 +73,7 @@ func TestDAPRealDebugpyLifecycle(t *testing.T) {
 						}
 						process.stateMu.Lock()
 						for group := range process.programGroups {
-							if !errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+							if !errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 								releasedBeforeExit.Store(true)
 							}
 						}
@@ -181,7 +183,7 @@ func TestDAPRealDebugpyLifecycle(t *testing.T) {
 			}
 			waitDAPCondition(t, "launched debuggee group survived teardown", func() bool {
 				for _, group := range groups {
-					if !errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+					if !errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 						return false
 					}
 				}
@@ -218,7 +220,7 @@ func TestDAPStartInheritedPipeDoesNotHang(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := procgroup.Signal(pid, syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			t.Error(err)
 		}
 	})

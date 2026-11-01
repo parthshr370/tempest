@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/toolio"
 )
 
@@ -101,12 +103,6 @@ func (process *adapterProcess) cleanup() error {
 			_ = process.transport.Close()
 		}
 		<-process.exited
-		if errors.Is(killErr, syscall.EPERM) {
-			// macOS refuses to signal a group whose only member is a zombie: an
-			// adapter that exited after the grace check but before Wait reaped it.
-			// Once it's reaped, the retry finds the group gone or kills what's left.
-			killErr = process.kill()
-		}
 		if process.client != nil {
 			<-process.client.done
 		}
@@ -199,7 +195,7 @@ func (process *adapterProcess) releaseWhenGone() {
 func (process *adapterProcess) releaseIfGone() bool {
 	process.stateMu.Lock()
 	for group := range process.programGroups {
-		if errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+		if errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 			delete(process.programGroups, group)
 		}
 	}
@@ -212,12 +208,13 @@ func (process *adapterProcess) releaseIfGone() bool {
 	return true
 }
 
+// killGroup SIGKILLs a process group. A group with no live member left, its
+// zombies waiting on a parent that may not be us, is already done.
 func killGroup(group int) error {
-	err := syscall.Kill(-group, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
+	if err := procgroup.Signal(group, syscall.SIGKILL); !errors.Is(err, os.ErrProcessDone) {
+		return err
 	}
-	return err
+	return nil
 }
 
 func (process *adapterProcess) kill() error {

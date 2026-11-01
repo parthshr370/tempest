@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/toolio"
 	"go.harness.dev/harness/internal/work"
 	"go.harness.dev/harness/internal/worktree"
@@ -69,13 +70,7 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	cmd := exec.CommandContext(processCtx, manager.options.ShellPath, "-c", command)
 	cmd.Dir = job.Cwd
 	cmd.WaitDelay = pipeJoinDelay
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 	streams, err := openStreams(cmd, spec.PTY, spec.Stdin)
 	if err != nil {
 		output.err = err
