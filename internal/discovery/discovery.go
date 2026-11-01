@@ -64,8 +64,10 @@ type SessionInputs struct {
 	Skills       []skills.Skill
 	GenericRules []string
 	Diagnostics  []Diagnostic
-	// ContextBytes counts the context file bytes kept, so nested discovery
-	// spends only what the total cap leaves.
+	// ContextBytes counts the context file bytes kept, without a cut
+	// notice, for doctor's report. Nested discovery spends the cap from the
+	// files' whole content instead, notice included, so a cut startup file
+	// leaves it nothing.
 	ContextBytes int
 	// Agents are the agent files of the workspace and the agent dir, first
 	// definition of a name first.
