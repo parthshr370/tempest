@@ -380,8 +380,13 @@ test without adding the venv to `PATH`.
 
 The stack owns the adapter and launched target process groups. It holds its host
 process permit until both are gone. Close and unanswered adapter requests send a
-short bounded disconnect before killing owned groups; attached targets are
-detached with `terminateDebuggee:false` and are never killed by Tempest. After the
+disconnect bounded to 500 ms before killing owned groups; attached targets are
+detached with `terminateDebuggee:false` and are never killed by Tempest. A
+debugger still traces the target until its detach finishes, and killing it then
+can leave the target stopped or killed, so Tempest kills an attach adapter only
+after it answers the disconnect or exits. An attach adapter that doesn't answer
+in time has its connection closed, which Delve treats as a detach, and gets up to
+5 s more to exit; only an adapter that outlives that is killed. After the
 adapter exits, an attached process gets `SIGCONT`: a debugger's detach halts the
 target, and a halt `SIGSTOP` that loses a race with another signal is delivered
 after detach and would leave the program stopped. Tempest pins the process named

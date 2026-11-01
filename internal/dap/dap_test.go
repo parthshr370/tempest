@@ -100,6 +100,45 @@ func TestDAPFakeAdapterSequence(t *testing.T) {
 	}
 }
 
+// slowDetachDelay outlasts the old fixed teardown budget (disconnectTimeout
+// plus disconnectGrace) and stays well inside detachTimeout.
+const slowDetachDelay = time.Second
+
+// An attach adapter that hasn't confirmed its detach still traces the target,
+// so cleanup must let it finish: one answers disconnect late, the other never
+// answers and detaches only when its client connection closes.
+func TestDAPCleanupWaitsForUnconfirmedDetach(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"slow", "on-eof"} {
+		t.Run(mode, func(t *testing.T) {
+			directory := t.TempDir()
+			sequence := filepath.Join(directory, "sequence")
+			session, err := New(directory, directory, map[string]Adapter{"fake": {Command: executable, Args: []string{"-test.run=^TestDAPAdapterProcess$", "--", "dap-helper", sequence}}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if _, err := session.Start(ctx, "attach", "fake", "", map[string]json.RawMessage{"detach": json.RawMessage(`"` + mode + `"`)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := session.Close(); err != nil {
+				t.Fatal(err)
+			}
+			recorded, err := os.ReadFile(sequence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasSuffix(string(recorded), "disconnect\ndetached\n") {
+				t.Fatalf("adapter killed before its detach finished; sequence=%s", recorded)
+			}
+		})
+	}
+}
+
 func TestDAPAdapterProcess(t *testing.T) {
 	if len(os.Args) < 3 || os.Args[len(os.Args)-2] != "dap-helper" {
 		return
@@ -112,6 +151,9 @@ func TestDAPAdapterProcess(t *testing.T) {
 	reader := bufio.NewReader(os.Stdin)
 	launchSeq := 0
 	launchCommand := ""
+	var options struct {
+		Detach string `json:"detach"`
+	}
 	send := func(response message) {
 		if err := writeMessage(os.Stdout, response); err != nil {
 			os.Exit(3)
@@ -139,6 +181,9 @@ func TestDAPAdapterProcess(t *testing.T) {
 				send(response)
 				continue
 			}
+			if err := json.Unmarshal(request.Arguments, &options); err != nil {
+				os.Exit(6)
+			}
 			launchSeq = request.Seq
 			launchCommand = request.Command
 			send(message{Type: "event", Event: "initialized"})
@@ -155,7 +200,25 @@ func TestDAPAdapterProcess(t *testing.T) {
 		case "continue", "next", "stepIn", "stepOut", "pause":
 			send(message{Type: "event", Event: "stopped", Body: json.RawMessage(`{"threadId":1}`)})
 		case "disconnect":
-			send(response)
+			switch options.Detach {
+			case "slow":
+				time.Sleep(slowDetachDelay)
+			case "on-eof":
+				// Never answer; the detach completes when the client connection closes.
+				for {
+					if _, err := readMessage(reader); err != nil {
+						break
+					}
+				}
+			}
+			if options.Detach != "" {
+				if _, err := fmt.Fprintln(logFile, "detached"); err != nil {
+					os.Exit(5)
+				}
+			}
+			if options.Detach != "on-eof" {
+				send(response)
+			}
 			return
 		}
 		send(response)

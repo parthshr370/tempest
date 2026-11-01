@@ -84,29 +84,29 @@ func (m *Manager) stop() error {
 
 func (process *adapterProcess) cleanup() error {
 	process.cleanupOnce.Do(func() {
-		// Cleanup must still work after the caller's request context expires.
-		if process.client != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
-			args := json.RawMessage(`{"terminateDebuggee":true}`)
-			if process.attached {
-				args = json.RawMessage(`{"terminateDebuggee":false}`)
-			}
-			// A failed disconnect isn't a cleanup failure if forced teardown works.
-			_, _ = process.client.request(ctx, "disconnect", args)
-			cancel()
-		}
+		confirmed := process.disconnect()
 		// debugpy launches the target in a separate process group. Kill it while
 		// the adapter can still reap it; attached programs are never ours to kill.
 		programErr := process.killPrograms()
+		if process.attached && !confirmed {
+			process.awaitDetach()
+		}
 		select {
 		case <-process.exited:
 		case <-time.After(disconnectGrace):
 		}
 		killErr := process.kill()
 		if process.transport != nil {
+			// Closing twice after awaitDetach only repeats an error; the adapter is already being torn down.
 			_ = process.transport.Close()
 		}
 		<-process.exited
+		if errors.Is(killErr, syscall.EPERM) {
+			// macOS refuses to signal a group whose only member is a zombie: an
+			// adapter that exited after the grace check but before Wait reaped it.
+			// Once it's reaped, the retry finds the group gone or kills what's left.
+			killErr = process.kill()
+		}
 		if process.client != nil {
 			<-process.client.done
 		}
@@ -121,6 +121,42 @@ func (process *adapterProcess) cleanup() error {
 		}
 	})
 	return process.cleanupErr
+}
+
+// disconnect ends the session and reports whether the adapter confirmed it.
+// Cleanup must still work after the caller's request context expires, so the
+// request gets its own deadline.
+func (process *adapterProcess) disconnect() bool {
+	if process.client == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
+	defer cancel()
+	args := json.RawMessage(`{"terminateDebuggee":true}`)
+	if process.attached {
+		args = json.RawMessage(`{"terminateDebuggee":false}`)
+	}
+	// A failed disconnect isn't a cleanup failure if forced teardown works.
+	_, err := process.client.request(ctx, "disconnect", args)
+	return err == nil
+}
+
+// awaitDetach waits for an adapter that hasn't confirmed its detach. Until the
+// detach finishes, the debugger still traces the attached target, and killing
+// the adapter then can leave the target stopped under an orphaned tracer or
+// killed. Delve's tracer (debugserver on macOS) runs in its own process group,
+// out of reach of the adapter group kill. Closing the transport tells the
+// adapter its client is gone; Delve then finishes a detach in progress, or
+// detaches, and exits. Adapter exit is the completion this waits for.
+func (process *adapterProcess) awaitDetach() {
+	if process.transport != nil {
+		// A close error leaves nothing to retry; adapter exit or the deadline decides what follows.
+		_ = process.transport.Close()
+	}
+	select {
+	case <-process.exited:
+	case <-time.After(detachTimeout):
+	}
 }
 
 func (process *adapterProcess) killPrograms() error {
@@ -549,6 +585,12 @@ func (m *Manager) Output() (toolio.OutputSnapshot, error) {
 
 const disconnectGrace = 100 * time.Millisecond
 const disconnectTimeout = 500 * time.Millisecond
+
+// detachTimeout bounds the wait for an attach adapter that didn't confirm its
+// detach within disconnectTimeout. With the CPU six times oversubscribed,
+// Delve's detach took 40 to 300 ms with rare runs past disconnectTimeout; the
+// bound is for an adapter that hangs.
+const detachTimeout = 5 * time.Second
 
 // Terminate disconnects (detaching attached targets), then joins owned processes.
 func (m *Manager) Terminate(ctx context.Context) error {
