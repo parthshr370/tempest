@@ -61,9 +61,7 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	// A project server the trust rules dropped is named here, not just missing.
-	for _, warning := range cfg.Warnings() {
-		fmt.Fprintln(stderr, "warning: "+warning)
-	}
+	printConfigWarnings(stderr, cfg)
 	store := mcpoauth.NewStore(mcpoauth.DefaultDir(cfg.AgentDir()))
 	servers := cfg.MCPServers()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

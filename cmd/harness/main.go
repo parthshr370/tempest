@@ -938,6 +938,15 @@ func logConfigWarnings(cfg *config.ResolvedConfig) {
 	}
 }
 
+// printConfigWarnings prints the same warnings on stderr, for commands that
+// report to a terminal rather than the log: a setting the trust rules dropped
+// is named instead of silently missing.
+func printConfigWarnings(stderr io.Writer, cfg *config.ResolvedConfig) {
+	for _, warning := range cfg.Warnings() {
+		fmt.Fprintln(stderr, "warning: "+warning)
+	}
+}
+
 // warnUnknownToolNames flags allow/deny entries that match no built-in tool.
 // MCP tools are discovered after startup, so mcp__ names are never warned about.
 func warnUnknownToolNames(stderr io.Writer, flagName string, names []string) {

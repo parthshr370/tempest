@@ -62,8 +62,8 @@ choose where credentials go apply only after the operator trusts the workspace:
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
-dropped are named in one warning in the log, in `tempest doctor`, and in
-`config show`.
+dropped are named in one warning in the log, in `tempest doctor` and `config show`,
+and on stderr from the `mcp` commands and `agents list`.
 
 An untrusted repository can narrow permissions and capabilities and never widen
 them. Its `"permission_mode_default": "plan"`, `"plan": true` and
@@ -148,7 +148,10 @@ profile again. Selecting a profile that no file defines, or that a higher file
 unsets, is an error.
 
 `-profile` is a settings profile. `tempest login`, `logout` and `auth` take a
-different `--profile`: the label of a saved ChatGPT account.
+different `--profile`: the label of a saved ChatGPT account. The session controls
+`fork`, `reset`, `compact`, `history` and `rewind` take `-profile`, `-c` and the
+other settings flags too; there they choose the session directory and faux script,
+and the session they reopen resolves its own settings from its workspace.
 
 ## Overrides with `-c`
 
