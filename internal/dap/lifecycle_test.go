@@ -293,6 +293,8 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			heartbeat := filepath.Join(directory, "heartbeat")
 			target := exec.Command(executable, "-test.run=^TestDAPAttachTarget$", "--", "attach-target", heartbeat)
 			target.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			var targetOutput bytes.Buffer
+			target.Stdout, target.Stderr = &targetOutput, &targetOutput
 			if err := target.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -354,7 +356,7 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			waitDAPCondition(t, "attached process didn't resume after detach", func() bool {
 				select {
 				case <-exited:
-					t.Fatalf("attached user process exited: %v", target.ProcessState)
+					t.Fatalf("attached user process exited: %v\n%s", target.ProcessState, targetOutput.String())
 				default:
 				}
 				current, err := os.ReadFile(heartbeat)
