@@ -853,8 +853,6 @@ func markConfigFlag(name string, values *config.FlagValues) {
 		values.Attach.Set = true
 	case "enable-web":
 		values.EnableWeb.Set = true
-	case "web-search-url":
-		values.WebSearchURL.Set = true
 	case "agent-dir":
 		values.AgentDir.Set = true
 	case "session-dir":

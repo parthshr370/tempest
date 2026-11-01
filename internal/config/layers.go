@@ -381,7 +381,7 @@ var settingInputs = []settingInput{
 	{key: "plan", env: "HARNESS_PLAN", flag: "plan", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.Plan }},
 	{key: "attach", env: "HARNESS_ATTACH", flag: "attach", kind: inputList, field: func(f *FlagValues) flagInput { return &f.Attach }},
 	{key: "enable_web", env: "HARNESS_ENABLE_WEB", flag: "enable-web", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.EnableWeb }},
-	{key: "web_search_url", env: "HARNESS_WEB_SEARCH_URL", flag: "web-search-url", field: func(f *FlagValues) flagInput { return &f.WebSearchURL }},
+	{key: "web_search_url", env: "HARNESS_WEB_SEARCH_URL"},
 	{key: "agent_dir", env: EnvAgentDir, flag: "agent-dir", field: func(f *FlagValues) flagInput { return &f.AgentDir }},
 	{key: "session_dir", env: EnvSessionDir, flag: "session-dir", field: func(f *FlagValues) flagInput { return &f.SessionDir }},
 	{key: "anthropic_base_url", env: "HARNESS_ANTHROPIC_BASE_URL", flag: "anthropic-base-url", field: func(f *FlagValues) flagInput { return &f.AnthropicBaseURL }},

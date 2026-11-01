@@ -29,26 +29,17 @@ func (c *ResolvedConfig) MCPSamplingMaxTokens() int { return c.mcpSamplingMaxTok
 // without asking when the session has no user to ask.
 func (c *ResolvedConfig) MCPSamplingAllowHeadless() bool { return c.mcpSamplingHeadless }
 
-func resolveMCP(flag StringInput, env string, settings fileSettings) ([]mcpconfig.Server, error) {
+// resolveMCP reads the merged settings, where -mcp-config and
+// HARNESS_MCP_CONFIG are layers: a selected file, empty for none, or else the
+// inline server array.
+func resolveMCP(settings fileSettings) ([]mcpconfig.Server, error) {
 	if settings.MCPConfig != nil && settings.MCPServers != nil {
 		return nil, errors.New("mcp_config and mcp_servers conflict")
 	}
-	path := ""
-	selected := false
-	switch {
-	case flag.Set:
-		path = flag.Value
-		selected = true
-	case env != "":
-		path = env
-		selected = true
-	case settings.MCPConfig != nil:
-		path = *settings.MCPConfig
-		selected = true
-	}
-	if !selected {
+	if settings.MCPConfig == nil {
 		return mcpconfig.Normalize(settings.MCPServers)
 	}
+	path := *settings.MCPConfig
 	if strings.TrimSpace(path) == "" {
 		return []mcpconfig.Server{}, nil
 	}

@@ -98,7 +98,6 @@ type FlagValues struct {
 	Plan                  BoolInput
 	Attach                StringsInput
 	EnableWeb             BoolInput
-	WebSearchURL          StringInput
 	AgentDir              StringInput
 	SessionDir            StringInput
 	AnthropicBaseURL      StringInput
@@ -580,8 +579,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	if err != nil {
 		return nil, &Error{Field: "providers", Err: err}
 	}
-	// -mcp-config and HARNESS_MCP_CONFIG already reached settings as layers.
-	mcpServers, err := resolveMCP(StringInput{}, "", settings)
+	mcpServers, err := resolveMCP(settings)
 	if err != nil {
 		return nil, &Error{Field: "mcp_config", Err: err}
 	}
