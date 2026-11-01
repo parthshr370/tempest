@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,15 +56,25 @@ func newHarness(t *testing.T, options mcpoauthtest.Options, client *mcpconfig.OA
 	return &harness{fixture: fixture, store: store, dir: dir, flow: flow}
 }
 
+// remotePeer stands for a server that answered from a public address, so
+// its loopback fixtures count as someone else's internal services.
+var remotePeer = netip.MustParseAddr("93.184.216.34")
+
 func (h *harness) login(t *testing.T) mcpoauth.Record {
 	t.Helper()
 	challenge, challenged, err := h.flow.Probe(t.Context())
 	if err != nil || !challenged {
 		t.Fatalf("probe: challenged=%v err=%v", challenged, err)
 	}
+	if !challenge.Peer.IsLoopback() {
+		t.Fatalf("probe reports the challenge came from %v, want the fixture's loopback address", challenge.Peer)
+	}
 	record, err := h.flow.Login(t.Context(), challenge, h.fixture.Browse)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if record.ServerNetwork != "loopback" {
+		t.Fatalf("record keeps server network %q, want loopback for refresh", record.ServerNetwork)
 	}
 	return record
 }
@@ -262,12 +273,11 @@ func TestLoginProbesWellKnownWhenPolicyRefusesResourceMetadata(t *testing.T) {
 	t.Cleanup(probe.Close)
 	for _, hint := range []string{probe.URL + "/metadata-probe", "http://metadata.example/metadata-probe"} {
 		h := newHarness(t, mcpoauthtest.Options{}, nil)
-		mcpoauth.TreatServerAsRemote(h.flow)
 		challenge, _, err := h.flow.Probe(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
-		challenge.ResourceMetadata = hint
+		challenge.ResourceMetadata, challenge.Peer = hint, remotePeer
 		// The well-known metadata on the server's own origin is read, so
 		// discovery gets as far as the (loopback, thus refused) issuer.
 		_, err = h.flow.Login(t.Context(), challenge, h.fixture.Browse)
@@ -282,11 +292,11 @@ func TestLoginProbesWellKnownWhenPolicyRefusesResourceMetadata(t *testing.T) {
 
 func TestLoginRefusesToReachInternalAuthorizationServerOfRemoteServer(t *testing.T) {
 	h := newHarness(t, mcpoauthtest.Options{}, nil)
-	mcpoauth.TreatServerAsRemote(h.flow)
 	challenge, _, err := h.flow.Probe(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
+	challenge.Peer = remotePeer
 	_, err = h.flow.Login(t.Context(), challenge, h.fixture.Browse)
 	if err == nil || !strings.Contains(err.Error(), "refusing to reach 127.0.0.1, a loopback address") {
 		t.Fatalf("login via an internal authorization server = %v", err)

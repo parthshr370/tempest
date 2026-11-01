@@ -122,12 +122,20 @@ authorization servers and their endpoints) is named by the server, so Tempest
 limits where it goes, as the MCP security best practices on server-side request
 forgery advise. It must be HTTPS; plain HTTP is accepted only from a server on
 loopback to a loopback address. The address actually connected to must be public
-or in the network the configured server's own address is in (loopback, private
-or link-local), so a remote server cannot point Tempest at `169.254.169.254`,
+or in the network (loopback, private or link-local) of the address the server's
+challenge came from. Tempest takes that network from the connection that carried
+the challenge and never resolves the server's name for it, so a server cannot
+grant itself an internal network by changing its DNS; the network is kept for the
+whole login and stored with the tokens for refresh. When a proxy carried that
+connection the server's address is unknown, and only public destinations are
+allowed. A remote server thus cannot point Tempest at `169.254.169.254`,
 `localhost` or an internal host, also not through DNS that changes between
-lookups. With an `HTTPS_PROXY`, the host is resolved and checked before the proxy
-connects. Redirects are never followed, responses are limited to 1 MiB and
-requests to 30 seconds.
+lookups. With an `HTTPS_PROXY`, Tempest resolves the host, checks every address,
+and asks the proxy to `CONNECT` to the checked IP address, not the name, so the
+proxy's own DNS cannot pick another destination; TLS still verifies the
+certificate for the host name. Only `http` and `https` proxies can do this, and a
+proxy that refuses the IP address fails the request. Redirects are never
+followed, responses are limited to 1 MiB and requests to 30 seconds.
 
 A server that needs authorization does not stop session startup. The first run
 authorizes it through the session's user: ACP clients that declare URL elicitation

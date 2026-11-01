@@ -1,6 +1,9 @@
 package mcpwire
 
-import "context"
+import (
+	"context"
+	"net/netip"
+)
 
 // Auth supplies OAuth bearer tokens to one HTTP server. It must not ask a
 // user anything: interactive authorization belongs to the caller, which sees
@@ -22,6 +25,9 @@ type Rejection struct {
 	Token string
 	// Retried marks the rejection of the single retry; no further retry follows.
 	Retried bool
+	// Peer is the address the rejection came from over a direct connection
+	// to the server, zero when a proxy carried it.
+	Peer netip.Addr
 }
 
 // AuthError is an authorization failure. The server rejected the request

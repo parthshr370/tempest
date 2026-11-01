@@ -44,6 +44,7 @@ func (a *serverAuth) Token(ctx context.Context) (string, error) { return a.flow.
 // "Scope Challenge Handling").
 func (a *serverAuth) Rejected(ctx context.Context, rejection mcpwire.Rejection) error {
 	challenge, _ := mcpoauth.ParseBearer(rejection.Challenges)
+	challenge.Peer = rejection.Peer
 	if rejection.Status == http.StatusForbidden {
 		if challenge.Error == "insufficient_scope" {
 			return &mcpoauth.LoginRequired{Server: a.name, Challenge: challenge, StepUp: true}

@@ -39,6 +39,9 @@ type Record struct {
 	// PendingScope is the scope a step-up challenge asked for while no user
 	// could authorize it; the next login requests it.
 	PendingScope string `json:"pending_scope,omitempty"`
+	// ServerNetwork is the network class (public, loopback, private,
+	// link-local) the server answered from at login; refresh may reach it.
+	ServerNetwork string `json:"server_network,omitempty"`
 }
 
 // Store keeps one owner-only JSON file per server name.
