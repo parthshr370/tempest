@@ -102,11 +102,16 @@ func syncsAfter(kind EntryType) bool {
 	return kind != KindModelChange && kind != KindPermission && kind != KindToolFinished && kind != KindJobRunning
 }
 
-// MessageEntry adds a transcript message.
+// MessageEntry adds a transcript message. QueueID names the queued input the
+// message consumes. Withdraws names the queued job completion notices a tool
+// result supersedes (a wait that returned those jobs' terminal state): they
+// are withdrawn in the same commit that records the result, so a crash leaves
+// either both or neither.
 type MessageEntry struct {
 	Meta
 	Message         ptypes.Message
 	QueueID         string
+	Withdraws       []string
 	Metered         bool
 	CallOccurrences []string
 }
@@ -263,6 +268,7 @@ type wireEntry struct {
 	TokensBefore    int             `json:"tokens_before,omitempty"`
 	Payload         json.RawMessage `json:"payload,omitempty"`
 	QueueID         string          `json:"queue_id,omitempty"`
+	Withdraws       []string        `json:"withdraws,omitempty"`
 	Metered         bool            `json:"metered,omitempty"`
 	CallOccurrences []string        `json:"call_occurrences,omitempty"`
 	SourceHash      string          `json:"source_hash,omitempty"`
@@ -309,7 +315,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 			return nil, fmt.Errorf("marshal message entry: %w", err)
 		}
 		wire.Message = message
-		wire.QueueID, wire.Metered, wire.CallOccurrences = e.QueueID, e.Metered, e.CallOccurrences
+		wire.QueueID, wire.Withdraws, wire.Metered, wire.CallOccurrences = e.QueueID, e.Withdraws, e.Metered, e.CallOccurrences
 	case ModelChangeEntry:
 		wire.Model, wire.Role = e.Model, e.Role
 	case CompactionEntry:
@@ -409,7 +415,7 @@ func decodeEntry(raw []byte) (Entry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("decode journal message: %w", err)
 		}
-		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences}, nil
+		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Withdraws: wire.Withdraws, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences}, nil
 	case KindModelChange:
 		return ModelChangeEntry{Meta: meta, Model: wire.Model, Role: wire.Role}, nil
 	case KindCompaction:

@@ -169,6 +169,13 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 				}
 				l.QueueConsumed[e.QueueID] = true
 			}
+			// Like queue_cancelled, withdrawing an already cancelled notice is a no-op.
+			for _, id := range e.Withdraws {
+				if item, ok := queue[id]; !ok || item.SourceJobID == "" || l.QueueConsumed[id] {
+					return fmt.Errorf("invalid queue withdrawal %q", id)
+				}
+				l.QueueCancelled[id] = true
+			}
 			if i, ok := runs[e.RunID]; ok {
 				r := &l.Runs[i]
 				text := boundedText(messageText(e.Message), 1<<20)

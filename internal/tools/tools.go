@@ -740,7 +740,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(EditTool),
-			Description: "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file. Supply the tag from the [path#TAG] header of read or grep output (or the full anchor an lsp_rename plan gives) as each edit's anchor to reject stale file contents before any change. " + localWriteHelp,
+			Description: "Edit a single file using exact text replacement. Every edits[].old_text must match a unique, non-overlapping region of the original file; to change several occurrences, give each its own edit with enough surrounding text to be unique. Set each edit's anchor to this file's [path#TAG] header from your latest read, grep, write or edit output (its 4-hex TAG alone, or the full anchor an lsp_rename plan gives, also work) to reject stale file contents before any change. " + localWriteHelp,
 			Parameters: schema.Object(schema.JSON{
 				"path": schema.String(),
 				"edits": schema.JSON{
@@ -787,26 +787,33 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 					return err
 				}
 				actualAnchor := ""
-				var staleErr error
 				for index, edit := range input.Edits {
-					if edit.Anchor == "" || staleErr != nil {
+					anchor := strings.TrimSpace(edit.Anchor)
+					if anchor == "" {
 						continue
 					}
-					if hashline.IsTag(edit.Anchor) {
-						if err := verifyEditTag(store, canonicalPath, input.Path, edit.Anchor, rawContent); err != nil {
-							staleErr = fmt.Errorf("edit hunk %d: %w", index+1, err)
+					if strings.HasPrefix(anchor, "[") {
+						tag, err := headerAnchorTag(cwd, options, target, input.Path, anchor)
+						if err != nil {
+							return fmt.Errorf("edit hunk %d: %w", index+1, err)
 						}
-						continue
+						anchor = tag
 					}
-					if actualAnchor == "" {
-						actualAnchor = editdiff.ContentAnchor(rawContent)
+					switch {
+					case hashline.IsTag(anchor):
+						if err := verifyEditTag(store, canonicalPath, input.Path, anchor, rawContent); err != nil {
+							return fmt.Errorf("edit hunk %d: %w", index+1, err)
+						}
+					case len(anchor) == editdiff.AnchorLength:
+						if actualAnchor == "" {
+							actualAnchor = editdiff.ContentAnchor(rawContent)
+						}
+						if anchor != actualAnchor {
+							return fmt.Errorf("edit hunk %d: %w", index+1, &editdiff.StaleAnchorError{Path: input.Path, Expected: anchor, Actual: actualAnchor})
+						}
+					default:
+						return fmt.Errorf("edit hunk %d: anchor %q is not a snapshot tag; pass the [path#TAG] header of %s from your latest read, grep, write or edit output, or its 4 hex digits", index+1, edit.Anchor, input.Path)
 					}
-					if edit.Anchor != actualAnchor {
-						staleErr = fmt.Errorf("edit hunk %d: %w", index+1, &editdiff.StaleAnchorError{Path: input.Path, Expected: edit.Anchor, Actual: actualAnchor})
-					}
-				}
-				if staleErr != nil {
-					return staleErr
 				}
 				bom, content := editdiff.StripBOM(string(rawContent))
 				ending := editdiff.DetectLineEnding(content)

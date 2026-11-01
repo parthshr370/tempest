@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/pathutil"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/toolio"
 )
@@ -36,6 +37,7 @@ const hashlineDescription = "Edit existing files with a line-anchored patch. `in
 	"MV DEST    move the file (quote paths with spaces); the section's edits apply first\n" +
 	"\n" +
 	"Body rows are `+TEXT`, verbatim, indentation after the `+`; a lone `+` is a blank line. There are no `-` or context rows: the range removes the old lines and the body is their complete final content. A literal line starting with `-` or `+` is written `+- item` / `++x`.\n" +
+	"Body text is written byte for byte: indent with the file's own tab or space characters. Inside the JSON argument a tab is `\\t`; `\\\\t` writes a backslash and a `t` into the file.\n" +
 	"\n" +
 	"Rules:\n" +
 	"- Touch only lines read or grep displayed under the tag; edits to other lines are rejected (re-read them).\n" +
@@ -272,6 +274,37 @@ func verifyEditTag(store *hashline.Store, canonicalPath, path, tag string, raw [
 		return &editdiff.StaleAnchorError{Path: path, Expected: strings.ToUpper(tag), Actual: current}
 	}
 	return nil
+}
+
+// headerAnchorTag returns the tag of an edit anchor given as the
+// [path#TAG] header the tools display. The header must name the file being
+// edited: a tag minted for another file says nothing about this one.
+func headerAnchorTag(cwd string, options ToolsOptions, target mutationTarget, path, header string) (string, error) {
+	named, tag, err := hashline.ParseHeader(header)
+	if err != nil {
+		return "", fmt.Errorf("anchor: %w", err)
+	}
+	if !namesTarget(cwd, options, target, named) {
+		return "", fmt.Errorf("anchor %s is the header of %s, but this edit changes %s; pass the [path#TAG] header of %s from your latest read of it", header, named, path, path)
+	}
+	return tag, nil
+}
+
+// namesTarget reports whether path resolves to the file target changes,
+// so `./a.go`, `a.go` and a symlink to it name the same file.
+func namesTarget(cwd string, options ToolsOptions, target mutationTarget, path string) bool {
+	if refs.IsURL(path) {
+		if target.canonicalPath != "" || options.Refs == nil {
+			return false
+		}
+		location, err := options.Refs.LocalTarget(path)
+		return err == nil && location.Abs() == target.queueKey
+	}
+	if target.canonicalPath == "" {
+		return false
+	}
+	_, canonical, err := rootRelPaths(cwd, pathutil.ResolveToCwd(path, cwd))
+	return err == nil && canonical == target.canonicalPath
 }
 
 // taggedResult renders the [path#TAG] header and changed-line preview that

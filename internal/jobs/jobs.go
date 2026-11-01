@@ -479,7 +479,7 @@ func (manager *Manager) capacity(kind string, shared, writer bool) error {
 			message += fmt.Sprintf(" Running: %s.", strings.Join(running, ", "))
 		}
 		if len(unread) > 0 {
-			message += fmt.Sprintf(" Finished, notice pending: %s; their notices arrive after you end this turn (reply without tool calls), which frees their slots.", strings.Join(unread, ", "))
+			message += fmt.Sprintf(" Finished, notice pending: %s; wait on them, or end this turn (reply without tool calls) to receive their notices, which frees their slots.", strings.Join(unread, ", "))
 		}
 		if len(running) > 0 {
 			message += " " + freeRunning(running) + "."
@@ -1275,10 +1275,12 @@ func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.
 	for {
 		manager.mu.Lock()
 		jobs := make([]work.Job, 0, len(jobIDs))
-		settled := false
+		var joined []string
 		for _, jobID := range jobIDs {
 			job := cloneJob(manager.entries[jobID].recovery.Job)
-			settled = settled || terminal(job.State) && (!manager.entries[jobID].live || manager.entries[jobID].joined)
+			if terminal(job.State) && (!manager.entries[jobID].live || manager.entries[jobID].joined) {
+				joined = append(joined, jobID)
+			}
 			jobs = append(jobs, job)
 		}
 		changed := manager.changed
@@ -1296,7 +1298,8 @@ func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.
 				}
 			}
 		}
-		if settled {
+		if len(joined) > 0 {
+			manager.withdrawNotices(ctx, joined)
 			return jobs, nil
 		}
 		select {
@@ -1306,6 +1309,25 @@ func (manager *Manager) Wait(ctx context.Context, jobIDs []string, timeout time.
 			return jobs, nil
 		case <-changed:
 		}
+	}
+}
+
+// withdrawNotices hands the queued completion notices of jobs whose terminal
+// state a wait is returning to the queue owner, which withdraws them in the
+// same commit that records the calling tool's result: that result carries
+// everything a notice says, and delivering the notice afterwards would cost
+// the model a redundant turn. Settled jobs have enqueued their notice before
+// they join, so it is there to withdraw. Until the result commits the notice
+// stays pending, and a notice the loop already claimed is delivered as before.
+func (manager *Manager) withdrawNotices(ctx context.Context, jobIDs []string) {
+	queues, ok := manager.host.Queues.(interface {
+		WithdrawCompletion(context.Context, string)
+	})
+	if !ok {
+		return
+	}
+	for _, jobID := range jobIDs {
+		queues.WithdrawCompletion(ctx, jobID)
 	}
 }
 

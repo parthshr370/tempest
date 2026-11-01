@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/agent"
 	types "go.harness.dev/harness/internal/engine/types"
@@ -66,6 +68,114 @@ func TestDurableQueueAckRetryCancelAndClaims(t *testing.T) {
 	}
 	if err = restored.Cancel(ctx, "unknown"); !errors.Is(err, ErrQueueNotFound) {
 		t.Fatal(err)
+	}
+}
+
+// TestDurableQueueWithdrawCompletion: wait only marks a notice for
+// withdrawal; the commit of that call's result withdraws it, in the same
+// entry. A reload before that commit still has the notice, and one after it
+// has neither the notice nor a redelivery. Waits outside a tool call, error
+// results and notices the loop already claimed withdraw nothing.
+func TestDurableQueueWithdrawCompletion(t *testing.T) {
+	ctx := context.Background()
+	s := queueStore(t)
+	q := NewDurableQueues(s, nil, nil)
+	notice := func(jobID string) work.QueueInput {
+		return work.QueueInput{Kind: work.FollowUp, Text: "job " + jobID + " completed", Key: "job:" + jobID + ":terminal", SourceJobID: jobID}
+	}
+	call := func(id string) context.Context {
+		return work.WithInvocation(ctx, work.Invocation{RunID: "run", CallID: id, ToolCallID: "raw"})
+	}
+	result := func(callID string, isError bool) {
+		t.Helper()
+		err := q.commitResult(ctx, callID, !isError, func(withdraws []string) error {
+			// A notice being withdrawn is not handed to the loop meanwhile.
+			if len(withdraws) > 0 {
+				if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) > 0 {
+					t.Errorf("took %+v while withdrawing %v: %v", taken, withdraws, err)
+				}
+			}
+			return s.Append(ctx, journal.MessageEntry{Withdraws: withdraws, Message: types.ToolResultMessage{ToolCallID: "raw", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}, IsError: isError}})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	reload := func() *journal.Loaded {
+		t.Helper()
+		loaded, err := journal.Load(ctx, s.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return loaded
+	}
+	if _, err := q.Enqueue(ctx, notice("job_waited")); err != nil {
+		t.Fatal(err)
+	}
+	q.WithdrawCompletion(ctx, "job_waited")
+	q.WithdrawCompletion(call("wait:0"), "job_waited")
+	q.WithdrawCompletion(call("wait:0"), "job_never_finished")
+	if len(q.Snapshot()) != 1 || len(reload().Queued) != 1 {
+		t.Fatalf("notice withdrawn before the wait result committed: %+v", q.Snapshot())
+	}
+	result("wait:0", false)
+	if pending, _ := q.Pending(); pending || len(q.PendingJobIDs()) != 0 {
+		t.Fatalf("withdrawn notice still pending: %+v", q.Snapshot())
+	}
+	loaded := reload()
+	if len(loaded.Queued) != 0 {
+		t.Fatalf("withdrawal lost on reload: %+v", loaded.Queued)
+	}
+	restored := NewDurableQueues(s, loaded, nil)
+	if again, err := restored.Enqueue(ctx, notice("job_waited")); err != nil || len(restored.Snapshot()) != 0 || again.SourceJobID != "job_waited" {
+		t.Fatalf("redelivery after reload: %+v %v", again, err)
+	}
+
+	kept, err := q.Enqueue(ctx, notice("job_kept"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.WithdrawCompletion(call("wait:1"), "job_kept")
+	result("wait:1", true)
+	if got := q.Snapshot(); len(got) != 1 || got[0].ID != kept.ID || len(reload().Queued) != 1 {
+		t.Fatalf("error result withdrew the notice: %+v", got)
+	}
+	if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) != 1 || taken[0].ID != kept.ID {
+		t.Fatalf("take=%+v %v", taken, err)
+	}
+	q.WithdrawCompletion(call("wait:2"), "job_kept")
+	result("wait:2", false)
+	if got := q.Snapshot(); len(got) != 1 || got[0].ID != kept.ID || len(reload().Queued) != 1 {
+		t.Fatalf("claimed notice withdrawn: %+v", got)
+	}
+	q.WithdrawCompletion(call("wait:3"), "job_kept")
+	q.ReleaseClaims()
+	if len(q.withdrawals) != 0 {
+		t.Fatalf("withdrawal outlived its run: %+v", q.withdrawals)
+	}
+
+	// The recorder commits inside the agent's emission, and Enqueue publishes
+	// through that emission while it holds mutation, so a withdrawing commit
+	// must not need mutation: an Enqueue during the commit completes.
+	q.WithdrawCompletion(call("wait:4"), "job_kept")
+	err = q.commitResult(ctx, "wait:4", true, func(withdraws []string) error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := q.Enqueue(ctx, notice("job_late"))
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				return err
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("enqueue blocked behind a withdrawing commit")
+		}
+		return s.Append(ctx, journal.MessageEntry{Withdraws: withdraws, Message: types.ToolResultMessage{ToolCallID: "raw", ToolName: "wait", Content: []types.ContentBlock{types.NewText("{}")}}})
+	})
+	if got := q.Snapshot(); err != nil || len(got) != 1 || got[0].SourceJobID != "job_late" || len(reload().Queued) != 1 {
+		t.Fatalf("withdraw during enqueue: %+v %v", got, err)
 	}
 }
 func TestDurableQueueConcurrentKeyAndBounds(t *testing.T) {
@@ -208,6 +318,117 @@ func TestCanonicalInvocationDuplicateRawIDs(t *testing.T) {
 			t.Fatal("colliding invocation", inv)
 		}
 		seen[inv.CallID] = true
+	}
+}
+
+// TestWaitWithdrawalFollowsCanonicalInvocation: two parallel calls in one
+// assistant message share the provider id "duplicate". A result withdraws only
+// the notices its own occurrence's wait marked, whatever order the calls
+// finish in. Results commit in source order, so the journal cut after the
+// first result must still hold the second wait's notice: a crash there has
+// neither that wait's result nor any other delivery of its job.
+func TestWaitWithdrawalFollowsCanonicalInvocation(t *testing.T) {
+	type call struct {
+		Name  string `json:"name"`
+		Wait  string `json:"wait,omitempty"`  // job whose notice this call marks
+		After string `json:"after,omitempty"` // call whose end must precede this one's
+		Fail  bool   `json:"fail,omitempty"`
+	}
+	for _, tc := range []struct {
+		name                   string
+		calls                  [2]call
+		pendingCut, pendingEnd []string
+	}{
+		{"source order finishes first", [2]call{{Name: "a", Wait: "job_A"}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_B"}, nil},
+		{"source order finishes last", [2]call{{Name: "a", Wait: "job_A", After: "b"}, {Name: "b", Wait: "job_B"}}, []string{"job_B"}, nil},
+		{"plain result first", [2]call{{Name: "a"}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_A", "job_B"}, []string{"job_A"}},
+		{"error result first", [2]call{{Name: "a", Wait: "job_A", Fail: true}, {Name: "b", Wait: "job_B", After: "a"}}, []string{"job_A", "job_B"}, []string{"job_A"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s := queueStore(t)
+			q := NewDurableQueues(s, nil, nil)
+			for _, job := range []string{"job_A", "job_B"} {
+				if _, err := q.Enqueue(ctx, work.QueueInput{Kind: work.FollowUp, Text: "job " + job + " completed", Key: "job:" + job + ":terminal", SourceJobID: job}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pending := func() []string {
+				t.Helper()
+				loaded, err := journal.Load(ctx, s.Path())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var jobs []string
+				for _, item := range loaded.Queued {
+					jobs = append(jobs, item.SourceJobID)
+				}
+				slices.Sort(jobs)
+				return jobs
+			}
+			var mu sync.Mutex
+			names := map[string]string{} // canonical call id -> call name
+			ended := map[string]chan struct{}{"a": make(chan struct{}), "b": make(chan struct{})}
+			tool := agent.AgentTool{Tool: types.Tool{Name: "wait", Parameters: json.RawMessage(`{"type":"object"}`)}, Execute: func(ctx context.Context, id string, args json.RawMessage, update agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+				var c call
+				if err := json.Unmarshal(args, &c); err != nil {
+					return agent.AgentToolResult{}, err
+				}
+				inv, _ := work.InvocationFromContext(ctx)
+				mu.Lock()
+				names[inv.CallID] = c.Name
+				mu.Unlock()
+				if c.After != "" {
+					<-ended[c.After]
+				}
+				if c.Wait != "" {
+					q.WithdrawCompletion(ctx, c.Wait)
+				}
+				if c.Fail {
+					return agent.AgentToolResult{}, errors.New("wait failed")
+				}
+				return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(c.Name)}}, nil
+			}}
+			var blocks []types.ContentBlock
+			for _, c := range tc.calls {
+				args, _ := json.Marshal(c)
+				blocks = append(blocks, faux.ToolCall("wait", args, "duplicate"))
+			}
+			f := faux.New(faux.Options{})
+			f.SetResponses(faux.Respond(blocks...), faux.Respond(faux.Text("done")))
+			a := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: f.Model(), Tools: []agent.AgentTool{tool}}, StreamFn: f.StreamSimple, SessionID: s.ID()})
+			AttachJournalWithOptions(a, s, RecordOptions{Queues: q})
+			var cut []string
+			results := 0
+			a.Subscribe(func(ctx context.Context, ev agent.AgentEvent) error {
+				switch ev.Type {
+				case agent.EventToolExecutionEnd:
+					inv, _ := work.InvocationFromContext(ctx)
+					mu.Lock()
+					close(ended[names[inv.CallID]])
+					mu.Unlock()
+				case agent.EventMessageEnd:
+					// The recorder listens first, so this is the durable cut
+					// after the first result and before the second.
+					if _, ok := ev.Message.(types.ToolResultMessage); ok {
+						if results++; results == 1 {
+							cut = pending()
+						}
+					}
+				}
+				return nil
+			})
+			result, err := a.PromptText(ctx, "go")
+			if err != nil || result.Err != nil {
+				t.Fatal(result, err)
+			}
+			if !slices.Equal(cut, tc.pendingCut) {
+				t.Fatalf("pending after the first result = %v, want %v", cut, tc.pendingCut)
+			}
+			if got := pending(); !slices.Equal(got, tc.pendingEnd) {
+				t.Fatalf("pending after both results = %v, want %v", got, tc.pendingEnd)
+			}
+		})
 	}
 }
 

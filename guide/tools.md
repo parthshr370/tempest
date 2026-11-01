@@ -57,11 +57,26 @@ applies if the live content hashes to it. Hunks may touch only lines a `read`, `
 or edit result actually displayed under that tag, and hunks may not overlap. Every
 section of a patch is validated before any file is written.
 
+Body rows are the file's exact text after the `+`. The patch travels as one JSON
+string that is decoded once and never unescaped again: a JSON `\t` writes a tab, and a
+JSON `\\t` writes a backslash followed by `t`. Indent with the characters the file
+uses.
+
 Each result returns the new tag and a numbered preview of the changed lines, so the
 next edit can chain from it. A stale tag is rejected with the current tag and the
-rows around the lines you named. LF/CRLF endings and a UTF-8 BOM are preserved. `edit`
-(exact-text replacement) accepts the same 4-hex tag as its anchor, as well as the full
-anchor an `lsp_rename` plan carries.
+rows around the lines you named. LF/CRLF endings and a UTF-8 BOM are preserved.
+
+`edit` (exact-text replacement) takes the same snapshot as its `anchor`: the whole
+`[path#TAG]` header exactly as `read`, `grep`, `write` or `edit` displayed it, the
+4-hex tag alone, or the full anchor an `lsp_rename` plan carries. A header must name
+the file being edited (`./a.go` and `a.go` are the same file); a header of another
+file is rejected with both paths named, and a stale tag is rejected as for
+`hashline`. Any other anchor text is rejected, never ignored.
+
+Each `old_text` must match exactly one place. When it matches several, nothing is
+written and the error lists every match (up to ten) as `LINE:TEXT` rows with one line
+of context on each side, so one retry can give each occurrence its own edit with
+unique text. There is no implicit replace-all.
 
 ## Atomic writes and rollback
 
@@ -116,7 +131,9 @@ way, with one shared match `limit`.
 
 The system prompt tells the model to batch known reads this way and to put independent
 tool calls in one response: the opening look at a task, searches, and edits or writes
-to different files. The agent loop already runs those concurrently.
+to different files. The agent loop already runs those concurrently. A known change-set
+(a function, its imports, its tests) goes out as one response of edits, and the tests
+that verify it run in the next response, never beside the edits they check.
 
 `read` takes more than files. Every text output below starts with the `[path#TAG]`
 header and accepts the same `path:START-END` / `path:START+COUNT` line ranges and
@@ -420,7 +437,7 @@ debug session is gone and requires an explicit new launch or attach.
 
 - `read`: files, directories, archives and their members, office documents, PDF text, SQLite, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`, `issue://`, `pr://`). Numbered content when the file fits one read, a structural outline for a Go file that does not. `paths` reads up to 20 files in one call, each with its own selector.
 - `write`: create or overwrite a file, or a `local://` scratch file.
-- `edit`: exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor). Also edits `local://` files.
+- `edit`: exact-text replacement, guarded by the file's `[path#TAG]` header, its tag, or an `lsp_rename` anchor. Also edits `local://` files.
 - `hashline`: line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers. See [Hashline edits](#hashline-edits).
 - `grep`: regex search across the tree, under up to 20 `paths` at once, or under an internal URL.
 - `find`: glob-based path lookup.
@@ -436,7 +453,7 @@ debug session is gone and requires an explicit new launch or attach.
 - `eval`: persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset. Requires `python3`, or `node`/`bun` for JS, only when called. See [Eval](eval.md).
 - `debug`: launch or attach a session-owned debugger, control execution and inspect state. Requires an installed adapter. Plan mode denies all actions.
 - `jobs`: page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
-- `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout.
+- `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout. A job whose finished state `wait` returns gets no later completion notice.
 - `cancel`: cancel one task or background bash job, by id or name.
 - `logs`: page a background command's bounded output (stdout and stderr in write order) by byte offset, by id or name.
 - `write_stdin`: type into a running background job (text, Ctrl-C, end of input) and get back the output it printed since the last call, by id or name.

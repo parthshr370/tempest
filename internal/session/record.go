@@ -119,8 +119,20 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		}
 	case agent.EventMessageEnd:
 		assistant, isAssistant := recordAssistant(ev.Message)
-		assigned, appendErr := r.store.AppendAssigned(ctx, journal.MessageEntry{Meta: meta, Message: ev.Message, QueueID: ev.QueueID, Metered: isAssistant})
-		err = appendErr
+		entry := journal.MessageEntry{Meta: meta, Message: ev.Message, QueueID: ev.QueueID, Metered: isAssistant}
+		var assigned journal.Meta
+		commit := func(withdraws []string) (err error) {
+			entry.Withdraws = withdraws
+			assigned, err = r.store.AppendAssigned(ctx, entry)
+			return err
+		}
+		if result, ok := ev.Message.(ptypes.ToolResultMessage); ok && r.queues != nil {
+			// The executor emits a result under its call's occurrence, so the
+			// canonical id names this result even when provider ids repeat.
+			err = r.queues.commitResult(ctx, invocation.CallID, !result.IsError, commit)
+		} else {
+			err = commit(nil)
+		}
 		if err == nil && ev.QueueID != "" && r.queues != nil {
 			err = r.queues.Acknowledge(ev.QueueID)
 		}
