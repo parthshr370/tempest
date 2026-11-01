@@ -252,7 +252,8 @@ settings `fallback_models` (`{"default": [...], "plan": [...], "smol": [...]}`),
 `-fallback-model` and `HARNESS_FALLBACK_MODELS` for the default role. The flag and
 variable set `fallback_models.default` in their layers, so they replace the default
 role's list and leave the other roles' entries from lower layers in place. Plan and
-smol use the default role's list unless they have their own. See
+smol use the default role's list unless they have their own. `serve`, `mcp` and SDK
+sessions run every role on one session model behind the default role's list. See
 [Backup models](providers.md#backup-models).
 
 ## Flags

@@ -236,10 +236,11 @@ Tempest declares the `sampling` capability to that server alone, and without the
 `tools` or `context` sub-capabilities. Every other server's
 `sampling/createMessage` gets `-32601`.
 
-- **Model.** Requests go to the `smol` role model. Settings
-  `mcp_sampling_model` (or `HARNESS_MCP_SAMPLING_MODEL`) names another model for
-  sampling only. The server's `modelPreferences`, `temperature` and
-  `stopSequences` are ignored; reasoning effort is the smol role's.
+- **Model.** Requests go to the `smol` role model, which in `serve` and `mcp` is the
+  session model, behind its backup models. Settings `mcp_sampling_model` (or
+  `HARNESS_MCP_SAMPLING_MODEL`) names another model for sampling only, routed with its
+  own credential and no backup models. The server's `modelPreferences`, `temperature`
+  and `stopSequences` are ignored; reasoning effort is the smol role's.
 - **What the model sees.** The server's `systemPrompt` and `messages` (text and
   images), nothing else. `includeContext` is treated as `none`, so no part of the
   session's conversation is shared. A request with `tools`, `toolChoice`,

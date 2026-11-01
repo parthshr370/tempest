@@ -121,6 +121,11 @@ sets `fallback_models.default` above the settings files, in the usual
 uses the default role's list; an empty list turns backups off for that role.
 `serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
+A `serve`, `mcp` or SDK session runs every role on its one session model (it does
+not read `plan_model` or `smol_model`; an SDK host's `Stack` may supply role models
+and their chains), so that one list backs the plan stack, explore children and MCP
+sampling as well; the `plan` and `smol` entries apply to CLI runs.
+`mcp_sampling_model` never has backups.
 Each backup is a full route with its own endpoint and credential. A credential
 belongs to a provider and a **credential scope**: the endpoint the route resolves to,
 with its scheme and host compared in any case (as DNS does) and its path exactly,
