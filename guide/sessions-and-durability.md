@@ -167,7 +167,7 @@ next model call. A budget-stopped run therefore ends on a complete turn, and
 | Flag | Cap |
 |---|---|
 | `-max-turns N` | Model calls. Finishing naturally on call N still reports `completed`; the cap stops a run only when another turn or outstanding work remains. |
-| `-max-cost USD` | The summed cost of the run's model calls. When the model's price is unknown and its route does not report billed cost, the run is refused at startup: an unknown price is not a zero price. On a billed-cost route, a call that comes back without a cost stops the run with that error. |
+| `-max-cost USD` | The summed cost of the run's model calls. When the price of a model the run can bill (its model, the plan and smol role models, the MCP sampling model, or a backup of any) is unknown and its route does not report billed cost, the run is refused at startup: an unknown price is not a zero price. On a billed-cost route, a call that comes back without a cost stops the run with that error. |
 | `-max-wall-time D` | Elapsed time, as a Go duration such as `10m`. |
 
 At the turn cap, the run checks for pending foreground tasks and job deliveries

@@ -225,9 +225,16 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	// Refuse an unenforceable budget before anything is written to disk. A
-	// backup model can answer any turn, so its price must be known too.
-	for _, model := range append([]ptypes.Model{stackModel}, stackFallbacks...) {
+	// Refuse an unenforceable budget before anything is written to disk. Every
+	// model the run can bill needs a known price: the stack model, the plan
+	// and smol roles agents run on, the MCP sampling model, and each one's
+	// backups, since a backup can answer any turn. Under a faux script the plan
+	// role runs on the faux model, as the stack does.
+	billable := slices.Concat([]ptypes.Model{stackModel, planSelected, roles.Smol.Model, roles.Sampling.Model}, stackFallbacks, smolFallbacks, roles.Sampling.Fallbacks)
+	if opts.Config.FauxScript() == "" {
+		billable = append(billable, roles.Plan.Fallbacks...)
+	}
+	for _, model := range billable {
 		if err := opts.Budget.Validate(model); err != nil {
 			fmt.Fprintf(stderr, "budget error: %v\n", err)
 			return 1
