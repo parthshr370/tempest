@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -128,7 +129,7 @@ func gitListArgs(cwd string) []string {
 
 func localGitFiles(ctx context.Context, cwd string, maxFiles int) (workspaceFiles, error) {
 	env := append(gitFreeEnv(), "GIT_OPTIONAL_LOCKS=0", "GIT_TERMINAL_PROMPT=0")
-	names, err := runNameCommand(ctx, "", env, maxFiles, gitListArgs(cwd))
+	names, err := runNameCommand(ctx, "", env, maxFiles, gitListArgs(cwd), nil)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return workspaceFiles{}, fmt.Errorf("git ls-files: %w", ctxErr)
 	}
@@ -157,9 +158,28 @@ func rgListArgs(rg string) []string {
 }
 
 // localRgFiles lists cwd with rg. At the deadline it lists the names found
-// so far, as the walk does.
+// so far, as the walk does. rg opens every .ignore and .gitignore it meets,
+// and a FIFO among them blocks it until it is killed, in a small workspace
+// before any name reaches us; telling that apart beforehand would take the
+// walk itself. So an rg that has named nothing by half the time left is
+// stopped, and the walk, which never opens a FIFO, gets the other half.
 func localRgFiles(ctx context.Context, rg string, cwd string, maxFiles int) (workspaceFiles, error) {
-	names, err := runNameCommand(ctx, cwd, nil, maxFiles, rgListArgs(rg))
+	rgCtx, stopRg := context.WithCancel(ctx)
+	defer stopRg()
+	var named, quiet atomic.Bool
+	if deadline, ok := ctx.Deadline(); ok {
+		timer := time.AfterFunc(time.Until(deadline)/2, func() {
+			if !named.Load() {
+				quiet.Store(true)
+				stopRg()
+			}
+		})
+		defer timer.Stop()
+	}
+	names, err := runNameCommand(rgCtx, cwd, nil, maxFiles, rgListArgs(rg), func() { named.Store(true) })
+	if quiet.Load() && ctx.Err() == nil {
+		return workspaceFiles{}, errors.New("rg --files: no name in half the listing time")
+	}
 	files := workspaceFiles{source: rgListingSource, paths: sortUnique(names.paths), more: names.more}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		if len(files.paths) == 0 {
@@ -197,9 +217,10 @@ type listedNames struct {
 
 // runNameCommand runs argv in dir (the current directory when "") with env
 // (the inherited one when nil) and reads its NUL-separated names, killing it
-// once maxFiles names are read. err reports a command that could not start
-// or whose output could not be read; the caller judges names.exit.
-func runNameCommand(ctx context.Context, dir string, env []string, maxFiles int, argv []string) (listedNames, error) {
+// once maxFiles names are read; named, when not nil, is called for each
+// name. err reports a command that could not start or whose output could not
+// be read; the caller judges names.exit.
+func runNameCommand(ctx context.Context, dir string, env []string, maxFiles int, argv []string, named func()) (listedNames, error) {
 	commandCtx, stop := context.WithCancel(ctx)
 	defer stop()
 	command := exec.CommandContext(commandCtx, argv[0], argv[1:]...)
@@ -229,6 +250,9 @@ func runNameCommand(ctx context.Context, dir string, env []string, maxFiles int,
 				break
 			}
 			names.paths = append(names.paths, name)
+			if named != nil {
+				named()
+			}
 		}
 		if readErr != nil {
 			break

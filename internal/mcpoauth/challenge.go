@@ -7,7 +7,10 @@
 // credential store, one file per configured server.
 package mcpoauth
 
-import "strings"
+import (
+	"net/netip"
+	"strings"
+)
 
 // Challenge is the Bearer challenge from a 401 or 403 WWW-Authenticate header
 // (RFC 6750 section 3, RFC 9728 section 5.1).
@@ -16,6 +19,10 @@ type Challenge struct {
 	Scope            string
 	Error            string
 	Description      string
+	// Peer is the address the challenge came from over a direct connection
+	// to the server, zero when a proxy carried it or it is unknown. Login
+	// lets discovery reach that address's network (destinations.go).
+	Peer netip.Addr
 }
 
 // ParseBearer returns the first Bearer challenge among the header values.

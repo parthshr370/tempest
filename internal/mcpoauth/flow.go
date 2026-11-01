@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"slices"
 	"strconv"
@@ -69,7 +70,7 @@ func New(cfg mcpconfig.Server, store *Store) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	dest := newDestinations(cfg.Name, parsed)
+	dest := newDestinations(cfg.Name, parsed, http.DefaultTransport.(*http.Transport).Clone())
 	client := &http.Client{Timeout: 30 * time.Second, Transport: dest.transport(),
 		// Credentials and codes must never follow a redirect to another endpoint.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
@@ -153,6 +154,7 @@ func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 // refreshLocked runs the refresh grant. A rotated refresh token replaces the
 // old one; a rejected refresh token clears the tokens so login is required.
 func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
+	ctx = within(ctx, parseNetClass(r.ServerNetwork))
 	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {r.RefreshToken}}
 	if r.TokenResource != "" {
 		form.Set("resource", r.TokenResource)
@@ -207,7 +209,8 @@ func (c *Client) NoteScope(ctx context.Context, scope string) error {
 }
 
 // Probe sends an unauthenticated initialize request and returns the Bearer
-// challenge of a 401 or 403 answer.
+// challenge of a 401 or 403 answer. Whatever the answer, the challenge
+// carries the address it came from.
 func (c *Client) Probe(ctx context.Context) (Challenge, bool, error) {
 	body := []byte(`{"jsonrpc":"2.0","id":"probe","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tempest","version":"login"}}}`)
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
@@ -219,11 +222,14 @@ func (c *Client) Probe(ctx context.Context) (Challenge, bool, error) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json, text/event-stream")
+	var remote net.Addr
+	request = request.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { remote = info.Conn.RemoteAddr() }}))
 	response, err := c.http.Do(request)
 	if err != nil {
 		return Challenge{}, false, err
 	}
 	response.Body.Close()
+	peer := c.dest.peer(request, remote)
 	if session := response.Header.Get("Mcp-Session-Id"); session != "" {
 		// The probe opened a session the client will not use.
 		closing, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.url, nil)
@@ -235,9 +241,10 @@ func (c *Client) Probe(ctx context.Context) (Challenge, bool, error) {
 		}
 	}
 	if response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusForbidden {
-		return Challenge{}, false, nil
+		return Challenge{Peer: peer}, false, nil
 	}
 	challenge, ok := ParseBearer(response.Header.Values("WWW-Authenticate"))
+	challenge.Peer = peer
 	return challenge, ok, nil
 }
 
@@ -298,6 +305,8 @@ type registration struct {
 func (c *Client) Login(ctx context.Context, challenge Challenge, present func(context.Context, string) error) (Record, error) {
 	ctx, cancel := context.WithTimeout(ctx, loginTimeout)
 	defer cancel()
+	network := serverNetwork(challenge.Peer)
+	ctx = within(ctx, network)
 	resource, err := c.resourceMetadata(ctx, challenge)
 	if err != nil {
 		return Record{}, fmt.Errorf("mcp_auth: %w", err)
@@ -414,7 +423,7 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	}
 	record := Record{Server: c.server, Resource: c.resource, TokenResource: tokenResource, Issuer: issuer, AuthorizationEndpoint: metadata.AuthorizationEndpoint, TokenEndpoint: metadata.TokenEndpoint,
 		ClientID: client.clientID, ClientSecret: client.secret, TokenAuthMethod: client.method, Registered: client.registered, AccessToken: token.AccessToken, RefreshToken: token.RefreshToken,
-		ExpiresAt: token.expiry(c.now()), Scope: granted}
+		ExpiresAt: token.expiry(c.now()), Scope: granted, ServerNetwork: network.String()}
 	if client.registered {
 		record.RedirectURI = client.redirect
 	}

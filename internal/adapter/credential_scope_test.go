@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -199,24 +200,32 @@ func TestGetAPIKeyBelongsToOneScopePerProvider(t *testing.T) {
 // deployment or /openai/v1 path selects a model within it, while any other
 // path may separate tenants.
 func TestRoutingForModelKeepsAzureResourceKeyAcrossEquivalentEndpoints(t *testing.T) {
-	config := RoutingConfig{ModelID: "azure:primary", BaseURL: "https://resource.example", APIKey: "resource-key", Env: func(string) string { return "" }}
 	for _, tc := range []struct {
-		name, endpoint string
-		wantKey        bool
+		name, configured, endpoint string
+		wantKey                    bool
 	}{
-		{"root trailing slash", "https://resource.example///", true},
-		{"v1 trailing slash", "https://resource.example/openai/v1/", true},
-		{"deployment trailing slash", "https://resource.example/openai/deployments/backup/", true},
-		{"hostname case", "https://RESOURCE.example", true},
-		{"scheme case", "HTTPS://resource.example/openai/v1", true},
-		{"custom tenant path", "https://resource.example/tenant", false},
-		{"custom tenant path case", "https://resource.example/Tenant", false},
-		{"custom deployment subpath", "https://resource.example/openai/deployments/backup/extra", false},
+		{"root trailing slash", "", "https://resource.example///", true},
+		{"v1 trailing slash", "", "https://resource.example/openai/v1/", true},
+		{"deployment trailing slash", "", "https://resource.example/openai/deployments/backup/", true},
+		{"hostname case", "", "https://RESOURCE.example", true},
+		// Only a lowercase @http(s):// starts an inline endpoint, so the
+		// scheme's case is varied on the configured endpoint.
+		{"scheme case", "HTTPS://resource.example", "https://resource.example/openai/v1", true},
+		{"custom tenant path", "", "https://resource.example/tenant", false},
+		{"custom tenant path case", "", "https://resource.example/Tenant", false},
+		{"custom deployment subpath", "", "https://resource.example/openai/deployments/backup/extra", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			config := RoutingConfig{ModelID: "azure:primary", BaseURL: cmp.Or(tc.configured, "https://resource.example"), APIKey: "resource-key", Env: func(string) string { return "" }}
 			derived := config.ForModel("azure:backup@" + tc.endpoint)
-			if _, err := NewProviderRouter(derived); err != nil {
+			router, err := NewProviderRouter(derived)
+			if err != nil {
 				t.Fatal(err)
+			}
+			// The row must reach the endpoint it names, not the configured
+			// one with the endpoint left in the model ID.
+			if router.Model.ID != "backup" || !strings.HasPrefix(router.Model.BaseURL, strings.TrimRight(tc.endpoint, "/")) {
+				t.Fatalf("routed model %q at %q, want backup at %s", router.Model.ID, router.Model.BaseURL, tc.endpoint)
 			}
 			if (derived.APIKey != "") != tc.wantKey {
 				t.Fatalf("kept resource key = %v, want %v", derived.APIKey != "", tc.wantKey)

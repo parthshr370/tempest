@@ -215,6 +215,36 @@ func TestWorkspaceListingWalkSkipsNonRegularIgnoreFile(t *testing.T) {
 	}
 }
 
+// rg opens every .ignore and .gitignore it meets, so a FIFO among them
+// blocks it before it prints a name. With no name by half the budget the
+// rg run is dropped and the walk, which never opens a FIFO, lists the
+// workspace in the time left.
+func TestWorkspaceListingWalksWhenRgListsNothingByHalfTheBudget(t *testing.T) {
+	if _, err := exec.LookPath("rg"); err != nil {
+		t.Skip("rg not installed")
+	}
+	for _, fifo := range []string{".ignore", "pkg/.gitignore"} {
+		t.Run(fifo, func(t *testing.T) {
+			dir := t.TempDir()
+			writeListingFiles(t, dir, map[string]string{"a.go": "package a\n", "pkg/b.go": "package pkg\n"})
+			if err := syscall.Mkfifo(filepath.Join(dir, fifo), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			listing, err := WorkspaceListing(context.Background(), nil, dir, config.WorkspaceListing{})
+			if err != nil {
+				t.Fatalf("listing after %s: %v", time.Since(start), err)
+			}
+			if !strings.HasPrefix(listing, `<workspace_files source="directory walk" paths="2">`) {
+				t.Fatalf("header:\n%s", listing)
+			}
+			if got := strings.Join(listedLines(t, listing), ","); got != "a.go,pkg/b.go" {
+				t.Fatalf("listed %q", got)
+			}
+		})
+	}
+}
+
 // An ignore file larger than the read bound is skipped whole, as git skips
 // one past its own limit, instead of being read into memory.
 func TestWorkspaceListingWalkSkipsOversizedIgnoreFile(t *testing.T) {

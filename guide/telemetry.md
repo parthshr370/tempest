@@ -182,7 +182,7 @@ turn loop.
 |---|---|---|---|---|
 | `gen_ai.client.token.usage` | `gen_ai_client_token_usage` | histogram | `{token}` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.token.type` (`input` with cached input included, `output`); a retried attempt's reported usage is recorded too |
 | `gen_ai.client.operation.duration` | `gen_ai_client_operation_duration_seconds` | histogram | `s` | as above without `gen_ai.token.type`, plus `error.type` on failure; retries included |
-| `gen_ai.client.operation.time_to_first_chunk` | `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | `s` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`; from sending an attempt to its first text, reasoning or tool-call output, not to an empty block start |
+| `gen_ai.client.operation.time_to_first_chunk` | `gen_ai_client_operation_time_to_first_chunk_seconds` | histogram | `s` | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`; from sending an attempt to its first text, reasoning or tool-call name or arguments, not to an empty block start or a tool call start that carries only its ID |
 | `gen_ai.client.operation.cost` | `gen_ai_client_operation_cost_usd` | histogram | `USD` | as for token usage without `gen_ai.token.type`; requests with an unknown price are not recorded, while a retried attempt's known cost is recorded |
 | `tempest.agent.runs` | `tempest_agent_runs_total` | counter | `{run}` | `gen_ai.agent.name`, `tempest.run.stop_reason` |
 | `tempest.tool.calls` | `tempest_tool_calls_total` | counter | `{call}` | `gen_ai.tool.name`, `tempest.tool.outcome` |

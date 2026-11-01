@@ -10,6 +10,8 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -33,6 +35,7 @@ type httpMessage struct {
 type httpTransport struct {
 	cfg       mcpconfig.Server
 	client    *http.Client
+	proxy     func(*http.Request) (*url.URL, error) // hides the server's address when it answers
 	handlers  Handlers
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -53,7 +56,7 @@ func dialHTTP(cfg mcpconfig.Server, handlers Handlers) (*httpTransport, error) {
 	transport.DialContext = (&net.Dialer{Timeout: startup, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = startup
 	ctx, cancel := context.WithCancel(context.Background())
-	return &httpTransport{cfg: cfg, handlers: handlers, ctx: ctx, cancel: cancel, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("mcp_protocol: redirects are forbidden") }}}, nil
+	return &httpTransport{cfg: cfg, handlers: handlers, ctx: ctx, cancel: cancel, proxy: transport.Proxy, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("mcp_protocol: redirects are forbidden") }}}, nil
 }
 func (h *httpTransport) setVersion(version string) { h.mu.Lock(); h.version = version; h.mu.Unlock() }
 func (h *httpTransport) alive() bool {
@@ -80,7 +83,14 @@ func (h *httpTransport) begin(ctx context.Context) (context.Context, func(), err
 // a 401 or 403 is retried once when Auth recovers without a user.
 func (h *httpTransport) request(ctx context.Context, method string, body []byte, initial bool, cursor string) (*http.Response, error) {
 	for retried := false; ; retried = true {
-		req, err := http.NewRequestWithContext(ctx, method, h.cfg.URL, bytes.NewReader(body))
+		// With Auth, a rejection reports the address it came from, which
+		// bounds where OAuth discovery may go.
+		var remote net.Addr
+		requestCtx := ctx
+		if h.handlers.Auth != nil {
+			requestCtx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { remote = info.Conn.RemoteAddr() }})
+		}
+		req, err := http.NewRequestWithContext(requestCtx, method, h.cfg.URL, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -134,7 +144,7 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 			if h.handlers.Auth == nil {
 				return nil, errors.New("mcp_auth: server rejected credentials")
 			}
-			rejection := Rejection{Status: response.StatusCode, Challenges: response.Header.Values("WWW-Authenticate"), Token: token, Retried: retried}
+			rejection := Rejection{Status: response.StatusCode, Challenges: response.Header.Values("WWW-Authenticate"), Token: token, Retried: retried, Peer: h.peer(req, remote)}
 			if err := h.handlers.Auth.Rejected(ctx, rejection); err != nil {
 				return nil, &AuthError{Err: err}
 			}
@@ -150,6 +160,25 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 		return response, nil
 	}
 }
+
+// peer is the address a response to req came from over remote, zero when a
+// proxy carried it.
+func (h *httpTransport) peer(req *http.Request, remote net.Addr) netip.Addr {
+	if remote == nil {
+		return netip.Addr{}
+	}
+	if h.proxy != nil {
+		if proxy, err := h.proxy(req); err != nil || proxy != nil {
+			return netip.Addr{}
+		}
+	}
+	addrPort, err := netip.ParseAddrPort(remote.String())
+	if err != nil {
+		return netip.Addr{}
+	}
+	return addrPort.Addr()
+}
+
 func responseType(response *http.Response) string {
 	contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
 	return contentType
