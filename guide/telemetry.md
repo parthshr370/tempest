@@ -155,7 +155,8 @@ Tempest uses W3C Trace Context (`traceparent` and `tracestate`):
 
 - **Incoming.** A `traceparent` header on `serve` requests becomes the run's parent.
   This covers the `/acp` WebSocket upgrade, `/a2a`, and a prompt's
-  `_meta.traceparent` in ACP, which wins over the upgrade header. A `tracestate`
+  `_meta.traceparent` in ACP, which wins over the upgrade header, together with
+  its `_meta.tracestate`. A `tracestate`
   header that comes with a valid `traceparent` is kept with it; repeated
   `tracestate` headers are joined into one list. A malformed `tracestate` (a bad key
   or value, a repeated key, or more than 32 entries) is dropped, and the
