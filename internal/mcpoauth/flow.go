@@ -84,7 +84,8 @@ func (c *Client) expiring(r Record) bool {
 }
 
 // Token returns the access token for the next request, refreshing one that
-// is about to expire. It returns "" when no usable token is stored.
+// is about to expire; while it has not expired, a failed refresh keeps it.
+// It returns "" when no usable token is stored.
 func (c *Client) Token(ctx context.Context) (string, error) {
 	r, err := c.store.Load(c.server)
 	if missing(err) {
@@ -118,6 +119,12 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 		return r.AccessToken, nil
 	}
 	refreshed, err := c.refreshLocked(ctx, &r)
+	if err != nil && r.AccessToken != "" && c.now().Before(r.ExpiresAt) {
+		// The refresh runs refreshMargin early; until the token really
+		// expires, an unreachable or failing authorization server leaves
+		// it usable and the MCP server judges it.
+		return r.AccessToken, nil
+	}
 	if err != nil || !refreshed {
 		return "", err
 	}

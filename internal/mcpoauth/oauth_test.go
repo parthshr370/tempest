@@ -287,6 +287,18 @@ func TestRefreshRotatesTokensAndRejectionRequiresLogin(t *testing.T) {
 	}
 }
 
+// Refreshing a minute early must not turn an unreachable authorization
+// server into an outage while the access token is still valid.
+func TestUnreachableRefreshKeepsTheUnexpiredToken(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	record := h.login(t)
+	h.fixture.AS.Close()
+	token, err := h.flow.Token(t.Context())
+	if err != nil || token != record.AccessToken {
+		t.Fatalf("token while the authorization server is down = %q %v, want the unexpired token", token, err)
+	}
+}
+
 func TestRefreshReusesTokenAnotherProcessRotated(t *testing.T) {
 	h := newHarness(t, mcpoauthtest.Options{}, nil)
 	record := h.login(t)
