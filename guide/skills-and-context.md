@@ -7,6 +7,8 @@ and loads one context file per directory, loads a sticky `RULES.md` that survive
 compaction, expands safe `@file` imports, and registers skills from your agent
 directory, the project and `-skill` paths. Skill bodies load on demand through the
 `skill` tool or a `skill://` read, so nothing bloats the prompt until it is needed.
+A resumed session (`-resume`) runs in the working directory it was created in, so
+discovery walks up from there, not from the directory you resume it from.
 
 In each directory the first of these files that exists and is not blank loads:
 
