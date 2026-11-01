@@ -58,6 +58,13 @@ type StackConfig struct {
 	SmolModel            ptypes.Model
 	StreamFn             agent.StreamFn
 	SmolStreamFn         agent.StreamFn
+	// FallbackModels and SmolFallbackModels are the backup models behind
+	// StreamFn and SmolStreamFn, in chain order.
+	FallbackModels     []ptypes.Model
+	SmolFallbackModels []ptypes.Model
+	// ModelRole names the role this stack's model serves for model-request
+	// hooks; empty is "plan" for a plan stack and "default" otherwise.
+	ModelRole string
 	// Reasoning is the default role's reasoning effort ("", "off", minimal,
 	// low, medium, high). PlanReasoning and SmolReasoning override it for
 	// the plan stack and smol (explore) children; empty inherits Reasoning.
@@ -571,6 +578,8 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 	agt = agent.NewAgent(agent.AgentOptions{
 		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, ThinkingLevel: thinkingLevel(reasoning), Tools: active, Messages: cfg.InitialMessages},
 		StreamFn:         cfg.StreamFn,
+		FallbackModels:   cfg.FallbackModels,
+		ModelRole:        modelRole(cfg),
 		PrepareNextTurnE: compact,
 		QueueSource:      cfg.QueueSource,
 		Work:             cfg.Work,
@@ -622,6 +631,18 @@ func thinkingLevel(reasoning string) agent.ThinkingLevel {
 		return agent.ThinkingOff
 	}
 	return agent.ThinkingLevel(reasoning)
+}
+
+// modelRole names the model role a stack runs on.
+func modelRole(cfg StackConfig) string {
+	switch {
+	case cfg.ModelRole != "":
+		return cfg.ModelRole
+	case cfg.Plan:
+		return "plan"
+	default:
+		return "default"
+	}
 }
 
 // PlanToolNames is the read-only plan stack's selection. Tools that are not

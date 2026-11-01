@@ -96,8 +96,12 @@ func ValidateBaseURL(raw string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return fmt.Errorf("must be an absolute HTTP URL")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return fmt.Errorf("must not contain credentials or URL fragments")
+	if parsed.User != nil {
+		return fmt.Errorf("must not contain credentials")
+	}
+	// ParseRequestURI leaves a fragment in the path, so look for it in raw.
+	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(raw, "#") {
+		return fmt.Errorf("must not contain a query string or fragment; set endpoint parameters in the provider's query setting")
 	}
 	return nil
 }
@@ -176,11 +180,21 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		model.ContextWindow = 200000
 	}
 	if prov == "azure" {
-		endpoint := strings.TrimRight(firstNonEmpty(model.BaseURL, env("AZURE_OPENAI_ENDPOINT")), "/")
-		if endpoint == "" {
+		model.BaseURL = strings.TrimRight(firstNonEmpty(model.BaseURL, env("AZURE_OPENAI_ENDPOINT")), "/")
+		if model.BaseURL == "" {
 			return route{}, fmt.Errorf("provider azure requires base_url or AZURE_OPENAI_ENDPOINT")
 		}
-		model.BaseURL = endpoint
+	}
+	// An endpoint from settings, the SDK or the environment meets the same
+	// rules as one in a model spec: a route appends model paths to it, which a
+	// query or fragment would swallow.
+	if model.BaseURL != "" {
+		if err := ValidateBaseURL(model.BaseURL); err != nil {
+			return route{}, fmt.Errorf("provider %s base URL is invalid: %w", prov, err)
+		}
+	}
+	if prov == "azure" {
+		endpoint := model.BaseURL
 		if !strings.HasSuffix(endpoint, "/openai/v1") && !strings.Contains(endpoint, "/openai/deployments/") {
 			model.BaseURL = endpoint + "/openai/deployments/" + url.PathEscape(spec.ModelID)
 		}
@@ -189,7 +203,11 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			delete(p.Query, "api-version")
 		}
 	}
+	// reasoningKnown records whether the catalog or settings say if the model
+	// reasons; an unlisted model leaves it to the endpoint's default.
+	reasoningKnown := false
 	if cm, ok := routeCatalogModel(prov, p.Protocol, spec.ModelID); ok {
+		reasoningKnown = true
 		model.ContextWindow = cm.ContextWindow
 		model.Cost = cm.Cost
 		model.OpenAICompat = cm.OpenAICompat
@@ -213,6 +231,7 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			}
 			if configured.Reasoning || p.modelFields[configured.ID]["reasoning"] {
 				model.Reasoning = configured.Reasoning
+				reasoningKnown = true
 			}
 			if configured.Input != nil {
 				model.Input = slices.Clone(configured.Input)
@@ -232,10 +251,24 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 			break
 		}
 	}
+	endpoint, _ := url.Parse(model.BaseURL)
+	firstPartyOpenAI := endpoint != nil && endpoint.Hostname() == "api.openai.com"
+	// OpenAI's own endpoint accepts function tools for reasoning models only
+	// on the Responses API, which serves every other model too, so the
+	// openai preset speaks Responses there unless the catalog or settings
+	// say the model does not reason ("reasoning": false keeps Chat
+	// Completions). Choosing the protocol claims no capability: a model the
+	// catalog and settings don't describe stays without reasoning support,
+	// because an unknown ID (a dated snapshot, a fine-tune) may not reason.
+	// Compatible third-party endpoints and an explicit protocol keep their
+	// wire protocol.
+	if prov == "openai" && firstPartyOpenAI && cfg.Providers[prov].Protocol == "" && (model.Reasoning || !reasoningKnown) {
+		p.Protocol = "openai-responses"
+		model.API = protocolAPI(p.Protocol)
+	}
 	model.OpenAICompat = mergeOpenAICompat(p.Compatibility, model.OpenAICompat)
 	// Unknown compatible endpoints don't inherit OpenAI-only cache fields.
-	endpoint, _ := url.Parse(model.BaseURL)
-	if prov == "openai" && (endpoint == nil || endpoint.Hostname() != "api.openai.com") && model.OpenAICompat != nil {
+	if prov == "openai" && !firstPartyOpenAI && model.OpenAICompat != nil {
 		if explicit := cfg.Providers[prov].Compatibility; explicit == nil || explicit.SupportsPromptCacheKey == nil {
 			model.OpenAICompat.SupportsPromptCacheKey = new(false)
 		}

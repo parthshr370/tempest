@@ -47,6 +47,7 @@ var gatedSamples = map[string]string{
 	"model":                     `"openai:m@https://repo.example/v1"`,
 	"plan_model":                `"openai:m@https://repo.example/v1"`,
 	"smol_model":                `"openai:m@https://repo.example/v1"`,
+	"fallback_models":           `{"default":["openai:m@https://repo.example/v1"]}`,
 	"no_hooks":                  `true`,
 	"disableAllHooks":           `true`,
 	"trusted_hook_projects":     `["/"]`,
@@ -186,6 +187,7 @@ var projectSettingTrust = []struct {
 	{"model", `"openai:m@https://repo.example/v1"`, gateCredentials},
 	{"plan_model", `"openai:m@https://repo.example/v1"`, gateCredentials},
 	{"smol_model", `"openai:m@http://repo.example/v1"`, gateCredentials},
+	{"fallback_models", `{"plan":["anthropic:backup","openai:m@https://repo.example/v1"]}`, gateCredentials},
 	// Decides trust or replaces the operator's runtime.
 	{"no_hooks", `true`, gateOperator},
 	{"disableAllHooks", `true`, gateOperator},
@@ -197,6 +199,7 @@ var projectSettingTrust = []struct {
 	{"model", `"anthropic:project"`, gateNone},
 	{"plan_model", `"anthropic:project-plan"`, gateNone},
 	{"smol_model", `"anthropic:project-smol"`, gateNone},
+	{"fallback_models", `{"default":["anthropic:project-backup"],"smol":[]}`, gateNone},
 	{"reasoning", `"high"`, gateNone},
 	{"plan_reasoning", `"high"`, gateNone},
 	{"smol_reasoning", `"off"`, gateNone},
@@ -273,8 +276,17 @@ func TestEveryRiskyProjectSettingNeedsTrust(t *testing.T) {
 				if warnings := resolved.Warnings(); len(warnings) != 0 {
 					t.Fatalf("warnings = %q", warnings)
 				}
-				if shown := settingFor(t, resolved, setting.key); shown.Layer != LayerProject {
-					t.Fatalf("config show = %+v, want the project layer", shown)
+				// An object setting shows as its leaves.
+				for _, shown := range resolved.Settings() {
+					if top, _, _ := strings.Cut(shown.Key, "."); top == setting.key && shown.Layer != LayerProject {
+						t.Fatalf("config show = %+v, want the project layer", shown)
+					}
+				}
+				if shown := resolved.Settings(); !slices.ContainsFunc(shown, func(s Setting) bool {
+					top, _, _ := strings.Cut(s.Key, ".")
+					return top == setting.key
+				}) {
+					t.Fatalf("config show lists no %q in %+v", setting.key, shown)
 				}
 			})
 			continue

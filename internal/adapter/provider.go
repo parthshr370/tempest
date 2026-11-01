@@ -73,14 +73,21 @@ type RoutingConfig struct {
 	Providers          map[string]ProviderConfig
 	// ChatGPTCredentials is explicit so SDK users never inherit ambient sign-in.
 	ChatGPTCredentials func(context.Context) (RequestCredential, error)
+	// FallbackModels are backup model specs tried in order when ModelID is
+	// unavailable. Each backup's routing comes from [RoutingConfig.ForModel],
+	// so one on another provider resolves its own endpoint and credential.
+	FallbackModels []string
 }
 
 // ProviderRouter bundles the resolved provider registry, the default model,
-// and the stream function that wires the agent loop to the base.
+// and the stream function that wires the agent loop to the base. With
+// backups, StreamFn is the fallback chain and Fallbacks lists the backup
+// models in order.
 type ProviderRouter struct {
-	Registry *base.Registry
-	Model    types.Model
-	StreamFn agent.StreamFn
+	Registry  *base.Registry
+	Model     types.Model
+	StreamFn  agent.StreamFn
+	Fallbacks []types.Model
 }
 
 // NewProviderRouter resolves the provider configuration from the given config
@@ -114,7 +121,7 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 		return ProviderRouter{}, fmt.Errorf("no provider registered for model API %q", rt.API)
 	}
 	r := ProviderRouter{Registry: registry, Model: rt.Model}
-	r = r.withStream(p.StreamSimple, rt, cfg.BlobReader)
+	r = r.withStream(p.StreamSimple, rt, providerDefaultRoute(cfg, env), cfg.BlobReader)
 	if cfg.Retry != nil {
 		retrier, err := retry.New(retry.StreamFunc(r.StreamFn), *cfg.Retry)
 		if err != nil {
@@ -122,21 +129,118 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 		}
 		r.StreamFn = agent.StreamFn(retrier.Stream)
 	}
-	return r, nil
+	backups := make([]ProviderRouter, 0, len(cfg.FallbackModels))
+	for _, spec := range cfg.FallbackModels {
+		route := cfg.ForModel(spec)
+		route.FallbackModels = nil
+		backup, err := NewProviderRouter(route)
+		if err != nil {
+			return ProviderRouter{}, fmt.Errorf("fallback model %q: %w", spec, err)
+		}
+		backups = append(backups, backup)
+	}
+	return chainRouters(r, backups)
+}
+
+// ForModel derives the routing for another model spec from cfg, as a backup
+// model or an agent preset on its own model needs. cfg's endpoint and
+// credential overrides (BaseURL, APIKey, AuthToken) were given for the route
+// cfg resolves to: its provider and credential scope ([types.RouteOf]: the
+// endpoint, or the Azure resource whose deployment the model selects) after
+// the model spec, flags, environment and provider defaults apply. A spec that
+// resolves to another provider drops all three and resolves its own from the
+// provider registry and Env; one that resolves to another scope of the same
+// provider keeps BaseURL (it is the configured endpoint) but gets no key or
+// token. Every derived route goes through here, so an override never follows
+// a model to another provider or endpoint.
+func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
+	derived := cfg
+	derived.ModelID = spec
+	if parseModelSpec(spec).Provider == "openai-chatgpt" {
+		derived.MaxTokens = 0
+	}
+	env := cfg.Env
+	if env == nil {
+		env = os.Getenv
+	}
+	// Both sides are resolved exactly as NewProviderRouter resolves them, so
+	// an empty ModelID (the environment's default model) or a dropped inline
+	// @endpoint is compared by where the requests actually go, and by the
+	// same scope BindAPIKey binds request credentials to. A route that does
+	// not resolve gets no overrides; building it reports the error.
+	from, fromErr := resolveRoute(cfg, env)
+	to, toErr := resolveRoute(derived, env)
+	switch {
+	case fromErr != nil || toErr != nil || from.Model.Provider != to.Model.Provider:
+		derived.BaseURL, derived.APIKey, derived.AuthToken = "", "", ""
+	case types.RouteOf(from.Model) != types.RouteOf(to.Model):
+		derived.APIKey, derived.AuthToken = "", ""
+	}
+	return derived
+}
+
+// providerDefaultRoute is the route cfg's provider resolves to without the
+// model spec's inline @endpoint: the provider's configured default scope, the
+// one scope of a provider other than the primary's where a key given for the
+// provider alone belongs (see [types.ProviderKeyApplies]). A backup's cfg comes
+// from [RoutingConfig.ForModel], so it is resolved from the primary's
+// configuration. A route that does not resolve has none.
+func providerDefaultRoute(cfg RoutingConfig, env func(string) string) types.Route {
+	raw := firstNonEmpty(cfg.ModelID, env("ANTHROPIC_DEFAULT_SONNET_MODEL"), "claude-opus-4-8")
+	if i := modelBaseURLIndex(raw); i >= 0 {
+		cfg.ModelID = raw[:i]
+	}
+	rt, err := resolveRoute(cfg, env)
+	if err != nil {
+		return types.Route{}
+	}
+	return types.RouteOf(rt.Model)
+}
+
+// chainRouters puts a primary route and its backups behind one fallback
+// stream. A backup that repeats an earlier model in the chain is dropped:
+// it would only resend a request that model already failed.
+func chainRouters(primary ProviderRouter, backups []ProviderRouter) (ProviderRouter, error) {
+	chain := []retry.Candidate{{Model: primary.Model, Stream: retry.StreamFunc(primary.StreamFn)}}
+	for _, backup := range backups {
+		repeated := false
+		for _, candidate := range chain {
+			repeated = repeated || retry.SameModel(candidate.Model, backup.Model)
+		}
+		if !repeated {
+			chain = append(chain, retry.Candidate{Model: backup.Model, Stream: retry.StreamFunc(backup.StreamFn)})
+		}
+	}
+	if len(chain) == 1 {
+		return primary, nil
+	}
+	fallback, err := retry.NewFallback(chain)
+	if err != nil {
+		return ProviderRouter{}, err
+	}
+	primary.StreamFn = agent.StreamFn(fallback.Stream)
+	primary.Fallbacks = fallback.Models()[1:]
+	return primary, nil
 }
 
 // withStream binds the resolved provider's StreamSimple to StreamFn, filling the
 // API key (or an authorization bearer header from authToken) and blob reader
-// that the caller left unset. A nil streamSimple can only arise from programmer
-// error since NewProviderRouter validates it, so it surfaces as a terminal error
-// event rather than a panic.
-func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route, blobReader types.BlobReader) ProviderRouter {
+// that the caller left unset. defaultRoute is the provider's default route,
+// where a caller's per-provider key may belong (see [types.ProviderKeyApplies]).
+// A nil streamSimple can only arise from programmer error since
+// NewProviderRouter validates it, so it surfaces as a terminal error event
+// rather than a panic.
+func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route, defaultRoute types.Route, blobReader types.BlobReader) ProviderRouter {
 	var reasoningWarning sync.Once
 	r.StreamFn = func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 		if streamSimple == nil {
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
+		// The caller's credentials were issued for the run's primary, and its
+		// per-provider key belongs to one scope of each provider; anywhere
+		// else this route authenticates with its own credential.
+		resolved.BindAPIKey(model, defaultRoute)
 		if rt.CredentialSource != nil {
 			if model.Provider != "openai-chatgpt" || model.API != rt.Model.API || model.BaseURL != rt.Model.BaseURL || len(model.Headers) != 0 || resolved.APIKey != "" || len(resolved.Headers) != 0 || len(resolved.Query) != 0 || resolved.NoAuth {
 				return erroredStream(model, fmt.Errorf("openai-chatgpt does not allow credential, endpoint or header overrides"))

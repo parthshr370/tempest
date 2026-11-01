@@ -222,7 +222,11 @@ delay and the cause.
 
 Cancellation and other 4xx failures (authentication, invalid request, context
 overflow) are not retried. When the attempts run out, the run stops with `error`
-naming the attempt count and the last cause.
+naming the attempt count and the last cause, unless the role has
+[backup models](providers.md#backup-models): then the next backup gets the same
+request, and the run stays on it until it ends. The switch is journaled as
+`model_fallback` before the backup is called, so a crash at any later point resumes
+on the backup, and a switch the journal cannot record stops the run instead.
 
 ## Output formats
 
@@ -287,11 +291,12 @@ contains the actual `tempest/gap` marker and the final report, stderr explains t
 incomplete stream, and the command exits 1. A broken pipe cancels and joins the run.
 
 Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output`,
-`tempest/message` and `tempest/compaction` updates as ACP and Go watchers. Output
-events only announce byte availability; read command logs separately. Child
-transcripts and thinking are not forwarded into the parent stream, but every
-agent-to-agent message is, as `tempest/message`. The final run-report shape is
-unchanged.
+`tempest/message`, `tempest/compaction` and `tempest/model_fallback` updates as ACP
+and Go watchers. `tempest/model_fallback` carries `runId`, `from`, `to`, `reason`,
+`attempts` and `fallbackIndex`. Output events only announce byte availability; read
+command logs separately. Child transcripts and thinking are not forwarded into the
+parent stream, but every agent-to-agent message is, as `tempest/message`. The final
+run-report shape is unchanged.
 
 ## Related pages
 

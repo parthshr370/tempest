@@ -104,6 +104,10 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			state.ContinuationOf = loaded.LastRun.RunID
 			state.LogicalRunID = loaded.LastRun.LogicalRunID
 			state.Usage, state.Turns, state.StartedAt = loaded.LogicalUsage(state.LogicalRunID)
+			// A switch to a backup model sticks for the whole logical run.
+			if fallback := loaded.LogicalFallback(state.LogicalRunID); fallback != nil {
+				state.Fallback = &agent.FallbackChoice{Index: fallback.FallbackIndex, Model: fallback.To}
+			}
 		}
 		r.runID = state.RunID
 		clear(r.toolStarts)
@@ -168,6 +172,10 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 		err = r.store.Append(ctx, journal.UsageRecord{Meta: meta, Model: ev.Model, Usage: ev.Usage, SourceRef: source, ChildSessionID: ev.ChildSessionID})
 		if err == nil && source != "" {
 			r.sources[source] = ev.Usage
+		}
+	case agent.EventModelFallback:
+		if fallback := ev.Fallback; fallback != nil {
+			err = r.store.Append(ctx, journal.ModelFallbackRecord{Meta: meta, From: fallback.From.Provider + ":" + fallback.From.ID, To: fallback.To.Provider + ":" + fallback.To.ID, Reason: fallback.Reason, Attempts: fallback.Attempts, FallbackIndex: fallback.Index})
 		}
 	case agent.EventToolPermission:
 		if ev.Permission != nil {

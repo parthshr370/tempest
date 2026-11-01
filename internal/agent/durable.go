@@ -25,6 +25,15 @@ type RunState struct {
 	Usage          types.Usage
 	Turns          int
 	UsageSources   map[string]types.Usage
+	// Fallback is the backup model a resumed logical run had switched to.
+	Fallback *FallbackChoice
+}
+
+// FallbackChoice is a recorded switch to a backup model: its position in the
+// fallback chain (1 is the first backup) and its "provider:model" spec.
+type FallbackChoice struct {
+	Index int
+	Model string
 }
 type runtimeBindings struct {
 	mu          sync.Mutex

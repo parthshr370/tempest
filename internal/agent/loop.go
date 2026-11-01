@@ -190,6 +190,9 @@ type loopRun struct {
 	stopHookContinuations int
 	stopHookActive        bool
 	hookFollowUp          bool
+	// fallbackIndex is the fallback chain position of config.Model: 0 for the
+	// primary, set when the run switches to a backup and kept until it ends.
+	fallbackIndex int
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -212,6 +215,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 			run.started = state.StartedAt
 		}
 		run.initialTurns = state.Turns
+		run.restoreFallback(state.Fallback)
 		if !run.root {
 			run.result.Usage = state.Usage
 		}
@@ -530,7 +534,20 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					run.messages = append(run.messages, attempt)
 					return run.accountUsage(ctx, attempt)
 				}
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, discarded)
+				// A switch to a backup model sticks for the rest of the run:
+				// changing models again would reset the provider's cache. The
+				// caller's request credentials stay bound to the model they
+				// were given for, so a later turn on the backup never sends them.
+				switched := func(fallback types.ModelFallback) error {
+					if config.CredentialRoute == (types.Route{}) {
+						config.CredentialRoute = types.RouteOf(fallback.From)
+					}
+					config.Model = fallback.To
+					run.fallbackIndex = fallback.Index
+					return run.emit(ctx, AgentEvent{Type: EventModelFallback, Fallback: &fallback})
+				}
+				request := newModelRequest(*config, run.config.bindings.snapshot().RunID, run.fallbackIndex)
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, switched: switched, request: request})
 				return message, errors.Join(err, run.accountUsage(ctx, message))
 			}()
 			if err != nil {
@@ -836,11 +853,19 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // errored assistant messages, so the re-sent request is unchanged), and
 // discarded accounts for it. The next attempt starts a new message. Tool calls
 // in a discarded attempt never run: they run only after the final message.
+// A switch to a backup model ([types.EvFallback]) discards the attempt the
+// same way and reports the switch; the backup is called only after that
+// report returned (it journals the switch), through the stream's
+// AdmitFallback, so the switch is durable before the backup can spend.
+//
+// Every attempt is reported to the model-request hooks without waiting: the
+// first when the request starts, each later one at its [types.EvAttempt],
+// when it is actually sent.
 //
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
 // provider's producer stops instead of running on unobserved.
-func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, discarded func(types.AssistantMessage) error) (types.AssistantMessage, error) {
+func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, observers responseObservers) (types.AssistantMessage, error) {
 	messages := cctx.Messages
 	if config.TransformContext != nil {
 		messages = config.TransformContext(ctx, messages)
@@ -857,16 +882,31 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		Tools:        tools,
 	}
 
-	resolvedAPIKey := config.APIKey
+	// The options' credentials were given for CredentialRoute: the run's
+	// primary, which switched records before the run leaves it. GetAPIKey goes
+	// with them unresolved; the provider route of each model the request is
+	// sent to, config.Model or a backup the fallback chain switches to, asks
+	// it only where its per-provider key belongs and drops the credentials
+	// anywhere but the primary's route (see [types.StreamOptions.BindAPIKey]).
+	options := config.SimpleStreamOptions
 	if config.GetAPIKey != nil {
-		if key := config.GetAPIKey(config.Model.Provider); key != "" {
-			resolvedAPIKey = key
+		options.APIKeyFor = config.GetAPIKey
+	}
+	// admitted carries the outcome of reporting each switch to the fallback
+	// chain, which waits for it before calling the backup.
+	admitted := make(chan error, 1)
+	options.AdmitFallback = func(admitCtx context.Context, _ types.ModelFallback) error {
+		select {
+		case err := <-admitted:
+			return err
+		case <-admitCtx.Done():
+			return admitCtx.Err()
 		}
 	}
-
-	options := config.SimpleStreamOptions
-	options.APIKey = resolvedAPIKey
 	streamCtx, cancelStream := context.WithCancel(ctx)
+	request := observers.request
+	request.begin()
+	defer request.end(requestCancelled, nil)
 	response := streamFn(streamCtx, config.Model, llmContext, &options)
 	defer func() {
 		cancelStream()
@@ -915,12 +955,14 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 				}
 			}
 
-		case types.EvRetry:
+		case types.EvRetry, types.EvFallback:
 			attempt := types.AssistantMessage{API: config.Model.API, Provider: config.Model.Provider, Model: config.Model.ID, StopReason: types.StopError}
 			if event.Err != nil {
 				attempt = snapshotAssistant(*event.Err)
 			}
-			slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
+			if event.Type == types.EvRetry {
+				slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
+			}
 			// An attempt that failed before streaming (an HTTP error) opened
 			// no message and reported no usage; the log line is its record.
 			if addedPartial {
@@ -929,10 +971,26 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 				if err := emit(ctx, MessageEnd(attempt)); err != nil {
 					return attempt, err
 				}
-				if err := discarded(attempt); err != nil {
+				if err := observers.discarded(attempt); err != nil {
 					return attempt, err
 				}
 			}
+			if event.Type == types.EvRetry || event.Fallback == nil {
+				request.end(requestFailed, &attempt)
+				continue
+			}
+			fallback := *event.Fallback
+			slog.Warn("assistant stream fallback", "from", modelSpec(fallback.From), "to", modelSpec(fallback.To), "reason", fallback.Reason, "attempts", fallback.Attempts, "fallback_index", fallback.Index, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes))
+			request.switchModel(fallback, &attempt)
+			config.Model = fallback.To
+			err := observers.switched(fallback)
+			admitted <- err
+			if err != nil {
+				return attempt, err
+			}
+
+		case types.EvAttempt:
+			request.begin()
 
 		case types.EvDone, types.EvError:
 			// Use background ctx for Result: we want the terminal message even
@@ -940,6 +998,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			// settlement still resolves. Reading Result under a canceled ctx
 			// would race the canceled run and lose the terminal metadata.
 			finalMessage := assistantResult(context.Background(), response, config)
+			request.finish(finalMessage)
 			if addedPartial {
 				cctx.Messages[len(cctx.Messages)-1] = finalMessage
 			} else {
@@ -963,6 +1022,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 	// Stream ended without an explicit EvDone/EvError (e.g. context cancel
 	// mid-fold). Synthesize the final message from Result.
 	finalMessage := assistantResult(ctx, response, config)
+	request.finish(finalMessage)
 	if addedPartial {
 		cctx.Messages[len(cctx.Messages)-1] = finalMessage
 	} else {
@@ -976,6 +1036,16 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		return finalMessage, err
 	}
 	return finalMessage, nil
+}
+
+// responseObservers receive what happens to one logical model request:
+// discarded accounts an attempt that is sent again, switched applies a
+// switch to a backup model, and request reports each attempt to the
+// model-request hooks.
+type responseObservers struct {
+	discarded func(types.AssistantMessage) error
+	switched  func(types.ModelFallback) error
+	request   *modelRequest
 }
 
 // assistantResult extracts the final AssistantMessage from a completed stream.

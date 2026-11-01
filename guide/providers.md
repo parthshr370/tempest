@@ -36,7 +36,7 @@ Unknown provider prefixes are configuration errors. Bare IDs use the Anthropic r
 | `anthropic:<id>` | `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN` | Anthropic Messages. |
 | `google:<id>` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Google Generative AI. Point it elsewhere with `google:<id>@<base-url>`. |
 | `openrouter:<id>` | `OPENROUTER_API_KEY` | OpenAI Chat Completions with OpenRouter's endpoint. Model IDs may carry a `~` prefix. Point it elsewhere with `openrouter:<id>@<base-url>`. |
-| `openai:<id>` | `OPENAI_API_KEY` | Endpoint comes from `-openai-base-url`, `HARNESS_OPENAI_BASE_URL`, settings `openai_base_url`, or `OPENAI_BASE_URL`, in that order. |
+| `openai:<id>` | `OPENAI_API_KEY` | Endpoint comes from `-openai-base-url`, `HARNESS_OPENAI_BASE_URL`, settings `openai_base_url`, or `OPENAI_BASE_URL`, in that order. On OpenAI's own endpoint, models that reason use the Responses API; see [OpenAI's endpoint](#openais-endpoint). |
 | `openai:<id>@<base-url>` | `OPENAI_API_KEY` | Explicit endpoint override. |
 | `openai-chatgpt:<id>` | Saved Sign in with ChatGPT grant | Public Responses endpoint, ChatGPT plan usage, no API-key fallback or endpoint overrides. |
 | `<custom>:<id>` | Depends on the registry entry | Any route configured in the `providers` registry. |
@@ -66,7 +66,131 @@ flowchart TD
   C --> K["catalog and model metadata: limits, cost, compatibility"]
   K --> X["protocol adapter"]
   X --> S["retrying stream"]
+  S --> F["fallback chain: next model when unavailable"]
 ```
+
+### OpenAI's endpoint
+
+OpenAI accepts function tools for reasoning models only on the Responses API; Chat
+Completions rejects a request that has both. So on `https://api.openai.com`, the
+`openai` route uses the [Responses adapter](#openai-responses), which serves every
+model, unless the catalog or the `providers.openai.models` settings say the model does
+not reason: a catalog model without reasoning, such as `gpt-4.1`, and a settings entry
+with `"reasoning": false` keep Chat Completions.
+
+Choosing Responses claims no capability. Only the catalog or a settings entry with
+`"reasoning": true` gives a model reasoning support, so a model ID neither describes
+(a dated snapshot such as `gpt-4.1-2025-04-14`, a fine-tune, a model newer than the
+catalog) gets Responses without it: `-reasoning` is ignored with a warning and the
+model reasons, or not, at OpenAI's default. The catalog lists the gpt-6 family
+(`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`, their `-pro` variants, `gpt-6.1-sol`,
+`gpt-6.1-terra` and their `-pro` variants) with reasoning, a 1,050,000-token context
+and per-token prices, so runs on them report `cost_usd`. Those prices are the
+standard tier. The catalog has one price per model, so the higher rate published for
+prompts of 272,000 tokens or more (twice the input and cache prices, 1.5 times the
+output price) is not modeled: for such a request, `cost_usd` and a `-max-cost`
+budget count the standard rate and understate the spend.
+
+Tempest never adds a reasoning effort on its own. With `-reasoning` unset or `off`,
+no effort is sent and the model reasons at OpenAI's default; it does not quietly
+send `none`.
+
+Any other endpoint for `openai:` (an `@<base-url>`, `-openai-base-url` or
+`OPENAI_BASE_URL`) is treated as a third-party compatible server and keeps Chat
+Completions. An explicit `providers.openai.protocol` always wins.
+
+## Backup models
+
+Each model role can name backup models, tried in order when its model is
+unavailable:
+
+```json
+{
+  "model": "openai:gpt-6-sol",
+  "fallback_models": {
+    "default": ["openai-responses:gpt-6-luna", "anthropic:claude-fable-5-1"],
+    "plan": ["anthropic:claude-fable-5-1"],
+    "smol": []
+  }
+}
+```
+
+`-fallback-model <route>` (repeatable) or `HARNESS_FALLBACK_MODELS` (comma separated)
+sets `fallback_models.default` above the settings files, in the usual
+[layer order](configuration.md). A role with no entry of its own
+uses the default role's list; an empty list turns backups off for that role.
+`serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
+`ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
+Each backup is a full route with its own endpoint and credential. A credential
+belongs to a provider and a **credential scope**: the endpoint the route resolves to,
+with its scheme and host compared in any case (as DNS does) and its path exactly,
+except on Azure, where it is the resource, so another deployment of the same resource
+(its `/openai/deployments/<name>` or `/openai/v1` path) is the same scope. Bedrock
+and Vertex build their regional, per-model URLs from the configured endpoint when a
+request is sent, so the endpoint is their scope. The SDK's explicit
+`ProviderConfig.APIKey`, `AuthToken` and `BaseURL` were given for the scope the
+primary resolves to once its `@<base-url>`, the endpoint settings, the environment
+(including the default model an empty `ModelID` takes from
+`ANTHROPIC_DEFAULT_SONNET_MODEL`) and the provider default apply. A backup, or an
+agent preset on its own model, keeps them only when it resolves to that same provider
+and scope. One on another provider gets none of the three; one on the same provider
+at another scope, including a backup without the primary's `@<base-url>` that
+therefore goes to the configured endpoint, keeps `BaseURL` but not the key or token.
+Request-level credentials are bound the same way: an API key, header or query
+parameter a caller sets on the request options was given for the primary's provider
+and scope, and a backup on another provider or scope never receives it, on the
+switching turn or any later one. `doctor` lists each role's backups under it.
+
+An agent's `GetApiKey(provider)` names only a provider, so it cannot tell two
+endpoints of one provider apart. Its answer for a provider belongs to exactly one
+scope of that provider for the whole run, decided by the primary and the routing
+configuration alone, never by the order the chain reaches its models:
+
+| Provider of the model | Scope that gets `GetApiKey`'s key |
+|---|---|
+| The primary's | The primary's scope. |
+| Any other | The provider's configured default scope: where `<provider>:<model>` goes without an `@<base-url>` (its `providers` entry, endpoint flag, setting or environment variable, else the built-in endpoint). |
+
+A model at any other scope of a provider is never given that key and authenticates
+with the key its own route resolves. The rule holds on the turn that switches, on
+every later turn on the backup, and when a resumed run continues on its recorded
+backup.
+
+A backup gets the request only when the model is **unavailable**, after the model's
+own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts
+(including a stream that sends nothing before the stall watchdog fires), or an
+unknown model ID: an HTTP 404 whose body is the provider's structured missing-model
+answer (OpenAI `"code": "model_not_found"`, Anthropic `not_found_error` with
+`"model: <id>"`, Google `NOT_FOUND` with `"models/<id> is not found"`). **A
+configuration error never falls back**: HTTP 400 and other rejected requests,
+whatever their body says about models, a 404 for a wrong path, 401 and 403, context
+overflow and cancellation stop the run and say why, because a backup would hide them.
+
+The backup receives the same request. Before it goes to a different provider or
+model, the adapter's usual history normalization drops provider-bound content:
+thinking signatures, encrypted reasoning and redacted thinking from the other model
+are removed, its visible thinking becomes text, and tool-call IDs are normalized.
+
+A switch lasts for the rest of the run, the prompt and every turn it causes, because
+changing models again would restart the provider's prompt cache. The next prompt
+tries the primary again. Each switch is:
+
+- **Journaled** as a `model_fallback` record (`from`, `to`, `reason`, `attempts`,
+  `fallback_index`) before the backup is called: the backup gets the request only
+  after the record is written, and if it cannot be written the run stops with that
+  error instead. A run resumed after a crash stays on the recorded backup. If the
+  backup is no longer configured, the run resumes on its primary with a warning.
+- **Published** as a `tempest/model_fallback` update on stream-json, ACP, Go
+  watchers and `serve`, and as an A2A task status message.
+- **Accounted** to the model that answered: each assistant message, its usage record
+  and its cost carry the backup's provider, model and price. A failed attempt that had
+  started streaming stays in the transcript as an errored message with the usage the
+  provider reported. One that failed before streaming (an HTTP error such as the 503
+  or 404 that caused the switch) has no message: its record is the log line, the
+  `PostModelRequest` hook and the switch's `model_fallback` record.
+
+A cost budget must be enforceable for every backup too. A backup with an unknown
+price is refused at startup, like the primary.
 
 ## Endpoint registry
 
@@ -89,7 +213,7 @@ keyed by lowercase route name:
 | Field | Meaning |
 |---|---|
 | `protocol` | One of `openai-chat`, `anthropic`, `google`, `openai-responses`, `bedrock`, `vertex`. |
-| `base_url` | Endpoint origin or base URL. Each protocol decides how much path it appends. |
+| `base_url` | Endpoint origin or base URL. Each protocol decides how much path it appends. It must be an absolute `http(s)` URL without credentials, a query string or a fragment, as must every other endpoint (an `@<base-url>`, `-anthropic-base-url`, `-openai-base-url`, the SDK's `ProviderConfig.BaseURL` and the `*_BASE_URL` / `AZURE_OPENAI_ENDPOINT` variables); put endpoint parameters in `query`. |
 | `api_key_env` | Name of the environment variable holding the key, never the key itself. |
 | `api_key` | Fallback key. The environment variable wins. |
 | `headers` | Extra request headers. |
@@ -138,7 +262,7 @@ fabricated assistant turn.
 | Route | Protocol | Credential | Default endpoint |
 |---|---|---|---|
 | `anthropic` | `anthropic` | `ANTHROPIC_API_KEY` | `https://api.anthropic.com` |
-| `openai` | `openai-chat` | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
+| `openai` | `openai-chat`; `openai-responses` for reasoning models on OpenAI's endpoint | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
 | `google` | `google` | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com` |
 | `openrouter` | `openai-chat` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
 | `groq` | `openai-chat` | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
@@ -192,7 +316,10 @@ also works: set `base_url` or `AZURE_OPENAI_ENDPOINT` to
 }
 ```
 
-Select it with `-model azure:<deployment>`.
+Select it with `-model azure:<deployment>`. The key belongs to the resource, so a
+backup or agent preset on another deployment of the same resource keeps an explicit
+SDK key; a different resource, or any other path below it, is another scope and gets
+none.
 
 ## Project provider definitions
 
@@ -239,7 +366,9 @@ request `reasoning.encrypted_content`. Replay requires nonempty encrypted conten
 and the same provider and model; set `supportsEncryptedReasoning: false` to turn
 both off. The session ID doubles as `prompt_cache_key`; IDs longer than 64 bytes
 use their SHA-256 hex digest. Reasoning effort and summary are sent when configured
-and supported by the model, and cached and reasoning token usage is read back.
+and supported by the model, and cached and reasoning token usage is read back. The
+`openai` preset uses this adapter for reasoning models on OpenAI's own endpoint; see
+[OpenAI's endpoint](#openais-endpoint).
 
 ### Sign in with ChatGPT
 
@@ -445,8 +574,11 @@ only rewritten by compaction, and the tool list is in name order.
 and each entry's `source` URL and `verified_at` date. Most direct-provider entries
 retain the imported snapshot's date. GPT-5.6 Luna's route and metadata were checked
 against OpenAI's model page on 2026-10-21. OpenRouter entries use the public
-discovery snapshot from that date. Discovery confirms exact IDs and advertised
-metadata, not a successful generation request.
+discovery snapshot from that date. The direct `openai` gpt-6 family entries take
+their context, output limit, standard-tier prices and reasoning support from the
+OpenRouter discovery entries `openai/gpt-6-*` and `openai/gpt-6.1-*` on 2026-11-01;
+those are public list prices, not a statement of OpenAI's bill. Discovery confirms
+exact IDs and advertised metadata, not a successful generation request.
 
 Routes use the vendor family for catalog lookup without changing the wire model ID:
 Responses uses OpenAI metadata, Vertex uses Google or Anthropic metadata (ignoring
@@ -477,7 +609,8 @@ when they differ. Each line names the roles and the exact model it pinged, then
 latency on success, or the typed failure code with the provider's HTTP status and
 bounded, redacted message, for example `provider HTTP 404: {...}` for an
 account/endpoint restriction. A missing credential error names the configured
-`api_key_env`.
+`api_key_env`. Ping probes each role's own model, never its backup models, so an
+unavailable primary shows up here instead of being answered by a backup.
 
 ## Output
 

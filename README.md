@@ -25,7 +25,7 @@ agent protocols, or embeds in a Go application, without a Node runtime or interp
 - **Hashline edits** anchored to the file you read, with atomic writes and batch rollback recovery.
 - **Permissions and plan mode**, with per-call guards for destructive commands and cloud changes.
 - **Subagents in worktrees**, with durable jobs, messages, and explicit three-way integration.
-- **Claude Code-compatible hooks**, with explicit trust for project commands.
+- **Claude Code-compatible hooks**, with explicit trust for project commands, plus observation-only model-request hooks.
 - **Go and subprocess extensions**, with named bundles, scoped memos, typed hooks, and pinned result wrappers.
 - **Checkpoint and rewind**, restoring files and branching the conversation without touching your Git index.
 - **Persistent eval kernels** for Python and JavaScript, started only when needed.
@@ -97,6 +97,7 @@ See [providers](guide/providers.md) for model routes and credentials.
 - **Exact model IDs**, separate from endpoint, protocol, and catalog metadata.
 - **20 endpoint presets**, plus custom routes for OpenAI-compatible, Responses, Bedrock, and Vertex endpoints.
 - **Model roles** for normal work, read-only planning, and small investigations.
+- **Backup models per role**: when a model is unavailable after its retries, the next one answers, sticks for the run, and is journaled, so a crash resumes on it.
 - **Billed cost first**, catalog prices as fallback, and unknown prices kept unknown.
 - **Catalog-aware limits**, shared across vendor protocols, with context-aware output clamping and configured overrides for unlisted models.
 - **Run budgets** for model calls, USD cost, and elapsed time.

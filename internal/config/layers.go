@@ -350,7 +350,9 @@ func (in *StringsInput) settingsNode() (*settingsNode, bool, error) {
 
 // settingInput connects a settings key to its HARNESS_* variable and flag.
 // A new setting with a variable or flag registers here, so both enter the
-// layer stack below -c and show up in `config show`.
+// layer stack below -c and show up in `config show`. A dotted key sets one
+// member of an object setting, so the input merges with the object's other
+// members from lower layers.
 type settingInput struct {
 	key   string
 	env   string
@@ -363,6 +365,7 @@ var settingInputs = []settingInput{
 	{key: "model", env: "HARNESS_MODEL", flag: "model", field: func(f *FlagValues) flagInput { return &f.Model }},
 	{key: "plan_model", env: "HARNESS_PLAN_MODEL", flag: "plan-model", field: func(f *FlagValues) flagInput { return &f.PlanModel }},
 	{key: "smol_model", env: "HARNESS_SMOL_MODEL", flag: "smol-model", field: func(f *FlagValues) flagInput { return &f.SmolModel }},
+	{key: "fallback_models.default", env: "HARNESS_FALLBACK_MODELS", flag: "fallback-model", kind: inputList, field: func(f *FlagValues) flagInput { return &f.FallbackModels }},
 	{key: "reasoning", env: "HARNESS_REASONING", flag: "reasoning", field: func(f *FlagValues) flagInput { return &f.Reasoning }},
 	{key: "plan_reasoning", env: "HARNESS_PLAN_REASONING", flag: "plan-reasoning", field: func(f *FlagValues) flagInput { return &f.PlanReasoning }},
 	{key: "smol_reasoning", env: "HARNESS_SMOL_REASONING", flag: "smol-reasoning", field: func(f *FlagValues) flagInput { return &f.SmolReasoning }},
@@ -456,7 +459,7 @@ func environmentLayer(lookup func(string) string) (*settingsLayer, map[string]er
 			invalid[input.key] = err
 			continue
 		}
-		layer.members[input.key] = node
+		setMember(layer.members, strings.Split(input.key, "."), node)
 		layer.origins[input.key] = input.env
 	}
 	if _, set := layer.members["log_level"]; !set && invalid["log_level"] == nil && strings.TrimSpace(lookup("HARNESS_DEBUG")) != "" {
@@ -507,7 +510,7 @@ func flagLayer(flags FlagValues) (*settingsLayer, error) {
 			return nil, &Error{Field: input.key, Err: err}
 		}
 		if set {
-			layer.members[input.key] = node
+			setMember(layer.members, strings.Split(input.key, "."), node)
 			layer.origins[input.key] = "-" + input.flag
 		}
 	}
@@ -591,12 +594,12 @@ var projectGates = map[string]trustGate{
 }
 
 // projectGate classifies one repository setting. A model with an @http(s)
-// endpoint suffix sends the route's credential there, so it needs provider trust.
+// endpoint suffix sends the route's credential there, so it needs provider
+// trust; so does a backup chain naming one.
 func projectGate(key string, value *settingsNode) trustGate {
 	switch key {
-	case "model", "plan_model", "smol_model":
-		var spec string
-		if json.Unmarshal(value.scalar, &spec) == nil && (strings.Contains(spec, "@http://") || strings.Contains(spec, "@https://")) {
+	case "model", "plan_model", "smol_model", "fallback_models":
+		if namesModelEndpoint(value) {
 			return gateCredentials
 		}
 		return gateNone
@@ -605,6 +608,24 @@ func projectGate(key string, value *settingsNode) trustGate {
 		return gateNone
 	}
 	return projectGates[key]
+}
+
+// namesModelEndpoint reports whether any model spec in value, a spec or an
+// object or array of them, carries an @http(s) endpoint suffix.
+func namesModelEndpoint(value *settingsNode) bool {
+	if value == nil {
+		return false
+	}
+	for _, member := range value.object {
+		if namesModelEndpoint(member) {
+			return true
+		}
+	}
+	if slices.ContainsFunc(value.array, namesModelEndpoint) {
+		return true
+	}
+	var spec string
+	return json.Unmarshal(value.scalar, &spec) == nil && (strings.Contains(spec, "@http://") || strings.Contains(spec, "@https://"))
 }
 
 // planModeNode is the strictest permission mode, which no lower mode is

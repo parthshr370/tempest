@@ -191,12 +191,14 @@ func TestExactBackoffSequence(t *testing.T) {
 			}
 			source.attempts = append(source.attempts, matrixAttempt{events: []types.StreamEvent{matrixDone()}})
 			events := collect(matrixRetrier(t, source, matrixConfig(sleeper, fixedRandom(tc.random))).Stream(context.Background(), testModel(), types.Context{}, nil))
-			if len(events) != len(tc.want)+1 || events[len(tc.want)].Type != types.EvDone || len(sleeper.delays) != len(tc.want) {
+			// Each retry is followed by the next attempt's announcement.
+			if len(events) != 2*len(tc.want)+1 || events[2*len(tc.want)].Type != types.EvDone || len(sleeper.delays) != len(tc.want) {
 				t.Fatalf("events=%+v delays=%v", events, sleeper.delays)
 			}
 			for i := range tc.want {
-				if sleeper.delays[i] != tc.want[i] || events[i].Type != types.EvRetry || events[i].Attempt != i+1 || events[i].RetryDelay != tc.want[i] {
-					t.Fatalf("delay[%d]=%v event=%+v want %v", i, sleeper.delays[i], events[i], tc.want[i])
+				retried, sent := events[2*i], events[2*i+1]
+				if sleeper.delays[i] != tc.want[i] || retried.Type != types.EvRetry || retried.Attempt != i+1 || retried.RetryDelay != tc.want[i] || sent.Type != types.EvAttempt || sent.Attempt != i+2 {
+					t.Fatalf("delay[%d]=%v events=%+v %+v want %v", i, sleeper.delays[i], retried, sent, tc.want[i])
 				}
 			}
 		})
@@ -449,7 +451,7 @@ func TestTypedErrorsAndRealExhaustedChain(t *testing.T) {
 	cfg := matrixConfig(&recordedSleeper{}, fixedRandom(1))
 	cfg.MaxAttempts = 2
 	events := collect(matrixRetrier(t, source, cfg).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if terminalCode(t, events) != CodeAttemptsExhausted || eventTypes(events) != "retry error" || !strings.Contains(events[1].Err.ErrorMessage, "2 attempts") || !strings.Contains(events[1].Err.ErrorMessage, "connection reset") {
+	if terminalCode(t, events) != CodeAttemptsExhausted || eventTypes(events) != "retry attempt error" || !strings.Contains(events[2].Err.ErrorMessage, "2 attempts") || !strings.Contains(events[2].Err.ErrorMessage, "connection reset") {
 		t.Fatalf("real-exhausted-chain events=%+v", events)
 	}
 	// The generated terminal frame is intentionally not the retryable provider cause.
@@ -507,7 +509,7 @@ func TestAttemptsAndReplaySafety(t *testing.T) {
 	// A failed attempt is discarded by a retry event, then a coherent second attempt forwarded.
 	replay := &matrixStreamer{attempts: source.attempts[1:]}
 	events = collect(matrixRetrier(t, replay, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if replay.calls != 2 || eventTypes(events) != "start text_start retry start text_delta done" || len(events[4].Partial.Content) != 1 || events[4].Partial.Content[0].Text != "again" {
+	if replay.calls != 2 || eventTypes(events) != "start text_start retry attempt start text_delta done" || len(events[5].Partial.Content) != 1 || events[5].Partial.Content[0].Text != "again" {
 		t.Fatalf("replay events=%+v", events)
 	}
 }
@@ -530,7 +532,7 @@ func TestEveryOutputKindIsRetriedWithOwnedPartials(t *testing.T) {
 			tc.event.Partial = downstreamPartial
 			source := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{tc.event, matrixRetryEvent("connection reset")}}, {events: []types.StreamEvent{matrixDone()}}}}
 			events := collect(matrixRetrier(t, source, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-			if source.calls != 2 || eventTypes(events) != string(tc.event.Type)+" retry done" {
+			if source.calls != 2 || eventTypes(events) != string(tc.event.Type)+" retry attempt done" {
 				t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 			}
 			if events[0].Partial == nil || events[0].Partial.API != "test" || events[0].Partial.Provider != "test" || events[0].Partial.Model != "test" || events[0].Partial == downstreamPartial {
@@ -539,7 +541,7 @@ func TestEveryOutputKindIsRetriedWithOwnedPartials(t *testing.T) {
 		})
 	}
 	terminalContent := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{ErrorMessage: "connection reset", Content: []types.ContentBlock{{Type: types.BlockText, Text: "visible"}}}}}}, {events: []types.StreamEvent{matrixDone()}}}}
-	if events := collect(matrixRetrier(t, terminalContent, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil)); terminalContent.calls != 2 || eventTypes(events) != "retry done" || events[0].Err.Content[0].Text != "visible" {
+	if events := collect(matrixRetrier(t, terminalContent, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil)); terminalContent.calls != 2 || eventTypes(events) != "retry attempt done" || events[0].Err.Content[0].Text != "visible" {
 		t.Fatalf("terminal content events=%+v calls=%d", events, terminalContent.calls)
 	}
 }
@@ -557,7 +559,7 @@ func TestFailureAfterAcceptedResponseIsClassifiedByCode(t *testing.T) {
 		{response: accepted, events: []types.StreamEvent{{Type: types.EvStart}, invalid}},
 	}}
 	events := collect(matrixRetrier(t, source, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if source.calls != 2 || eventTypes(events) != "start text_delta retry start error" || events[2].Err.ErrorCode != string(CodeStreamInterrupted) || events[4].Err.ErrorCode != "invalid_request_error" {
+	if source.calls != 2 || eventTypes(events) != "start text_delta retry attempt start error" || events[2].Err.ErrorCode != string(CodeStreamInterrupted) || events[5].Err.ErrorCode != "invalid_request_error" {
 		t.Fatalf("calls=%d events=%s", source.calls, eventTypes(events))
 	}
 }
@@ -565,12 +567,12 @@ func TestFailureAfterAcceptedResponseIsClassifiedByCode(t *testing.T) {
 func TestStreamClose(t *testing.T) {
 	before := &matrixStreamer{attempts: []matrixAttempt{{events: nil}, {events: []types.StreamEvent{matrixDone()}}}}
 	events := collect(matrixRetrier(t, before, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if before.calls != 2 || eventTypes(events) != "retry done" {
+	if before.calls != 2 || eventTypes(events) != "retry attempt done" {
 		t.Fatalf("stream-close-before-output calls=%d events=%+v", before.calls, events)
 	}
 	after := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvTextDelta, ContentIndex: 0, Delta: "visible"}}}, {events: []types.StreamEvent{matrixDone()}}}}
 	events = collect(matrixRetrier(t, after, matrixConfig(&recordedSleeper{}, fixedRandom(1))).Stream(context.Background(), testModel(), types.Context{}, nil))
-	if after.calls != 2 || eventTypes(events) != "text_delta retry done" || events[1].Err.ErrorCode != string(CodeStreamInterrupted) || events[1].Err.Content[0].Text != "visible" {
+	if after.calls != 2 || eventTypes(events) != "text_delta retry attempt done" || events[1].Err.ErrorCode != string(CodeStreamInterrupted) || events[1].Err.Content[0].Text != "visible" {
 		t.Fatalf("stream-close-after-output calls=%d events=%+v", after.calls, events)
 	}
 	empty := &matrixStreamer{attempts: []matrixAttempt{{events: []types.StreamEvent{{Type: types.EvStart}, matrixDone()}}}}
@@ -598,7 +600,7 @@ func TestConcurrentRNG(t *testing.T) {
 				return
 			}
 			events := collect(r.Stream(context.Background(), testModel(), types.Context{}, nil))
-			if source.calls != 2 || eventTypes(events) != "retry done" {
+			if source.calls != 2 || eventTypes(events) != "retry attempt done" {
 				errCh <- errors.New("incoherent concurrent stream")
 			}
 		}()

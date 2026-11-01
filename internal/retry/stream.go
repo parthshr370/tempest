@@ -53,15 +53,20 @@ func (r *Retrier) Stream(ctx context.Context, model types.Model, c types.Context
 // arrive. An attempt that fails transiently, before or after it produced
 // output, is announced with a [types.EvRetry] event carrying the discarded
 // attempt, and the same request (same context, same options) is sent again
-// after the backoff. Re-sending after output was forwarded is safe because
-// nothing acts on a response before its terminal event: the agent loop runs
-// tool calls only after the stream reports done.
+// after the backoff; a [types.EvAttempt] event marks that send, after the
+// backoff and the cancellation check, so a cancelled backoff announces none.
+// Re-sending after output was forwarded is safe because nothing acts on a
+// response before its terminal event: the agent loop runs tool calls only
+// after the stream reports done.
 func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, model types.Model, c types.Context, opts *types.SimpleStreamOptions) {
 	logical := types.NewAssistantBuilder(model.API, model.Provider, model.ID)
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
 			r.pushCanceled(output, model, ctx.Err())
 			return
+		}
+		if attempt > 1 {
+			output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: attempt})
 		}
 		var response types.ProviderResponse
 		attemptOpts := cloneOptions(opts, func(received types.ProviderResponse, receivedModel types.Model) error {

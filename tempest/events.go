@@ -82,6 +82,12 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			m.childJobs[ev.Work.Job.ChildSessionID] = ev.Work.Job.ID
 		}
 		return []Update{mapWorkUpdate(*ev.Work, at)}
+	case agent.EventModelFallback:
+		if ev.Fallback == nil {
+			return nil
+		}
+		fallback := ev.Fallback
+		return []Update{update("tempest/model_fallback", map[string]any{"runId": m.runID, "from": fallback.From.Provider + ":" + fallback.From.ID, "to": fallback.To.Provider + ":" + fallback.To.ID, "reason": fallback.Reason, "attempts": fallback.Attempts, "fallbackIndex": fallback.Index}, at)}
 	case agent.EventAgentStart:
 		m.started = at
 		m.turn = 0

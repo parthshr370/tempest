@@ -559,6 +559,231 @@
       "verified_at": "2026-10-21"
     },
     {
+      "provider": "openai",
+      "id": "gpt-6-luna",
+      "name": "GPT-6 Luna",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "openai_compat": {
+        "reasoningDisableMode": "none-effort"
+      },
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6-luna-pro",
+      "name": "GPT-6 Luna Pro",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheRead": 0.01,
+        "cacheWrite": 0.125
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "openai_compat": {
+        "reasoningDisableMode": "none-effort"
+      },
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6-sol",
+      "name": "GPT-6 Sol",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 2.0,
+        "output": 10.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 2.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "openai_compat": {
+        "reasoningDisableMode": "none-effort"
+      },
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6-sol-pro",
+      "name": "GPT-6 Sol Pro",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 2.0,
+        "output": 10.0,
+        "cacheRead": 0.2,
+        "cacheWrite": 2.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "openai_compat": {
+        "reasoningDisableMode": "none-effort"
+      },
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6-astra",
+      "name": "GPT-6 Astra",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cacheRead": 1.0,
+        "cacheWrite": 12.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6-astra-pro",
+      "name": "GPT-6 Astra Pro",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 10.0,
+        "output": 50.0,
+        "cacheRead": 1.0,
+        "cacheWrite": 12.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6.1-sol",
+      "name": "GPT-6.1 Sol",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 2.0,
+        "output": 10.0,
+        "cacheRead": 0.1,
+        "cacheWrite": 2.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6.1-sol-pro",
+      "name": "GPT-6.1 Sol Pro",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 2.0,
+        "output": 10.0,
+        "cacheRead": 0.1,
+        "cacheWrite": 2.5
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6.1-terra",
+      "name": "GPT-6.1 Terra",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 1.0,
+        "output": 5.0,
+        "cacheRead": 0.05,
+        "cacheWrite": 1.25
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "openai_compat": {
+        "reasoningDisableMode": "none-effort"
+      },
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-6.1-terra-pro",
+      "name": "GPT-6.1 Terra Pro",
+      "context_window": 1050000,
+      "max_tokens": 128000,
+      "cost": {
+        "input": 1.0,
+        "output": 5.0,
+        "cacheRead": 0.05,
+        "cacheWrite": 1.25
+      },
+      "capabilities": [
+        "thinking",
+        "tools",
+        "images",
+        "cache"
+      ],
+      "source": "https://openrouter.ai/api/v1/models",
+      "verified_at": "2026-11-01"
+    },
+    {
       "provider": "openrouter",
       "id": "~anthropic/claude-fable-latest",
       "name": "Anthropic: Claude Fable Latest",

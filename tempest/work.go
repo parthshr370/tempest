@@ -55,11 +55,15 @@ func (c *sessionCore) publishWork(ctx context.Context, event work.Event) error {
 	}
 	return c.hub.Listener()(ctx, agent.AgentEvent{Type: agent.EventWork, Work: &event, At: time.Now()})
 }
-func childModel(cfg StackConfig, spec work.TaskSpec) (types.Model, agent.StreamFn) {
+
+// childModel selects the model a child task runs on: the smol role for an
+// explore task when one is configured, else the parent's model. It returns cfg
+// with that model, its stream, its backup models and its role applied.
+func childModel(cfg StackConfig, spec work.TaskSpec) StackConfig {
 	if spec.SubagentType == "explore" && cfg.SmolModel.ID != "" && cfg.SmolStreamFn != nil {
-		return cfg.SmolModel, cfg.SmolStreamFn
+		cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.SmolModel, cfg.SmolStreamFn, cfg.SmolFallbackModels, "smol"
 	}
-	return cfg.Model, cfg.StreamFn
+	return cfg
 }
 func (c *sessionCore) selectedToolNames() []string {
 	return session.ToolNames(c.agent.State().Tools)
@@ -82,7 +86,7 @@ func (c *sessionCore) prepareTask(ctx context.Context, cfg StackConfig, spec wor
 	if err != nil {
 		return work.TaskEnvironment{}, err
 	}
-	model, _ := childModel(cfg, spec)
+	model := childModel(cfg, spec).Model
 	return work.TaskEnvironment{Ceiling: permission.CaptureCeiling(mode, c.selectedToolNames(), c.permissionPolicy), Model: model.ID, Provider: model.Provider, Workspace: cfg.Environment.Reference()}, nil
 }
 func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.TaskLaunch) (result work.TaskResult, err error) {
@@ -97,7 +101,8 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	if err != nil {
 		return result, err
 	}
-	model, stream := childModel(cfg, launch.Spec)
+	routed := childModel(cfg, launch.Spec)
+	model := routed.Model
 	if model.ID != launch.Environment.Model || model.Provider != launch.Environment.Provider {
 		return result, errors.New("recorded child model/provider is unavailable")
 	}
@@ -177,7 +182,7 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 		childCfg.Environment = nil
 		childCfg.EnvironmentReference = environment.Reference{}
 	}
-	childCfg.Model, childCfg.StreamFn = model, stream
+	childCfg.Model, childCfg.StreamFn, childCfg.FallbackModels, childCfg.ModelRole = routed.Model, routed.StreamFn, routed.FallbackModels, routed.ModelRole
 	if launch.Spec.SubagentType == "explore" && cfg.SmolReasoning != "" {
 		childCfg.Reasoning = cfg.SmolReasoning
 	}
@@ -448,18 +453,16 @@ func (c *sessionCore) presetConfig(cfg StackConfig, spec work.TaskSpec) (StackCo
 		switch preset.Model {
 		case cfg.Model.ID:
 		case cfg.SmolModel.ID:
-			cfg.Model, cfg.StreamFn = cfg.SmolModel, cfg.SmolStreamFn
+			cfg.Model, cfg.StreamFn, cfg.FallbackModels, cfg.ModelRole = cfg.SmolModel, cfg.SmolStreamFn, cfg.SmolFallbackModels, "smol"
 		default:
 			if c.customStream {
 				return cfg, errors.New("preset model unavailable from custom provider")
 			}
-			provider := c.providerConfig
-			provider.ModelID = preset.Model
-			router, err := adapter.NewProviderRouter(provider)
+			router, err := adapter.NewProviderRouter(c.providerConfig.ForModel(preset.Model))
 			if err != nil {
 				return cfg, err
 			}
-			cfg.Model, cfg.StreamFn = router.Model, router.StreamFn
+			cfg.Model, cfg.StreamFn, cfg.FallbackModels = router.Model, router.StreamFn, router.Fallbacks
 		}
 	}
 	cfg.PromptAdditions = append(append([]string(nil), cfg.PromptAdditions...), preset.Instructions)

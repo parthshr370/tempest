@@ -938,10 +938,10 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 	}
 	stop := context.AfterFunc(ctx, cancel)
 	defer func() { stop(); cancel() }()
-	// Attempts the retry layer abandoned can still be billed; count the usage they reported.
+	// Attempts the retry or fallback layer abandoned can still be billed; count the usage they reported.
 	var discarded ptypes.Usage
 	for event := range response.Events() {
-		if event.Type == ptypes.EvRetry && event.Err != nil {
+		if (event.Type == ptypes.EvRetry || event.Type == ptypes.EvFallback) && event.Err != nil {
 			discarded.Add(event.Err.Usage)
 		}
 	}

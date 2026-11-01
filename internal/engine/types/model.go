@@ -1,6 +1,9 @@
 package types
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // AnthropicCompat holds per-model Anthropic compatibility flags. Pointers keep
 // the tri-state (unset vs explicit true/false) so a nil default can be resolved
@@ -13,6 +16,45 @@ type AnthropicCompat struct {
 	SupportsTemperature             *bool `json:"supportsTemperature,omitempty"`
 	ForceAdaptiveThinking           *bool `json:"forceAdaptiveThinking,omitempty"`
 	AllowEmptySignature             *bool `json:"allowEmptySignature,omitempty"`
+}
+
+// Route is the credential scope of a model's requests: the provider and the
+// endpoint a credential for it is issued for. It is the identity a
+// per-request credential is bound to.
+type Route struct {
+	Provider string
+	Scope    string
+}
+
+// RouteOf returns the credential scope of model's requests. It is the base
+// URL, with its scheme and host lowercased since DNS ignores their case; the
+// path is kept exact, since it may itself separate tenants. On Azure a key
+// belongs to the resource: the /openai/deployments/<name> path a route appends
+// for the model, or the /openai/v1 path, only selects a model within it and is
+// dropped. Bedrock and Vertex build their regional, per-model URLs from the
+// configured endpoint when a request is sent, so their base URL already is the
+// scope.
+func RouteOf(model Model) Route {
+	scope := model.BaseURL
+	if i := strings.Index(scope, "://"); i >= 0 {
+		end := len(scope)
+		if j := strings.IndexAny(scope[i+len("://"):], "/?#"); j >= 0 {
+			end = i + len("://") + j
+		}
+		if origin := strings.ToLower(scope[:end]); origin != scope[:end] {
+			scope = origin + scope[end:]
+		}
+	}
+	if model.Provider == "azure" {
+		if resource, ok := strings.CutSuffix(scope, "/openai/v1"); ok {
+			scope = resource
+		} else if i := strings.LastIndex(scope, "/openai/deployments/"); i >= 0 {
+			if deployment := scope[i+len("/openai/deployments/"):]; deployment != "" && !strings.Contains(deployment, "/") {
+				scope = scope[:i]
+			}
+		}
+	}
+	return Route{Provider: model.Provider, Scope: scope}
 }
 
 // Model describes an LLM plus capability metadata (02-map-ai-agent.md A16). The

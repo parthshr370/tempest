@@ -3,6 +3,7 @@ package retry
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,10 @@ const (
 	CodeProviderFailure    Code = "provider_failure"
 	CodeAttemptsExhausted  Code = "attempts_exhausted"
 	CodeRetryDelayExceeded Code = "retry_delay_exceeded"
+	// CodeModelNotFound is a request for a model the endpoint does not serve.
+	// It is terminal for the model but not a configuration error of the
+	// request, so a fallback chain moves past it.
+	CodeModelNotFound Code = "model_not_found"
 )
 
 var (
@@ -122,6 +127,9 @@ func Classify(f Failure, now time.Time) *Error {
 	if isContextOverflow(combined) {
 		return result(CodeContextOverflow, false)
 	}
+	if isModelNotFound(f.Status, strings.ToLower(providerCode), combined) {
+		return result(CodeModelNotFound, false)
+	}
 	if strings.HasPrefix(providerCode, "subscription_sharing_") && (f.Status == 429 || providerCode == "subscription_sharing_usage_limit_exceeded") {
 		return result(Code(providerCode), false)
 	}
@@ -212,6 +220,32 @@ func retryAfterOrZero(headers map[string]string, now time.Time) time.Duration {
 func isContextOverflow(value string) bool {
 	return containsAny(value, "context_length_exceeded", "prompt_too_long", "maximum context length", "too many input tokens") || (strings.Contains(value, "context window") && strings.Contains(value, "exceeded"))
 }
+
+// isModelNotFound recognizes an endpoint's structured answer that it does not
+// serve the requested model, which a fallback chain moves past. Only HTTP 404
+// qualifies: P2 never falls back on 400 or 401/403, which are configuration
+// errors that must surface. The recognized answers are OpenAI's
+// model_not_found code, Anthropic's not_found_error whose message is
+// "model: <id>", and Google's NOT_FOUND "models/<id> is not found". A 404 that
+// merely mentions a model is an endpoint or path error.
+func isModelNotFound(status int, providerCode, value string) bool {
+	if status != 404 {
+		return false
+	}
+	return providerCode == "model_not_found" || openAIMissingModel.MatchString(value) ||
+		anthropicNotFound.MatchString(value) && anthropicMissingModel.MatchString(value) ||
+		googleNotFound.MatchString(value) && googleMissingModel.MatchString(value)
+}
+
+// The provider error bodies isModelNotFound recognizes, matched on the
+// lowercased body text.
+var (
+	openAIMissingModel    = regexp.MustCompile(`"code"\s*:\s*"model_not_found"`)
+	anthropicNotFound     = regexp.MustCompile(`"type"\s*:\s*"not_found_error"`)
+	anthropicMissingModel = regexp.MustCompile(`"message"\s*:\s*"model: `)
+	googleNotFound        = regexp.MustCompile(`"status"\s*:\s*"not_found"`)
+	googleMissingModel    = regexp.MustCompile(`"message"\s*:\s*"models/[^"\s]+ is not found`)
+)
 
 func containsAny(value string, patterns ...string) bool {
 	for _, pattern := range patterns {

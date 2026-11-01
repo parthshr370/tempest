@@ -136,8 +136,13 @@ func (run *loopRun) completeWithHooks(ctx context.Context) ([]work.QueuedMessage
 }
 
 // EndSessionHooks runs cleanup hooks after work has joined, before the host closes its event stream.
+// A child has no SessionEnd of its own but still flushes its queued model-request observations.
 func (a *Agent) EndSessionHooks(ctx context.Context) error {
-	if a.Hooks == nil || a.Child {
+	if a.Hooks == nil {
+		return nil
+	}
+	if a.Child {
+		a.Hooks.FlushObservations(ctx)
 		return nil
 	}
 	ctx = hooks.WithRun(ctx, func(ctx context.Context, report hooks.Report) error {
