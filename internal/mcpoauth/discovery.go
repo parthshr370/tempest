@@ -78,34 +78,41 @@ func wellKnown(base *url.URL, suffix, escapedPath string) string {
 	return base.Scheme + "://" + base.Host + "/.well-known/" + suffix + escapedPath
 }
 
-// resourceMetadata follows the challenge's resource_metadata URL, or probes
-// the path-inserted and then the root well-known URI.
+// resourceMetadata follows the challenge's resource_metadata URL, as MCP
+// 2025-11-25 requires, or probes the path-inserted and then the root
+// well-known URI on the server's own origin. The hint names a destination
+// the server chose, so the discovery policy applies to it; a hint the
+// policy refuses is passed over for the well-known probes.
 func (c *Client) resourceMetadata(ctx context.Context, challenge Challenge) (ResourceMetadata, error) {
-	// RFC 9728 places the metadata on the resource's own origin; a hint
-	// naming another origin is not fetched, and the well-known probes run.
-	var candidates []string
-	if challenge.ResourceMetadata != "" && c.dest.sameOrigin(challenge.ResourceMetadata) {
-		candidates = []string{challenge.ResourceMetadata}
-	} else {
-		u, err := url.Parse(c.url)
-		if err != nil {
-			return ResourceMetadata{}, err
+	var metadata ResourceMetadata
+	var found bool
+	var err error
+	var refused refusedError
+	if challenge.ResourceMetadata != "" {
+		found, err = c.firstJSON(ctx, []string{challenge.ResourceMetadata}, &metadata)
+		if err == nil && !found {
+			return metadata, fmt.Errorf("server %s challenge names OAuth protected resource metadata at %s, which does not serve it", c.server, challenge.ResourceMetadata)
 		}
+	}
+	if challenge.ResourceMetadata == "" || errors.As(err, &refused) {
+		u, parseErr := url.Parse(c.url)
+		if parseErr != nil {
+			return ResourceMetadata{}, parseErr
+		}
+		var candidates []string
 		if path := strings.TrimSuffix(u.EscapedPath(), "/"); path != "" {
 			candidates = append(candidates, wellKnown(u, "oauth-protected-resource", path))
 		}
 		candidates = append(candidates, wellKnown(u, "oauth-protected-resource", ""))
+		if found, err = c.firstJSON(ctx, candidates, &metadata); err == nil && !found {
+			if refused.error != nil {
+				return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata on its own origin, and the URL its challenge names is refused: %w", c.server, refused)
+			}
+			return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata", c.server)
+		}
 	}
-	var metadata ResourceMetadata
-	found, err := c.firstJSON(ctx, candidates, &metadata)
 	if err != nil {
 		return metadata, err
-	}
-	if !found {
-		if challenge.ResourceMetadata != "" && !c.dest.sameOrigin(challenge.ResourceMetadata) {
-			return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata on its own origin; its challenge named %q on another origin, which Tempest does not fetch", c.server, challenge.ResourceMetadata)
-		}
-		return metadata, fmt.Errorf("server %s publishes no OAuth protected resource metadata", c.server)
 	}
 	if metadata.Resource == "" || len(metadata.AuthorizationServers) == 0 {
 		return metadata, fmt.Errorf("server %s protected resource metadata lacks resource or authorization_servers", c.server)

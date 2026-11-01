@@ -90,8 +90,9 @@ An HTTP server without a configured `Authorization` header that answers `401` ge
 OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
 
 1. Protected resource metadata (RFC 9728) from the `resource_metadata` URL in the
-   `WWW-Authenticate` challenge when it is on the server's own origin, else from
-   the well-known path-inserted and then root URI on that origin.
+   `WWW-Authenticate` challenge, on any origin the destination limits below allow;
+   without that URL, or when the limits refuse it, from the well-known
+   path-inserted and then root URI on the server's own origin.
 2. Authorization server metadata (RFC 8414), trying the OAuth and OpenID Connect
    well-known locations in the specification's order. A server that does not
    advertise PKCE `S256` is refused.
@@ -116,17 +117,17 @@ token replaces the old one, and a rejected refresh token clears the tokens. A
 `403` with `insufficient_scope` asks for authorization again with the granted and
 challenged scopes together, then retries the request once.
 
-Every URL in discovery other than the server's own origin (authorization servers
-and their endpoints) is named by the server, so Tempest limits where it goes, as
-the MCP security best practices on server-side request forgery advise. It must be
-HTTPS; plain HTTP is accepted only from a server on loopback to a loopback
-address. The address actually connected to must be public or in the network the
-configured server's own address is in (loopback, private or link-local), so a
-remote server cannot point Tempest at `169.254.169.254`, `localhost` or an
-internal host, also not through DNS that changes between lookups. With an
-`HTTPS_PROXY`, the host is resolved and checked before the proxy connects.
-Redirects are never followed, responses are limited to 1 MiB and requests to 30
-seconds.
+Every URL in discovery other than the server's own origin (`resource_metadata`,
+authorization servers and their endpoints) is named by the server, so Tempest
+limits where it goes, as the MCP security best practices on server-side request
+forgery advise. It must be HTTPS; plain HTTP is accepted only from a server on
+loopback to a loopback address. The address actually connected to must be public
+or in the network the configured server's own address is in (loopback, private
+or link-local), so a remote server cannot point Tempest at `169.254.169.254`,
+`localhost` or an internal host, also not through DNS that changes between
+lookups. With an `HTTPS_PROXY`, the host is resolved and checked before the proxy
+connects. Redirects are never followed, responses are limited to 1 MiB and
+requests to 30 seconds.
 
 A server that needs authorization does not stop session startup. The first run
 authorizes it through the session's user: ACP clients that declare URL elicitation

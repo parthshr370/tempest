@@ -92,12 +92,6 @@ func origin(u *url.URL) string {
 	return strings.ToLower(u.Scheme) + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
-// sameOrigin reports whether raw has the configured server's origin.
-func (d *destinations) sameOrigin(raw string) bool {
-	u, err := url.Parse(raw)
-	return err == nil && u.Host != "" && origin(u) == d.origin
-}
-
 // destinations applies the policy to one configured server's OAuth traffic.
 type destinations struct {
 	server   string
@@ -118,13 +112,16 @@ func newDestinations(server string, mcpURL *url.URL) *destinations {
 		}}
 }
 
+// refusedError is a destination the policy does not let discovery reach.
+type refusedError struct{ error }
+
 // secure enforces the HTTPS rule for discovered URLs: OAuth 2.1 section 1.5
 // allows plain HTTP only on loopback, and only a loopback MCP server may
 // send Tempest to one.
 func (d *destinations) secure(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.Fragment != "" || u.User != nil {
-		return fmt.Errorf("invalid endpoint %q", raw)
+		return refusedError{fmt.Errorf("invalid endpoint %q", raw)}
 	}
 	switch {
 	case u.Scheme == "https":
@@ -132,9 +129,9 @@ func (d *destinations) secure(raw string) error {
 	case u.Scheme == "http" && d.loopback && loopbackHost(u.Hostname()):
 		return nil
 	case u.Scheme == "http" && loopbackHost(u.Hostname()):
-		return fmt.Errorf("endpoint %q uses plain HTTP on loopback, which only a loopback MCP server may name", raw)
+		return refusedError{fmt.Errorf("endpoint %q uses plain HTTP on loopback, which only a loopback MCP server may name", raw)}
 	}
-	return fmt.Errorf("endpoint %q must use HTTPS", raw)
+	return refusedError{fmt.Errorf("endpoint %q must use HTTPS", raw)}
 }
 
 // allowed returns the network classes beyond public that discovered URLs
@@ -171,7 +168,7 @@ func (d *destinations) check(ctx context.Context, addr netip.Addr) error {
 	if class == classPublic || (class != classReserved && d.allowed(ctx)[class]) {
 		return nil
 	}
-	return fmt.Errorf("mcp_auth: refusing to reach %s, a %s address named by server %s's OAuth metadata; only public addresses and the server's own network are allowed", addr, class, d.server)
+	return refusedError{fmt.Errorf("mcp_auth: refusing to reach %s, a %s address named by server %s's OAuth metadata; only public addresses and the server's own network are allowed", addr, class, d.server)}
 }
 
 // transport sends requests for the configured origin unchecked and checks
