@@ -305,8 +305,9 @@ func (l *agentListener) chunk(event agent.AgentEvent) {
 }
 
 // carriesOutput reports whether a stream event delivers response content:
-// text, reasoning or a tool call. The GenAI time-to-first-chunk excludes
-// events that only open or close an empty block.
+// text, reasoning or a tool call's name or arguments. The GenAI
+// time-to-first-chunk excludes events that only open or close an empty
+// block, such as a tool call start that carries nothing but its ID.
 func carriesOutput(event *types.StreamEvent) bool {
 	if event == nil {
 		return false
@@ -317,7 +318,7 @@ func carriesOutput(event *types.StreamEvent) bool {
 	case types.EvTextEnd, types.EvThinkingEnd:
 		return event.Content != ""
 	case types.EvToolCallStart, types.EvToolCallEnd:
-		return event.ToolCall != nil
+		return event.ToolCall != nil && (event.ToolCall.Name != "" || len(event.ToolCall.Arguments) != 0)
 	}
 	return false
 }

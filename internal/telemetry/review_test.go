@@ -288,8 +288,9 @@ func TestTokenMetricsCountCachedInputAndDiscardedAttempts(t *testing.T) {
 }
 
 // Time to first chunk runs from the attempt's send to its first output, not
-// to an empty block start, and a retried attempt's send time comes from the
-// retrying stream, however late its retry event is handled.
+// to an empty block start or a tool call start carrying only its ID, and a
+// retried attempt's send time comes from the retrying stream, however late
+// its retry event is handled.
 func TestTimeToFirstChunkMeasuresOutputFromTheRealSend(t *testing.T) {
 	tel := New(Options{Settings: config.OTelSettings{ServiceName: "tempest"}})
 	agt := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: testModel}})
@@ -306,6 +307,7 @@ func TestTimeToFirstChunkMeasuresOutputFromTheRealSend(t *testing.T) {
 		{Type: agent.EventMessageStart, At: at(time.Millisecond), Message: types.AssistantMessage{}},
 		update(100*time.Millisecond, types.StreamEvent{Type: types.EvTextStart}),
 		update(200*time.Millisecond, types.StreamEvent{Type: types.EvTextDelta}),
+		update(300*time.Millisecond, types.StreamEvent{Type: types.EvToolCallStart, ToolCall: &types.ContentBlock{Type: types.BlockToolCall, ID: "call-early"}}),
 		update(700*time.Millisecond, types.StreamEvent{Type: types.EvTextDelta, Delta: "hi"}),
 		// The attempt fails at 1s and is sent again 2s later, at 3s; the
 		// loop only handles the retry event at 10s.
