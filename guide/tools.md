@@ -131,7 +131,9 @@ way, with one shared match `limit`.
 
 The system prompt tells the model to batch known reads this way and to put independent
 tool calls in one response: the opening look at a task, searches, and edits or writes
-to different files. The agent loop already runs those concurrently.
+to different files. The agent loop already runs those concurrently. A known change-set
+(a function, its imports, its tests) goes out as one response of edits, and the tests
+that verify it run in the next response, never beside the edits they check.
 
 `read` takes more than files. Every text output below starts with the `[path#TAG]`
 header and accepts the same `path:START-END` / `path:START+COUNT` line ranges and
