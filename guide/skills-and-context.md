@@ -137,7 +137,9 @@ turns on `ls` and `find`.
   `git` leaves the session without a listing. rg blocks on a FIFO named
   `.ignore` or `.gitignore`, so when rg has listed no name by half the time
   left, the walk starts beside it: whichever finishes first is the listing, and
-  at the deadline rg's names are, or the walk's when rg has none. A remote
+  at the deadline rg's names are, or the walk's when rg has none. The loser is
+  stopped, and the listing waits for a stopped walk to end, at most until the
+  deadline. A remote
   environment lists its own workspace with the same code in 1.5 of the 2
   seconds, leaving the rest for its reply to arrive.
 - **Size.** The listed names fit `workspace_listing_max_bytes` (default 4096).
