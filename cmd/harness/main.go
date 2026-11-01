@@ -239,18 +239,17 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	if opts.Config.Environment() == "" && opts.resumeEnvironment.ID != "" {
 		stack.EnvironmentReference = opts.resumeEnvironment
 	}
-	var cwd string
-	if opts.Config.Environment() == "" && !environment.IsLocation(opts.resumeCwd) {
+	// A resumed session runs in its journal's workspace, so its context files
+	// and agent files come from there, not from where the command started.
+	cwd := opts.resumeCwd
+	if cwd == "" && opts.Config.Environment() == "" {
 		cwd, err = os.Getwd()
 		if err != nil {
 			fmt.Fprintf(stderr, "cwd error: %v\n", err)
 			return 1
 		}
-	} else {
-		cwd = opts.resumeCwd
-		if cwd == "" {
-			cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
-		}
+	} else if cwd == "" {
+		cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
 	}
 	// SIGINT/SIGTERM abort the run cleanly: tools are cancelled and joined and
 	// the journal records the aborted run. The first signal then restores the

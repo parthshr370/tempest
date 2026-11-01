@@ -67,9 +67,10 @@ type Loaded struct {
 	HookRuns        map[string]HookState
 	// EvalLanguages survives transcript compaction; process state doesn't.
 	EvalLanguages map[string]bool
-	// ContextFiles are the nested context files already surfaced, in order;
-	// like EvalLanguages they survive transcript compaction.
-	ContextFiles []ContextFileRecord
+	// ContextFiles are every tool result, a fork's prefix included, that
+	// delivered nested context files, in order, whether or not the
+	// transcript still holds it: a later rewind can bring one back.
+	ContextFiles []ContextDelivery
 	snapshots    map[string][]ptypes.Message
 	prefixes     map[string][]ptypes.Message
 
@@ -253,6 +254,11 @@ func loadContentsResolved(ctx context.Context, path string, contents []byte, wit
 				}
 				loaded.prefixes[head.ID] = append(loaded.prefixes[head.ID], message)
 			}
+			deliveries, err := prefixDeliveries(segment.Records, loaded.prefixes[head.ID])
+			if err != nil {
+				return nil, err
+			}
+			loaded.ContextFiles = append(loaded.ContextFiles, deliveries...)
 		}
 		entries = append(entries, entry)
 	}

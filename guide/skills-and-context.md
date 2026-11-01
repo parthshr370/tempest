@@ -7,6 +7,8 @@ and loads one context file per directory, loads a sticky `RULES.md` that survive
 compaction, expands safe `@file` imports, and registers skills from your agent
 directory, the project and `-skill` paths. Skill bodies load on demand through the
 `skill` tool or a `skill://` read, so nothing bloats the prompt until it is needed.
+A resumed session (`-resume`) runs in the working directory it was created in, so
+discovery walks up from there, not from the directory you resume it from.
 
 In each directory the first of these files that exists and is not blank loads:
 
@@ -74,10 +76,13 @@ first context file it finds there (same name order as above). Reading
   data: it refines shallower instructions for files under its directory, and the
   user's requests win over it. The system prompt never changes, so the provider's
   prompt cache keeps working.
-- Each directory surfaces once per session. The record of it is written into
-  the same journal entry as the tool result that carries the file, so a resumed
-  session neither shows it again nor spends its bytes twice, and a crash before
-  that result was saved leaves no record: the resumed session shows it again.
+- A directory surfaces once while the conversation holds the tool result that
+  carried its file. A rewind or reset to before that result, a fork made before
+  it, or a compaction that summarizes it away lets the file surface again on
+  the next read there; a fork made after it keeps it. The record is written
+  into the same journal entry as the tool result, so a resumed session neither
+  shows the file again nor spends its bytes twice, and a crash before that
+  result was saved leaves no record: the resumed session shows it again.
 - Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
   and nested files count against `context_files.max_bytes` together with the
   startup files. A cut file ends with a `[harness: cut at ...]` notice. The work

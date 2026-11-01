@@ -80,13 +80,19 @@ func reduce(loaded *Loaded, entries []Entry) {
 	var startOrder []*toolState
 	var runs []RunSummary
 	runIndex := map[string]int{}
+	// turns holds each run's latest assistant timestamp, which names the
+	// turn a tool result answers.
+	turns := map[string]int64{}
 
 	for _, entry := range entries {
 		switch e := entry.(type) {
 		case MessageEntry:
-			loaded.ContextFiles = append(loaded.ContextFiles, e.ContextFiles...)
+			if result, ok := e.Message.(ptypes.ToolResultMessage); ok && len(e.ContextFiles) > 0 {
+				loaded.ContextFiles = append(loaded.ContextFiles, ContextDelivery{Turn: turns[e.RunID], ToolCallID: result.ToolCallID, Files: e.ContextFiles})
+			}
 			replay := replayMessage{id: e.ID, runID: e.RunID, message: e.Message}
 			if assistant, ok := e.Message.(ptypes.AssistantMessage); ok {
+				turns[e.RunID] = assistant.Timestamp
 				clear(calls)
 				if assistant.StopReason != ptypes.StopError && assistant.StopReason != ptypes.StopAborted {
 					for _, block := range assistant.Content {

@@ -70,7 +70,7 @@ Review only the files named in the task. Report each finding with its path and l
 | `tools` | no | Allowlist, as a YAML list or a comma-separated string. Harness tool names, the Claude Code names `Read`, `Write`, `Edit`, `MultiEdit`, `Grep`, `Glob`, `LS`, `Bash`, `WebFetch`, `WebSearch`, `TodoWrite`, `Task`, or `mcp__*` names. Absent means the general child's tools; `[]` means none. |
 | `model` | no | `default`, `plan`, `smol`, or a model spec such as `openai-responses:gpt-6-luna`. Claude Code's `inherit`, `sonnet` and `opus` mean `default`; `haiku` means `smol`. A spec with an `@http(s)` endpoint is rejected: define the route under settings `providers`. |
 | `reasoning` | no | `off`, `minimal`, `low`, `medium` or `high`. |
-| `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string; an empty value is invalid. Used when the `task` call passes no `output_schema`. |
+| `output_schema` | no | JSON Schema for the child's final answer, as a YAML mapping or a JSON string. An empty string (`""`) is invalid; a key with no value, or `null`, means no schema. Used when the `task` call passes no `output_schema`. |
 
 The body below the header is the agent's instructions; it is required.
 

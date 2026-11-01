@@ -80,7 +80,7 @@ func TestNestedRefusesContextOutsideWorkspace(t *testing.T) {
 
 	nested := NewNested(NestedOptions{Root: root})
 	for _, dir := range []string{"link", "imp"} {
-		blocks, _, err := nested.Surface(context.Background(), filepath.Join(root, dir, "x.go"), false, false)
+		blocks, _, err := nested.Surface(context.Background(), filepath.Join(root, dir, "x.go"), false, false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +97,7 @@ func TestNestedSkipsNonRegularContextFiles(t *testing.T) {
 	writeAll(t, filepath.Join(root, "pipe", "x.go"), "package pipe\n")
 	fifo(t, filepath.Join(root, "pipe", "AGENTS.md"))
 	returnsInTime(t, "nested discovery of a FIFO", func() {
-		if _, _, err := NewNested(NestedOptions{Root: root}).Surface(context.Background(), filepath.Join(root, "pipe", "x.go"), false, false); err != nil {
+		if _, _, err := NewNested(NestedOptions{Root: root}).Surface(context.Background(), filepath.Join(root, "pipe", "x.go"), false, false, nil); err != nil {
 			t.Error(err)
 		}
 	})
