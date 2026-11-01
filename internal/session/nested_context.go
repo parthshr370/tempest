@@ -43,7 +43,7 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 		for _, delivery := range cfg.Loaded.ContextFiles {
 			files := make([]discovery.NestedFile, 0, len(delivery.Files))
 			for _, record := range delivery.Files {
-				files = append(files, discovery.NestedFile{Dir: record.Dir, Path: record.Path, Bytes: record.Bytes, Withheld: record.Withheld})
+				files = append(files, discovery.NestedFile{Dir: record.Dir, Path: record.Path, Bytes: record.Bytes, Withheld: record.Withheld, Frame: record.Frame})
 			}
 			deliveries.record(deliveryKey{turn: delivery.Turn, call: delivery.ToolCallID}, files)
 		}
@@ -75,7 +75,7 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 			if cfg.Journal != nil {
 				records := make([]journal.ContextFileRecord, 0, len(files))
 				for _, file := range files {
-					records = append(records, journal.ContextFileRecord{Dir: file.Dir, Path: file.Path, Bytes: file.Bytes, Withheld: file.Withheld})
+					records = append(records, journal.ContextFileRecord{Dir: file.Dir, Path: file.Path, Bytes: file.Bytes, Withheld: file.Withheld, Frame: file.Frame})
 				}
 				cfg.Journal.StageContextFiles(contextCallKey(ctx, call.ToolCall.ID), records)
 			}
@@ -93,7 +93,7 @@ func nestedContextHook(cfg StackConfig, cwd string, local bool) func(context.Con
 
 // deliveryKey names a tool result by its assistant turn's timestamp and its
 // call ID. Distinct turns may share both, so a result holds a delivered
-// file only while it also carries the file's frame.
+// file only while it also carries the file's whole frame.
 type deliveryKey struct {
 	turn int64
 	call string
@@ -151,9 +151,10 @@ func (d *contextDeliveries) shown(messages []ptypes.Message, current ptypes.Assi
 	return shown
 }
 
-// carries reports whether result still holds file: its frame is one of the
-// result's text blocks. A file recorded without a frame, the context file
-// the read showed whole, is held by its result alone.
+// carries reports whether result still holds file: the file's frame, the
+// exact block that delivered it, is one of the result's text blocks. A file
+// recorded without a frame, the context file the read showed whole, is held
+// by its result alone.
 func carries(result ptypes.ToolResultMessage, file discovery.NestedFile) bool {
 	if file.Bytes == 0 && !file.Withheld {
 		return true

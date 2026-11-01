@@ -77,8 +77,10 @@ first context file it finds there (same name order as above). Reading
   user's requests win over it. The system prompt never changes, so the provider's
   prompt cache keeps working.
 - A directory surfaces once while the conversation holds the tool result that
-  carried its file, with that file's frame still in it. Another result with
-  the same call ID and turn time does not count. A rewind or reset to before
+  carried its file, with that file's exact frame still in it: the journal
+  records each frame's SHA-256, so tool output that only looks like a frame
+  does not count, and neither does another result with the same call ID and
+  turn time. A rewind or reset to before
   that result, a fork made before it, or a compaction that summarizes it away
   lets the file surface again on the next read there; a fork made after it
   keeps it. The record is written

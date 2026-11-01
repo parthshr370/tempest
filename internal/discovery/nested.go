@@ -2,6 +2,8 @@ package discovery
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html"
@@ -19,11 +21,14 @@ import (
 // Path are root-relative slash paths; Bytes counts the content kept against
 // the context_files budgets. Withheld marks the file named instead of
 // loaded because the budget was spent; after it nothing more is looked up.
+// Frame is the hex SHA-256 of the block that delivered the file, empty for
+// a file recorded without one.
 type NestedFile struct {
 	Dir      string
 	Path     string
 	Bytes    int
 	Withheld bool
+	Frame    string
 }
 
 // NestedOptions configures on-read discovery of context files in
@@ -143,10 +148,11 @@ func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool, sh
 			return blocks, files, err
 		}
 		remaining -= file.Bytes
-		files = append(files, file)
 		if block != "" {
+			file.Frame = frameDigest(block)
 			blocks = append(blocks, block)
 		}
+		files = append(files, file)
 		if file.Withheld {
 			break
 		}
@@ -250,10 +256,17 @@ func nestedOpening(rel string) string {
 }
 
 // Frames reports whether text is the block Surface framed for f, the
-// text a tool result carries while it holds f. A file recorded without a
-// block, the context file a read showed whole, is framed by no text.
+// text a tool result carries while it holds f: all of it, so tool output
+// that only looks like a frame, or a frame of other content, does not stand
+// in for the delivery. A file recorded without a block, the context file a
+// read showed whole, is framed by no text.
 func (f NestedFile) Frames(text string) bool {
-	return strings.HasPrefix(text, nestedOpening(f.Path))
+	return f.Frame != "" && strings.HasPrefix(text, nestedOpening(f.Path)) && frameDigest(text) == f.Frame
+}
+
+func frameDigest(block string) string {
+	sum := sha256.Sum256([]byte(block))
+	return hex.EncodeToString(sum[:])
 }
 
 // relative maps an absolute tool path to a root-relative one, refusing
