@@ -217,9 +217,7 @@ func (m *Manager) ReadResource(ctx context.Context, raw string) (refs.Resource, 
 	if uri == "" {
 		return refs.Resource{URI: ResourceScheme + name + "/", Data: []byte(renderListing(name, snapshot)), Rendered: true}, nil, nil
 	}
-	callCtx, cancel := context.WithTimeout(ctx, peer.callTimeout)
-	defer cancel()
-	result, err := peer.call(callCtx, client, "resources/read", struct {
+	result, err := peer.call(ctx, client, "resources/read", struct {
 		URI string `json:"uri"`
 	}{uri})
 	if err != nil {

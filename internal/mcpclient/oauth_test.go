@@ -284,3 +284,28 @@ func TestMCPOAuthStreamRefusalKeepsCallsAndResumesAfterLogin(t *testing.T) {
 	fixture.Notify(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"after"}}`)
 	logs.expect(t, "after")
 }
+
+// callTimeout bounds each request, not the user: a login that a resource
+// read needs may take longer than one call, as it may for a tool call.
+func TestMCPOAuthLoginForAResourceReadOutlastsTheCallTimeout(t *testing.T) {
+	fixture := mcpoauthtest.New(t, mcpoauthtest.Options{Resources: true})
+	setup := oauthSetup{fixture: fixture, server: mcpconfig.Server{Name: "secure", Transport: "http", URL: fixture.URL, StartupTimeout: "10s", CallTimeout: "1s"}, dir: filepath.Join(t.TempDir(), "mcp-oauth")}
+	user := &browser{fixture: fixture}
+	slowUser := func(ctx context.Context, request question.Elicit) (question.ElicitResult, error) {
+		if len(user.asked) > 0 {
+			// The user takes longer than one call to sign in again.
+			time.Sleep(1500 * time.Millisecond)
+		}
+		return user.elicit(ctx, request)
+	}
+	manager := setup.open(t, slowUser)
+	if err := manager.Prepare(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	fixture.ExpireAccessTokens()
+	fixture.RevokeRefreshTokens()
+	resource, _, err := manager.ReadResource(t.Context(), "mcp://secure/fixture://note")
+	if err != nil || string(resource.Data) != "note text" {
+		t.Fatalf("read needing a slow login: %q %v", resource.Data, err)
+	}
+}

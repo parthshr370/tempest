@@ -211,8 +211,9 @@ func (s *server) execution(remoteName string, outputSchema *jsonschema.Schema) f
 	}
 }
 
-// call sends one request bounded by the server's call timeout. When the
-// server rejects it for authorization, the interactive login runs once and
+// call sends one request, which the client bounds by the server's call
+// timeout. When the server rejects it for authorization, the interactive
+// login runs once, bounded by its own timeout rather than the call's, and
 // the request is resent: the server refused it before processing it.
 func (s *server) call(ctx context.Context, client *mcpwire.Client, method string, params any) (json.RawMessage, error) {
 	var seen uint64
