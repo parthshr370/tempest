@@ -234,6 +234,23 @@ func (q *DurableQueues) removePendingLocked(id string) {
 	}
 }
 
+// WithdrawCompletion durably withdraws a job's completion notice the model
+// has not been given yet, because it already read the same terminal result
+// through wait. A notice that was never enqueued, or is already claimed or
+// consumed, is left alone.
+func (q *DurableQueues) WithdrawCompletion(ctx context.Context, jobID string) error {
+	q.mu.Lock()
+	id, ok := q.keys["job:"+jobID+":terminal"]
+	q.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := q.Cancel(ctx, id); err != nil && !errors.Is(err, ErrQueueTooLate) {
+		return err
+	}
+	return nil
+}
+
 // Take claims one head. Only the recorder's committed message removes it.
 func (q *DurableQueues) Take(ctx context.Context, kind work.QueueKind) ([]work.QueuedMessage, error) {
 	if err := ctx.Err(); err != nil {

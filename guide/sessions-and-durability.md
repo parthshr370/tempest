@@ -139,7 +139,9 @@ background jobs and consumes their result follow-ups before completing.
 A result follow-up is a short host notice in the transcript: job id, kind, state,
 exit code or reason, a bounded output or result preview, artifact paths, and the
 `wait`/`logs` calls that return the full details. No detached next run is started
-automatically.
+automatically. A `wait` that returns a job's finished state withdraws that job's
+pending notice (durably, as a queue cancellation), so the model never reads the same
+result twice and the run does not take an extra turn for it.
 
 ### Stop reasons
 

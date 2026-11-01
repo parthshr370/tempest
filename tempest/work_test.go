@@ -220,12 +220,13 @@ func TestDefaultStackHonorsConfiguredTaskOptIn(t *testing.T) {
 
 // TestNamedBashRunsInBackgroundWithoutAsync replays the benchmark's call
 // shape: bash with a name and no async starts a background job the model
-// then waits for by name.
+// then waits for by name. The wait returns the finished job, so its
+// completion notice is withdrawn: one DONE ends the run, and a second
+// model call (the 05-background duplicate turn) would exhaust the script.
 func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
-	// The job's completion follow-up opens one more turn after the first DONE.
-	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"},{"text":"DONE"}]`)
+	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"}]`)
 	owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, FauxScript: script})
 	if err != nil {
 		t.Fatal(err)
@@ -249,5 +250,12 @@ func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
 	}
 	if marker, err := os.ReadFile(filepath.Join(cwd, "marker.txt")); err != nil || string(marker) != "ready" {
 		t.Fatalf("marker=%q %v", marker, err)
+	}
+	transcript, err := json.Marshal(owner.Messages())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(transcript), "Background job notice") {
+		t.Fatalf("completion notice delivered after wait returned the job: %s", transcript)
 	}
 }

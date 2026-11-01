@@ -68,6 +68,52 @@ func TestDurableQueueAckRetryCancelAndClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestDurableQueueWithdrawCompletion: a completion notice withdrawn because
+// wait returned the job stays withdrawn after a reload, while a notice the
+// loop already claimed is still delivered.
+func TestDurableQueueWithdrawCompletion(t *testing.T) {
+	ctx := context.Background()
+	s := queueStore(t)
+	q := NewDurableQueues(s, nil, nil)
+	notice := func(jobID string) work.QueueInput {
+		return work.QueueInput{Kind: work.FollowUp, Text: "job " + jobID + " completed", Key: "job:" + jobID + ":terminal", SourceJobID: jobID}
+	}
+	if _, err := q.Enqueue(ctx, notice("job_waited")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.WithdrawCompletion(ctx, "job_waited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.WithdrawCompletion(ctx, "job_never_finished"); err != nil {
+		t.Fatal("no notice to withdraw", err)
+	}
+	if pending, _ := q.Pending(); pending || len(q.PendingJobIDs()) != 0 {
+		t.Fatalf("withdrawn notice still pending: %+v", q.Snapshot())
+	}
+	loaded, err := journal.Load(ctx, s.Path())
+	if err != nil || len(loaded.Queued) != 0 {
+		t.Fatalf("withdrawal lost on reload: %+v %v", loaded.Queued, err)
+	}
+	restored := NewDurableQueues(s, loaded, nil)
+	if again, err := restored.Enqueue(ctx, notice("job_waited")); err != nil || len(restored.Snapshot()) != 0 || again.SourceJobID != "job_waited" {
+		t.Fatalf("redelivery after reload: %+v %v", again, err)
+	}
+
+	claimed, err := q.Enqueue(ctx, notice("job_claimed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if taken, err := q.Take(ctx, work.FollowUp); err != nil || len(taken) != 1 || taken[0].ID != claimed.ID {
+		t.Fatalf("take=%+v %v", taken, err)
+	}
+	if err := q.WithdrawCompletion(ctx, "job_claimed"); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.Snapshot(); len(got) != 1 || got[0].ID != claimed.ID {
+		t.Fatalf("claimed notice withdrawn: %+v", got)
+	}
+}
 func TestDurableQueueConcurrentKeyAndBounds(t *testing.T) {
 	s := queueStore(t)
 	q := NewDurableQueues(s, nil, nil)
