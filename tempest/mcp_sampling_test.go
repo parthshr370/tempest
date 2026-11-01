@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -203,6 +205,63 @@ func TestSessionMCPSamplingChargesAttemptsAFallbackDiscarded(t *testing.T) {
 	if spent.Input <= failed.Input || spent.Output <= failed.Output {
 		t.Fatalf("sampling receipt %+v leaves out the attempt the fallback discarded (%+v)", spent, failed)
 	}
+}
+
+// mcp_sampling_model is routed like a role model, as in a CLI run: the
+// session's backup models back the session's model, not it, and the key the
+// caller gave for the session model's endpoint does not follow it to
+// another endpoint.
+func TestSessionMCPSamplingModelRoutesOnItsOwn(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	sample := func(t *testing.T, endpoint string) (types.AssistantMessage, []string) {
+		mu.Lock()
+		requests = nil
+		mu.Unlock()
+		stack := &StackConfig{MCP: session.MCPClientSettings{Sampling: session.MCPSamplingSettings{ModelSpec: "openai:sampler@" + server.URL + endpoint, AllowHeadless: true}}}
+		provider := ProviderConfig{ModelID: "openai:root@" + server.URL + "/root", APIKey: "root-key", FallbackModels: []string{"openai:backup@" + server.URL + "/backup"}, Env: func(string) string { return "" }}
+		mcp := MCPServerConfig{Name: "fixture", Transport: "stdio", Command: mcpFixtureServer, Permission: "allow", Sampling: true}
+		s, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{MCPServers: []MCPServerConfig{mcp}}, Stack: stack, Provider: provider})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(context.Background())
+		sampling := s.core.sampling
+		final, err := sampling.stream(t.Context(), sampling.model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("hi")}}}, &types.SimpleStreamOptions{}).Result(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return *final, append([]string(nil), requests...)
+	}
+	t.Run("no session backups", func(t *testing.T) {
+		// The backup has no key for its endpoint, so a switch to it would
+		// end on its own credential error instead of the sampler's 503.
+		final, sent := sample(t, "/root")
+		if final.Model != "sampler" || len(sent) != 1 || sent[0] != "/root/chat/completions Bearer root-key" {
+			t.Fatalf("sampling ended on %s (%s) after %v, want the sampling model's own failure", final.Model, final.ErrorMessage, sent)
+		}
+	})
+	t.Run("session key stays on its endpoint", func(t *testing.T) {
+		final, sent := sample(t, "/sampling")
+		for _, request := range sent {
+			if strings.Contains(request, "root-key") {
+				t.Fatalf("the session model's key reached the sampling endpoint: %v", sent)
+			}
+		}
+		if final.Model != "sampler" || !strings.Contains(final.ErrorMessage, "missing API key") {
+			t.Fatalf("sampling ended on %s (%s), want the sampler's own missing key", final.Model, final.ErrorMessage)
+		}
+	})
 }
 
 func TestSessionMCPSamplingAsksOnFirstUse(t *testing.T) {
