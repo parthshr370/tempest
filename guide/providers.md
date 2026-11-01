@@ -86,7 +86,10 @@ model reasons, or not, at OpenAI's default. The catalog lists the gpt-6 family
 (`gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra`, their `-pro` variants, `gpt-6.1-sol`,
 `gpt-6.1-terra` and their `-pro` variants) with reasoning, a 1,050,000-token context
 and per-token prices, so runs on them report `cost_usd`. Those prices are the
-standard tier; OpenAI's higher rate for prompts over 272,000 tokens is not modeled.
+standard tier. The catalog has one price per model, so the higher rate published for
+prompts of 272,000 tokens or more (twice the input and cache prices, 1.5 times the
+output price) is not modeled: for such a request, `cost_usd` and a `-max-cost`
+budget count the standard rate and understate the spend.
 
 Tempest never adds a reasoning effort on its own. With `-reasoning` unset or `off`,
 no effort is sent and the model reasons at OpenAI's default; it does not quietly
@@ -118,14 +121,23 @@ sets `fallback_models.default` above the settings files, in the usual
 uses the default role's list; an empty list turns backups off for that role.
 `serve` and `mcp` take `-fallback-model` for their sessions, and SDK sessions use
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
-Each backup is a full route with its own endpoint and credential. A backup on another
-provider never inherits the primary's `@<base-url>`, key or token. Request-level
-credentials are bound the same way: an API key, header or query parameter a caller sets
-on the request options, and the key `GetApiKey` resolves for the primary's provider,
-were given for the primary's provider and endpoint. A backup on another provider, or
-at another endpoint, never receives them, on the switching turn or any later one; it
-authenticates with its own credential, or on later turns with the key `GetApiKey`
-resolves for the backup's provider. `doctor` lists each role's backups under it.
+Each backup is a full route with its own endpoint and credential. The SDK's explicit
+`ProviderConfig.APIKey`, `AuthToken` and `BaseURL` were given for the route the
+primary resolves to: its provider and endpoint once its `@<base-url>`, the endpoint
+settings, the environment (including the default model an empty `ModelID` takes from
+`ANTHROPIC_DEFAULT_SONNET_MODEL`) and the provider default apply. A backup, or an
+agent preset on its own model, keeps them only when it resolves to that same provider
+and endpoint. One on another provider gets none of the three; one on the same
+provider at another endpoint, including a backup without the primary's `@<base-url>`
+that therefore goes to the configured endpoint, keeps `BaseURL` but not the key or
+token.
+Request-level credentials are bound the same way: an API key, header or query
+parameter a caller sets on the request options was given for the primary's provider
+and endpoint, and a backup on another provider or endpoint never receives it, on the
+switching turn or any later one. `GetApiKey` is asked for the key of the provider each
+request goes to, the backup's included, on every turn including the one that switches;
+a backup it has no key for authenticates with its own credential. `doctor` lists each
+role's backups under it.
 
 A backup gets the request only when the model is **unavailable**, after the model's
 own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts

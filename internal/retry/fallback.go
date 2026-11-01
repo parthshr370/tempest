@@ -90,6 +90,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 	if opts != nil && opts.CredentialRoute != (types.Route{}) {
 		issued = opts.CredentialRoute
 	}
+	switched := false
 	for {
 		var status int
 		attemptOpts := cloneOptions(opts, func(received types.ProviderResponse, receivedModel types.Model) error {
@@ -100,6 +101,11 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 			return nil
 		})
 		attemptOpts.CredentialRoute = issued
+		if switched {
+			// A backup's key comes from the caller's resolver for its own
+			// provider, as the first model's did before the request started.
+			attemptOpts.BindAPIKey(model)
+		}
 		// Admission belongs to this chain's switches, not to anything the
 		// candidate's stream might chain itself.
 		attemptOpts.AdmitFallback = nil
@@ -120,7 +126,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 		}
 		fallback := types.ModelFallback{From: model, To: next, Reason: string(reason), Attempts: attempts, Index: index}
 		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &fallback})
-		model = next
+		model, switched = next, true
 		// The backup is called only once the caller has admitted the switch
 		// (the agent loop journals it first) and nothing cancelled the request
 		// meanwhile; only then is its first attempt announced.

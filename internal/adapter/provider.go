@@ -144,23 +144,35 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 
 // ForModel derives the routing for another model spec from cfg, as a backup
 // model or an agent preset on its own model needs. cfg's endpoint and
-// credential overrides (BaseURL, APIKey, AuthToken) were given for cfg's own
-// model, so a spec on another provider drops all three and resolves its own
-// from the provider registry and Env, and a spec on the same provider that
-// names another @endpoint gets no key or token. Every derived route goes
-// through here, so an override never follows a model to another provider.
+// credential overrides (BaseURL, APIKey, AuthToken) were given for the route
+// cfg resolves to: its provider and endpoint after the model spec, flags,
+// environment and provider defaults apply. A spec that resolves to another
+// provider drops all three and resolves its own from the provider registry
+// and Env; one that resolves to another endpoint of the same provider keeps
+// BaseURL (it is the configured endpoint) but gets no key or token. Every
+// derived route goes through here, so an override never follows a model to
+// another provider or endpoint.
 func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
 	derived := cfg
 	derived.ModelID = spec
-	from, to := parseModelSpec(cfg.ModelID), parseModelSpec(spec)
-	switch {
-	case firstNonEmpty(to.Provider, "anthropic") != firstNonEmpty(from.Provider, "anthropic"):
-		derived.BaseURL, derived.APIKey, derived.AuthToken = "", "", ""
-	case to.BaseURL != "" && to.BaseURL != firstNonEmpty(from.BaseURL, cfg.BaseURL):
-		derived.APIKey, derived.AuthToken = "", ""
-	}
-	if to.Provider == "openai-chatgpt" {
+	if parseModelSpec(spec).Provider == "openai-chatgpt" {
 		derived.MaxTokens = 0
+	}
+	env := cfg.Env
+	if env == nil {
+		env = os.Getenv
+	}
+	// Both sides are resolved exactly as NewProviderRouter resolves them, so
+	// an empty ModelID (the environment's default model) or a dropped inline
+	// @endpoint is compared by where the requests actually go. A route that
+	// does not resolve gets no overrides; building it reports the error.
+	from, fromErr := resolveRoute(cfg, env)
+	to, toErr := resolveRoute(derived, env)
+	switch {
+	case fromErr != nil || toErr != nil || from.Model.Provider != to.Model.Provider:
+		derived.BaseURL, derived.APIKey, derived.AuthToken = "", "", ""
+	case types.RouteOf(from.Model) != types.RouteOf(to.Model):
+		derived.APIKey, derived.AuthToken = "", ""
 	}
 	return derived
 }

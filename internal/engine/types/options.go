@@ -35,9 +35,15 @@ type StreamOptions struct {
 	// per-request credential never reaches another provider or endpoint.
 	// Zero means the route of the model the request is sent with; a stream
 	// function that forwards a request to a different model sets it first.
-	CredentialRoute Route  `json:"-"`
-	DisableEnvAuth  bool   `json:"-"`
-	Transport       string `json:"transport,omitempty"`
+	CredentialRoute Route `json:"-"`
+	// APIKeyFor, when set, resolves the API key for a provider (the agent's
+	// GetApiKey). BindAPIKey applies it for the model a request is sent to,
+	// so a stream function that forwards a request to another model (a
+	// backup) resolves that model's key the same way its first model did.
+	// It may be called from the stream's goroutine.
+	APIKeyFor      func(provider string) string `json:"-"`
+	DisableEnvAuth bool                         `json:"-"`
+	Transport      string                       `json:"transport,omitempty"`
 	// The Go seam uses a plain string map; header suppression can be added when a
 	// caller needs it.
 	Headers  map[string]string `json:"headers,omitempty"`
@@ -65,6 +71,30 @@ type StreamOptions struct {
 	// satisfy. Providers with native structured output constrain the text
 	// response to it; tool calls stay unconstrained. Nil asks for free text.
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+}
+
+// BindAPIKey prepares the options' credentials for a request sent to model.
+// Credentials without a CredentialRoute were given for model. When APIKeyFor
+// resolves a key for model's provider, that key is bound to model's route; if
+// the other credentials were bound to another route they are dropped with it,
+// since they were never meant for model.
+func (o *StreamOptions) BindAPIKey(model Model) {
+	route := RouteOf(model)
+	if o.CredentialRoute == (Route{}) {
+		o.CredentialRoute = route
+	}
+	if o.APIKeyFor == nil {
+		return
+	}
+	key := o.APIKeyFor(model.Provider)
+	if key == "" {
+		return
+	}
+	o.APIKey = key
+	if route != o.CredentialRoute {
+		o.Headers, o.Query, o.NoAuth = nil, nil, false
+		o.CredentialRoute = route
+	}
 }
 
 // SimpleStreamOptions is the higher-level option bag whose reasoning level is

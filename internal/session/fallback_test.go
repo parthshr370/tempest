@@ -398,6 +398,29 @@ func TestFallbackSwitchThatCannotBeJournaledNeverCallsTheBackup(t *testing.T) {
 	}
 }
 
+// A listener that fails on the switch refuses its admission like a journal
+// failure: the run returns that error, the backup is never called, and the
+// waiting fallback chain is released instead of deadlocking.
+func TestFallbackSwitchAListenerRefusesNeverCallsTheBackup(t *testing.T) {
+	rig := newFallbackRig(t, newFallbackStore(t), http.StatusServiceUnavailable, nil, nil)
+	refused := errors.New("listener refused the switch")
+	rig.agent.Subscribe(func(_ context.Context, ev agent.AgentEvent) error {
+		if ev.Type == agent.EventModelFallback {
+			return refused
+		}
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rig.agent.PromptText(ctx, "do it")
+	if ctx.Err() != nil {
+		t.Fatal("a refused switch deadlocked the run")
+	}
+	if !errors.Is(errors.Join(err, result.Err), refused) || rig.backup.callCount() != 0 {
+		t.Fatalf("run = %+v err=%v backup calls=%d", result, err, rig.backup.callCount())
+	}
+}
+
 // A crash while the switch is being taken, after the journal append, leaves
 // a run that resumes on the backup; the crashed run never called it.
 func TestFallbackCrashAtTheSwitchResumesOnTheBackup(t *testing.T) {
