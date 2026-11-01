@@ -142,6 +142,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
 	logConfigWarnings(opts.Config)
+	tel := startTelemetry(opts.Config, false)
+	defer stopTelemetry(tel)
 	if opts.Prompt == "" && opts.Resume == "" && !opts.Continue {
 		fmt.Fprintln(stderr, "usage: tempest -p <prompt> [-model <id>] [-output-format text|json|stream-json] [-max-turns N] [-max-cost USD] [-max-wall-time DURATION] (tempest -help lists flags and commands)")
 		return 1
@@ -229,6 +231,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}
 
 	stack := session.StackConfigFromConfig(opts.Config)
+	stack.Telemetry = tel
 	if opts.Config.Environment() == "" && opts.resumeEnvironment.ID != "" {
 		stack.EnvironmentReference = opts.resumeEnvironment
 	}

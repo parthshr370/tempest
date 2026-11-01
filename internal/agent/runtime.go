@@ -103,6 +103,10 @@ type AgentOptions struct {
 	Hooks          *hooks.Runner
 	Extensions     ExtensionRuntime
 	Child          bool
+	// Trace starts a span for each run, model request and tool call: the
+	// run's context carries it to providers, tools and child agents, and
+	// events are delivered under it (see internal/tracecontext).
+	Trace bool
 	// PrepareNextTurn is called after each turn for a stateless config swap.
 	PrepareNextTurn func() *AgentLoopTurnUpdate
 	// PrepareNextTurnWithContext is the stateful variant — preferred when set;
@@ -183,6 +187,7 @@ type Agent struct {
 	Hooks                      *hooks.Runner
 	Extensions                 ExtensionRuntime
 	Child                      bool
+	Trace                      bool
 	PrepareNextTurn            func() *AgentLoopTurnUpdate
 	PrepareNextTurnWithContext func(c ShouldStopAfterTurnContext) *AgentLoopTurnUpdate
 	PrepareNextTurnE           func(context.Context, ShouldStopAfterTurnContext) (*AgentLoopTurnUpdate, error)
@@ -275,6 +280,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		Hooks:                      opts.Hooks,
 		Extensions:                 opts.Extensions,
 		Child:                      opts.Child,
+		Trace:                      opts.Trace,
 		PrepareNextTurn:            opts.PrepareNextTurn,
 		PrepareNextTurnWithContext: opts.PrepareNextTurnWithContext,
 		PrepareNextTurnE:           opts.PrepareNextTurnE,
@@ -654,6 +660,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		Hooks:            a.Hooks,
 		Extensions:       a.Extensions,
 		Child:            a.Child,
+		Trace:            a.Trace,
 		ConvertToLlm:     convertToLlm,
 		TransformContext: a.TransformContext,
 		GetAPIKey:        a.GetApiKey,

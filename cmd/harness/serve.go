@@ -136,6 +136,10 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	}
 	stack := session.StackConfigFromConfig(cfg)
 	stack.PermissionPolicy = toolPolicy(stderr, cfg)
+	// serve -listen keeps metrics for /metrics even without an OTLP endpoint.
+	tel := startTelemetry(cfg, command == "serve" && listen != "")
+	defer stopTelemetry(tel)
+	stack.Telemetry = tel
 	if cfg.FauxScript() != "" {
 		provider, model, err := loadFauxScript(cfg.FauxScript())
 		if err != nil {
