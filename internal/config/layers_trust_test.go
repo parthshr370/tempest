@@ -23,38 +23,40 @@ func sessionStartHook(command string) string {
 // gatedSamples holds, for every key a repository needs trust (or the
 // operator) to set, a value that changes the resolved runtime configuration.
 var gatedSamples = map[string]string{
-	"mcp_config":                `"repo-mcp.json"`,
-	"mcp_servers":               `[{"name":"repo","transport":"stdio","command":"repo-server"}]`,
-	"lsp_config":                `"repo-lsp.json"`,
-	"debug_adapters":            `{"repo":{"command":"repo-adapter"}}`,
-	"cloud_policy":              `"repo-policy.json"`,
-	"permission_mode_default":   `"bypass"`,
-	"permission_allow_tools":    `["bash"]`,
-	"permission_deny_tools":     `["bash"]`,
-	"plan":                      `true`,
-	"attach":                    `["/etc/hosts"]`,
-	"agent_dir":                 `"/tmp/repo-agent"`,
-	"session_dir":               `"/tmp/repo-sessions"`,
-	"log_file":                  `"/tmp/repo.log"`,
-	"faux_script":               `"/tmp/repo-faux.json"`,
-	"skill_paths":               `["/tmp/repo-private-skills"]`,
-	"enable_lsp":                `true`,
-	"enable_web":                `true`,
-	"providers":                 `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`,
-	"anthropic_base_url":        `"https://repo.example"`,
-	"openai_base_url":           `"https://repo.example/v1"`,
-	"web_search_url":            `"https://repo.example/search"`,
-	"model":                     `"openai:m@https://repo.example/v1"`,
-	"plan_model":                `"openai:m@https://repo.example/v1"`,
-	"smol_model":                `"openai:m@https://repo.example/v1"`,
-	"fallback_models":           `{"default":["openai:m@https://repo.example/v1"]}`,
-	"no_hooks":                  `true`,
-	"disableAllHooks":           `true`,
-	"trusted_hook_projects":     `["/"]`,
-	"trusted_provider_projects": `["/"]`,
-	"environment":               `"repo"`,
-	"environments":              `{"repo":{"argv":["repo-env"]}}`,
-	"hooks":                     sessionStartHook("printf repo > marker"),
+	"mcp_config":                  `"repo-mcp.json"`,
+	"mcp_servers":                 `[{"name":"repo","transport":"stdio","command":"repo-server"}]`,
+	"lsp_config":                  `"repo-lsp.json"`,
+	"debug_adapters":              `{"repo":{"command":"repo-adapter"}}`,
+	"cloud_policy":                `"repo-policy.json"`,
+	"permission_mode_default":     `"bypass"`,
+	"permission_allow_tools":      `["bash"]`,
+	"permission_deny_tools":       `["bash"]`,
+	"plan":                        `true`,
+	"attach":                      `["/etc/hosts"]`,
+	"agent_dir":                   `"/tmp/repo-agent"`,
+	"session_dir":                 `"/tmp/repo-sessions"`,
+	"log_file":                    `"/tmp/repo.log"`,
+	"faux_script":                 `"/tmp/repo-faux.json"`,
+	"skill_paths":                 `["/tmp/repo-private-skills"]`,
+	"enable_lsp":                  `true`,
+	"enable_web":                  `true`,
+	"providers":                   `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`,
+	"anthropic_base_url":          `"https://repo.example"`,
+	"openai_base_url":             `"https://repo.example/v1"`,
+	"web_search_url":              `"https://repo.example/search"`,
+	"model":                       `"openai:m@https://repo.example/v1"`,
+	"plan_model":                  `"openai:m@https://repo.example/v1"`,
+	"smol_model":                  `"openai:m@https://repo.example/v1"`,
+	"fallback_models":             `{"default":["openai:m@https://repo.example/v1"]}`,
+	"no_hooks":                    `true`,
+	"disableAllHooks":             `true`,
+	"trusted_hook_projects":       `["/"]`,
+	"workspace_listing_max_files": `1000000`,
+	"workspace_listing_max_bytes": `1048576`,
+	"trusted_provider_projects":   `["/"]`,
+	"environment":                 `"repo"`,
+	"environments":                `{"repo":{"argv":["repo-env"]}}`,
+	"hooks":                       sessionStartHook("printf repo > marker"),
 }
 
 // caseVariants are spellings encoding/json would match to key: other ASCII
@@ -179,6 +181,11 @@ var projectSettingTrust = []struct {
 	{"permission_mode_default", `"bypass"`, gateExecutable},
 	{"permission_deny_tools", `null`, gateExecutable},
 	{"plan", `false`, gateExecutable},
+	// Raises a session-start listing cap above the operator's value.
+	{"workspace_listing_max_files", `10001`, gateExecutable},
+	{"workspace_listing_max_files", `1000000`, gateExecutable},
+	{"workspace_listing_max_bytes", `4097`, gateExecutable},
+	{"workspace_listing_max_bytes", `1048576`, gateExecutable},
 	// Chooses where credentials go.
 	{"providers", `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`, gateCredentials},
 	{"anthropic_base_url", `"https://repo.example"`, gateCredentials},
@@ -219,18 +226,15 @@ var projectSettingTrust = []struct {
 	{"retry_max_delay_ms", `100`, gateNone},
 	{"retry_jitter_min", `0`, gateNone},
 	{"retry_jitter_max", `1`, gateNone},
-	// The session-start listing reads only path names inside the workspace,
-	// which the model lists with its own tools anyway, and sends them to the
-	// provider the operator chose. Its caps bound prompt size, which the
-	// repository already controls through its uncapped AGENTS.md, and file
-	// reading also stops at a fixed deadline. Every value applies without
-	// trust in both directions, like max_tokens.
+	// The session-start listing may be turned off or its caps lowered below
+	// the operator's values; the operator's value, true and the default caps
+	// here, applies again unchanged.
 	{"workspace_listing", `false`, gateNone},
 	{"workspace_listing", `true`, gateNone},
 	{"workspace_listing_max_files", `1`, gateNone},
-	{"workspace_listing_max_files", `1000000`, gateNone},
+	{"workspace_listing_max_files", `10000`, gateNone},
 	{"workspace_listing_max_bytes", `1`, gateNone},
-	{"workspace_listing_max_bytes", `1048576`, gateNone},
+	{"workspace_listing_max_bytes", `4096`, gateNone},
 }
 
 // Every settings key has an audited trust class, and each repository value
@@ -431,6 +435,55 @@ func TestProjectSkillPathsAndLSPNeedTrust(t *testing.T) {
 	resolved = w.mustResolve()
 	if !slices.Equal(resolved.SkillPaths(), []string{outside}) || !resolved.LSP().Enabled {
 		t.Fatal("trusted project skill_paths or enable_lsp not applied")
+	}
+}
+
+// An untrusted repository may turn the session-start listing off or lower
+// its caps, but never above the operator's values: not by a larger number,
+// not by enabling a listing the operator turned off, and not by null or an
+// invalid value that would fall back to the built-in default. Trust lifts
+// the ceiling.
+func TestProjectListingCapsCannotRaiseTheOperatorsValues(t *testing.T) {
+	const operator = `{"workspace_listing":false,"workspace_listing_max_files":500,"workspace_listing_max_bytes":2048}`
+	operatorPolicy := WorkspaceListing{Disabled: true, MaxFiles: 500, MaxBytes: 2048}
+	for _, testCase := range []struct {
+		name    string
+		project string
+		want    WorkspaceListing
+		dropped []string
+	}{
+		{"raise", `{"workspace_listing":true,"workspace_listing_max_files":600,"workspace_listing_max_bytes":3000}`, operatorPolicy, []string{"workspace_listing", "workspace_listing_max_files", "workspace_listing_max_bytes"}},
+		{"lower", `{"workspace_listing":false,"workspace_listing_max_files":200,"workspace_listing_max_bytes":1024}`, WorkspaceListing{Disabled: true, MaxFiles: 200, MaxBytes: 1024}, nil},
+		{"equal", `{"workspace_listing_max_files":500,"workspace_listing_max_bytes":2048}`, operatorPolicy, nil},
+		{"null resets to the default", `{"workspace_listing_max_files":null,"workspace_listing_max_bytes":null}`, operatorPolicy, []string{"workspace_listing_max_files", "workspace_listing_max_bytes"}},
+		{"invalid", `{"workspace_listing_max_files":0,"workspace_listing_max_bytes":-1}`, operatorPolicy, []string{"workspace_listing_max_files", "workspace_listing_max_bytes"}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, operator)
+			w.write(w.projectPath(), testCase.project)
+			resolved := w.mustResolve()
+			if got := resolved.WorkspaceListing(); got != testCase.want {
+				t.Fatalf("untrusted listing policy = %+v, want %+v", got, testCase.want)
+			}
+			warnings := strings.Join(resolved.Warnings(), "\n")
+			for _, key := range testCase.dropped {
+				if !strings.Contains(warnings, key+" (needs -trust-project-hooks") {
+					t.Fatalf("warnings %q do not name the dropped %s", warnings, key)
+				}
+			}
+			if testCase.dropped == nil && warnings != "" {
+				t.Fatalf("warnings = %q", warnings)
+			}
+		})
+	}
+
+	w := newLayerWorkspace(t)
+	w.write(w.user, operator)
+	w.write(w.projectPath(), `{"workspace_listing":true,"workspace_listing_max_files":600,"workspace_listing_max_bytes":3000}`)
+	w.flags.TrustProjectHooks = BoolInput{Value: true, Set: true}
+	if got, want := w.mustResolve().WorkspaceListing(), (WorkspaceListing{MaxFiles: 600, MaxBytes: 3000}); got != want {
+		t.Fatalf("trusted listing policy = %+v, want %+v", got, want)
 	}
 }
 

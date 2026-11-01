@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -10,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -115,6 +115,115 @@ func TestWorkspaceListingWalkOutsideGitHonoursGitignore(t *testing.T) {
 	}
 }
 
+// The walk applies every .gitignore at its own level, as git does. The same
+// tree is listed by the walk and then, once it is a repository, by git; the
+// two must agree, and the cases the walk must get right are named.
+func TestWorkspaceListingWalkMatchesGitForNestedIgnoreFiles(t *testing.T) {
+	// Isolate git from the machine's global excludes file.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	writeListingFiles(t, dir, map[string]string{
+		".gitignore":              "*.log\n!keep.log\n/docs/build\ndocs/out\nvendor/\n*.gen\ncache/\n!cache/keep.txt\n\\#hash.txt\ntrail.txt   \n**/tmp\n",
+		"a.log":                   "",
+		"keep.log":                "",
+		"sub/b.log":               "",
+		"sub/keep.log":            "",
+		"docs/build/x.txt":        "",
+		"docs/out/y.txt":          "",
+		"nested/docs/out/z.txt":   "",
+		"nested/docs/build/w.txt": "",
+		"vendor/v.go":             "",
+		"nested/vendor/w.go":      "",
+		"top.gen":                 "",
+		"cache/keep.txt":          "",
+		"#hash.txt":               "",
+		"trail.txt":               "",
+		"a/b/tmp/t.txt":           "",
+		"pkg/.gitignore":          "secret.key\n!*.gen\n/local.txt\n",
+		"pkg/secret.key":          "",
+		"pkg/deep/secret.key":     "",
+		"pkg/x.gen":               "",
+		"pkg/local.txt":           "",
+		"pkg/deep/local.txt":      "",
+		"pkg/public.go":           "",
+	})
+
+	walked := listedLines(t, takeListing(t, nil, dir, config.WorkspaceListing{}))
+	want := []string{".gitignore", "keep.log", "nested/docs/build/w.txt", "nested/docs/out/z.txt", "pkg/.gitignore", "pkg/deep/local.txt", "pkg/public.go", "pkg/x.gen", "sub/keep.log"}
+	if got := strings.Join(walked, ","); got != strings.Join(want, ",") {
+		t.Fatalf("walk listed %q, want %q", got, strings.Join(want, ","))
+	}
+	runListingGit(t, dir, "init", "-q")
+	if got := listedLines(t, takeListing(t, nil, dir, config.WorkspaceListing{})); strings.Join(got, ",") != strings.Join(walked, ",") {
+		t.Fatalf("walk %q differs from git ls-files %q", walked, got)
+	}
+}
+
+// A .gitignore that is not a regular file is never opened: a FIFO would
+// block the read forever. The listing still returns well inside its deadline
+// and, like git, names only regular files and symbolic links.
+func TestWorkspaceListingWalkSkipsNonRegularIgnoreFile(t *testing.T) {
+	dir := t.TempDir()
+	writeListingFiles(t, dir, map[string]string{"a.go": "package a\n", "pkg/b.go": "package pkg\n"})
+	for _, name := range []string{".gitignore", "pkg/.gitignore"} {
+		if err := syscall.Mkfifo(filepath.Join(dir, name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	type outcome struct {
+		listing string
+		err     error
+	}
+	listed := make(chan outcome, 1)
+	go func() {
+		listing, err := WorkspaceListing(context.Background(), nil, dir, config.WorkspaceListing{})
+		listed <- outcome{listing, err}
+	}()
+	select {
+	case result := <-listed:
+		if result.err != nil {
+			t.Fatalf("listing: %v", result.err)
+		}
+		if got := strings.Join(listedLines(t, result.listing), ","); got != "a.go,pkg/b.go" {
+			t.Fatalf("listed %q", got)
+		}
+	case <-time.After(workspaceListingTimeout + time.Second):
+		// Release the blocked reader so the test binary can exit.
+		for _, name := range []string{".gitignore", "pkg/.gitignore"} {
+			if writer, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+				writer.Close()
+			}
+		}
+		t.Fatal("listing blocked on a FIFO .gitignore past its deadline")
+	}
+}
+
+// An ignore file larger than the read bound is skipped whole, as git skips
+// one past its own limit, instead of being read into memory.
+func TestWorkspaceListingWalkSkipsOversizedIgnoreFile(t *testing.T) {
+	dir := t.TempDir()
+	padding := strings.Repeat("#\n", gitignoreMaxBytes/len("#\n"))
+	writeListingFiles(t, dir, map[string]string{"a.go": "package a\n", "big.txt": "x\n", ".gitignore": "big.txt\n" + padding})
+
+	if got := strings.Join(listedLines(t, takeListing(t, nil, dir, config.WorkspaceListing{})), ","); got != ".gitignore,a.go,big.txt" {
+		t.Fatalf("listed %q", got)
+	}
+}
+
+// After the deadline the listing returns without starting the walk.
+func TestWorkspaceListingExpiredContextDoesNotWalk(t *testing.T) {
+	dir := t.TempDir()
+	writeListingFiles(t, dir, map[string]string{"a.go": "package a\n"})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	listing, err := WorkspaceListing(ctx, nil, dir, config.WorkspaceListing{})
+	if listing != "" || !errors.Is(err, context.Canceled) {
+		t.Fatalf("listing=%q err=%v", listing, err)
+	}
+}
+
 func TestWorkspaceListingEmptyOrDisabledHasNoBlock(t *testing.T) {
 	if listing := takeListing(t, nil, t.TempDir(), config.WorkspaceListing{}); listing != "" {
 		t.Fatalf("empty workspace listing = %q", listing)
@@ -208,10 +317,15 @@ func TestWorkspaceListingEscapesNamesThatCouldBreakTheFrame(t *testing.T) {
 	}
 }
 
+// remoteListingLease serves workspace through the environment RPC with the
+// operations a daemon binds, and returns the host's remote lease.
 func remoteListingLease(t *testing.T, workspace string, capabilities environment.Capabilities) environment.Lease {
 	t.Helper()
 	daemon, err := envlocal.New(workspace)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BindEnvironment(daemon, ToolsOptions{SessionDataDir: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 	clientStream, serverStream := net.Pipe()
@@ -237,11 +351,11 @@ func remoteListingLease(t *testing.T, workspace string, capabilities environment
 	return lease
 }
 
-func TestWorkspaceListingRemoteRunsGitThroughEnvironmentExec(t *testing.T) {
+func TestWorkspaceListingRemoteRunsGitInTheEnvironment(t *testing.T) {
 	workspace := t.TempDir()
 	writeListingFiles(t, workspace, map[string]string{"remote.go": "package remote\n"})
 	runListingGit(t, workspace, "init", "-q")
-	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Exec})
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
 	if environment.IsLocal(lease) {
 		t.Fatal("rpc lease reports local")
 	}
@@ -253,10 +367,50 @@ func TestWorkspaceListingRemoteRunsGitThroughEnvironmentExec(t *testing.T) {
 	}
 }
 
-func TestWorkspaceListingRemoteWithoutExecIsSkipped(t *testing.T) {
+// The environment's git must ignore GIT_* routing in the daemon's own
+// environment, exactly as the local listing does: here GIT_INDEX_FILE names
+// another repository's index, whose file names must not reach the model.
+func TestWorkspaceListingRemoteIgnoresInheritedGitRouting(t *testing.T) {
+	workspace, outside := t.TempDir(), t.TempDir()
+	writeListingFiles(t, workspace, map[string]string{"remote.go": "package remote\n"})
+	writeListingFiles(t, outside, map[string]string{"outside-secret-name.txt": "x\n"})
+	runListingGit(t, workspace, "init", "-q")
+	runListingGit(t, outside, "init", "-q")
+	runListingGit(t, outside, "add", ".")
+	t.Setenv("GIT_INDEX_FILE", filepath.Join(outside, ".git", "index"))
+	t.Setenv("GIT_WORK_TREE", outside)
+
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
+	for name, listing := range map[string]string{
+		"local":  takeListing(t, nil, workspace, config.WorkspaceListing{}),
+		"remote": takeListing(t, lease, workspace, config.WorkspaceListing{}),
+	} {
+		if got := strings.Join(listedLines(t, listing), ","); got != "remote.go" {
+			t.Errorf("%s listing followed inherited GIT_* routing: %q", name, got)
+		}
+	}
+}
+
+// A remote workspace that is not a git work tree gets the same ignore-aware
+// walk as a local one, run inside the environment.
+func TestWorkspaceListingRemoteWalksNonGitWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	writeListingFiles(t, workspace, map[string]string{"main.py": "print(1)\n", "pkg/.gitignore": "secret.key\n", "pkg/secret.key": "private\n", "pkg/public.py": "x = 1\n"})
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
+
+	listing := takeListing(t, lease, t.TempDir(), config.WorkspaceListing{})
+	if !strings.Contains(listing, `source="directory walk"`) {
+		t.Fatalf("remote non-git listing:\n%s", listing)
+	}
+	if got, want := strings.Join(listedLines(t, listing), ","), "main.py,pkg/.gitignore,pkg/public.py"; got != want {
+		t.Fatalf("listed %q, want %q", got, want)
+	}
+}
+
+func TestWorkspaceListingRemoteWithoutSearchIsSkipped(t *testing.T) {
 	workspace := t.TempDir()
 	writeListingFiles(t, workspace, map[string]string{"remote.go": "package remote\n"})
-	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files})
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Exec})
 
 	listing, err := WorkspaceListing(context.Background(), lease, workspace, config.WorkspaceListing{})
 	if listing != "" || !errors.Is(err, environment.ErrUnsupported) {
@@ -264,31 +418,27 @@ func TestWorkspaceListingRemoteWithoutExecIsSkipped(t *testing.T) {
 	}
 }
 
-// truncatedExecLease answers exec_argv with output cut mid-name, as the
-// environment's byte bound does.
-type truncatedExecLease struct{ output string }
+// The environment returns whole names up to its reply bound and says there
+// are more, so a huge remote workspace still yields a usable listing.
+func TestWorkspaceListingRemoteReplyStopsAtByteBound(t *testing.T) {
+	const nameLength = 100
+	fileCount := remoteListingMaxBytes/nameLength + 1
+	workspace := t.TempDir()
+	files := make(map[string]string, fileCount)
+	for index := range fileCount {
+		name := fmt.Sprintf("%05d", index)
+		files[name+strings.Repeat("x", nameLength-1-len(name))] = ""
+	}
+	writeListingFiles(t, workspace, files)
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
 
-func (truncatedExecLease) Reference() environment.Reference {
-	return environment.Reference{ID: "remote", Generation: "1", Cwd: "."}
-}
-func (truncatedExecLease) Capabilities() environment.Capabilities {
-	return environment.Capabilities{environment.Exec}
-}
-func (lease truncatedExecLease) Call(context.Context, environment.Call) (json.RawMessage, error) {
-	return json.Marshal(environment.ExecResult{Output: lease.output, Truncated: true})
-}
-func (truncatedExecLease) Cancel(context.Context, string) (environment.Cancellation, error) {
-	return environment.Cancellation{}, nil
-}
-func (truncatedExecLease) Lookup(context.Context, string) (environment.Outcome, error) {
-	return environment.Outcome{}, nil
-}
-func (truncatedExecLease) Close() error { return nil }
-
-func TestWorkspaceListingRemoteTruncatedOutputDropsPartialName(t *testing.T) {
-	listing := takeListing(t, truncatedExecLease{output: "a.go\x00b.go\x00partial/na"}, "", config.WorkspaceListing{})
+	listing := takeListing(t, lease, workspace, config.WorkspaceListing{MaxBytes: remoteListingMaxBytes * 2})
 	lines := listedLines(t, listing)
-	if got := strings.Join(lines, ","); got != "a.go,b.go,[truncated: stopped reading after 2 paths; use find or ls for the rest]" {
-		t.Fatalf("listed %q", got)
+	read := len(lines) - 1
+	if want := fmt.Sprintf("[truncated: stopped reading after %d paths; use find or ls for the rest]", read); lines[read] != want {
+		t.Fatalf("last line %q, want %q", lines[read], want)
+	}
+	if read == 0 || read*nameLength > remoteListingMaxBytes {
+		t.Fatalf("remote reply held %d names of %d bytes, bound %d", read, nameLength, remoteListingMaxBytes)
 	}
 }

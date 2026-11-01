@@ -16,11 +16,21 @@ turns on `ls` and `find`.
 
 - **Source.** In a git work tree the listing is `git ls-files --cached --others
   --exclude-standard`: tracked files plus untracked files that are not ignored,
-  relative to the working directory. Outside git it is a directory walk that
-  skips `.git` and honours the root `.gitignore`. Both stop reading after
-  `workspace_listing_max_files` paths (default 10000). Listing gets 2 seconds:
-  a walk that runs out of time lists what it found, and a slower `git` leaves
-  the session without a listing.
+  relative to the working directory. `git` runs with every inherited `GIT_*`
+  variable removed and `core.fsmonitor` off, so it reads the working directory's
+  own repository and runs no configured program. Outside git it is a directory
+  walk that skips `.git`, names only regular files and symbolic links, and
+  applies every `.gitignore` in the tree as git does: each file's patterns
+  apply in its own directory and below, a deeper file outranks the ones above
+  it, the last matching pattern wins, `!` re-includes a file but nothing under
+  an excluded directory, a `/` at the start or in the middle anchors a pattern
+  to its file's directory, and `**`, trailing `/`, `\#`, `\!` and trailing
+  spaces follow git. It does not read `.git/info/exclude`, `core.excludesFile`
+  or `.ignore` files, and it opens only a regular `.gitignore` (never a FIFO
+  or a symbolic link) of at most 1 MiB; a larger one is skipped. Both stop
+  reading after `workspace_listing_max_files` paths (default 10000). Listing
+  gets 2 seconds, a hard limit: a walk that runs out of time lists what it
+  found, and a slower `git` leaves the session without a listing.
 - **Size.** The listed names fit `workspace_listing_max_bytes` (default 4096).
   Past it the listing folds to per-directory file counts (`internal/tools/ (40
   files)`); if that still does not fit it is cut, and a final
@@ -32,18 +42,26 @@ turns on `ls` and `find`.
   sent it; the block is added to each provider request.
 - **Snapshot.** The listing is taken when the session is created and journaled
   with the session. Resume and forks of the same workspace reuse those bytes and
-  never list again, so the cached prompt prefix does not change. Delegated
-  children reuse their parent's listing. A fork into another working directory
-  or environment lists its own.
-- **Remote environments.** A remote workspace runs the same `git ls-files`
-  through the environment's exec service in one call (at most 64 KiB of
-  output). Without exec, or outside git, a remote session starts without a
-  listing.
+  never list again, so the cached prompt prefix does not change. A fork into
+  another working directory or environment lists its own.
+- **Delegated children.** A child that works in its parent's directory (an
+  `explore` child, or a `general` child outside git) sends its parent's
+  listing bytes. A `general` child in its own git worktree lists that worktree
+  when it starts, so it sees files committed after the parent's listing, and
+  journals the bytes in its own journal; a resumed child sends them again.
+- **Remote environments.** The environment takes the listing on its own host
+  with the same code, in one `workspace_listing` call of its search service:
+  `git` there gets the same environment clean-up, and a workspace outside git
+  gets the same walk. One reply carries at most 64 KiB of names and says when
+  there are more. An environment without the search service, or one that does
+  not know the call, leaves the session without a listing.
 - **Off switch.** Set `"workspace_listing": false` in settings (or
   `HARNESS_WORKSPACE_LISTING=false`, or `-c workspace_listing=false`) to stop new
   sessions from taking one. A session that already has a listing keeps it.
   `tempest doctor` shows the current policy and `tempest config show` the layer
-  that set it.
+  that set it. A repository's own settings may turn the listing off or lower its
+  caps, never raise them above yours without trust; see
+  [Configuration](configuration.md#project-settings-and-trust).
 
 ## Skill format
 

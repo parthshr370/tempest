@@ -52,21 +52,18 @@ below every settings file.
 Repository files are untrusted. Settings in `.harness/settings.json`,
 `.harness/settings.local.json`, and the profiles defined in them that run code, read
 local files into the model context, write outside the repository, widen permissions,
-turn on web tools, or choose where credentials go apply only after the operator
-trusts the workspace:
+turn on web tools, raise the operator's workspace listing caps, or choose where
+credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model`, `smol_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
 dropped are named in one warning in the log, in `tempest doctor`, and in
-`config show`. The `workspace_listing` keys apply either way, on or off and with
-caps raised or lowered: the listing holds only path names inside the workspace,
-which the model can list with its own tools, and a repository already adds what it
-likes to the prompt through its `AGENTS.md`.
+`config show`.
 
 An untrusted repository can narrow permissions and capabilities and never widen
 them. Its `"permission_mode_default": "plan"`, `"plan": true` and
@@ -81,6 +78,17 @@ layer that added an entry, or to the operator's layer when the project added non
 Allow lists, looser modes and `"plan": false` are dropped with the trust warning. In
 a trusted workspace these keys are a settings layer like the rest: the project's deny
 list replaces the user's and its `null` unsets it.
+
+The session-start [workspace listing](skills-and-context.md#workspace-listing)
+works the same way. An untrusted repository may turn it off
+(`"workspace_listing": false`) or lower `workspace_listing_max_files` and
+`workspace_listing_max_bytes` to any whole number from 1 up to the operator's value:
+the merged value of the managed, user, profile, environment, flag and `-c` layers,
+or the built-in default when none sets it. A larger value, `"workspace_listing":
+true` when the operator turned the listing off, and a `null` or invalid value, which
+would fall back to the default, are dropped with the trust warning. Trust lifts the
+ceiling. The caps bound prompt size and the work a session does before its first
+request, which is the operator's budget to set.
 
 Trusted project `hooks` add to the hooks below them instead of replacing them: each
 event's array from `settings.json`, then from `settings.local.json`, is appended to the

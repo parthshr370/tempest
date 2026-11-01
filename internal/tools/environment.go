@@ -143,7 +143,8 @@ func environmentCallKey(ctx context.Context, sessionID, fallback string) string 
 	return fallback
 }
 
-// BindEnvironment installs the ordinary workspace tools on a Local daemon lease.
+// BindEnvironment installs the ordinary workspace tools and the session-start
+// workspace listing on a Local daemon lease.
 func BindEnvironment(local *envlocal.Local, options ToolsOptions) error {
 	options.Environment = local
 	options.ImageInput = true
@@ -153,5 +154,6 @@ func BindEnvironment(local *envlocal.Local, options ToolsOptions) error {
 			return err
 		}
 	}
+	bindWorkspaceListing(local)
 	return nil
 }

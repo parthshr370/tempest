@@ -76,7 +76,7 @@ func ToolCapability(name string) Capability {
 	switch name {
 	case "read", "read_bytes", "stat", "write", "edit", "hashline", "ls", "view_image":
 		return Files
-	case "grep", "find":
+	case "grep", "find", "workspace_listing":
 		return Search
 	case "bash", "exec_argv":
 		return Exec
@@ -127,6 +127,20 @@ type FileInfo struct {
 	Size      int64  `json:"size"`
 	Mode      uint32 `json:"mode"`
 	Directory bool   `json:"directory"`
+}
+
+// ListingRequest asks for the session-start listing of the workspace root,
+// taken on the environment's host.
+type ListingRequest struct {
+	MaxFiles int `json:"maxFiles"`
+}
+
+// ListingResult holds whole relative file names, sorted, and More when the
+// environment stopped before the end of the workspace.
+type ListingResult struct {
+	Source string   `json:"source"`
+	Paths  []string `json:"paths"`
+	More   bool     `json:"more,omitempty"`
 }
 
 // ExecRequest launches argv without interpreting any argument as shell syntax.

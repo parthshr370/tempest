@@ -555,8 +555,9 @@ type trustGate int
 const (
 	gateNone trustGate = iota
 	// gateExecutable settings run code, read local files into the model
-	// context, write outside the repository, widen permissions, or open a
-	// network channel the model can send repository contents through.
+	// context, write outside the repository, widen permissions, open a
+	// network channel the model can send repository contents through, or
+	// raise a resource cap above the operator's value.
 	gateExecutable
 	// gateCredentials settings choose where credentials are sent.
 	gateCredentials
@@ -567,39 +568,43 @@ const (
 // projectGates holds what a repository setting needs. For a key
 // narrowsPermissions checks by value, it is what a loosening value needs.
 var projectGates = map[string]trustGate{
-	"hooks":                     gateExecutable,
-	"mcp_config":                gateExecutable,
-	"mcp_servers":               gateExecutable,
-	"lsp_config":                gateExecutable,
-	"enable_lsp":                gateExecutable,
-	"debug_adapters":            gateExecutable,
-	"cloud_policy":              gateExecutable,
-	"permission_mode_default":   gateExecutable,
-	"permission_allow_tools":    gateExecutable,
-	"permission_deny_tools":     gateExecutable,
-	"plan":                      gateExecutable,
-	"enable_web":                gateExecutable,
-	"attach":                    gateExecutable,
-	"skill_paths":               gateExecutable,
-	"agent_dir":                 gateExecutable,
-	"session_dir":               gateExecutable,
-	"log_file":                  gateExecutable,
-	"faux_script":               gateExecutable,
-	"providers":                 gateCredentials,
-	"anthropic_base_url":        gateCredentials,
-	"openai_base_url":           gateCredentials,
-	"web_search_url":            gateCredentials,
-	"no_hooks":                  gateOperator,
-	"trusted_hook_projects":     gateOperator,
-	"trusted_provider_projects": gateOperator,
-	"environment":               gateOperator,
-	"environments":              gateOperator,
+	"hooks":                       gateExecutable,
+	"mcp_config":                  gateExecutable,
+	"mcp_servers":                 gateExecutable,
+	"lsp_config":                  gateExecutable,
+	"enable_lsp":                  gateExecutable,
+	"debug_adapters":              gateExecutable,
+	"cloud_policy":                gateExecutable,
+	"permission_mode_default":     gateExecutable,
+	"permission_allow_tools":      gateExecutable,
+	"permission_deny_tools":       gateExecutable,
+	"plan":                        gateExecutable,
+	"enable_web":                  gateExecutable,
+	"attach":                      gateExecutable,
+	"skill_paths":                 gateExecutable,
+	"agent_dir":                   gateExecutable,
+	"session_dir":                 gateExecutable,
+	"log_file":                    gateExecutable,
+	"faux_script":                 gateExecutable,
+	"providers":                   gateCredentials,
+	"anthropic_base_url":          gateCredentials,
+	"openai_base_url":             gateCredentials,
+	"web_search_url":              gateCredentials,
+	"no_hooks":                    gateOperator,
+	"trusted_hook_projects":       gateOperator,
+	"trusted_provider_projects":   gateOperator,
+	"environment":                 gateOperator,
+	"environments":                gateOperator,
+	"workspace_listing":           gateExecutable,
+	"workspace_listing_max_files": gateExecutable,
+	"workspace_listing_max_bytes": gateExecutable,
 }
 
 // projectGate classifies one repository setting. A model with an @http(s)
 // endpoint suffix sends the route's credential there, so it needs provider
-// trust; so does a backup chain naming one.
-func projectGate(key string, value *settingsNode) trustGate {
+// trust; so does a backup chain naming one. operator is the operator's own
+// settings, nil for none.
+func projectGate(key string, value *settingsNode, operator *fileSettings) trustGate {
 	switch key {
 	case "model", "plan_model", "smol_model", "fallback_models":
 		if namesModelEndpoint(value) {
@@ -607,7 +612,7 @@ func projectGate(key string, value *settingsNode) trustGate {
 		}
 		return gateNone
 	}
-	if narrowsPermissions(key, value) {
+	if narrowsPermissions(key, value, operator) {
 		return gateNone
 	}
 	return projectGates[key]
@@ -636,11 +641,16 @@ func namesModelEndpoint(value *settingsNode) bool {
 var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
 
 // narrowsPermissions reports whether a repository value can only tighten the
-// permissions and capabilities the layers below it set, so it applies without
-// trust: plan mode, web tools off, and a deny list, which an untrusted
-// repository adds to the lists below it (unionProjectDenies). Every other
-// value of these keys, null included, could lift an operator's restriction.
-func narrowsPermissions(key string, value *settingsNode) bool {
+// permissions, capabilities and resource caps the layers below it set, so it
+// applies without trust: plan mode, web tools off, a deny list, which an
+// untrusted repository adds to the lists below it (unionProjectDenies), and
+// the session-start listing off or capped at most at the operator's values.
+// Every other value of these keys, null included, could lift an operator's
+// restriction.
+func narrowsPermissions(key string, value *settingsNode, operator *fileSettings) bool {
+	if operator == nil {
+		operator = &fileSettings{}
+	}
 	switch key {
 	case "plan":
 		return equalSettings(value, boolNode(true))
@@ -650,24 +660,48 @@ func narrowsPermissions(key string, value *settingsNode) bool {
 		return equalSettings(value, planModeNode)
 	case "permission_deny_tools":
 		return value.isArray
+	case "workspace_listing":
+		operatorLists := operator.WorkspaceListing == nil || *operator.WorkspaceListing
+		return equalSettings(value, boolNode(false)) || operatorLists && equalSettings(value, boolNode(true))
+	case "workspace_listing_max_files":
+		return withinCap(value, operator.ListingMaxFiles, DefaultWorkspaceListingMaxFiles)
+	case "workspace_listing_max_bytes":
+		return withinCap(value, operator.ListingMaxBytes, DefaultWorkspaceListingMaxBytes)
 	}
 	return false
+}
+
+// withinCap reports whether value is a whole number from 1 to the operator's
+// cap, or to builtin when the operator set none.
+func withinCap(value *settingsNode, operator *int, builtin int) bool {
+	var limit int
+	if json.Unmarshal(value.scalar, &limit) != nil || limit < 1 {
+		return false
+	}
+	ceiling := builtin
+	if operator != nil {
+		ceiling = *operator
+	}
+	return limit <= ceiling
 }
 
 // profileGate classifies a setting of a profile as a repository would change
 // it. Hooks are operator-only there: a profile replaces hook arrays, which
 // would remove the operator's hooks, while a project file appends to them.
-func profileGate(key string, value *settingsNode) trustGate {
+func profileGate(key string, value *settingsNode, operator *fileSettings) trustGate {
 	if key == "hooks" {
 		return gateOperator
 	}
-	return projectGate(key, value)
+	return projectGate(key, value, operator)
 }
 
 // projectTrust is what the operator trusts a workspace's settings to do.
+// operator is the operator's own settings, the ceiling for caps a repository
+// may only lower; nil means the built-in values.
 type projectTrust struct {
 	executable  bool
 	credentials bool
+	operator    *fileSettings
 }
 
 func (t projectTrust) any() bool { return t.executable || t.credentials }
@@ -711,7 +745,7 @@ func (l *settingsLayer) applyProjectGates(trust projectTrust) []droppedSetting {
 	}
 	var dropped []droppedSetting
 	for _, key := range slices.Sorted(maps.Keys(l.members)) {
-		gate := classify(key, l.members[key])
+		gate := classify(key, l.members[key], trust.operator)
 		if reason := trust.refusal(gate); reason != "" {
 			dropped = append(dropped, droppedSetting{l, key, gate, reason})
 			delete(l.members, key)
@@ -799,9 +833,9 @@ func keepUnremovable(profiles []*settingsLayer, unset *settingsLayer, trust proj
 		remaining := &settingsLayer{name: profile.name, file: profile.file, profile: profile.profile, isFile: profile.isFile, members: map[string]*settingsNode{}}
 		for _, key := range slices.Sorted(maps.Keys(profile.members)) {
 			value := profile.members[key]
-			gate := profileGate(key, value)
+			gate := profileGate(key, value, trust.operator)
 			if trust.refusal(gate) == "" {
-				gate = profileGate(key, null)
+				gate = profileGate(key, null, trust.operator)
 			}
 			if reason := trust.refusal(gate); reason != "" {
 				remaining.members[key] = value
@@ -1114,6 +1148,7 @@ func (r *layerResolver) projectTrust(root string) projectTrust {
 	return projectTrust{
 		executable:  r.options.trustHooks || listsProject(r.operator.TrustedHookProjects, root),
 		credentials: r.options.trustProviders || listsProject(r.operator.TrustedProviderProjects, root),
+		operator:    &r.operator,
 	}
 }
 

@@ -170,12 +170,3 @@ func searchRelative(base, p string) string {
 	}
 	return strings.TrimPrefix(strings.TrimPrefix(p, base), "/")
 }
-
-// loadGitignore reads the root .gitignore when present.
-func loadGitignore(root *os.Root) *gitignoreMatcher {
-	data, err := root.ReadFile(".gitignore")
-	if err != nil {
-		return nil
-	}
-	return parseGitignore(string(data))
-}
