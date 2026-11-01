@@ -617,6 +617,22 @@ func TestInvalidEnvironmentValueFailsOnlyWhenItWins(t *testing.T) {
 	}
 }
 
+// An invalid variable for an object setting names the variable, and any flag
+// or -c override of that object, a member of it, or null replaces it.
+func TestInvalidObjectVariableNamesItselfAndYieldsToOverrides(t *testing.T) {
+	w := newLayerWorkspace(t)
+	w.env["OTEL_EXPORTER_OTLP_HEADERS"] = "no-pairs-here"
+	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_HEADERS") {
+		t.Fatalf("err = %v, want it to name the variable", err)
+	}
+	for _, override := range []string{`otel.headers={"x-team":"a"}`, "otel.headers.x-team=a", "otel.headers=null", "otel=null"} {
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{override}}
+		if _, err := w.resolve(); err != nil {
+			t.Errorf("-c %s: %v", override, err)
+		}
+	}
+}
+
 // A field name that contains "token" or "key" is not a credential label: the
 // message after it stays readable, while credentials inside it stay masked.
 func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {

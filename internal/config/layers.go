@@ -490,7 +490,7 @@ func environmentLayer(lookup func(string) string) (*settingsLayer, map[string]er
 		}
 		node, err := parseEnvironmentValue(input.kind, value)
 		if err != nil {
-			invalid[input.key] = err
+			invalid[input.key] = fmt.Errorf("%s: %w", input.env, err)
 			continue
 		}
 
@@ -1290,13 +1290,29 @@ func (r *layerResolver) resolve(root string) (*layeredSettings, error) {
 	}
 	result.attribute(merged, stack, r.set.requirements, r.options.managedPath, defaultOrigins)
 	for _, key := range slices.Sorted(maps.Keys(r.set.invalidEnvironment)) {
-		switch result.sources[key].Layer {
-		case LayerFlag, LayerOverride, LayerRequirement:
-		default:
+		if !r.set.replacesEnvironment(strings.Split(key, ".")) {
 			return nil, &Error{Field: key, Err: r.set.invalidEnvironment[key]}
 		}
 	}
 	return result, nil
+}
+
+// replacesEnvironment reports whether a flag, a -c override or a managed
+// requirement sets path, a member of it or an object above it, so an invalid
+// variable for path would not have taken effect.
+func (set *layerSet) replacesEnvironment(path []string) bool {
+	for _, layer := range append([]*settingsLayer{set.flags}, set.overrides...) {
+		if _, exact, shadowing := memberAt(layer.members, path); exact || shadowing {
+			return true
+		}
+	}
+	for _, requirement := range set.requirements {
+		common := min(len(path), len(requirement.path))
+		if slices.Equal(path[:common], requirement.path[:common]) {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeEffective merges the stack, applies requirements, then fills built-in
