@@ -96,7 +96,12 @@ func TestCaseVariantKeysNeverReachDecoding(t *testing.T) {
 	baseline := newLayerWorkspace(t)
 	baseline.flags.Profile = StringInput{Value: "review", Set: true}
 	baseline.write(baseline.user, `{"profiles":{"review":{}}}`)
-	want := runtimeView(baseline.mustResolve())
+	base := baseline.mustResolve()
+	want := runtimeView(base)
+	baseLayers := map[string]string{}
+	for _, setting := range base.Settings() {
+		baseLayers[setting.Key] = setting.Layer
+	}
 
 	placements := map[string]func(w *layerWorkspace, member string){
 		"project":       func(w *layerWorkspace, member string) { w.write(w.projectPath(), "{"+member+"}") },
@@ -125,9 +130,16 @@ func TestCaseVariantKeysNeverReachDecoding(t *testing.T) {
 					if got := runtimeView(resolved); !reflect.DeepEqual(got, want) {
 						t.Fatalf("%q in %s changed the runtime configuration", variant, placement)
 					}
+					// An object setting lists one dotted key per member
+					// (context_files.fallback); its top-level name is the
+					// one to compare with the variant.
 					for _, setting := range resolved.Settings() {
-						if strings.EqualFold(strings.SplitN(setting.Key, ".", 2)[0], variant) && setting.Key != key {
+						top := strings.SplitN(setting.Key, ".", 2)[0]
+						if strings.EqualFold(top, variant) && top != key {
 							t.Fatalf("config show lists %q", setting.Key)
+						}
+						if top == key && setting.Layer != baseLayers[setting.Key] {
+							t.Fatalf("config show lists %q from %s, want the baseline's %q", setting.Key, setting.Layer, baseLayers[setting.Key])
 						}
 					}
 					if !strings.Contains(strings.Join(resolved.Warnings(), "\n"), variant) {
