@@ -443,14 +443,20 @@ func (s *Session) resumePending(ctx context.Context) (*Run, error) {
 		return nil, ErrClosed
 	}
 	if !busy {
-		for _, task := range c.jobs.Tasks.Snapshot() {
-			// Only summaries are speculative. Ordinary task resume keeps its
-			// settled-decision contract for callers and host alarm processing.
-			if task.Owner == "" && task.Definition != session.CompactionTaskName {
-				if err := c.jobs.Tasks.ResumeTask(ctx, task.ID); err != nil {
-					return nil, err
+		err := c.drainTasks(func() error {
+			for _, task := range c.jobs.Tasks.Snapshot() {
+				// Only summaries are speculative. Ordinary task resume keeps its
+				// settled-decision contract for callers and host alarm processing.
+				if task.Owner == "" && task.Definition != session.CompactionTaskName {
+					if err := c.jobs.Tasks.ResumeTask(ctx, task.ID); err != nil {
+						return err
+					}
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 	c.admission.Lock()

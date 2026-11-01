@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"go.harness.dev/harness/internal/procgroup"
 )
 
 // Events is the supported command-hook lifecycle, in display order.
@@ -442,14 +444,14 @@ func execute(ctx context.Context, command Command, event, cwd string, payload []
 	cmd.Env = append(os.Environ(), "TEMPEST_PROJECT_DIR="+cwd, "CLAUDE_PROJECT_DIR="+cwd)
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = time.Second
 	var stdout, stderr cappedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	// Descendants that closed their pipes must not escape the lifecycle command.
 	if cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL)
 	}
 	report := Report{Event: event, Command: command.Command, ExitCode: 0, Stdout: stdout.String(), Stderr: stderr.String(), TimedOut: errors.Is(ctx.Err(), context.DeadlineExceeded)}
 	if err != nil {

@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"go.harness.dev/harness/internal/procgroup"
 )
 
 func debugpyAdapter(t *testing.T) string {
@@ -71,7 +73,7 @@ func TestDAPRealDebugpyLifecycle(t *testing.T) {
 						}
 						process.stateMu.Lock()
 						for group := range process.programGroups {
-							if !errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+							if !errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 								releasedBeforeExit.Store(true)
 							}
 						}
@@ -181,7 +183,7 @@ func TestDAPRealDebugpyLifecycle(t *testing.T) {
 			}
 			waitDAPCondition(t, "launched debuggee group survived teardown", func() bool {
 				for _, group := range groups {
-					if !errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+					if !errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 						return false
 					}
 				}
@@ -218,7 +220,7 @@ func TestDAPStartInheritedPipeDoesNotHang(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		if err := procgroup.Signal(pid, syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			t.Error(err)
 		}
 	})
@@ -293,6 +295,15 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			heartbeat := filepath.Join(directory, "heartbeat")
 			target := exec.Command(executable, "-test.run=^TestDAPAttachTarget$", "--", "attach-target", heartbeat)
 			target.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			// debugserver stops the target with SIGSTOP before ptrace(PT_DETACH).
+			// When Go's async preemption signal arrives first, PT_DETACH fails
+			// with EBUSY, Delve then ends debugserver, and the kernel kills the
+			// still-traced target. That's outside Tempest; guide/tools.md
+			// documents it. Without preemption signals the test sees only
+			// Tempest's detach handling.
+			target.Env = append(os.Environ(), "GODEBUG=asyncpreemptoff=1")
+			var targetOutput bytes.Buffer
+			target.Stdout, target.Stderr = &targetOutput, &targetOutput
 			if err := target.Start(); err != nil {
 				t.Fatal(err)
 			}
@@ -354,7 +365,7 @@ func TestDAPAttachDetachesWithoutKillingTarget(t *testing.T) {
 			waitDAPCondition(t, "attached process didn't resume after detach", func() bool {
 				select {
 				case <-exited:
-					t.Fatal("attached user process was killed")
+					t.Fatalf("attached user process exited: %v\n%s", target.ProcessState, targetOutput.String())
 				default:
 				}
 				current, err := os.ReadFile(heartbeat)

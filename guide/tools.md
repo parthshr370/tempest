@@ -378,10 +378,35 @@ breakpoint, stack, scopes, variables, evaluation, continuation and termination.
 Set `TEMPEST_TEST_DEBUGPY_ADAPTER` to a venv's `debugpy-adapter` to run that optional
 test without adding the venv to `PATH`.
 
+On macOS, detaching Delve from a Go program can kill the program, and Tempest
+can't prevent it. Delve's tracer, Apple's `debugserver`, stops the program before
+`ptrace(PT_DETACH)`. When Go's async preemption signal (`SIGURG`) arrives first,
+`PT_DETACH` fails with `EBUSY` (`debugserver` logs it), Delve ends `debugserver`
+anyway, and the kernel kills the still-traced program with `SIGKILL`. In stress
+runs with the CPU oversubscribed this hit about 6% of detaches, and none when the
+program ran with `GODEBUG=asyncpreemptoff=1`. Start a Go program with that
+setting if it must survive a detach.
+
 The stack owns the adapter and launched target process groups. It holds its host
 process permit until both are gone. Close and unanswered adapter requests send a
-short bounded disconnect before killing owned groups; attached targets are
-detached with `terminateDebuggee:false` and are never killed by Tempest.
+disconnect bounded to 500 ms before killing owned groups; attached targets are
+detached with `terminateDebuggee:false` and are never killed by Tempest. A
+debugger still traces the target until its detach finishes, and killing it then
+can leave the target stopped or killed, so Tempest kills an attach adapter only
+after it answers the disconnect or exits. An attach adapter that doesn't answer
+in time has its connection closed, which Delve treats as a detach, and gets up to
+5 s more to exit; only an adapter that outlives that is killed. After the
+adapter exits, an attached process gets `SIGCONT`: a debugger's detach halts the
+target, and a halt `SIGSTOP` that loses a race with another signal is delivered
+after detach and would leave the program stopped. Tempest pins the process named
+by `processId` before starting the adapter (its start time, plus a pidfd on Linux
+when the kernel allows) and signals it only if the pid still names that process.
+On Linux with pidfds the signal can't reach another process. Without one (macOS,
+FreeBSD, Linux before 5.3) the start time is compared just before `kill`, so a
+pid that exits and is reused inside that window could still receive the `SIGCONT`.
+Where the start time can't be read (OpenBSD, NetBSD, 32-bit FreeBSD, or Linux
+without `/proc`), attached processes get no `SIGCONT`. A target that handles
+`SIGCONT` sees one delivery even when it was never stopped.
 Output previews are bounded to 32 KiB or 500 lines. Larger output spills beneath
 `<journal>.d/tool-output/`; retained adapter output has a 64 MiB disk cap.
 

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/tempest/durable"
 )
@@ -547,11 +548,11 @@ func (p *process) close(ctx context.Context) error {
 			return
 		default:
 		}
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGTERM)
+		_ = procgroup.Signal(p.cmd.Process.Pid, syscall.SIGTERM)
 		select {
 		case <-p.done:
 		case <-closeCtx.Done():
-			_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+			_ = procgroup.Signal(p.cmd.Process.Pid, syscall.SIGKILL)
 			<-p.done
 		}
 	})

@@ -1314,6 +1314,8 @@ func (r *Runtime) FencedCommit(ctx context.Context, task extension.Task, batch d
 func (r *Runtime) Suspend(ctx context.Context) error {
 	r.mu.Lock()
 	r.paused = true
+	// Wake idle drains so they observe the pause and return; Close joins them.
+	r.notify()
 	var joins []chan struct{}
 	for id, invocation := range r.live {
 		task := r.tasks[id]

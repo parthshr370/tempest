@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -478,12 +477,26 @@ func TestCLIRunLifecycle(t *testing.T) {
 	})
 
 	t.Run("bash timeout flag kills the command group", func(t *testing.T) {
-		script := `[{"toolCalls":[{"id":"timeout","name":"bash","arguments":{"command":"printf '%s' $$ > timeout-pgid; exec sleep 30"}}]},{"text":"handled timeout"}]`
-		started := time.Now()
-		report, sessionDir, code := run(t, script, "-bash-timeout", "1s", "-permission-mode", "bypass")
-		if elapsed := time.Since(started); elapsed >= 2*time.Second {
-			t.Fatalf("timeout run took %s, want less than 2s", elapsed)
+		// The shell leads its group and waits on a background sleep, which
+		// sh -c (no job control) keeps in that group. Killing only the leader
+		// would leave the sleep holding the tool's output open.
+		script := `[{"toolCalls":[{"id":"timeout","name":"bash","arguments":{"command":"sleep 30 & printf '%s %s' $$ $! > timeout-pgid; wait"}}]},{"text":"handled timeout"}]`
+		pgidPath := filepath.Join(tmp, "timeout-pgid")
+		readGroup := func() (pgid, child int, err error) {
+			recorded, err := os.ReadFile(pgidPath)
+			if err != nil {
+				return 0, 0, err
+			}
+			_, err = fmt.Sscan(string(recorded), &pgid, &child)
+			return pgid, child, err
 		}
+		t.Cleanup(func() {
+			// A failed run must not leave the fixture's sleep behind.
+			if pgid, _, err := readGroup(); err == nil && pgid > 0 {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL) // ESRCH is the passing case.
+			}
+		})
+		report, sessionDir, code := run(t, script, "-bash-timeout", "1s", "-permission-mode", "bypass")
 		if code != 0 || report.Text != "handled timeout" {
 			t.Fatalf("timeout run exit %d, report %+v", code, report)
 		}
@@ -495,16 +508,49 @@ func TestCLIRunLifecycle(t *testing.T) {
 		if !ok || !toolResult.IsError || len(toolResult.Content) != 1 || !strings.Contains(toolResult.Content[0].Text, "Command timed out after 1 seconds") {
 			t.Fatalf("timeout result = %#v", loaded.Messages[2])
 		}
-		pgidBytes, err := os.ReadFile(filepath.Join(tmp, "timeout-pgid"))
+		// The contract is that the command group dies at the 1s timeout. Time
+		// it from the journal and the command's own start, not the harness
+		// process: startup, streaming and reporting stretch under machine load.
+		// The whole timeout window lies between the tool call and its result.
+		call, ok := loaded.Messages[1].(ptypes.AssistantMessage)
+		if !ok {
+			t.Fatalf("timeout call = %#v", loaded.Messages[1])
+		}
+		resultAt := time.UnixMilli(toolResult.Timestamp)
+		if waited := resultAt.Sub(time.UnixMilli(call.Timestamp)); waited < time.Second {
+			t.Fatalf("bash result came %s after its call, before the 1s timeout", waited)
+		}
+		started, err := os.Stat(pgidPath)
 		if err != nil {
 			t.Fatal(err)
 		}
-		pgid, err := strconv.Atoi(string(pgidBytes))
+		// The command recorded its group as it started. A group member that
+		// survived the kill would hold the tool until the 2s WaitDelay
+		// escalation (or the 30s sleep), so its result would land 3s or more
+		// after that write.
+		if lived := resultAt.Sub(started.ModTime()); lived >= 2*time.Second {
+			t.Fatalf("bash command ran %s before its result, want its group killed at the 1s timeout", lived)
+		}
+		pgid, child, err := readGroup()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
-			t.Fatalf("process group %d still exists: %v", pgid, err)
+		// The killed sleep's parent died with it, so init reaps it shortly
+		// after; until then it is a zombie that still counts as a member. A
+		// sleep that survived the kill outlives this wait by far.
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			err := syscall.Kill(-pgid, 0)
+			if errors.Is(err, syscall.ESRCH) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("process group %d (background child %d) still exists: %v", pgid, child, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := syscall.Kill(child, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("background child %d survived the group kill: %v", child, err)
 		}
 	})
 

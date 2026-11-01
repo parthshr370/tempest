@@ -15,6 +15,7 @@ import (
 
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/obs"
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/rpc"
 )
 
@@ -218,13 +219,13 @@ func (s *stdioTransport) close(ctx context.Context) error {
 			}
 		}
 		if !wait() {
-			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+			_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGTERM)
 			if !wait() {
-				_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+				_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGKILL)
 			}
 		}
 		// Descendants may still own inherited pipes even after the group leader exited.
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGKILL)
 		_ = s.conn.Close()
 		s.closeErr = errors.Join(s.closeErr, s.conn.Drain(ctx))
 		select {

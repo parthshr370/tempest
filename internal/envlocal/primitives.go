@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/tempest/environment"
 )
 
@@ -117,13 +118,7 @@ func (l *Local) execArgv(ctx context.Context, call environment.Call) (json.RawMe
 	command := exec.CommandContext(commandCtx, request.Argv[0], request.Argv[1:]...)
 	command.Dir = l.root
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	command.Cancel = func() error {
-		err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	command.Cancel = func() error { return procgroup.Signal(command.Process.Pid, syscall.SIGKILL) }
 	command.WaitDelay = time.Second
 	output := &execOutput{remaining: request.MaxBytes}
 	command.Stdout = output

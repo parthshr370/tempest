@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/work"
 )
 
@@ -78,13 +79,7 @@ func command(ctx context.Context, cwd string, env []string, args ...string) *exe
 	cmd.Env = append(filtered, env...)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 	return cmd
 }
 func git(ctx context.Context, cwd string, env []string, args ...string) (string, error) {

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/tempest/environment"
 )
@@ -117,12 +118,12 @@ func Connect(ctx context.Context, stream io.ReadWriteCloser, want environment.Re
 	return r, nil
 }
 
-func signalProcessGroupUnlessDone(done <-chan struct{}, pid int, signal syscall.Signal, kill func(int, syscall.Signal) error) error {
+func signalProcessGroupUnlessDone(done <-chan struct{}, pgid int, signal syscall.Signal, signalGroup func(int, syscall.Signal) error) error {
 	select {
 	case <-done:
 		return nil
 	default:
-		return kill(-pid, signal)
+		return signalGroup(pgid, signal)
 	}
 }
 
@@ -186,13 +187,13 @@ func Launch(ctx context.Context, o ProcessOptions, want environment.Reference) (
 				return
 			default:
 			}
-			_ = signalProcessGroupUnlessDone(exited, cmd.Process.Pid, syscall.SIGTERM, syscall.Kill)
+			_ = signalProcessGroupUnlessDone(exited, cmd.Process.Pid, syscall.SIGTERM, procgroup.Signal)
 			_ = in.Close()
 			_ = out.Close()
 			select {
 			case <-done:
 			case <-time.After(time.Second):
-				_ = signalProcessGroupUnlessDone(exited, cmd.Process.Pid, syscall.SIGKILL, syscall.Kill)
+				_ = signalProcessGroupUnlessDone(exited, cmd.Process.Pid, syscall.SIGKILL, procgroup.Signal)
 				<-done
 			}
 		})

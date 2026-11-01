@@ -83,7 +83,10 @@ cleanup runs in a session-owned cancellation scope that `Session.Close` can stop
 `Session.CancelTask` targets the owned subtree. `Session.CancelAll` includes
 background roots. `Session.Close` joins local invocations and suspends durable
 phases without recording background user abort. It cancels and joins in-flight
-task drains before releasing the store. No resume scope can bypass suspension.
+task drains before releasing the store; a `ResumePending`, `CancelTask` or
+`CancelAll` drain that Close cuts short returns `ErrClosed`. `CreateTask`,
+`RetryTask`, `CancelTask` and `CancelAll` called once Close has started return
+`ErrClosed` without changing any task. No resume scope can bypass suspension.
 Reopen and explicitly resume to continue them. Sleeping foreground tasks don't
 prevent steering or follow-up delivery.
 

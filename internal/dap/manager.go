@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/toolio"
 )
 
@@ -39,6 +41,7 @@ type adapterProcess struct {
 	transport     io.Closer
 	exited        chan struct{}
 	attached      bool
+	target        *attachTarget
 	release       func()
 	cleanupOnce   sync.Once
 	cleanupErr    error
@@ -83,26 +86,20 @@ func (m *Manager) stop() error {
 
 func (process *adapterProcess) cleanup() error {
 	process.cleanupOnce.Do(func() {
-		// Cleanup must still work after the caller's request context expires.
-		if process.client != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
-			args := json.RawMessage(`{"terminateDebuggee":true}`)
-			if process.attached {
-				args = json.RawMessage(`{"terminateDebuggee":false}`)
-			}
-			// A failed disconnect isn't a cleanup failure if forced teardown works.
-			_, _ = process.client.request(ctx, "disconnect", args)
-			cancel()
-		}
+		confirmed := process.disconnect()
 		// debugpy launches the target in a separate process group. Kill it while
 		// the adapter can still reap it; attached programs are never ours to kill.
 		programErr := process.killPrograms()
+		if process.attached && !confirmed {
+			process.awaitDetach()
+		}
 		select {
 		case <-process.exited:
 		case <-time.After(disconnectGrace):
 		}
 		killErr := process.kill()
 		if process.transport != nil {
+			// Closing twice after awaitDetach only repeats an error; the adapter is already being torn down.
 			_ = process.transport.Close()
 		}
 		<-process.exited
@@ -110,7 +107,7 @@ func (process *adapterProcess) cleanup() error {
 			<-process.client.done
 		}
 		// A late process event may have arrived during disconnect.
-		programErr = errors.Join(programErr, process.killPrograms())
+		programErr = errors.Join(programErr, process.killPrograms(), process.continueAttached())
 		process.outputMu.Lock()
 		process.cleanupErr = errors.Join(programErr, killErr, process.outputErr, process.output.CloseTempFile())
 		process.outputMu.Unlock()
@@ -120,6 +117,42 @@ func (process *adapterProcess) cleanup() error {
 		}
 	})
 	return process.cleanupErr
+}
+
+// disconnect ends the session and reports whether the adapter confirmed it.
+// Cleanup must still work after the caller's request context expires, so the
+// request gets its own deadline.
+func (process *adapterProcess) disconnect() bool {
+	if process.client == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
+	defer cancel()
+	args := json.RawMessage(`{"terminateDebuggee":true}`)
+	if process.attached {
+		args = json.RawMessage(`{"terminateDebuggee":false}`)
+	}
+	// A failed disconnect isn't a cleanup failure if forced teardown works.
+	_, err := process.client.request(ctx, "disconnect", args)
+	return err == nil
+}
+
+// awaitDetach waits for an adapter that hasn't confirmed its detach. Until the
+// detach finishes, the debugger still traces the attached target, and killing
+// the adapter then can leave the target stopped under an orphaned tracer or
+// killed. Delve's tracer (debugserver on macOS) runs in its own process group,
+// out of reach of the adapter group kill. Closing the transport tells the
+// adapter its client is gone; Delve then finishes a detach in progress, or
+// detaches, and exits. Adapter exit is the completion this waits for.
+func (process *adapterProcess) awaitDetach() {
+	if process.transport != nil {
+		// A close error leaves nothing to retry; adapter exit or the deadline decides what follows.
+		_ = process.transport.Close()
+	}
+	select {
+	case <-process.exited:
+	case <-time.After(detachTimeout):
+	}
 }
 
 func (process *adapterProcess) killPrograms() error {
@@ -133,6 +166,19 @@ func (process *adapterProcess) killPrograms() error {
 		result = errors.Join(result, killGroup(group))
 	}
 	return result
+}
+
+// continueAttached runs after the adapter has exited. Detaching halts the
+// target first, and debugserver halts by sending SIGSTOP; when another signal
+// (Go's preemption SIGURG, for one) wins that race, the SIGSTOP stays pending
+// and the kernel delivers it after detach, leaving the program stopped. SIGCONT
+// discards a pending stop and resumes a stopped one. A running program that
+// handles SIGCONT sees one extra delivery.
+func (process *adapterProcess) continueAttached() error {
+	if process.target == nil {
+		return nil
+	}
+	return process.target.resume()
 }
 
 func (process *adapterProcess) releaseWhenGone() {
@@ -149,7 +195,7 @@ func (process *adapterProcess) releaseWhenGone() {
 func (process *adapterProcess) releaseIfGone() bool {
 	process.stateMu.Lock()
 	for group := range process.programGroups {
-		if errors.Is(syscall.Kill(-group, 0), syscall.ESRCH) {
+		if errors.Is(procgroup.Signal(group, 0), os.ErrProcessDone) {
 			delete(process.programGroups, group)
 		}
 	}
@@ -162,12 +208,13 @@ func (process *adapterProcess) releaseIfGone() bool {
 	return true
 }
 
+// killGroup SIGKILLs a process group. A group with no live member left, its
+// zombies waiting on a parent that may not be us, is already done.
 func killGroup(group int) error {
-	err := syscall.Kill(-group, syscall.SIGKILL)
-	if errors.Is(err, syscall.ESRCH) {
-		return nil
+	if err := procgroup.Signal(group, syscall.SIGKILL); !errors.Is(err, os.ErrProcessDone) {
+		return err
 	}
-	return err
+	return nil
 }
 
 func (process *adapterProcess) kill() error {
@@ -261,9 +308,26 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	if !ok {
 		return nil, fmt.Errorf("debug adapter %q is not configured", name)
 	}
-	process, err := m.spawn(ctx, adapter, action == "attach")
+	defaults := adapter.Launch
+	if action == "attach" {
+		defaults = adapter.Attach
+	}
+	merged := make(map[string]json.RawMessage, len(defaults)+len(arguments))
+	for key, value := range defaults {
+		merged[key] = value
+	}
+	for key, value := range arguments {
+		merged[key] = value
+	}
+	var target *attachTarget
+	if action == "attach" {
+		// Pin the named process before the adapter, and with it the exit
+		// observer that runs cleanup, exists.
+		target = pinAttachTarget(merged["processId"])
+	}
+	process, err := m.spawn(ctx, adapter, action == "attach", target)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(err, target.release())
 	}
 	m.active = process
 	success := false
@@ -281,17 +345,6 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	capabilities, err := process.client.request(ctx, "initialize", json.RawMessage(`{"clientID":"tempest","adapterID":"tempest","pathFormat":"path","linesStartAt1":true,"columnsStartAt1":true,"supportsRunInTerminalRequest":false,"supportsVariableType":true}`))
 	if err != nil {
 		return nil, err
-	}
-	defaults := adapter.Launch
-	if action == "attach" {
-		defaults = adapter.Attach
-	}
-	merged := make(map[string]json.RawMessage, len(defaults)+len(arguments))
-	for key, value := range defaults {
-		merged[key] = value
-	}
-	for key, value := range arguments {
-		merged[key] = value
 	}
 	encoded, err := json.Marshal(merged)
 	if err != nil {
@@ -360,7 +413,9 @@ waitInitialized:
 	return body, nil
 }
 
-func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool) (*adapterProcess, error) {
+// spawn starts the adapter. An attach target is stored before the exit
+// observer that runs cleanup starts, so cleanup always sees it.
+func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, target *attachTarget) (*adapterProcess, error) {
 	release := func() {}
 	if m.admit != nil {
 		var err error
@@ -369,7 +424,7 @@ func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool) (*a
 			return nil, err
 		}
 	}
-	process := &adapterProcess{attached: attached, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
+	process := &adapterProcess{attached: attached, target: target, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
 	args := append([]string(nil), adapter.Args...)
 	var listener net.Listener
 	if adapter.Transport == "reverse_tcp" {
@@ -527,6 +582,12 @@ func (m *Manager) Output() (toolio.OutputSnapshot, error) {
 
 const disconnectGrace = 100 * time.Millisecond
 const disconnectTimeout = 500 * time.Millisecond
+
+// detachTimeout bounds the wait for an attach adapter that didn't confirm its
+// detach within disconnectTimeout. With the CPU six times oversubscribed,
+// Delve's detach took 40 to 300 ms with rare runs past disconnectTimeout; the
+// bound is for an adapter that hangs.
+const detachTimeout = 5 * time.Second
 
 // Terminate disconnects (detaching attached targets), then joins owned processes.
 func (m *Manager) Terminate(ctx context.Context) error {

@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/obs"
+	"go.harness.dev/harness/internal/procgroup"
 	"go.harness.dev/harness/internal/rpc"
 )
 
@@ -329,13 +330,13 @@ func (s *server) stop(graceful bool) {
 		// EOF on stdin, then TERM and KILL with one-second grace each.
 		_ = s.stream.stdin.Close()
 		if !waitExit(exitGrace) {
-			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+			_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGTERM)
 			if !waitExit(exitGrace) {
-				_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+				_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGKILL)
 			}
 		}
 		// Group members may outlive the leader and keep inherited pipes open.
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGKILL)
+		_ = procgroup.Signal(s.cmd.Process.Pid, syscall.SIGKILL)
 		_ = s.conn.Close()
 		<-s.exited
 		<-s.served
