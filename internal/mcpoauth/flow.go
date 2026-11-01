@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,9 @@ type Client struct {
 	dest     *destinations
 	http     *http.Client
 	now      func() time.Time
+	// mu guards kept, the tokens of a refresh the store did not save.
+	mu   sync.Mutex
+	kept *keptTokens
 }
 
 // New binds a client to a normalized HTTP server configuration. Requests
@@ -86,15 +90,18 @@ func (c *Client) expiring(r Record) bool {
 
 // Token returns the access token for the next request, refreshing one that
 // is about to expire; while it has not expired, a failed refresh keeps it.
-// It returns "" when no usable token is stored.
+// A refresh that succeeded but could not be saved returns an error, and
+// later calls in this process use the new token. It returns "" when no
+// usable token is stored.
 func (c *Client) Token(ctx context.Context) (string, error) {
-	r, err := c.store.Load(c.server)
+	stored, err := c.store.Load(c.server)
 	if missing(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	r := c.current(stored)
 	if !c.bound(r) || r.AccessToken == "" {
 		return "", nil
 	}
@@ -106,24 +113,27 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer unlock()
-	r, err = c.store.Load(c.server)
+	stored, err = c.store.Load(c.server)
 	if missing(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	r = c.current(stored)
 	if !c.bound(r) || r.AccessToken == "" {
 		return "", nil
 	}
 	if !c.expiring(r) {
 		return r.AccessToken, nil
 	}
-	refreshed, err := c.refreshLocked(ctx, &r)
-	if err != nil && r.AccessToken != "" && c.now().Before(r.ExpiresAt) {
+	refreshed, err := c.refreshLocked(ctx, stored, &r)
+	if err != nil && !refreshed && r.AccessToken != "" && c.now().Before(r.ExpiresAt) {
 		// The refresh runs refreshMargin early; until the token really
 		// expires, an unreachable or failing authorization server leaves
-		// it usable and the MCP server judges it.
+		// it usable and the MCP server judges it. A refresh that succeeded
+		// but was not saved is not a failed refresh: its error must reach
+		// the caller.
 		return r.AccessToken, nil
 	}
 	if err != nil || !refreshed {
@@ -134,19 +144,22 @@ func (c *Client) Token(ctx context.Context) (string, error) {
 
 // Refresh replaces an access token the server rejected. It reports true when
 // a different token is now stored, including one another process refreshed.
+// A refresh that succeeded but could not be saved reports true with the
+// error, and this process uses the new token.
 func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 	unlock, err := c.store.Lock(ctx, c.server)
 	if err != nil {
 		return false, err
 	}
 	defer unlock()
-	r, err := c.store.Load(c.server)
+	stored, err := c.store.Load(c.server)
 	if missing(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
+	r := c.current(stored)
 	if !c.bound(r) {
 		return false, nil
 	}
@@ -156,13 +169,15 @@ func (c *Client) Refresh(ctx context.Context, rejected string) (bool, error) {
 	if r.RefreshToken == "" {
 		return false, nil
 	}
-	return c.refreshLocked(ctx, &r)
+	return c.refreshLocked(ctx, stored, &r)
 }
 
-// refreshLocked runs the refresh grant. A rotated refresh token replaces the
-// old one; a rejected refresh token clears the tokens so login is required,
-// and a rejected dynamic client (invalid_client) is dropped with them.
-func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
+// refreshLocked runs the refresh grant for r, which is stored with any
+// tokens this process kept. A rotated refresh token replaces the old one; a
+// rejected refresh token clears the tokens so login is required, and a
+// rejected dynamic client (invalid_client) is dropped with them. It reports
+// true when the grant succeeded, even if saving the new tokens failed.
+func (c *Client) refreshLocked(ctx context.Context, stored Record, r *Record) (bool, error) {
 	ctx = within(ctx, parseNetClass(r.ServerNetwork))
 	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {r.RefreshToken}}
 	if r.TokenResource != "" {
@@ -179,7 +194,10 @@ func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 		if token.Error == "invalid_client" && r.Registered {
 			forgetClient(r)
 		}
-		return false, c.store.Save(*r)
+		if err := c.save(stored, *r); err != nil {
+			return false, fmt.Errorf("mcp_auth: server %s refused the refresh token, and removing it from the credential store failed: %w", c.server, err)
+		}
+		return false, nil
 	}
 	if err != nil || status != http.StatusOK || token.Error != "" {
 		return false, fmt.Errorf("mcp_auth: server %s token refresh failed with HTTP %d %s", c.server, status, token.Error)
@@ -195,7 +213,49 @@ func (c *Client) refreshLocked(ctx context.Context, r *Record) (bool, error) {
 	if token.Scope != "" {
 		r.Scope = token.Scope
 	}
-	return true, c.store.Save(*r)
+	if err := c.save(stored, *r); err != nil {
+		return true, fmt.Errorf("mcp_auth: server %s token refresh succeeded but the new token was not saved; this process keeps using it, while other processes and later runs still have the old one: %w", c.server, err)
+	}
+	return true, nil
+}
+
+// keptTokens are the tokens of a refresh the store refused to save. They
+// stand in for the stored tokens they replaced, so a rotated refresh token
+// is not lost while this process runs. Once the store holds other tokens (a
+// later save, a login, a logout, another process's refresh) they are dropped.
+type keptTokens struct {
+	replacedAccess, replacedRefresh string
+	record                          Record
+}
+
+// current returns stored with the tokens this process kept in its place.
+func (c *Client) current(stored Record) Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.kept
+	if kept == nil {
+		return stored
+	}
+	if stored.AccessToken != kept.replacedAccess || stored.RefreshToken != kept.replacedRefresh {
+		c.kept = nil
+		return stored
+	}
+	stored.AccessToken, stored.RefreshToken = kept.record.AccessToken, kept.record.RefreshToken
+	stored.ExpiresAt, stored.Scope = kept.record.ExpiresAt, kept.record.Scope
+	return stored
+}
+
+// save stores r, whose tokens replace those of stored. When the store
+// refuses, this process keeps r's tokens in memory.
+func (c *Client) save(stored, r Record) error {
+	err := c.store.Save(r)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.kept = nil
+	if err != nil {
+		c.kept = &keptTokens{replacedAccess: stored.AccessToken, replacedRefresh: stored.RefreshToken, record: r}
+	}
+	return err
 }
 
 // NoteScope remembers a step-up scope no user could authorize, so the next

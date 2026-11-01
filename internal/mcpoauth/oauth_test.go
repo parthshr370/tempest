@@ -442,6 +442,64 @@ func TestUnreachableRefreshKeepsTheUnexpiredToken(t *testing.T) {
 	}
 }
 
+// refuseRecordWrites leaves the stored record readable but makes its atomic
+// replacement fail, as a full or read-only disk would.
+func (h *harness) refuseRecordWrites(t *testing.T) {
+	t.Helper()
+	if err := os.Chmod(h.dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.dir, 0700) })
+}
+
+// A refresh the authorization server granted but the store could not save
+// is not a failed refresh: the caller must hear that it was not saved, and
+// this process must keep the rotated refresh token the server now expects.
+func TestUnsavedRefreshIsReportedAndKeptByThisProcess(t *testing.T) {
+	// A 30s lifetime is inside the refresh margin, so every Token call refreshes.
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	h.refuseRecordWrites(t)
+	token, err := h.flow.Token(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "not saved") || token != "" {
+		t.Fatalf("successful refresh swallowed credential save failure; returned token present=%v err=%v", token != "", err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.RefreshToken != first.RefreshToken {
+		t.Fatalf("store changed although saving failed: %v", err)
+	}
+	if err := os.Chmod(h.dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// The fixture rotated first.RefreshToken away; only the kept one refreshes.
+	token, err = h.flow.Token(t.Context())
+	if err != nil || token == "" {
+		t.Fatalf("token after the store recovered = %q %v, want a refresh with the kept refresh token", token, err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.AccessToken != token {
+		t.Fatalf("the refresh after recovery did not save its token: %v", err)
+	}
+}
+
+func TestUnsavedRefreshOfARejectedTokenIsUsedByThisProcess(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	first := h.login(t)
+	h.refuseRecordWrites(t)
+	refreshed, err := h.flow.Refresh(t.Context(), first.AccessToken)
+	if !refreshed || err == nil || !strings.Contains(err.Error(), "not saved") {
+		t.Fatalf("unsaved refresh = %v %v, want true with an error saying it was not saved", refreshed, err)
+	}
+	token, err := h.flow.Token(t.Context())
+	if err != nil || token == "" || token == first.AccessToken {
+		t.Fatalf("token after an unsaved refresh = %q %v, want the new token", token, err)
+	}
+	if refreshed, err := h.flow.Refresh(t.Context(), first.AccessToken); err != nil || !refreshed {
+		t.Fatalf("refresh of the replaced token = %v %v, want the kept token reported", refreshed, err)
+	}
+	if stored, err := h.store.Load("secure"); err != nil || stored.AccessToken != first.AccessToken {
+		t.Fatalf("store changed although saving failed: %v", err)
+	}
+}
+
 func TestRefreshReusesTokenAnotherProcessRotated(t *testing.T) {
 	h := newHarness(t, mcpoauthtest.Options{}, nil)
 	record := h.login(t)
