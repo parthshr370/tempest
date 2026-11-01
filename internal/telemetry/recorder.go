@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -18,7 +19,8 @@ import (
 //
 //	invoke_agent <agent>            one per run; a child agent's run sits
 //	├── chat <model>                under the parent's execute_tool span
-//	│   └── chat <model>            a failed attempt that was retried
+//	│   └── chat <model>            a failed attempt that was retried, or
+//	│                               whose model a backup replaced
 //	├── execute_tool <tool>
 //	└── chat <model>
 //
@@ -26,13 +28,21 @@ import (
 // of a request span that has already ended. Run totals go on the run span
 // as gen_ai.aggregated_usage.*, a namespace of its own, so summing
 // gen_ai.usage.* over a trace does not count a request twice.
+//
+// A request whose model is unavailable goes on to a backup model. The
+// request span then describes the backup, which answers it, and carries a
+// tempest.model.fallback event for the switch; the failed model's attempts
+// stay its children under their own model.
 
 const (
 	defaultAgentName  = "tempest"
 	maxErrorTextRunes = 1024
 	// attemptRetry marks an attempt the retrying stream sent again to the
-	// same model.
-	attemptRetry = "retry"
+	// same model; attemptFallback one whose request went to a backup model.
+	attemptRetry    = "retry"
+	attemptFallback = "fallback"
+	// fallbackEvent is the request span event for a switch to a backup.
+	fallbackEvent = "tempest.model.fallback"
 )
 
 // AgentInfo identifies the agent an event listener reports on.
@@ -74,8 +84,10 @@ type runTrace struct {
 }
 
 type requestTrace struct {
-	span         *span
-	request      *agent.ModelRequest
+	span *span
+	// model is the model attempts go to: the request's, then the backup a
+	// switch named.
+	model        types.Model
 	attemptStart time.Time
 	firstChunk   bool
 	// messageOpen is set between an attempt's message_start and its
@@ -119,7 +131,14 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 		if at.IsZero() {
 			at = event.At
 		}
-		l.attemptFailed(attemptFailure{at: at, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: at.Add(event.RetryDelay)})
+		failure := attemptFailure{at: at, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: at.Add(event.RetryDelay)}
+		if event.Fallback != nil {
+			// The backup's first attempt is timed from its switch event.
+			failure.kind = attemptFallback
+		}
+		l.attemptFailed(failure)
+	case agent.EventModelFallback:
+		l.switched(event)
 	case agent.EventMessageEnd:
 		l.messageEnd(event)
 	case agent.EventToolPermission, agent.EventToolExecutionStart:
@@ -186,14 +205,9 @@ func (l *agentListener) startRequest(ctx context.Context, event agent.AgentEvent
 	}
 	l.abandonRequest(l.run, event.At)
 	request := event.Request
-	model := request.Model
-	requestSpan := newSpan(ctx, "chat "+model.ID, spanKindClient, event.At)
-	requestSpan.attributes = append(requestSpan.attributes,
-		stringAttribute("gen_ai.operation.name", "chat"),
-		stringAttribute("gen_ai.provider.name", model.Provider),
-		stringAttribute("gen_ai.request.model", model.ID),
-	)
-	requestSpan.attributes = append(requestSpan.attributes, serverAttributes(model.BaseURL)...)
+	requestSpan := newSpan(ctx, "chat "+request.Model.ID, spanKindClient, event.At)
+	requestSpan.attributes = append(requestSpan.attributes, stringAttribute("gen_ai.operation.name", "chat"))
+	requestSpan.attributes = append(requestSpan.attributes, modelAttributes(request.Model)...)
 	if request.MaxTokens > 0 {
 		requestSpan.attributes = append(requestSpan.attributes, intAttribute("gen_ai.request.max_tokens", int64(request.MaxTokens)))
 	}
@@ -209,7 +223,53 @@ func (l *agentListener) startRequest(ctx context.Context, event agent.AgentEvent
 		}
 		requestSpan.attributes = append(requestSpan.attributes, deferredAttribute("gen_ai.input.messages", inputMessages(request.Messages)))
 	}
-	l.run.request = &requestTrace{span: requestSpan, request: request, attemptStart: event.At}
+	l.run.request = &requestTrace{span: requestSpan, model: request.Model, attemptStart: event.At}
+}
+
+// modelAttributes describe the model a request goes to: its provider, id
+// and endpoint.
+func modelAttributes(model types.Model) []attribute {
+	attrs := []attribute{
+		stringAttribute("gen_ai.provider.name", model.Provider),
+		stringAttribute("gen_ai.request.model", model.ID),
+	}
+	return append(attrs, serverAttributes(model.BaseURL)...)
+}
+
+// isModelAttribute reports whether attr is one modelAttributes sets.
+func isModelAttribute(attr attribute) bool {
+	switch attr.key {
+	case "gen_ai.provider.name", "gen_ai.request.model", "server.address", "server.port":
+		return true
+	}
+	return false
+}
+
+// switched moves the open request to the backup model a switch named: the
+// backup answers it, so the request span and the metrics of its response
+// and later attempts are the backup's. The failed model's attempts already
+// closed as child spans under their own model. The backup is sent once the
+// switch event has been handled, so its first attempt is timed from it.
+func (l *agentListener) switched(event agent.AgentEvent) {
+	if l.run == nil || event.Fallback == nil {
+		return
+	}
+	fallback := *event.Fallback
+	target := l.run.span
+	if request := l.run.request; request != nil {
+		target = request.span
+		request.model = fallback.To
+		request.span.name = "chat " + fallback.To.ID
+		request.span.attributes = append(slices.DeleteFunc(request.span.attributes, isModelAttribute), modelAttributes(fallback.To)...)
+		request.attemptStart = event.At
+		request.firstChunk = false
+	}
+	attrs := append(fallbackAttributes(fallback),
+		intAttribute("tempest.fallback.attempts", int64(fallback.Attempts)),
+		intAttribute("tempest.fallback.index", int64(fallback.Index)),
+	)
+	target.events = append(target.events, spanEvent{name: fallbackEvent, at: event.At, attributes: attrs})
+	l.telemetry.recordFallback(fallback)
 }
 
 // serverAttributes reports the provider endpoint's host and port.
@@ -241,7 +301,7 @@ func (l *agentListener) chunk(event agent.AgentEvent) {
 		return
 	}
 	request.firstChunk = true
-	l.telemetry.recordFirstChunk(request.request.Model, event.At.Sub(request.attemptStart))
+	l.telemetry.recordFirstChunk(request.model, event.At.Sub(request.attemptStart))
 }
 
 // carriesOutput reports whether a stream event delivers response content:
@@ -269,9 +329,9 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 	if request == nil {
 		return
 	}
-	model := failure.message.Model
+	provider, model := failure.message.Provider, failure.message.Model
 	if model == "" {
-		model = request.request.Model.ID
+		provider, model = request.model.Provider, request.model.ID
 	}
 	attemptSpan := &span{
 		traceID:  request.span.traceID,
@@ -286,7 +346,7 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 	}
 	attemptSpan.attributes = append(attemptSpan.attributes,
 		stringAttribute("gen_ai.operation.name", "chat"),
-		stringAttribute("gen_ai.provider.name", failure.message.Provider),
+		stringAttribute("gen_ai.provider.name", provider),
 		stringAttribute("gen_ai.request.model", model),
 		stringAttribute("error.type", errorType(failure.message)),
 		stringAttribute("tempest.attempt.outcome", failure.kind),
@@ -297,8 +357,8 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 	attemptSpan.attributes = append(attemptSpan.attributes, usageAttributes("gen_ai.usage.", failure.message.Usage)...)
 	attemptSpan.attributes = append(attemptSpan.attributes, costAttributes(failure.message.Usage.Cost)...)
 	l.telemetry.record(attemptSpan, l.run.sampled && request.span.spanID != tracecontext.SpanID{})
-	l.telemetry.recordAttemptFailure(failure.kind, request.request.Model, errorType(failure.message))
-	l.telemetry.recordDiscardedUsage(request.request.Model, failure.message)
+	l.telemetry.recordAttemptFailure(failure.kind, request.model, errorType(failure.message))
+	l.telemetry.recordDiscardedUsage(request.model, failure.message)
 	request.discardNextEnd = request.messageOpen
 	request.messageOpen = false
 	request.firstChunk = false
@@ -341,7 +401,7 @@ func (l *agentListener) messageEnd(event agent.AgentEvent) {
 		requestSpan.attributes = append(requestSpan.attributes, deferredAttribute("gen_ai.output.messages", outputMessages(message)))
 	}
 	l.telemetry.record(requestSpan, l.run.sampled)
-	l.telemetry.recordRequest(request.request.Model, responseModel, message, event.At.Sub(requestSpan.start))
+	l.telemetry.recordRequest(request.model, responseModel, message, event.At.Sub(requestSpan.start))
 }
 
 // abandonRequest ends a run's request that never reported its response,

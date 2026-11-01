@@ -299,17 +299,19 @@ const (
 	EventHook  AgentEventType = "hook"
 	// EventModelFallback reports that the run switched to a backup model
 	// because the model it was using is unavailable. The run stays on the
-	// backup until it ends.
+	// backup until it ends. Fallback describes the switch; the backup is
+	// called once every listener has returned.
 	EventModelFallback AgentEventType = "model_fallback"
 	// EventModelRequest is emitted just before a model request is sent;
 	// Request describes it. The message events of its response follow.
 	EventModelRequest AgentEventType = "model_request"
-	// EventModelRetry reports a failed attempt that is sent again after
-	// RetryDelay: Message is the discarded attempt (its error and any usage),
-	// Attempt its 1-based ordinal and FailedAt when the retrying stream saw it
-	// fail, which is RetryDelay before the next attempt is sent. When the
-	// attempt had opened a message, that message's message_end follows this
-	// event.
+	// EventModelRetry reports a failed attempt that is sent again: Message is
+	// the discarded attempt (its error and any usage), Attempt its 1-based
+	// ordinal on its model and FailedAt when the stream saw it fail. Without
+	// Fallback the same model gets the request RetryDelay after FailedAt.
+	// With Fallback the model was unavailable and the request goes to
+	// Fallback.To, whose model_fallback event follows. When the attempt had
+	// opened a message, that message's message_end follows this event.
 	EventModelRetry AgentEventType = "model_retry"
 )
 

@@ -104,6 +104,7 @@ type metricSet struct {
 	runs             *instrument
 	toolCalls        *instrument
 	failedAttempts   *instrument
+	fallbacks        *instrument
 	permissions      *instrument
 	hookRuns         *instrument
 }
@@ -116,7 +117,8 @@ func newMetricSet(start time.Time) *metricSet {
 	set.cost = set.histogram("gen_ai.client.operation.cost", "USD", "Model request cost in US dollars; requests with an unknown price are not recorded.", costBuckets)
 	set.runs = set.counter("tempest.agent.runs", "{run}", "Agent runs by how they ended.")
 	set.toolCalls = set.counter("tempest.tool.calls", "{call}", "Tool calls by tool and outcome.")
-	set.failedAttempts = set.counter("tempest.model.failed_attempts", "{attempt}", "Model request attempts that failed and were sent again, by error type and outcome.")
+	set.failedAttempts = set.counter("tempest.model.failed_attempts", "{attempt}", "Model request attempts that failed and were sent again, to the same model or a backup, by error type and outcome.")
+	set.fallbacks = set.counter("tempest.model.fallbacks", "{switch}", "Switches to a backup model by reason, failed model and backup model.")
 	set.permissions = set.counter("tempest.permission.decisions", "{decision}", "Tool permission decisions by outcome and source.")
 	set.hookRuns = set.counter("tempest.hook.runs", "{run}", "Hook command runs by event and outcome.")
 	return set

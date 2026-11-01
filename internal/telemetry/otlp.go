@@ -93,8 +93,16 @@ type span struct {
 	start      time.Time
 	end        time.Time
 	attributes []attribute
+	events     []spanEvent
 	status     statusCode
 	message    string
+}
+
+// spanEvent is something that happened at one point during a span.
+type spanEvent struct {
+	name       string
+	at         time.Time
+	attributes []attribute
 }
 
 type wireAnyValue struct {
@@ -128,16 +136,23 @@ type wireStatus struct {
 	Message string     `json:"message,omitempty"`
 }
 
+type wireSpanEvent struct {
+	TimeUnixNano string         `json:"timeUnixNano"`
+	Name         string         `json:"name"`
+	Attributes   []wireKeyValue `json:"attributes,omitempty"`
+}
+
 type wireSpan struct {
-	TraceID           string         `json:"traceId"`
-	SpanID            string         `json:"spanId"`
-	ParentSpanID      string         `json:"parentSpanId,omitempty"`
-	Name              string         `json:"name"`
-	Kind              spanKind       `json:"kind"`
-	StartTimeUnixNano string         `json:"startTimeUnixNano"`
-	EndTimeUnixNano   string         `json:"endTimeUnixNano"`
-	Attributes        []wireKeyValue `json:"attributes,omitempty"`
-	Status            wireStatus     `json:"status"`
+	TraceID           string          `json:"traceId"`
+	SpanID            string          `json:"spanId"`
+	ParentSpanID      string          `json:"parentSpanId,omitempty"`
+	Name              string          `json:"name"`
+	Kind              spanKind        `json:"kind"`
+	StartTimeUnixNano string          `json:"startTimeUnixNano"`
+	EndTimeUnixNano   string          `json:"endTimeUnixNano"`
+	Attributes        []wireKeyValue  `json:"attributes,omitempty"`
+	Events            []wireSpanEvent `json:"events,omitempty"`
+	Status            wireStatus      `json:"status"`
 }
 
 type wireScopeSpans struct {
@@ -244,6 +259,12 @@ func encodeTraces(res resource, spans []*span) ([]byte, error) {
 		}
 		if finished.parentID != (tracecontext.SpanID{}) {
 			entry.ParentSpanID = finished.parentID.String()
+		}
+		if len(finished.events) > 0 {
+			entry.Events = make([]wireSpanEvent, len(finished.events))
+			for j, event := range finished.events {
+				entry.Events[j] = wireSpanEvent{TimeUnixNano: unixNano(event.at), Name: event.name, Attributes: wireAttributes(event.attributes)}
+			}
 		}
 		wire[i] = entry
 	}

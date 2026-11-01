@@ -121,7 +121,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 			discarded = &types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, StopReason: types.StopError, ErrorCode: string(reason), Timestamp: time.Now().UnixMilli()}
 		}
 		fallback := types.ModelFallback{From: model, To: next, Reason: string(reason), Attempts: attempts, Index: index}
-		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &fallback})
+		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &fallback, FailedAt: time.Now()})
 		model = next
 		// The backup is called only once the caller has admitted the switch
 		// (the agent loop journals it first) and nothing cancelled the request

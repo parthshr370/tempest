@@ -142,6 +142,23 @@ func (t *Telemetry) recordAttemptFailure(kind string, model types.Model, errorTy
 	)
 }
 
+// fallbackAttributes describe one switch to a backup model. Every value is
+// bounded: the models are the configured chain's and the reason is a retry
+// failure category.
+func fallbackAttributes(fallback types.ModelFallback) []attribute {
+	return []attribute{
+		stringAttribute("tempest.fallback.from_provider", fallback.From.Provider),
+		stringAttribute("tempest.fallback.from_model", fallback.From.ID),
+		stringAttribute("tempest.fallback.to_provider", fallback.To.Provider),
+		stringAttribute("tempest.fallback.to_model", fallback.To.ID),
+		stringAttribute("tempest.fallback.reason", fallback.Reason),
+	}
+}
+
+func (t *Telemetry) recordFallback(fallback types.ModelFallback) {
+	t.metrics.increment(t.metrics.fallbacks, fallbackAttributes(fallback)...)
+}
+
 func (t *Telemetry) recordPermission(tool, decision, source string) {
 	t.metrics.increment(t.metrics.permissions,
 		stringAttribute("gen_ai.tool.name", tool),

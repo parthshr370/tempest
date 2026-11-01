@@ -80,7 +80,7 @@ AI instrumentation (format 5):
 ```
 invoke_agent <agent>              one per run (internal)
 ├── chat <model>                  one per model request (client)
-│   └── chat <model>              a failed attempt that was retried
+│   └── chat <model>              a failed attempt that was retried or replaced by a backup
 ├── execute_tool <tool>           one per tool call (internal)
 │   └── invoke_agent <subagent>   a task child's run, under the tool that started it
 └── chat <model>
@@ -98,13 +98,36 @@ define it, `input_tokens` counts every input token, cached ones included;
 `cache_read.input_tokens` and `cache_creation.input_tokens` say how many of them were
 read from or written to the provider's cache.
 
+### Backup models
+
+When the model is unavailable and the run switches to a backup (see
+[Backup models](providers.md#backup-models)), the backup answers the request. The
+request span is then named for the backup, and its `gen_ai.provider.name`,
+`gen_ai.request.model`, `server.address` and `server.port` are the backup's. Every
+attempt the failed model made stays a child span under that model's name, the last
+one with `tempest.attempt.outcome` `fallback`. The request span gets one
+`tempest.model.fallback` event per switch, at the time of the switch:
+
+| Event attribute | Meaning |
+|---|---|
+| `tempest.fallback.from_provider`, `tempest.fallback.from_model` | the model that was unavailable |
+| `tempest.fallback.to_provider`, `tempest.fallback.to_model` | the backup that gets the request |
+| `tempest.fallback.reason` | the retry failure category, such as `model_not_found`, `server_failure`, `rate_limited` or `network_failure` |
+| `tempest.fallback.attempts` | how many attempts the failed model got |
+| `tempest.fallback.index` | the backup's position in the chain; the primary is 0 |
+
+The run stays on the backup, so later requests are the backup's from the start. The
+request's duration includes the failed model's attempts; its tokens, time to first
+chunk and cost are the backup's. A failed attempt's own reported usage is measured
+under the failed model.
+
 ### Attributes
 
 | Span | Attributes |
 |---|---|
 | `invoke_agent` | `gen_ai.operation.name`, `gen_ai.agent.name` (`tempest`, or the subagent type), `gen_ai.conversation.id` (session id), `gen_ai.agent.call.id` (run id), `tempest.run.stop_reason`, `tempest.run.turns`, `gen_ai.aggregated_usage.{input_tokens,output_tokens,cache_read.input_tokens,cache_creation.input_tokens}`, `tempest.cost.usd` or `tempest.cost.unknown`, and `error.type` when the run ends in `error`, `output_invalid` or `repeated_failure`. |
 | `chat` (request) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens`, `gen_ai.request.temperature`, `tempest.request.reasoning`, `server.address`, `server.port`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons`, `gen_ai.usage.{input_tokens,output_tokens,cache_read.input_tokens,cache_creation.input_tokens}`, `tempest.cost.usd` or `tempest.cost.unknown`, and `error.type` on failure (`incomplete` when the run ended mid-request). |
-| `chat` (failed attempt) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt`, `tempest.attempt.outcome` (`retry`), and the usage and cost the attempt reported before it failed. |
+| `chat` (failed attempt) | `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt`, `tempest.attempt.outcome` (`retry`, or `fallback` when a backup model takes the request), and the usage and cost the attempt reported before it failed. |
 | `execute_tool` | `gen_ai.operation.name`, `gen_ai.tool.name`, `gen_ai.tool.call.id`, `tempest.permission.decision` (`allow`, `deny`), `tempest.permission.source`, `tempest.tool.outcome` (`success`, `error`), and `error.type` (`tool_error`, or `incomplete` when the run ended first). |
 
 Failed spans have status `ERROR`. Their status message is redacted and cut to 1024
@@ -163,7 +186,8 @@ turn loop.
 | `gen_ai.client.operation.cost` | `gen_ai_client_operation_cost_usd` | histogram | `USD` | as for token usage without `gen_ai.token.type`; requests with an unknown price are not recorded, while a retried attempt's known cost is recorded |
 | `tempest.agent.runs` | `tempest_agent_runs_total` | counter | `{run}` | `gen_ai.agent.name`, `tempest.run.stop_reason` |
 | `tempest.tool.calls` | `tempest_tool_calls_total` | counter | `{call}` | `gen_ai.tool.name`, `tempest.tool.outcome` |
-| `tempest.model.failed_attempts` | `tempest_model_failed_attempts_total` | counter | `{attempt}` | `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt.outcome` (`retry`) |
+| `tempest.model.failed_attempts` | `tempest_model_failed_attempts_total` | counter | `{attempt}` | `gen_ai.provider.name`, `gen_ai.request.model`, `error.type`, `tempest.attempt.outcome` (`retry`, `fallback`) |
+| `tempest.model.fallbacks` | `tempest_model_fallbacks_total` | counter | `{switch}` | `tempest.fallback.reason`, `tempest.fallback.from_provider`, `tempest.fallback.from_model`, `tempest.fallback.to_provider`, `tempest.fallback.to_model`; the models come from the configured chain |
 | `tempest.permission.decisions` | `tempest_permission_decisions_total` | counter | `{decision}` | `gen_ai.tool.name`, `tempest.permission.decision`, `tempest.permission.source` |
 | `tempest.hook.runs` | `tempest_hook_runs_total` | counter | `{run}` | `tempest.hook.event`, `tempest.hook.outcome` (`success`, `blocked` for exit 2, `failed`, `error`, `timeout`) |
 | `tempest.sessions` | `tempest_sessions` | gauge | `{session}` | none; open root sessions |

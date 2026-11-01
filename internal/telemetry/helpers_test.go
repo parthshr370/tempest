@@ -6,31 +6,42 @@ import (
 	"testing"
 )
 
+// receivedAttribute is one OTLP/JSON key-value as a collector decodes it.
+type receivedAttribute struct {
+	Key   string `json:"key"`
+	Value struct {
+		StringValue *string  `json:"stringValue"`
+		IntValue    string   `json:"intValue"`
+		DoubleValue *float64 `json:"doubleValue"`
+		BoolValue   *bool    `json:"boolValue"`
+		ArrayValue  *struct {
+			Values []struct {
+				StringValue string `json:"stringValue"`
+			} `json:"values"`
+		} `json:"arrayValue"`
+	} `json:"value"`
+}
+
 // receivedSpan is a span as a collector decodes it from OTLP/JSON.
 type receivedSpan struct {
-	TraceID      string `json:"traceId"`
-	SpanID       string `json:"spanId"`
-	ParentSpanID string `json:"parentSpanId"`
-	Name         string `json:"name"`
-	Kind         int    `json:"kind"`
-	Attributes   []struct {
-		Key   string `json:"key"`
-		Value struct {
-			StringValue *string  `json:"stringValue"`
-			IntValue    string   `json:"intValue"`
-			DoubleValue *float64 `json:"doubleValue"`
-			BoolValue   *bool    `json:"boolValue"`
-			ArrayValue  *struct {
-				Values []struct {
-					StringValue string `json:"stringValue"`
-				} `json:"values"`
-			} `json:"arrayValue"`
-		} `json:"value"`
-	} `json:"attributes"`
-	Status struct {
+	TraceID      string              `json:"traceId"`
+	SpanID       string              `json:"spanId"`
+	ParentSpanID string              `json:"parentSpanId"`
+	Name         string              `json:"name"`
+	Kind         int                 `json:"kind"`
+	Attributes   []receivedAttribute `json:"attributes"`
+	Events       []receivedEvent     `json:"events"`
+	Status       struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 	} `json:"status"`
+}
+
+// receivedEvent is a span event as a collector decodes it.
+type receivedEvent struct {
+	TimeUnixNano string              `json:"timeUnixNano"`
+	Name         string              `json:"name"`
+	Attributes   []receivedAttribute `json:"attributes"`
 }
 
 func decodeSpans(t *testing.T, body []byte) []receivedSpan {
@@ -55,8 +66,13 @@ func decodeSpans(t *testing.T, body []byte) []receivedSpan {
 }
 
 // attr renders one attribute value as text, or "" when it is absent.
-func (s receivedSpan) attr(key string) string {
-	for _, attribute := range s.Attributes {
+func (s receivedSpan) attr(key string) string { return attributeText(s.Attributes, key) }
+
+// attr renders one event attribute value as text, or "" when it is absent.
+func (e receivedEvent) attr(key string) string { return attributeText(e.Attributes, key) }
+
+func attributeText(attributes []receivedAttribute, key string) string {
+	for _, attribute := range attributes {
 		if attribute.Key != key {
 			continue
 		}

@@ -59,9 +59,9 @@ type ModelFallback struct {
 // Attempt, the wait before the next attempt in RetryDelay and, in FailedAt,
 // when the retrying stream saw the attempt fail: the next attempt is sent
 // RetryDelay after FailedAt, however late a consumer reads the event. A
-// fallback carries the discarded attempt in Err and the model switch in
-// Fallback. An attempt carries the ordinal of the attempt being sent in
-// Attempt.
+// fallback carries the discarded attempt in Err, the model switch in Fallback
+// and, in FailedAt, when the fallback chain saw the model fail. An attempt
+// carries the ordinal of the attempt being sent in Attempt.
 type StreamEvent struct {
 	Type         StreamEventType
 	ContentIndex int
@@ -75,7 +75,7 @@ type StreamEvent struct {
 	Attempt      int               // retry: 1-based ordinal of the failed attempt; attempt: of the one being sent
 	RetryDelay   time.Duration     // retry: wait before the next attempt
 	Fallback     *ModelFallback    // fallback: the switch to the next model
-	FailedAt     time.Time         // retry: when the attempt failed
+	FailedAt     time.Time         // retry / fallback: when the attempt failed
 }
 
 // AssistantBuilder folds a stream of StreamEvents into an AssistantMessage. The

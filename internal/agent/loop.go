@@ -971,9 +971,17 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			}
 			if event.Type == types.EvRetry {
 				slog.Warn("assistant stream retry", "model", attempt.Model, "provider", attempt.Provider, "attempt", event.Attempt, "delay", event.RetryDelay, "errorCode", attempt.ErrorCode, "errorMessage", redactTruncate(attempt.ErrorMessage, errorLogRunes), "outputTokens", attempt.Usage.Output)
-				if err := emit(ctx, AgentEvent{Type: EventModelRetry, Message: attempt, Attempt: event.Attempt, RetryDelay: event.RetryDelay, FailedAt: event.FailedAt}); err != nil {
-					return attempt, err
-				}
+			}
+			// A switch's retry event names the backup and comes before the
+			// discarded message ends, as a retry's does; the switch itself is
+			// reported after, once the attempt is accounted.
+			retried := AgentEvent{Type: EventModelRetry, Message: attempt, Attempt: event.Attempt, RetryDelay: event.RetryDelay, FailedAt: event.FailedAt}
+			if event.Fallback != nil {
+				fallback := *event.Fallback
+				retried.Attempt, retried.Fallback = fallback.Attempts, &fallback
+			}
+			if err := emit(ctx, retried); err != nil {
+				return attempt, err
 			}
 			// An attempt that failed before streaming (an HTTP error) opened
 			// no message and reported no usage; the retry event is its record.
