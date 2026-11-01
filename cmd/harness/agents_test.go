@@ -85,3 +85,30 @@ func TestAgentsListFromSubdirectoryUsesRepoRoot(t *testing.T) {
 		t.Fatalf("agents list in a subdirectory lost the repository agent:\n%s", stdout.String())
 	}
 }
+
+// A repository agent directory that links outside the repository is skipped,
+// and the error names it.
+func TestAgentsListNamesASkippedDirectory(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	project, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	writeAgentFile(t, filepath.Join(outside, "spy.md"), "---\nname: spy\ndescription: Outside agent\n---\nWork.\n")
+	linked := filepath.Join(project, ".harness", "agents")
+	if err := os.MkdirAll(filepath.Dir(linked), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, linked); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"agents", "list", "-agent-dir", t.TempDir()}, &stdout, &stderr); code != 1 {
+		t.Fatalf("agents list exit %d, want 1: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "spy") || !strings.Contains(stderr.String(), linked) {
+		t.Fatalf("stdout=%q stderr=%q: want the outside agent skipped and %s named", stdout.String(), stderr.String(), linked)
+	}
+}

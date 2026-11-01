@@ -34,8 +34,8 @@ const (
 	RoleSmol    = "smol"
 )
 
-// claudeModelRoles maps Claude Code's agent model aliases onto roles so
-// .claude/agents files load unchanged.
+// claudeModelRoles maps Claude Code's agent model aliases onto roles, so a
+// .claude/agents file's model field needs no edit.
 var claudeModelRoles = map[string]string{"inherit": RoleDefault, "sonnet": RoleDefault, "opus": RoleDefault, "haiku": RoleSmol}
 
 // claudeToolNames maps Claude Code tool names onto the harness tools that do
@@ -155,7 +155,7 @@ func Load(ctx context.Context, options Options) ([]Agent, []Diagnostic, error) {
 		}
 		var skipped *skipError
 		if errors.As(err, &skipped) {
-			diagnostics = append(diagnostics, Diagnostic{Path: dir, Message: skipped.Error(), Err: err})
+			diagnostics = append(diagnostics, Diagnostic{Path: dir, Message: fmt.Sprintf("agent directory %s: %s", dir, skipped), Err: err})
 			continue
 		}
 		if err != nil {
