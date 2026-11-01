@@ -47,6 +47,9 @@ type Options struct {
 	// nil, or an answer of question.Unavailable, means no user can be
 	// asked: elicitations are declined and authorization names the command.
 	Elicit question.Elicitor
+	// OnPromptsChanged receives every server's prompts after a refresh
+	// changed one server's list, including the first discovery.
+	OnPromptsChanged func([]Prompt)
 }
 
 // Manager owns connections and complete catalogs for one Tempest session.
@@ -61,6 +64,8 @@ type Manager struct {
 	closeErr     error
 	admitProcess func(context.Context) (func(), error)
 	elicit       question.Elicitor
+	// onPromptsChanged is Options.OnPromptsChanged.
+	onPromptsChanged func([]Prompt)
 }
 
 type progressCall struct {
@@ -113,7 +118,7 @@ func Open(ctx context.Context, configs []mcpconfig.Server, options Options) (*Ma
 		logger = slog.Default()
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger, admitProcess: options.AdmitProcess, elicit: options.Elicit}
+	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger, admitProcess: options.AdmitProcess, elicit: options.Elicit, onPromptsChanged: options.OnPromptsChanged}
 	var store *mcpoauth.Store
 	if options.CredentialDir != "" {
 		store = mcpoauth.NewStore(options.CredentialDir)
@@ -246,7 +251,9 @@ func (s *server) startRefreshLocked(ctx context.Context, reconnect bool) {
 			var next catalog
 			next, err = s.discover(refreshCtx, client)
 			s.mu.Lock()
+			promptsChanged := false
 			if err == nil {
+				promptsChanged = !samePrompts(s.catalog.prompts, next.prompts)
 				s.catalog = next
 				s.unavailable = nil
 			}
@@ -257,6 +264,9 @@ func (s *server) startRefreshLocked(ctx context.Context, reconnect bool) {
 				close(done)
 			}
 			s.mu.Unlock()
+			if promptsChanged && s.manager.onPromptsChanged != nil {
+				s.manager.onPromptsChanged(s.manager.Prompts())
+			}
 			if !again {
 				return
 			}

@@ -97,7 +97,8 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 		if f.mode == "modern" {
 			version = "2026-07-28"
 		}
-		return map[string]any{"protocolVersion": version, "capabilities": map[string]any{"tools": map[string]bool{"listChanged": true}, "resources": map[string]bool{"listChanged": true}}, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
+		capabilities := map[string]map[string]bool{"tools": {"listChanged": true}, "resources": {"listChanged": true}, "prompts": {"listChanged": true}}
+		return map[string]any{"protocolVersion": version, "capabilities": capabilities, "serverInfo": map[string]string{"name": "fixture", "version": "1"}}, nil
 	case "notifications/initialized":
 		f.mu.Lock()
 		f.initialized = true
@@ -256,12 +257,42 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 			case read.URI == "fixture://bump":
 				f.resourceGeneration.Add(1)
 				_ = f.conn.Notify(ctx, "notifications/resources/list_changed", struct{}{})
+				_ = f.conn.Notify(ctx, "notifications/prompts/list_changed", struct{}{})
 				content["mimeType"], content["text"] = "text/plain", "bumped"
 			default:
 				return nil, rpc.NewError(-32002, "not_found", "resource not found")
 			}
 			return map[string]any{"contents": []map[string]string{content}}, nil
 		}), nil
+	case "prompts/list":
+		prompts := []map[string]any{
+			{"name": "review", "description": "Review a file", "arguments": []map[string]any{{"name": "path", "required": true}, {"name": "focus"}}},
+			{"name": "dialogue", "title": "Worked example"},
+		}
+		if f.resourceGeneration.Load() > 0 {
+			prompts = append(prompts, map[string]any{"name": "added"})
+		}
+		return map[string]any{"prompts": prompts}, nil
+	case "prompts/get":
+		var get struct {
+			Name      string            `json:"name"`
+			Arguments map[string]string `json:"arguments"`
+		}
+		_ = json.Unmarshal(params, &get)
+		type message struct {
+			Role    string         `json:"role"`
+			Content map[string]any `json:"content"`
+		}
+		var messages []message
+		switch get.Name {
+		case "review":
+			messages = []message{{"user", map[string]any{"type": "text", "text": "Review " + get.Arguments["path"] + " focusing on " + get.Arguments["focus"]}}, {"user", map[string]any{"type": "image", "data": pixelPNG, "mimeType": "image/png"}}}
+		case "dialogue":
+			messages = []message{{"user", map[string]any{"type": "text", "text": "What is 2+2?"}}, {"assistant", map[string]any{"type": "text", "text": "4"}}, {"user", map[string]any{"type": "text", "text": "Now explain."}}}
+		default:
+			return nil, rpc.NewError(-32602, "invalid_params", "unknown prompt")
+		}
+		return map[string]any{"messages": messages}, nil
 	default:
 		return nil, rpc.NewError(-32601, "method_not_found", "fixture doesn't implement method")
 	}

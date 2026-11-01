@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
@@ -543,18 +544,27 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 	if err != nil {
 		return nil, failure(err)
 	}
+	announce := func() {
+		// Clients learn the session's slash commands once it exists; later
+		// changes arrive through the session's update stream.
+		if commands := s.Commands(); len(commands) > 0 {
+			if err := c.conn.Notify(ctx, "session/update", map[string]any{"sessionId": s.ID(), "update": tempest.NewCommandsUpdate(commands)}); err != nil {
+				slog.Warn("announcing available commands failed", "session", s.ID(), "error", err)
+			}
+		}
+	}
 	if method == "session/new" {
-		return map[string]any{"sessionId": s.ID()}, nil
+		return rpc.Response{Value: map[string]any{"sessionId": s.ID()}, After: announce}, nil
 	}
 	if method == "session/resume" {
-		return struct{}{}, nil
+		return rpc.Response{Value: struct{}{}, After: announce}, nil
 	}
 	_, after, e := c.startWatch(ctx, s, false, 256, nil, true)
 	if e != nil {
 		return nil, e
 	}
 	// Replay precedes the response; live updates stay queued until after it.
-	return rpc.Response{Value: struct{}{}, After: after}, nil
+	return rpc.Response{Value: struct{}{}, After: func() { announce(); after() }}, nil
 }
 
 // checkWorkspace rejects a cwd that a session could not run tools in.

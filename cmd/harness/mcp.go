@@ -5,13 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/mcpclient"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/mcpoauth"
 )
@@ -19,7 +22,7 @@ import (
 func runMCP(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 {
 		switch args[0] {
-		case "login", "logout", "list":
+		case "login", "logout", "list", "prompts":
 			return runMCPClient(args[0], args[1:], stdout, stderr)
 		}
 	}
@@ -48,12 +51,12 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 			values.AgentDir.Set = true
 		}
 	})
-	wantName := command != "list"
+	wantName := command != "list" && command != "prompts"
 	if (wantName && fs.NArg() != 1) || (!wantName && fs.NArg() != 0) {
 		if wantName {
 			fmt.Fprintf(stderr, "usage: tempest mcp %s [flags] <server>\n", command)
 		} else {
-			fmt.Fprintln(stderr, "usage: tempest mcp list [flags]")
+			fmt.Fprintf(stderr, "usage: tempest mcp %s [flags]\n", command)
 		}
 		return exitUsage
 	}
@@ -69,6 +72,8 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 	switch command {
 	case "list":
 		return printMCPServers(stdout, stderr, servers, store)
+	case "prompts":
+		return printMCPPrompts(ctx, stdout, stderr, servers, mcpoauth.DefaultDir(cfg.AgentDir()))
 	case "logout":
 		name := fs.Arg(0)
 		server, found := findMCPServer(servers, name)
@@ -179,6 +184,46 @@ func printMCPServers(stdout, stderr io.Writer, servers []mcpconfig.Server, store
 	}
 	return 0
 }
+
+// printMCPPrompts starts the configured servers and lists their prompts as
+// the slash commands a session accepts.
+func printMCPPrompts(ctx context.Context, stdout, stderr io.Writer, servers []mcpconfig.Server, credentialDir string) int {
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	manager, err := mcpclient.Open(ctx, servers, mcpclient.Options{Cwd: cwd, Logger: logger, CredentialDir: credentialDir})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), mcpCloseTimeout)
+		defer cancel()
+		if err := manager.Close(closeCtx); err != nil {
+			fmt.Fprintln(stderr, err)
+		}
+	}()
+	prompts := manager.Prompts()
+	if len(prompts) == 0 {
+		fmt.Fprintln(stdout, "No MCP prompts.")
+		return 0
+	}
+	table := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	for _, prompt := range prompts {
+		fmt.Fprintf(table, "/%s %s\t%s\n", prompt.Command(), prompt.Hint(), prompt.Summary())
+	}
+	if err := table.Flush(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+// mcpCloseTimeout bounds stopping the servers a listing started.
+const mcpCloseTimeout = 10 * time.Second
 
 func mcpCredentialSource(server mcpconfig.Server) string {
 	if server.Transport == "stdio" {

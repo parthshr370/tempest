@@ -139,8 +139,28 @@ read mcp://docs/logs://2026-11-01    a URI built from a template such as logs://
 Text contents come back as numbered rows like a file. A PNG, JPEG, GIF or WebP
 blob is passed to the model as an image; any other blob is saved under the
 session's `local://mcp/` directory and the read names that file. Tempest reads
-the server's tools, resources and resource templates as one catalog at startup,
-and re-reads all of it when the server sends any `list_changed` notification.
+the server's tools, resources, resource templates and prompts as one catalog at
+startup, and re-reads all of it when the server sends any `list_changed`
+notification.
+
+### Prompts
+
+Each server prompt is a slash command `/<server>:<prompt>`. A prompt sent as
+`/docs:summarize guide.md short` is replaced, before the run starts, by the
+messages `prompts/get` returns, and those messages become the user turn. Arguments
+follow the command, either all as `name=value` words or as words in the order the
+server declares, the last argument taking the rest of the line. A missing required
+argument fails the run with the command's usage. When the prompt also speaks as the
+assistant, each change of role is marked `[user]` or `[assistant]` in the turn.
+Text that names no known prompt is sent unchanged.
+
+ACP clients get the commands as an `available_commands_update` after
+`session/new`, `session/load` and `session/resume`, and again whenever a server's
+prompt list changes. On the command line:
+
+```sh
+tempest mcp prompts             # /docs:summarize <path> [style]  Summarize a file
+```
 
 ### Elicitation from servers
 

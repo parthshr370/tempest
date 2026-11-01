@@ -567,7 +567,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	c.permissionPolicy = &cfg.PermissionPolicy
 	// MCP spills sit with the session's other tool output, where read can open them.
 	cfg.AdmitProcess = o.admitProcess
-	c.mcp, err = mcpclient.Open(ctx, selectedMCP, mcpclient.Options{Cwd: cwd, SpillDir: filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), Logger: logger, AdmitProcess: o.admitProcess, CredentialDir: cfg.MCP.CredentialDir, Elicit: c.elicitor(o.Elicitor)})
+	c.mcp, err = mcpclient.Open(ctx, selectedMCP, mcpclient.Options{Cwd: cwd, SpillDir: filepath.Join(store.Path()+".d", refs.LocalDirName, "mcp"), Logger: logger, AdmitProcess: o.admitProcess, CredentialDir: cfg.MCP.CredentialDir, Elicit: c.elicitor(o.Elicitor), OnPromptsChanged: c.announceCommands})
 	if err != nil {
 		return nil, err
 	}
@@ -899,6 +899,10 @@ func (s *Session) execute(runCtx context.Context, p *Prompt, schema *outputschem
 	c.agent.SetOutputSchema(schema)
 	if p == nil {
 		r.result, r.err = c.agent.Continue(runCtx)
+		return
+	}
+	// /<server>:<prompt> becomes that MCP prompt's messages, as this turn.
+	if p, r.err = c.expandCommand(runCtx, p); r.err != nil {
 		return
 	}
 	if len(p.Media) == 0 && schema == nil {

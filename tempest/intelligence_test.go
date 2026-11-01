@@ -19,8 +19,9 @@ import (
 	"go.harness.dev/harness/internal/tools"
 )
 
-// fixtureServer is internal/lsp's language-server fixture, built once.
-var fixtureServer string
+// fixtureServer is internal/lsp's language-server fixture and
+// mcpFixtureServer internal/mcpclient's MCP server fixture, built once.
+var fixtureServer, mcpFixtureServer string
 
 func TestMain(m *testing.M) {
 	os.Exit(runWithFixture(m))
@@ -34,9 +35,12 @@ func runWithFixture(m *testing.M) int {
 	}
 	defer os.RemoveAll(dir)
 	fixtureServer = filepath.Join(dir, "lsp-fixture")
-	if output, err := exec.Command("go", "build", "-o", fixtureServer, "../internal/lsp/testdata/server").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "build LSP fixture: %v\n%s", err, output)
-		return 1
+	mcpFixtureServer = filepath.Join(dir, "mcp-fixture")
+	for binary, source := range map[string]string{fixtureServer: "../internal/lsp/testdata/server", mcpFixtureServer: "../internal/mcpclient/testdata/server"} {
+		if output, err := exec.Command("go", "build", "-o", binary, source).CombinedOutput(); err != nil {
+			fmt.Fprintf(os.Stderr, "build %s: %v\n%s", source, err, output)
+			return 1
+		}
 	}
 	return m.Run()
 }

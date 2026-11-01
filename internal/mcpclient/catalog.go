@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -28,6 +29,7 @@ type catalog struct {
 	tools     []agent.AgentTool
 	resources []resource
 	templates []resourceTemplate
+	prompts   []Prompt
 }
 
 type resource struct {
@@ -79,6 +81,22 @@ func (s *server) discover(ctx context.Context, client *mcpwire.Client) (catalog,
 				return errors.New("mcp_protocol: resource template needs uriTemplate and name")
 			}
 			next.templates = append(next.templates, entry)
+			return nil
+		})
+		if err != nil {
+			return catalog{}, err
+		}
+	}
+	if caps.Prompts {
+		err = paginate(ctx, client, "prompts/list", "prompts", func(raw json.RawMessage) error {
+			prompt, err := decodePrompt(s.config.Name, raw)
+			if err != nil {
+				return err
+			}
+			if slices.ContainsFunc(next.prompts, func(seen Prompt) bool { return seen.Name == prompt.Name }) {
+				return fmt.Errorf("mcp_protocol: duplicate prompt %q", prompt.Name)
+			}
+			next.prompts = append(next.prompts, prompt)
 			return nil
 		})
 		if err != nil {

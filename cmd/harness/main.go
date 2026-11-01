@@ -685,7 +685,8 @@ Commands:
   serve     serve durable sessions over ACP on stdio, or ACP WebSocket and A2A with -listen
   env       serve an identified workspace daemon over dedicated stdio
   mcp       run as a stdio MCP server that exposes the tempest_run tool;
-            mcp login|logout <server> manages MCP OAuth, mcp list shows servers and sign-in state
+            mcp login|logout <server> manages MCP OAuth, mcp list shows servers and sign-in state,
+            mcp prompts lists server prompts as /<server>:<prompt> commands
   fork      create a sibling from a safe durable transcript entry
   reset     start an empty context without deleting audit history or spend
   compact   summarize context through the durable native task scheduler
