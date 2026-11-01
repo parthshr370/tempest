@@ -434,7 +434,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if skillPaths == nil {
 			skillPaths = defaults.SkillPaths()
 		}
-		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: skillPaths, IncludeDefaultSkills: true})
+		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: skillPaths, IncludeDefaultSkills: true, Files: cfg.ContextFileSettings})
 		if e != nil {
 			return nil, e
 		}

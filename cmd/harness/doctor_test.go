@@ -137,3 +137,35 @@ func TestDoctorCustomProviderRedactsConfiguredCredentials(t *testing.T) {
 		t.Fatalf("doctor custom provider=%s", &output)
 	}
 }
+
+func TestDoctorListsLoadedContextFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	agentDir := filepath.Join(home, "agent")
+	t.Setenv("HARNESS_AGENT_DIR", agentDir)
+	repo := filepath.Join(home, "repo")
+	for _, dir := range []string{filepath.Join(repo, ".git"), agentDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, body := range map[string]string{
+		filepath.Join(agentDir, "AGENTS.override.md"): "user override",
+		filepath.Join(repo, "CLAUDE.md"):              "repo claude",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(repo)
+	var output, diagnostics bytes.Buffer
+	if code := runDoctor(nil, &output, &diagnostics); code != 0 {
+		t.Fatalf("doctor = %d: %s", code, diagnostics.String())
+	}
+	text := output.String()
+	for _, want := range []string{"context files: ", "AGENTS.override.md (13 bytes)", "CLAUDE.md (11 bytes)"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("doctor output lacks %q:\n%s", want, text)
+		}
+	}
+}

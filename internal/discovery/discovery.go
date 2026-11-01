@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/contextfile"
@@ -23,6 +25,9 @@ type Options struct {
 	HomeDir              string
 	SkillPaths           []string
 	IncludeDefaultSkills bool
+	// Files names context files and bounds their bytes; zero values take the
+	// built-in defaults.
+	Files config.ContextFileSettings
 }
 
 // DiagnosticCode classifies non-fatal discovery diagnostics.
@@ -32,6 +37,7 @@ const (
 	DiagnosticSkill     DiagnosticCode = "skill"
 	DiagnosticCollision DiagnosticCode = "collision"
 	DiagnosticImport    DiagnosticCode = "import"
+	DiagnosticTruncated DiagnosticCode = "truncated"
 )
 
 // Diagnostic is a non-fatal source warning.
@@ -49,6 +55,24 @@ type SessionInputs struct {
 	Skills       []skills.Skill
 	GenericRules []string
 	Diagnostics  []Diagnostic
+	// ContextBytes counts the context file bytes kept, so nested discovery
+	// spends only what the total cap leaves.
+	ContextBytes int
+}
+
+// UserContextNames are the user-level context files, first hit wins.
+var UserContextNames = []string{"AGENTS.override.md", "AGENTS.md"}
+
+// ContextNames is the per-directory lookup order: AGENTS.override.md, then
+// AGENTS.md, then the configured fallback names. Only the first hit loads.
+func ContextNames(fallback []string) []string {
+	names := slices.Clone(UserContextNames)
+	for _, name := range fallback {
+		if !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // ErrorCode classifies fatal discovery failures.
@@ -116,8 +140,10 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		return SessionInputs{}, &Error{Code: code, Op: "resolve root", Path: options.RepoRoot, Err: err}
 	}
 	inputs := SessionInputs{RepoRoot: repoRoot}
+	files := options.Files.WithDefaults()
+	names := ContextNames(files.Fallback)
 
-	userContext, err := readCandidate(filepath.Join(agentDir, "AGENTS.md"), ReadContext)
+	userContext, err := firstCandidate(agentDir, UserContextNames)
 	if err != nil {
 		return SessionInputs{}, err
 	}
@@ -138,7 +164,7 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		}
 		var standalone *candidate
 		if !strings.HasPrefix(filepath.Base(ancestor), ".") {
-			standalone, err = readCandidate(filepath.Join(ancestor, "AGENTS.md"), ReadContext)
+			standalone, err = firstCandidate(ancestor, names)
 		}
 		if err != nil {
 			return SessionInputs{}, err
@@ -193,6 +219,11 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 		}
 	}
 	inputs.ContextFiles = append(inputs.ContextFiles, collapsed...)
+	var notice *Diagnostic
+	inputs.ContextFiles, inputs.ContextBytes, notice = capContextFiles(inputs.ContextFiles, files.MaxBytes)
+	if notice != nil {
+		inputs.Diagnostics = append(inputs.Diagnostics, *notice)
+	}
 	for _, rule := range []*candidate{userRule, nativeRule} {
 		if rule == nil {
 			continue
@@ -233,6 +264,62 @@ func readCandidate(path string, code ErrorCode) (*candidate, error) {
 		return nil, nil
 	}
 	return &candidate{path: path, content: data}, nil
+}
+
+// firstCandidate returns the first nonblank file of names in dir, so
+// AGENTS.override.md shadows AGENTS.md and both shadow fallback names.
+func firstCandidate(dir string, names []string) (*candidate, error) {
+	for _, name := range names {
+		found, err := readCandidate(filepath.Join(dir, name), ReadContext)
+		if err != nil || found != nil {
+			return found, err
+		}
+	}
+	return nil, nil
+}
+
+// capContextFiles keeps files in prompt order until maxBytes is spent. The
+// file that crosses the cap is cut at a UTF-8 boundary and carries a notice
+// naming the cap and every file left out, so the model knows the context is
+// incomplete. It returns the kept files, the bytes they spend (without the
+// notice) and a diagnostic when anything was cut.
+func capContextFiles(files []prompt.ContextFile, maxBytes int) ([]prompt.ContextFile, int, *Diagnostic) {
+	used := 0
+	for index, file := range files {
+		if used+len(file.Content) <= maxBytes {
+			used += len(file.Content)
+			continue
+		}
+		kept := TruncateUTF8(file.Content, maxBytes-used)
+		omitted := make([]string, 0, len(files)-index-1)
+		for _, later := range files[index+1:] {
+			omitted = append(omitted, later.Path)
+		}
+		message := fmt.Sprintf("context files exceed context_files.max_bytes (%d bytes): the last %d bytes of %s were cut", maxBytes, len(file.Content)-len(kept), file.Path)
+		if len(omitted) > 0 {
+			message += "; omitted: " + strings.Join(omitted, ", ")
+		}
+		file.Content = kept + "\n\n[harness: " + message + "]"
+		result := append(slices.Clone(files[:index]), file)
+		return result, used + len(kept), &Diagnostic{Code: DiagnosticTruncated, Path: file.Path, Message: message}
+	}
+	return files, used, nil
+}
+
+// TruncateUTF8 returns the longest prefix of s within limit bytes that does
+// not split a UTF-8 sequence.
+func TruncateUTF8(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func expandContext(ctx context.Context, item candidate, home string) (prompt.ContextFile, error) {

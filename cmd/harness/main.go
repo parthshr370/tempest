@@ -259,7 +259,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	var inputs discovery.SessionInputs
 	if !environment.IsLocation(cwd) {
 		inputs, err = discovery.Discover(runCtx, discovery.Options{
-			Cwd: cwd, AgentDir: opts.Config.AgentDir(), SkillPaths: opts.Config.SkillPaths(), IncludeDefaultSkills: true,
+			Cwd: cwd, AgentDir: opts.Config.AgentDir(), SkillPaths: opts.Config.SkillPaths(), IncludeDefaultSkills: true, Files: opts.Config.ContextFiles(),
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "context discovery error: %v\n", err)

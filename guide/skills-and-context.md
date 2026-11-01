@@ -2,11 +2,43 @@
 
 ## Context discovery
 
-At startup the agent walks `AGENTS.md` up from your working directory, loads a
-sticky `RULES.md` that survives compaction, expands safe `@file` imports, and
-registers skills from your agent directory, the project and `-skill` paths. Skill
-bodies load on demand through the `skill` tool or a `skill://` read, so nothing
-bloats the prompt until it is needed.
+At startup the agent walks up from your working directory to the repository root
+and loads one context file per directory, loads a sticky `RULES.md` that survives
+compaction, expands safe `@file` imports, and registers skills from your agent
+directory, the project and `-skill` paths. Skill bodies load on demand through the
+`skill` tool or a `skill://` read, so nothing bloats the prompt until it is needed.
+
+In each directory the first of these files that exists and is not blank loads:
+
+1. `AGENTS.override.md`
+2. `AGENTS.md`
+3. each name in `context_files.fallback`, by default `["CLAUDE.md"]`
+
+So a personal `AGENTS.override.md` shadows the checked-in `AGENTS.md`, and a
+repository that only has `CLAUDE.md` still gets its instructions. Directories
+whose name starts with `.` are skipped. The nearest `.harness/AGENTS.md` keeps
+its place: it replaces the standalone file of its own directory. At user level,
+`<agent-dir>/AGENTS.override.md` wins over `<agent-dir>/AGENTS.md`; fallback names
+do not apply there.
+
+Files load user first, then repository root down to the working directory.
+`@file` imports expand in every kind of context file, including `CLAUDE.md`.
+
+The loaded files share one budget, `context_files.max_bytes` (default 65536
+bytes, counted after imports expand). The file that crosses it is cut and ends
+with a `[harness: context files exceed context_files.max_bytes ...]` notice that
+names the cut and every file left out, so the model knows its instructions are
+incomplete. `harness doctor` lists the files a run in the current directory
+would load, their sizes, and the notice if any.
+
+```json
+{
+  "context_files": {
+    "fallback": ["CLAUDE.md", "GEMINI.md"],
+    "max_bytes": 65536
+  }
+}
+```
 
 ## Workspace listing
 

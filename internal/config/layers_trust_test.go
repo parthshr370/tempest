@@ -40,6 +40,7 @@ var gatedSamples = map[string]string{
 	"log_file":                    `"/tmp/repo.log"`,
 	"faux_script":                 `"/tmp/repo-faux.json"`,
 	"skill_paths":                 `["/tmp/repo-private-skills"]`,
+	"context_files":               `{"fallback":["PRIVATE.md"],"max_bytes":100000,"nested_max_bytes":10000,"nested":false}`,
 	"enable_lsp":                  `true`,
 	"enable_web":                  `true`,
 	"providers":                   `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`,
@@ -174,6 +175,7 @@ var projectSettingTrust = []struct {
 	{"attach", `["/outside/private.txt"]`, gateExecutable},
 	{"skill_paths", `["/outside/private-skills"]`, gateExecutable},
 	{"agent_dir", `"/outside/agent"`, gateExecutable},
+	{"context_files", `{"fallback":["PRIVATE.md"],"max_bytes":100000,"nested_max_bytes":10000,"nested":false}`, gateExecutable},
 	// Writes outside the repository.
 	{"session_dir", `"/outside/sessions"`, gateExecutable},
 	{"log_file", `"/outside/repo.log"`, gateExecutable},

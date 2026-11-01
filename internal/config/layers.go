@@ -616,6 +616,7 @@ var projectGates = map[string]trustGate{
 	"attach":                      gateExecutable,
 	"skill_paths":                 gateExecutable,
 	"agent_dir":                   gateExecutable,
+	"context_files":               gateExecutable,
 	"session_dir":                 gateExecutable,
 	"log_file":                    gateExecutable,
 	"faux_script":                 gateExecutable,
@@ -1006,7 +1007,17 @@ func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[
 		"workspace_listing_max_files": numberNode(strconv.Itoa(DefaultWorkspaceListingMaxFiles)),
 		"workspace_listing_max_bytes": numberNode(strconv.Itoa(DefaultWorkspaceListingMaxBytes)),
 		"mcp_sampling_allow_headless": boolNode(false),
+		"context_files": {object: map[string]*settingsNode{
+			"max_bytes":        numberNode(strconv.Itoa(DefaultContextMaxBytes)),
+			"nested_max_bytes": numberNode(strconv.Itoa(DefaultContextNestedMaxBytes)),
+			"nested":           boolNode(true),
+		}},
 	}
+	fallback, err := stringsNode(DefaultContextFallback)
+	if err != nil {
+		return nil, nil, err
+	}
+	defaults["context_files"].object["fallback"] = fallback
 	origins := map[string]string{}
 	for key, value := range map[string]string{
 		"model":                   defaultModel,
@@ -1303,11 +1314,7 @@ func mergeEffective(stack []*settingsLayer, requirements []managedRequirement, l
 	if err != nil {
 		return nil, nil, err
 	}
-	for key, value := range defaults {
-		if _, set := merged[key]; !set {
-			merged[key] = value
-		}
-	}
+	fillDefaults(merged, defaults)
 	if _, set := merged["mcp_sampling_max_tokens"]; !set {
 		// Sampling inherits the effective output cap when no layer sets its own.
 		merged["mcp_sampling_max_tokens"] = merged["max_tokens"].clone()
@@ -1325,6 +1332,21 @@ func mergeEffective(stack []*settingsLayer, requirements []managedRequirement, l
 		merged["session_dir"] = sessionDir
 	}
 	return merged, defaultOrigins, nil
+}
+
+// fillDefaults sets each default member a layer left unset. An object default
+// fills the unset members of a layered object of the same key, so setting
+// context_files.nested keeps the default context_files.max_bytes.
+func fillDefaults(merged, defaults map[string]*settingsNode) {
+	for key, value := range defaults {
+		existing, set := merged[key]
+		switch {
+		case !set:
+			merged[key] = value
+		case existing.object != nil && value.object != nil:
+			fillDefaults(existing.object, value.object)
+		}
+	}
 }
 
 // reportDropped names, in one warning, each repository setting the trust

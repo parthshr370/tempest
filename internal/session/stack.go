@@ -77,10 +77,13 @@ type StackConfig struct {
 	CustomPrompt     string
 	PromptGuidelines []string
 	ContextFiles     []prompt.ContextFile
-	Skills           []skills.Skill
-	Rules            []prompt.PromptRule
-	GenericRules     []string
-	Personality      string
+	// ContextFileSettings names and bounds context files for discovery in
+	// tempest.Open and for nested discovery on reads.
+	ContextFileSettings config.ContextFileSettings
+	Skills              []skills.Skill
+	Rules               []prompt.PromptRule
+	GenericRules        []string
+	Personality         string
 	// WorkspaceListing is the session's journaled start-of-session file
 	// listing (tools.WorkspaceListing). Every provider request carries it at
 	// the head of the first user message; the transcript stays unchanged.
@@ -215,6 +218,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		EnableWeb:            cfg.EnableWeb(),
 		WebSearchURL:         cfg.WebSearchURL(),
 		SkillPaths:           cfg.SkillPaths(),
+		ContextFileSettings:  cfg.ContextFiles(),
 		BashTimeout:          cfg.BashTimeout(),
 		Hooks:                cfg.Hooks(),
 		WorkspaceHooks:       cfg.WorkspaceHooks,

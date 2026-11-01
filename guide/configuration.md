@@ -57,7 +57,7 @@ credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `context_files`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, `otel`, and a `model`, `plan_model`, `smol_model`, `mcp_sampling_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
@@ -339,6 +339,7 @@ each flag and variable above, names the same setting. The main keys:
 | `otel` | OpenTelemetry export: endpoints, headers, service name, content capture. Each key also reads its standard `OTEL_*` variable. See [Telemetry](telemetry.md#settings). |
 | `skill_paths` | Extra skill directories; `-skill` flags replace the list. |
 | `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
+| `context_files` | Object: `fallback` file names tried after `AGENTS.md` (default `["CLAUDE.md"]`) and `max_bytes`, the total context file cap (default 65536). See [Skills and context](skills-and-context.md#context-discovery). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 
