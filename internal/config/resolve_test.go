@@ -302,3 +302,65 @@ func TestChatGPTRejectsOnlyExplicitUserOutputCaps(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveWorkspaceListing(t *testing.T) {
+	noEnvironment := func(string) string { return "" }
+	defaults, err := (Config{SettingsPath: filepath.Join(t.TempDir(), "missing.json"), LookupEnv: noEnvironment}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := defaults.WorkspaceListing(), (WorkspaceListing{MaxFiles: DefaultWorkspaceListingMaxFiles, MaxBytes: DefaultWorkspaceListingMaxBytes}); got != want {
+		t.Fatalf("defaults = %+v, want %+v", got, want)
+	}
+	settingsPath := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"workspace_listing":false,"workspace_listing_max_files":50,"workspace_listing_max_bytes":2048}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	settings, err := (Config{SettingsPath: settingsPath, LookupEnv: func(string) string { return "" }}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := settings.WorkspaceListing(), (WorkspaceListing{Disabled: true, MaxFiles: 50, MaxBytes: 2048}); got != want {
+		t.Fatalf("settings = %+v, want %+v", got, want)
+	}
+	environment := map[string]string{"HARNESS_WORKSPACE_LISTING": "true", "HARNESS_WORKSPACE_LISTING_MAX_BYTES": "1024"}
+	overridden, err := (Config{SettingsPath: settingsPath, LookupEnv: func(key string) string { return environment[key] }}).Resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := overridden.WorkspaceListing(), (WorkspaceListing{MaxFiles: 50, MaxBytes: 1024}); got != want {
+		t.Fatalf("environment = %+v, want %+v", got, want)
+	}
+	for key, layer := range map[string]string{"workspace_listing": LayerEnv, "workspace_listing_max_files": LayerUser, "workspace_listing_max_bytes": LayerEnv} {
+		if shown := settingFor(t, overridden, key); shown.Layer != layer {
+			t.Fatalf("config show %s = %+v, want the %s layer", key, shown, layer)
+		}
+	}
+	overrides := Config{SettingsPath: settingsPath, LookupEnv: func(key string) string { return environment[key] }, Flags: FlagValues{Overrides: StringsInput{Set: true, Values: []string{"workspace_listing=false"}}}}
+	if resolved, err := overrides.Resolve(); err != nil || !resolved.WorkspaceListing().Disabled {
+		t.Fatalf("-c workspace_listing=false did not outrank the environment: %v", err)
+	}
+	for variable, field := range map[string]string{"HARNESS_WORKSPACE_LISTING": "workspace_listing", "HARNESS_WORKSPACE_LISTING_MAX_FILES": "workspace_listing_max_files", "HARNESS_WORKSPACE_LISTING_MAX_BYTES": "workspace_listing_max_bytes"} {
+		_, err := (Config{SettingsPath: settingsPath, LookupEnv: func(key string) string {
+			if key == variable {
+				return "many"
+			}
+			return ""
+		}}).Resolve()
+		var configErr *Error
+		if !errors.As(err, &configErr) || configErr.Field != field {
+			t.Fatalf("%s=many error = %v", variable, err)
+		}
+	}
+	for _, field := range []string{"workspace_listing_max_files", "workspace_listing_max_bytes"} {
+		invalid := filepath.Join(t.TempDir(), "settings.json")
+		if err := os.WriteFile(invalid, []byte(`{"`+field+`":0}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := (Config{SettingsPath: invalid, LookupEnv: func(string) string { return "" }}).Resolve()
+		var configErr *Error
+		if !errors.As(err, &configErr) || configErr.Field != field {
+			t.Fatalf("%s=0 error = %v", field, err)
+		}
+	}
+}

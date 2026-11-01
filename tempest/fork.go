@@ -70,6 +70,13 @@ func (host *Host) Fork(ctx context.Context, parentID, entryID string, options Fo
 	if options.Cwd != "" {
 		cwd = options.Cwd
 	}
+	// A fork of the same workspace keeps the parent's listing bytes, so the
+	// inherited transcript's first request is unchanged; another workspace
+	// gets its own listing.
+	if options.Cwd == "" && options.Environment == nil {
+		stack.WorkspaceListing = choice.WorkspaceListing
+		configured.forkKeepsListing = true
+	}
 	return host.createFork(ctx, seed, configured, stack, choice, cwd)
 }
 

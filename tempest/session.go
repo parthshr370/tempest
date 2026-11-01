@@ -334,6 +334,16 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 			modelSpec = loaded.Model
 		}
 	}
+	// A new session lists its workspace once; persistAgent journals the
+	// bytes with the agent selection, so resume and forks never re-list.
+	if o.New != nil && !o.forkKeepsListing && cfg.WorkspaceListing == "" {
+		var listingErr error
+		cfg.WorkspaceListing, listingErr = tools.WorkspaceListing(ctx, lease, cwd, cfg.ListingPolicy)
+		if listingErr != nil {
+			// The listing only saves discovery turns; start without it.
+			logger.Debug("session starts without a workspace listing", "error", listingErr)
+		}
+	}
 	if mode == "" && defaults != nil {
 		mode = PermissionMode(defaults.PermissionModeDefault())
 	}

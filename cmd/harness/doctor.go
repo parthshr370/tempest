@@ -104,6 +104,8 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "  log_file: %s\n", opts.Config.LogFile())
 	fmt.Fprintf(stdout, "  enable_web: %t\n", opts.Config.EnableWeb())
 	fmt.Fprintf(stdout, "  web_search_url: %s\n", redactedURL(opts.Config.WebSearchURL()))
+	listing := opts.Config.WorkspaceListing()
+	fmt.Fprintf(stdout, "  workspace_listing: %t (max_files=%d max_bytes=%d)\n", !listing.Disabled, listing.MaxFiles, listing.MaxBytes)
 	fmt.Fprintf(stdout, "  anthropic_base_url: %s\n", redactedURL(opts.Config.AnthropicBaseURL()))
 	fmt.Fprintf(stdout, "  openai_base_url: %s\n", redactedURL(opts.Config.OpenAIBaseURL()))
 	fmt.Fprintln(stdout, "  provider_credentials: REDACTED")

@@ -79,6 +79,13 @@ type StackConfig struct {
 	Rules            []prompt.PromptRule
 	GenericRules     []string
 	Personality      string
+	// WorkspaceListing is the session's journaled start-of-session file
+	// listing (tools.WorkspaceListing). Every provider request carries it at
+	// the head of the first user message; the transcript stays unchanged.
+	WorkspaceListing string
+	// ListingPolicy decides whether a new session takes a workspace listing
+	// and its caps. Resume and fork reuse the journaled listing instead.
+	ListingPolicy config.WorkspaceListing
 
 	// InitialMessages seeds the agent transcript when resuming a session. Nil
 	// starts a fresh conversation.
@@ -178,6 +185,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		LSP:                  &lspConfig,
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
+		ListingPolicy:        cfg.WorkspaceListing(),
 	}
 }
 
@@ -576,6 +584,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		}
 	}
 	agt = agent.NewAgent(agent.AgentOptions{
+		TransformContext: withWorkspaceListing(cfg.WorkspaceListing),
 		InitialState:     &agent.AgentState{SystemPrompt: systemPrompt, Model: model, ThinkingLevel: thinkingLevel(reasoning), Tools: active, Messages: cfg.InitialMessages},
 		StreamFn:         cfg.StreamFn,
 		FallbackModels:   cfg.FallbackModels,

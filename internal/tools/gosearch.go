@@ -44,9 +44,9 @@ func goGrep(ctx context.Context, root *os.Root, base string, pattern string, glo
 		return nil, false, err
 	}
 	// rg only honours .gitignore inside a Git worktree; mirror that.
-	var ignore *gitignoreMatcher
+	ignore := newIgnoreSet(ctx)
 	if insideGitRepo(root.Name()) {
-		ignore = loadGitignore(root)
+		ignore = rootGitignore(ctx, root)
 	}
 	matches := []grepMatch{}
 	limitReached := false
@@ -58,15 +58,15 @@ func goGrep(ctx context.Context, root *os.Root, base string, pattern string, glo
 			return err
 		}
 		if entry.IsDir() {
-			if entry.Name() == ".git" && p != base {
+			if p != base && (entry.Name() == ".git" || ignore.excluded(p, true)) {
 				return fs.SkipDir
 			}
 			return nil
 		}
-		name := searchRelative(base, p)
-		if ignore.Ignore(name, false) {
+		if p != base && ignore.excluded(p, false) {
 			return nil
 		}
+		name := searchRelative(base, p)
 		if !matchGlobPattern(glob, name) {
 			return nil
 		}
@@ -112,7 +112,7 @@ func goFind(ctx context.Context, root *os.Root, base string, pattern string, lim
 	}
 	// fd always honours .gitignore here: the fast path passes
 	// --no-require-git outside git repos, so ignore files apply either way.
-	ignore := loadGitignore(root)
+	ignore := rootGitignore(ctx, root)
 	results := []string{}
 	limitReached := false
 	walkErr := fs.WalkDir(root.FS(), base, func(p string, entry fs.DirEntry, err error) error {
@@ -131,7 +131,7 @@ func goFind(ctx context.Context, root *os.Root, base string, pattern string, lim
 			}
 		}
 		name := searchRelative(base, p)
-		if ignore.Ignore(name, entry.IsDir()) {
+		if p != base && ignore.excluded(p, entry.IsDir()) {
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -171,11 +171,42 @@ func searchRelative(base, p string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(p, base), "/")
 }
 
-// loadGitignore reads the root .gitignore when present.
-func loadGitignore(root *os.Root) *gitignoreMatcher {
-	data, err := root.ReadFile(".gitignore")
-	if err != nil {
-		return nil
+// matchGlobPattern applies a user-supplied glob to a search-relative path the
+// way rg and fd do: a glob without `/` matches basenames at any depth, a glob
+// with `/` matches the whole relative path.
+func matchGlobPattern(glob string, name string) bool {
+	if glob == "" {
+		return true
 	}
-	return parseGitignore(string(data))
+	if !strings.Contains(glob, "/") {
+		ok, err := path.Match(glob, path.Base(name))
+		return err == nil && ok
+	}
+	return matchSegments(strings.Split(glob, "/"), strings.Split(name, "/"))
+}
+
+// matchSegments matches a glob split on `/` against a path split on `/`,
+// with `**` matching zero or more segments.
+func matchSegments(pattern []string, name []string) bool {
+	for len(pattern) > 0 {
+		if pattern[0] == "**" {
+			if len(pattern) == 1 {
+				return true
+			}
+			for i := range len(name) + 1 {
+				if matchSegments(pattern[1:], name[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(name) == 0 {
+			return false
+		}
+		if ok, err := path.Match(pattern[0], name[0]); err != nil || !ok {
+			return false
+		}
+		pattern, name = pattern[1:], name[1:]
+	}
+	return len(name) == 0
 }

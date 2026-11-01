@@ -52,12 +52,12 @@ below every settings file.
 Repository files are untrusted. Settings in `.harness/settings.json`,
 `.harness/settings.local.json`, and the profiles defined in them that run code, read
 local files into the model context, write outside the repository, widen permissions,
-turn on web tools, or choose where credentials go apply only after the operator
-trusts the workspace:
+turn on web tools, raise the operator's workspace listing caps, or choose where
+credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files` or `workspace_listing_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model`, `smol_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
@@ -78,6 +78,17 @@ layer that added an entry, or to the operator's layer when the project added non
 Allow lists, looser modes and `"plan": false` are dropped with the trust warning. In
 a trusted workspace these keys are a settings layer like the rest: the project's deny
 list replaces the user's and its `null` unsets it.
+
+The session-start [workspace listing](skills-and-context.md#workspace-listing)
+works the same way. An untrusted repository may turn it off
+(`"workspace_listing": false`) or lower `workspace_listing_max_files` and
+`workspace_listing_max_bytes` to any whole number from 1 up to the operator's value:
+the merged value of the managed, user, profile, environment, flag and `-c` layers,
+or the built-in default when none sets it. A larger value, `"workspace_listing":
+true` when the operator turned the listing off, and a `null` or invalid value, which
+would fall back to the default, are dropped with the trust warning. Trust lifts the
+ceiling. The caps bound prompt size and the work a session does before its first
+request, which is the operator's budget to set.
 
 Trusted project `hooks` add to the hooks below them instead of replacing them: each
 event's array from `settings.json`, then from `settings.local.json`, is appended to the
@@ -290,6 +301,7 @@ problem.
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |
 | `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
+| `HARNESS_WORKSPACE_LISTING`, `HARNESS_WORKSPACE_LISTING_MAX_FILES`, `HARNESS_WORKSPACE_LISTING_MAX_BYTES` | Session-start file listing and its caps (settings `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`). |
 | `HARNESS_STREAM_IDLE_SECONDS`, `HARNESS_STREAM_FIRST_OUTPUT_SECONDS` | Stream stall bounds: seconds without an SSE event once output has started (default 90), and before the first output (default 300, never below the idle bound). |
 | `HARNESS_WEB_SEARCH_URL` | Web-search endpoint when web tools are enabled. |
 | `HARNESS_ENABLE_LSP`, `HARNESS_LSP_CONFIG` | Language-server tools and server file (settings `enable_lsp`, `lsp_config`). |
@@ -323,6 +335,7 @@ each flag and variable above, names the same setting. The main keys:
 | `providers` | Endpoint registry keyed by route name. See [Providers](providers.md#endpoint-registry). |
 | `trusted_provider_projects` | Absolute canonical paths whose project provider settings are trusted. |
 | `skill_paths` | Extra skill directories; `-skill` flags replace the list. |
+| `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 

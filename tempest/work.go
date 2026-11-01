@@ -17,7 +17,9 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/session"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tools"
 	"go.harness.dev/harness/internal/work"
+	"go.harness.dev/harness/tempest/durable"
 	"go.harness.dev/harness/tempest/environment"
 )
 
@@ -45,6 +47,46 @@ func (s *Session) enqueue(ctx context.Context, kind work.QueueKind, input Queued
 	}
 	return s.core.queues.Enqueue(ctx, work.QueueInput{Kind: kind, Text: input.Text, Key: input.Key})
 }
+
+// childWorkspaceListing is the listing a child's first request carries. A
+// child in the parent's directory (shared or explore) sends the parent's
+// journaled bytes. An isolated worktree child lists its own worktree once,
+// when its journal is created, and journals the bytes in the child's agent
+// selection, so a resumed child sends the same first request.
+func (c *sessionCore) childWorkspaceListing(ctx context.Context, cfg StackConfig, job work.Job, store *journal.Store, resumed bool) (string, error) {
+	if job.Isolation != "worktree" {
+		return cfg.WorkspaceListing, nil
+	}
+	if resumed {
+		page, err := store.Read(ctx, durable.Query{Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Limit: 1})
+		if err != nil || len(page.Records) == 0 {
+			return "", err
+		}
+		choice, err := decodeAgentSelection(page.Records[0].Value)
+		if err != nil {
+			return "", fmt.Errorf("child agent selection: %w", err)
+		}
+		return choice.WorkspaceListing, nil
+	}
+	listing, err := tools.WorkspaceListing(ctx, cfg.Environment, job.Cwd, cfg.ListingPolicy)
+	if err != nil {
+		// The listing only saves discovery turns; start the child without it.
+		c.logger.Debug("child starts without a workspace listing", "job_id", job.ID, "error", err)
+	}
+	if listing == "" {
+		return "", nil
+	}
+	raw, err := json.Marshal(agentSelection{WorkspaceListing: listing})
+	if err != nil {
+		return "", err
+	}
+	selection := durable.Change{SessionID: store.ID(), Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection", Version: 1, Value: raw}
+	if _, err := store.Commit(ctx, durable.Commit{ID: "agent:1", Expected: []durable.RevisionCheck{{SessionID: store.ID(), Kind: durable.DocumentKind, Namespace: "_tempest/agent", ID: "selection"}}, Changes: []durable.Change{selection}}); err != nil {
+		return "", fmt.Errorf("journal child workspace listing: %w", err)
+	}
+	return listing, nil
+}
+
 func (c *sessionCore) publishWork(ctx context.Context, event work.Event) error {
 	defer (&Session{core: c}).publishDurable(ctx)
 	if c.agent != nil {
@@ -209,6 +251,9 @@ func (c *sessionCore) runTask(ctx context.Context, cfg StackConfig, launch work.
 	childCfg.InitialMessages = nil
 	if loaded != nil {
 		childCfg.InitialMessages = loaded.Messages
+	}
+	if childCfg.WorkspaceListing, err = c.childWorkspaceListing(childCtx, childCfg, launch.Job, store, loaded != nil); err != nil {
+		return result, err
 	}
 	childCfg.AllowedTools = childToolNames(launch.Spec.SubagentType, launch.Environment.Ceiling.Tools)
 	if launch.Spec.PresetID != "" {

@@ -50,6 +50,7 @@ The bundled remote daemon offers:
 
 - The existing bounded file reader, directory listing, conditional edit, write, and atomic hashline batches.
 - Literal and regular-expression search, plus filename search.
+- The session-start [workspace listing](skills-and-context.md#workspace-listing), taken on the daemon's host by the same code as Local and part of the search service.
 - Shell commands and direct argv execution.
 - Bounded command output, with output artifacts read through the same remote lease.
 - Byte-range UTF-8 reads and portable stat metadata for extension consumers.
