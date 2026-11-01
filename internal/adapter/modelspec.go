@@ -96,8 +96,12 @@ func ValidateBaseURL(raw string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return fmt.Errorf("must be an absolute HTTP URL")
 	}
-	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return fmt.Errorf("must not contain credentials or URL fragments")
+	if parsed.User != nil {
+		return fmt.Errorf("must not contain credentials")
+	}
+	// ParseRequestURI leaves a fragment in the path, so look for it in raw.
+	if parsed.RawQuery != "" || parsed.ForceQuery || strings.Contains(raw, "#") {
+		return fmt.Errorf("must not contain a query string or fragment; set endpoint parameters in the provider's query setting")
 	}
 	return nil
 }
@@ -176,11 +180,21 @@ func resolveRoute(cfg RoutingConfig, env func(string) string) (route, error) {
 		model.ContextWindow = 200000
 	}
 	if prov == "azure" {
-		endpoint := strings.TrimRight(firstNonEmpty(model.BaseURL, env("AZURE_OPENAI_ENDPOINT")), "/")
-		if endpoint == "" {
+		model.BaseURL = strings.TrimRight(firstNonEmpty(model.BaseURL, env("AZURE_OPENAI_ENDPOINT")), "/")
+		if model.BaseURL == "" {
 			return route{}, fmt.Errorf("provider azure requires base_url or AZURE_OPENAI_ENDPOINT")
 		}
-		model.BaseURL = endpoint
+	}
+	// An endpoint from settings, the SDK or the environment meets the same
+	// rules as one in a model spec: a route appends model paths to it, which a
+	// query or fragment would swallow.
+	if model.BaseURL != "" {
+		if err := ValidateBaseURL(model.BaseURL); err != nil {
+			return route{}, fmt.Errorf("provider %s base URL is invalid: %w", prov, err)
+		}
+	}
+	if prov == "azure" {
+		endpoint := model.BaseURL
 		if !strings.HasSuffix(endpoint, "/openai/v1") && !strings.Contains(endpoint, "/openai/deployments/") {
 			model.BaseURL = endpoint + "/openai/deployments/" + url.PathEscape(spec.ModelID)
 		}

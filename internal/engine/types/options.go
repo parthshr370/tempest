@@ -29,19 +29,18 @@ type StreamOptions struct {
 	// Query carries endpoint parameters without persisting credentials.
 	Query  map[string]string `json:"-"`
 	NoAuth bool              `json:"-"`
-	// CredentialRoute is the route (credential scope, see [RouteOf]) APIKey,
-	// NoAuth, Headers and Query were issued for. A provider route that sends
-	// the request to another scope drops all four and authenticates with its
-	// own credential, so a per-request credential never reaches another
-	// provider or endpoint. Zero means the route of the model the request is
-	// sent with; a stream function that forwards a request to a different
-	// model sets it first.
+	// CredentialRoute is the route (credential scope, see [RouteOf]) of the
+	// run's primary model: APIKey, NoAuth, Headers and Query were issued for
+	// it, and it decides where APIKeyFor's keys belong (see [ProviderKeyApplies]).
+	// It names the primary for the whole run, whichever model a request is
+	// sent to, so nothing rewrites it while a request moves between models.
+	// Zero means the route of the model the request is sent with; a stream
+	// function that forwards a request to a different model sets it first.
 	CredentialRoute Route `json:"-"`
 	// APIKeyFor, when set, resolves the API key for a provider (the agent's
-	// GetApiKey). BindAPIKey applies it for the model a request is sent to,
-	// so a stream function that forwards a request to another model (a
-	// backup) resolves that model's key the same way its first model did.
-	// It may be called from the stream's goroutine.
+	// GetApiKey). The provider route a request is sent through applies it
+	// with [StreamOptions.BindAPIKey], so a backup's key is resolved the same
+	// way as its primary's. It may be called from the stream's goroutine.
 	APIKeyFor      func(provider string) string `json:"-"`
 	DisableEnvAuth bool                         `json:"-"`
 	Transport      string                       `json:"transport,omitempty"`
@@ -74,32 +73,44 @@ type StreamOptions struct {
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 }
 
-// BindAPIKey prepares the options' credentials for a request sent to model.
-// Credentials without a CredentialRoute were given for model. APIKeyFor
-// answers per provider, so it cannot tell two scopes of one provider apart:
-// its key for the provider of CredentialRoute is that route's key. It is
-// therefore asked for model's key when model is on CredentialRoute itself or
-// on another provider, and that key is bound to model's route, dropping the
-// other credentials if they were bound to another route, since they were never
-// meant for model. A model on CredentialRoute's provider at another scope is
-// not asked about: the binding stays, and model's provider route, seeing
-// credentials issued for another scope, authenticates with its own.
-func (o *StreamOptions) BindAPIKey(model Model) {
+// ProviderKeyApplies reports whether a key that names only a provider (an
+// APIKeyFor answer) belongs to candidate in a run whose primary is primary.
+// Such a key cannot tell two scopes of one provider apart, so it belongs to
+// exactly one scope per provider for the whole run: the primary's scope for
+// the primary's provider, and for any other provider the scope its route
+// resolves to without an inline endpoint, providerDefault (zero when there is
+// none). Every other scope of a provider authenticates with its own route's
+// credential. The answer depends on these three routes alone, never on the
+// order a run reaches its models.
+func ProviderKeyApplies(primary, candidate, providerDefault Route) bool {
+	if candidate.Provider == primary.Provider {
+		return candidate == primary
+	}
+	return candidate == providerDefault
+}
+
+// BindAPIKey prepares the options' credentials for a request sent to model,
+// whose provider's default route is providerDefault (see
+// [ProviderKeyApplies]). The credentials issued for CredentialRoute (APIKey,
+// NoAuth, Headers, Query) stay only when model is on that route; anywhere
+// else they are dropped. APIKeyFor is asked for model's key only where
+// [ProviderKeyApplies] places it, and a key it gives replaces APIKey. Without
+// a key, model's provider route authenticates with its own credential.
+// CredentialRoute is left as it is.
+func (o *StreamOptions) BindAPIKey(model Model, providerDefault Route) {
 	route := RouteOf(model)
-	if o.CredentialRoute == (Route{}) {
-		o.CredentialRoute = route
+	primary := o.CredentialRoute
+	if primary == (Route{}) {
+		primary = route
 	}
-	if o.APIKeyFor == nil || route.Provider == o.CredentialRoute.Provider && route != o.CredentialRoute {
+	if route != primary {
+		o.APIKey, o.Headers, o.Query, o.NoAuth = "", nil, nil, false
+	}
+	if o.APIKeyFor == nil || !ProviderKeyApplies(primary, route, providerDefault) {
 		return
 	}
-	key := o.APIKeyFor(model.Provider)
-	if key == "" {
-		return
-	}
-	o.APIKey = key
-	if route != o.CredentialRoute {
-		o.Headers, o.Query, o.NoAuth = nil, nil, false
-		o.CredentialRoute = route
+	if key := o.APIKeyFor(model.Provider); key != "" {
+		o.APIKey = key
 	}
 }
 

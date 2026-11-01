@@ -84,13 +84,14 @@ func SameModel(a, b types.Model) bool {
 }
 
 func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, index int, model types.Model, c types.Context, opts *types.SimpleStreamOptions) {
-	// The caller's credentials were issued for the model it asked for; the
-	// provider route of a backup drops them (see types.StreamOptions).
+	// The caller's credentials were issued for the run's primary: the model it
+	// asked for unless it named their route. Every candidate's provider route
+	// binds them, and the caller's per-provider key, against that one route
+	// (see types.StreamOptions.BindAPIKey), so a switch never changes it.
 	issued := types.RouteOf(model)
 	if opts != nil && opts.CredentialRoute != (types.Route{}) {
 		issued = opts.CredentialRoute
 	}
-	switched := false
 	for {
 		var status int
 		attemptOpts := cloneOptions(opts, func(received types.ProviderResponse, receivedModel types.Model) error {
@@ -101,14 +102,6 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 			return nil
 		})
 		attemptOpts.CredentialRoute = issued
-		if switched {
-			// A backup on another provider takes its key from the caller's
-			// resolver, as the first model did before the request started; one
-			// on the issued provider at another endpoint uses its own route's
-			// key, since the resolver's key for that provider is the issued
-			// route's (see types.StreamOptions.BindAPIKey).
-			attemptOpts.BindAPIKey(model)
-		}
 		// Admission belongs to this chain's switches, not to anything the
 		// candidate's stream might chain itself.
 		attemptOpts.AdmitFallback = nil
@@ -129,7 +122,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 		}
 		fallback := types.ModelFallback{From: model, To: next, Reason: string(reason), Attempts: attempts, Index: index}
 		output.Push(types.StreamEvent{Type: types.EvFallback, Err: discarded, Fallback: &fallback})
-		model, switched = next, true
+		model = next
 		// The backup is called only once the caller has admitted the switch
 		// (the agent loop journals it first) and nothing cancelled the request
 		// meanwhile; only then is its first attempt announced.

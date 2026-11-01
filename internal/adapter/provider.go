@@ -121,7 +121,7 @@ func NewProviderRouter(cfg RoutingConfig) (ProviderRouter, error) {
 		return ProviderRouter{}, fmt.Errorf("no provider registered for model API %q", rt.API)
 	}
 	r := ProviderRouter{Registry: registry, Model: rt.Model}
-	r = r.withStream(p.StreamSimple, rt, cfg.BlobReader)
+	r = r.withStream(p.StreamSimple, rt, providerDefaultRoute(cfg, env), cfg.BlobReader)
 	if cfg.Retry != nil {
 		retrier, err := retry.New(retry.StreamFunc(r.StreamFn), *cfg.Retry)
 		if err != nil {
@@ -179,6 +179,24 @@ func (cfg RoutingConfig) ForModel(spec string) RoutingConfig {
 	return derived
 }
 
+// providerDefaultRoute is the route cfg's provider resolves to without the
+// model spec's inline @endpoint: the provider's configured default scope, the
+// one scope of a provider other than the primary's where a key given for the
+// provider alone belongs (see [types.ProviderKeyApplies]). A backup's cfg comes
+// from [RoutingConfig.ForModel], so it is resolved from the primary's
+// configuration. A route that does not resolve has none.
+func providerDefaultRoute(cfg RoutingConfig, env func(string) string) types.Route {
+	raw := firstNonEmpty(cfg.ModelID, env("ANTHROPIC_DEFAULT_SONNET_MODEL"), "claude-opus-4-8")
+	if i := modelBaseURLIndex(raw); i >= 0 {
+		cfg.ModelID = raw[:i]
+	}
+	rt, err := resolveRoute(cfg, env)
+	if err != nil {
+		return types.Route{}
+	}
+	return types.RouteOf(rt.Model)
+}
+
 // chainRouters puts a primary route and its backups behind one fallback
 // stream. A backup that repeats an earlier model in the chain is dropped:
 // it would only resend a request that model already failed.
@@ -207,22 +225,22 @@ func chainRouters(primary ProviderRouter, backups []ProviderRouter) (ProviderRou
 
 // withStream binds the resolved provider's StreamSimple to StreamFn, filling the
 // API key (or an authorization bearer header from authToken) and blob reader
-// that the caller left unset. A nil streamSimple can only arise from programmer
-// error since NewProviderRouter validates it, so it surfaces as a terminal error
-// event rather than a panic.
-func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route, blobReader types.BlobReader) ProviderRouter {
+// that the caller left unset. defaultRoute is the provider's default route,
+// where a caller's per-provider key may belong (see [types.ProviderKeyApplies]).
+// A nil streamSimple can only arise from programmer error since
+// NewProviderRouter validates it, so it surfaces as a terminal error event
+// rather than a panic.
+func (r ProviderRouter) withStream(streamSimple base.SimpleStreamFunc, rt route, defaultRoute types.Route, blobReader types.BlobReader) ProviderRouter {
 	var reasoningWarning sync.Once
 	r.StreamFn = func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
 		if streamSimple == nil {
 			return erroredStream(model, fmt.Errorf("provider stream not configured for model API %q", model.API))
 		}
 		resolved := cloneSimpleOptions(opts)
-		if issued := resolved.CredentialRoute; issued != (types.Route{}) && issued != types.RouteOf(model) {
-			// The caller's credential and endpoint parameters were issued for
-			// another provider or credential scope (a backup model, an agent on
-			// its own model); this route authenticates with its own credential.
-			resolved.APIKey, resolved.Headers, resolved.Query, resolved.NoAuth = "", nil, nil, false
-		}
+		// The caller's credentials were issued for the run's primary, and its
+		// per-provider key belongs to one scope of each provider; anywhere
+		// else this route authenticates with its own credential.
+		resolved.BindAPIKey(model, defaultRoute)
 		if rt.CredentialSource != nil {
 			if model.Provider != "openai-chatgpt" || model.API != rt.Model.API || model.BaseURL != rt.Model.BaseURL || len(model.Headers) != 0 || resolved.APIKey != "" || len(resolved.Headers) != 0 || len(resolved.Query) != 0 || resolved.NoAuth {
 				return erroredStream(model, fmt.Errorf("openai-chatgpt does not allow credential, endpoint or header overrides"))

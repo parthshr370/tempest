@@ -882,19 +882,16 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		Tools:        tools,
 	}
 
-	// The options' credentials were given for CredentialRoute (the run's
-	// primary once it switched, see switched). GetAPIKey resolves the key for
-	// the provider of the model each request is sent to, config.Model here and
-	// a backup the fallback chain switches to, through the same BindAPIKey;
-	// a model on CredentialRoute's provider at another endpoint is not asked
-	// about, because GetAPIKey's key for that provider is CredentialRoute's.
-	// A route other than the one a credential is bound to drops it (see
-	// [types.StreamOptions]).
+	// The options' credentials were given for CredentialRoute: the run's
+	// primary, which switched records before the run leaves it. GetAPIKey goes
+	// with them unresolved; the provider route of each model the request is
+	// sent to, config.Model or a backup the fallback chain switches to, asks
+	// it only where its per-provider key belongs and drops the credentials
+	// anywhere but the primary's route (see [types.StreamOptions.BindAPIKey]).
 	options := config.SimpleStreamOptions
 	if config.GetAPIKey != nil {
 		options.APIKeyFor = config.GetAPIKey
 	}
-	options.BindAPIKey(config.Model)
 	// admitted carries the outcome of reporting each switch to the fallback
 	// chain, which waits for it before calling the backup.
 	admitted := make(chan error, 1)

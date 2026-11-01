@@ -27,14 +27,24 @@ type Route struct {
 }
 
 // RouteOf returns the credential scope of model's requests. It is the base
-// URL, except on Azure, where a key belongs to the resource: the
-// /openai/deployments/<name> path a route appends for the model, or the
-// /openai/v1 path, only selects a model within it. Every other path stays in
-// the scope, since it may itself separate tenants. Bedrock and Vertex build
-// their regional, per-model URLs from the configured endpoint when a request
-// is sent, so their base URL already is the scope.
+// URL, with its scheme and host lowercased since DNS ignores their case; the
+// path is kept exact, since it may itself separate tenants. On Azure a key
+// belongs to the resource: the /openai/deployments/<name> path a route appends
+// for the model, or the /openai/v1 path, only selects a model within it and is
+// dropped. Bedrock and Vertex build their regional, per-model URLs from the
+// configured endpoint when a request is sent, so their base URL already is the
+// scope.
 func RouteOf(model Model) Route {
 	scope := model.BaseURL
+	if i := strings.Index(scope, "://"); i >= 0 {
+		end := len(scope)
+		if j := strings.IndexAny(scope[i+len("://"):], "/?#"); j >= 0 {
+			end = i + len("://") + j
+		}
+		if origin := strings.ToLower(scope[:end]); origin != scope[:end] {
+			scope = origin + scope[end:]
+		}
+	}
 	if model.Provider == "azure" {
 		if resource, ok := strings.CutSuffix(scope, "/openai/v1"); ok {
 			scope = resource

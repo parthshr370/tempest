@@ -264,10 +264,10 @@ func TestPerRequestCredentialsNeverReachAnotherRoute(t *testing.T) {
 }
 
 // The agent's GetApiKey resolves the key for the provider of the model each
-// request goes to, the backup included on the turn that switches to it. The
-// primary's key never reaches the backup: a backup the resolver has no key
-// for authenticates with its own credential, and one it has a key for gets
-// that key even when no ambient key exists.
+// request goes to, a backup at its provider's configured endpoint included on
+// the turn that switches to it. The primary's key never reaches the backup: a
+// backup the resolver has no key for authenticates with its own credential,
+// and one it has a key for gets that key even when no ambient key exists.
 func TestAgentGetAPIKeyAuthenticatesEachModelOnTheSwitchingTurn(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -287,7 +287,8 @@ func TestAgentGetAPIKeyAuthenticatesEachModelOnTheSwitchingTurn(t *testing.T) {
 			defer backupServer.Close()
 			router, err := NewProviderRouter(RoutingConfig{
 				ModelID:        "anthropic:claude-primary@" + primaryServer.URL,
-				FallbackModels: []string{"openai:gpt-backup@" + backupServer.URL},
+				OpenAIBaseURL:  backupServer.URL,
+				FallbackModels: []string{"openai:gpt-backup"},
 				Env:            func(name string) string { return tc.env[name] },
 			})
 			if err != nil {

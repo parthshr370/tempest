@@ -297,7 +297,7 @@ func TestEveryProtocolClampsOutputToContextAndModel(t *testing.T) {
 				s.Push(types.StreamEvent{Type: types.EvDone, Reason: types.StopStop, Message: &types.AssistantMessage{StopReason: types.StopStop}})
 				s.End()
 				return s
-			}, rt, nil)
+			}, rt, types.Route{}, nil)
 			result, err := router.StreamFn(context.Background(), model, types.Context{Messages: []types.Message{types.UserMessage{Content: types.StringContent("prompt")}}}, &types.SimpleStreamOptions{StreamOptions: types.StreamOptions{MaxTokens: 100000}}).Result(context.Background())
 			if err != nil || result.StopReason != types.StopStop {
 				t.Fatalf("result=%+v err=%v", result, err)

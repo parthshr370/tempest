@@ -123,6 +123,7 @@ uses the default role's list; an empty list turns backups off for that role.
 `ProviderConfig.FallbackModels`, falling back to the user's `fallback_models.default`.
 Each backup is a full route with its own endpoint and credential. A credential
 belongs to a provider and a **credential scope**: the endpoint the route resolves to,
+with its scheme and host compared in any case (as DNS does) and its path exactly,
 except on Azure, where it is the resource, so another deployment of the same resource
 (its `/openai/deployments/<name>` or `/openai/v1` path) is the same scope. Bedrock
 and Vertex build their regional, per-model URLs from the configured endpoint when a
@@ -138,13 +139,22 @@ therefore goes to the configured endpoint, keeps `BaseURL` but not the key or to
 Request-level credentials are bound the same way: an API key, header or query
 parameter a caller sets on the request options was given for the primary's provider
 and scope, and a backup on another provider or scope never receives it, on the
-switching turn or any later one. `GetApiKey(provider)` names only a provider, so it
-cannot tell two endpoints of one provider apart: its key for the primary's provider
-is the primary's. On every turn, including the one that switches, it is asked for
-the key of a model on the primary's scope or on another provider, and a backup it has
-no key for authenticates with its own credential. A backup on the primary's provider
-at another scope is never given the callback's key; it authenticates with the key its
-own route resolves. `doctor` lists each role's backups under it.
+switching turn or any later one. `doctor` lists each role's backups under it.
+
+An agent's `GetApiKey(provider)` names only a provider, so it cannot tell two
+endpoints of one provider apart. Its answer for a provider belongs to exactly one
+scope of that provider for the whole run, decided by the primary and the routing
+configuration alone, never by the order the chain reaches its models:
+
+| Provider of the model | Scope that gets `GetApiKey`'s key |
+|---|---|
+| The primary's | The primary's scope. |
+| Any other | The provider's configured default scope: where `<provider>:<model>` goes without an `@<base-url>` (its `providers` entry, endpoint flag, setting or environment variable, else the built-in endpoint). |
+
+A model at any other scope of a provider is never given that key and authenticates
+with the key its own route resolves. The rule holds on the turn that switches, on
+every later turn on the backup, and when a resumed run continues on its recorded
+backup.
 
 A backup gets the request only when the model is **unavailable**, after the model's
 own retry policy has given up: HTTP 5xx and 529, 429, network errors, timeouts
@@ -203,7 +213,7 @@ keyed by lowercase route name:
 | Field | Meaning |
 |---|---|
 | `protocol` | One of `openai-chat`, `anthropic`, `google`, `openai-responses`, `bedrock`, `vertex`. |
-| `base_url` | Endpoint origin or base URL. Each protocol decides how much path it appends. |
+| `base_url` | Endpoint origin or base URL. Each protocol decides how much path it appends. It must be an absolute `http(s)` URL without credentials, a query string or a fragment, as must every other endpoint (an `@<base-url>`, `-anthropic-base-url`, `-openai-base-url`, the SDK's `ProviderConfig.BaseURL` and the `*_BASE_URL` / `AZURE_OPENAI_ENDPOINT` variables); put endpoint parameters in `query`. |
 | `api_key_env` | Name of the environment variable holding the key, never the key itself. |
 | `api_key` | Fallback key. The environment variable wins. |
 | `headers` | Extra request headers. |
