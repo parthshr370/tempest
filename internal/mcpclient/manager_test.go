@@ -38,12 +38,16 @@ func TestMain(suite *testing.M) {
 	_ = os.RemoveAll(directory)
 	os.Exit(code)
 }
-func openFixture(t *testing.T, mode string) (*Manager, string) {
+func openFixture(t *testing.T, mode string, configure ...func(*mcpconfig.Server, *Options)) (*Manager, string) {
 	t.Helper()
 	directory := t.TempDir()
 	ledger := filepath.Join(directory, "ledger")
-	configs := []mcpconfig.Server{{Name: "fixture", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", mode, "-ledger", ledger}, StartupTimeout: "10s", CallTimeout: "5s"}}
-	manager, err := Open(context.Background(), configs, Options{Cwd: directory, SpillDir: filepath.Join(directory, "output")})
+	config := mcpconfig.Server{Name: "fixture", Transport: "stdio", Command: fixtureBinary, Args: []string{"-mode", mode, "-ledger", ledger}, StartupTimeout: "10s", CallTimeout: "5s"}
+	options := Options{Cwd: directory, SpillDir: filepath.Join(directory, "output")}
+	for _, change := range configure {
+		change(&config, &options)
+	}
+	manager, err := Open(context.Background(), []mcpconfig.Server{config}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +115,7 @@ func TestMCPVersionNegotiation(t *testing.T) {
 	for _, mode := range []string{"normal", "june"} {
 		t.Run(mode, func(t *testing.T) {
 			manager, _ := openFixture(t, mode)
-			if len(manager.Tools()) != 8 {
+			if len(manager.Tools()) != 9 {
 				t.Fatalf("tools %d", len(manager.Tools()))
 			}
 		})

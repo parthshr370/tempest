@@ -37,6 +37,9 @@ type Handlers struct {
 	// Auth supplies OAuth bearer tokens over HTTP; nil sends only the
 	// configured headers.
 	Auth Auth
+	// Elicitation declares the elicitation capability (form and URL
+	// modes); Request must then answer elicitation/create.
+	Elicitation bool
 }
 
 type transport interface {
@@ -141,18 +144,26 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 		_ = wire.close(closeCtx)
 		return nil, fmt.Errorf("mcp_startup: server %s initialize: %w", cfg.Name, cause)
 	}
+	type modes struct {
+		Form struct{} `json:"form"`
+		URL  struct{} `json:"url"`
+	}
 	params := struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		Capabilities    struct {
 			Roots struct {
 				ListChanged bool `json:"listChanged"`
 			} `json:"roots"`
+			Elicitation *modes `json:"elicitation,omitempty"`
 		} `json:"capabilities"`
 		ClientInfo struct {
 			Name    string `json:"name"`
 			Version string `json:"version"`
 		} `json:"clientInfo"`
 	}{ProtocolVersion: PreferredVersion}
+	if handlers.Elicitation {
+		params.Capabilities.Elicitation = &modes{}
+	}
 	params.ClientInfo.Name = "tempest"
 	params.ClientInfo.Version = build.Current().Version
 	raw, err := wire.call(startupCtx, "mcp_1", "initialize", params)

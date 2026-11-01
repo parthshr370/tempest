@@ -64,7 +64,7 @@ func (a *serverAuth) Rejected(ctx context.Context, rejection mcpwire.Rejection) 
 
 // handlers wires this server's callbacks into a new connection.
 func (s *server) handlers() mcpwire.Handlers {
-	handlers := mcpwire.Handlers{Notify: s.notification, AdmitProcess: s.manager.admitProcess}
+	handlers := mcpwire.Handlers{Notify: s.notification, Request: s.request, AdmitProcess: s.manager.admitProcess, Elicitation: true}
 	if s.auth != nil {
 		handlers.Auth = s.auth
 	}

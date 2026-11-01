@@ -142,6 +142,17 @@ session's `local://mcp/` directory and the read names that file. Tempest reads
 the server's tools, resources and resource templates as one catalog at startup,
 and re-reads all of it when the server sends any `list_changed` notification.
 
+### Elicitation from servers
+
+Tempest declares the `elicitation` capability in both modes. A server's
+`elicitation/create` goes to the session's user the same way an authorization URL
+does: ACP clients that declared that mode get `elicitation/create`, the client of a
+`tempest mcp` run gets it passed through, and a one-shot run on a terminal asks
+field by field. Every surface names the asking server. A form schema outside the
+flat primitive subset the specification allows is refused with `-32602` before
+anyone is asked. With no user to ask (headless runs, `serve` without such a
+client), the reply is `{"action":"decline"}`.
+
 ## MCP server
 
 ```sh

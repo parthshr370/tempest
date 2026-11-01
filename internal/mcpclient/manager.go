@@ -43,8 +43,9 @@ type Options struct {
 	// CredentialDir is the OAuth token store. Empty treats an HTTP 401 as a
 	// rejected credential instead of starting authorization.
 	CredentialDir string
-	// Elicit shows authorization URLs to the user; nil, or an answer of
-	// question.Unavailable, means no user can be asked.
+	// Elicit shows server elicitations and authorization URLs to the user;
+	// nil, or an answer of question.Unavailable, means no user can be
+	// asked: elicitations are declined and authorization names the command.
 	Elicit question.Elicitor
 }
 

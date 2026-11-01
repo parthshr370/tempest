@@ -34,6 +34,8 @@ type fixture struct {
 	// resourceGeneration counts reads of fixture://bump, which adds a
 	// resource and announces it.
 	resourceGeneration atomic.Uint64
+	// clientCaps holds the capabilities the client declared at initialize.
+	clientCaps map[string]json.RawMessage
 }
 
 const pixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg=="
@@ -81,6 +83,13 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 	f.record(method, "")
 	switch method {
 	case "initialize":
+		var hello struct {
+			Capabilities map[string]json.RawMessage `json:"capabilities"`
+		}
+		_ = json.Unmarshal(params, &hello)
+		f.mu.Lock()
+		f.clientCaps = hello.Capabilities
+		f.mu.Unlock()
 		version := mcpwire.PreferredVersion
 		if f.mode == "june" {
 			version = "2025-06-18"
@@ -125,7 +134,7 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				Cursor string `json:"cursor"`
 			}
 			_ = json.Unmarshal(params, &page)
-			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change"}
+			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change", "elicit"}
 			if f.generation.Load() > 0 {
 				names = append(names, "added")
 			}
@@ -199,6 +208,8 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 					_ = f.conn.Notify(callCtx, "notifications/tools/list_changed", struct{}{})
 				}
 				text = "changed"
+			case "elicit":
+				text = f.elicit(callCtx, call.Arguments)
 			case "mixed":
 				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": pixelPNG, "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
 			}
@@ -250,3 +261,30 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 }
 
 var _ io.ReadWriteCloser = stdio{}
+
+// elicit asks the client for input in the mode named by the call's value
+// and returns the client's raw reply, or why there is none.
+func (f *fixture) elicit(ctx context.Context, arguments json.RawMessage) string {
+	var args struct {
+		Value string `json:"value"`
+	}
+	_ = json.Unmarshal(arguments, &args)
+	f.mu.Lock()
+	declared := string(f.clientCaps["elicitation"])
+	f.mu.Unlock()
+	if declared == "" {
+		return "elicitation not declared"
+	}
+	request := map[string]any{"mode": "form", "message": "Pick a color", "requestedSchema": json.RawMessage(`{"type":"object","properties":{"color":{"type":"string","enum":["red","blue"]}},"required":["color"]}`)}
+	switch args.Value {
+	case "url":
+		request = map[string]any{"mode": "url", "message": "Connect the fixture account", "url": "https://fixture.example/connect", "elicitationId": "fixture-1"}
+	case "nested":
+		request["requestedSchema"] = json.RawMessage(`{"type":"object","properties":{"address":{"type":"object","properties":{"city":{"type":"string"}}}}}`)
+	}
+	var reply json.RawMessage
+	if err := f.conn.Call(ctx, "elicitation/create", request, &reply); err != nil {
+		return "elicitation error: " + err.Error()
+	}
+	return string(reply)
+}
