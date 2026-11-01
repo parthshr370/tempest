@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -111,5 +112,79 @@ func TestOTelHeadersRedactedInConfigShow(t *testing.T) {
 	}
 	if setting.Source != "OTEL_EXPORTER_OTLP_HEADERS" {
 		t.Fatalf("source = %q", setting.Source)
+	}
+}
+
+// otelExports reports whether settings send anything anywhere or capture
+// content.
+func otelExports(settings OTelSettings) bool {
+	return settings.TracesEndpoint != "" || settings.MetricsEndpoint != "" || settings.CaptureMessageContent || len(settings.Headers) != 0
+}
+
+// A repository cannot configure export through a spelling encoding/json would
+// fold onto otel or one of its members, trusted or not: the schema drops the
+// spelling before the trust gate and decoding see it, and config show never
+// lists it.
+func TestOTelCaseVariantsNeverConfigureExport(t *testing.T) {
+	const marker = "P3_HEADER_SECRET_6134"
+	for _, project := range []string{
+		`{"OTel":{"endpoint":"http://127.0.0.1:4318","capture_message_content":true}}`,
+		`{"OTEL":{"ENDPOINT":"http://127.0.0.1:4318","Headers":{"x-team":"` + marker + `"}}}`,
+		`{"otel":{"Endpoint":"http://127.0.0.1:4318","Traces_Endpoint":"http://127.0.0.1:4318/v1/traces","CAPTURE_MESSAGE_CONTENT":true,"Headers":{"x-team":"` + marker + `"}}}`,
+		`{"profiles":{"review":{"OTel":{"endpoint":"http://127.0.0.1:4318","capture_message_content":true}}}}`,
+	} {
+		for _, trusted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("trusted=%v/%s", trusted, project), func(t *testing.T) {
+				w := newLayerWorkspace(t)
+				w.flags.Profile = StringInput{Value: "review", Set: true}
+				w.write(w.user, `{"profiles":{"review":{}}}`)
+				w.flags.TrustProjectProviders = BoolInput{Value: trusted, Set: true}
+				w.flags.TrustProjectHooks = BoolInput{Value: trusted, Set: true}
+				w.write(w.projectPath(), project)
+				resolved := w.mustResolve()
+				if got := resolved.OTel(); otelExports(got) {
+					t.Fatalf("a case variant configured telemetry: %+v", got)
+				}
+				for _, setting := range resolved.Settings() {
+					// A trusted project's otel object whose members were all
+					// unknown spellings is left empty: {} and nothing else.
+					top, _, _ := strings.Cut(setting.Key, ".")
+					if strings.Contains(string(setting.Value), marker) || strings.EqualFold(top, "otel") && (setting.Key != "otel" || string(setting.Value) != "{}") {
+						t.Fatalf("config show lists %+v", setting)
+					}
+				}
+				if !strings.Contains(strings.Join(resolved.Warnings(), "\n"), "unknown") {
+					t.Fatalf("no unknown-setting warning: %q", resolved.Warnings())
+				}
+			})
+		}
+	}
+}
+
+// A header set through any spelling of otel.headers either applies and is
+// masked by config show, or is unknown and dropped; its value never prints.
+func TestOTelHeaderSpellingsNeverShowTheValue(t *testing.T) {
+	const marker = "P3_HEADER_SECRET_6134"
+	for _, override := range []string{
+		`otel.Headers={"x-collector-team":"` + marker + `"}`,
+		`otel.HEADERS.x-collector-team=` + marker,
+		`OTel.headers={"x-collector-team":"` + marker + `"}`,
+		`otel.headers={"x-collector-team":"` + marker + `"}`,
+		`otel.headers.x-collector-team=` + marker,
+	} {
+		t.Run(override, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.flags.Overrides = StringsInput{Set: true, Values: []string{override}}
+			resolved := w.mustResolve()
+			exact := strings.HasPrefix(override, "otel.headers")
+			if got := resolved.OTel().Headers["x-collector-team"]; (got == marker) != exact {
+				t.Fatalf("header = %q; the exact spelling alone applies", got)
+			}
+			for _, setting := range resolved.Settings() {
+				if strings.Contains(string(setting.Value), marker) {
+					t.Fatalf("config show printed the header value: %+v", setting)
+				}
+			}
+		})
 	}
 }
