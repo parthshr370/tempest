@@ -387,8 +387,14 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 			http.Error(w, "Authorization state did not match", http.StatusBadRequest)
 			return
 		}
-		// RFC 9207: a returned issuer must be the one this request went to.
-		if iss := values.Get("iss"); iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
+		// RFC 9207: a returned issuer must be the one this request went to,
+		// and a server that advertises the parameter must return it.
+		iss := values.Get("iss")
+		if iss == "" && metadata.IssParameterSupported {
+			http.Error(w, "Authorization response lacks the issuer its server promised", http.StatusBadRequest)
+			return
+		}
+		if iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
 			http.Error(w, "Authorization issuer did not match", http.StatusBadRequest)
 			return
 		}

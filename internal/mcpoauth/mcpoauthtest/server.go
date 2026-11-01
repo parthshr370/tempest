@@ -37,6 +37,9 @@ type Options struct {
 	IssuerPath string
 	// StaticClient is accepted without registration; Register stays open.
 	StaticClient string
+	// OmitIss leaves the RFC 9207 iss parameter out of authorization
+	// responses although the metadata advertises it.
+	OmitIss bool
 }
 
 // Server is one authorization server and its protected MCP endpoint. Tool
@@ -163,7 +166,7 @@ func (s *Server) authorization(w http.ResponseWriter, r *http.Request) {
 		if s.Options.NoPKCE {
 			methods = nil
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"issuer": s.Issuer, "authorization_endpoint": s.AS.URL + "/authorize", "token_endpoint": s.AS.URL + "/token", "registration_endpoint": s.AS.URL + "/register", "code_challenge_methods_supported": methods, "scopes_supported": []string{"mcp:read", "mcp:write"}})
+		writeJSON(w, http.StatusOK, map[string]any{"issuer": s.Issuer, "authorization_endpoint": s.AS.URL + "/authorize", "token_endpoint": s.AS.URL + "/token", "registration_endpoint": s.AS.URL + "/register", "code_challenge_methods_supported": methods, "scopes_supported": []string{"mcp:read", "mcp:write"}, "authorization_response_iss_parameter_supported": true})
 	case "/register":
 		var request struct {
 			RedirectURIs []string `json:"redirect_uris"`
@@ -214,7 +217,9 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request) {
 		values := target.Query()
 		values.Set("code", code)
 		values.Set("state", query.Get("state"))
-		values.Set("iss", s.Issuer)
+		if !s.Options.OmitIss {
+			values.Set("iss", s.Issuer)
+		}
 		target.RawQuery = values.Encode()
 		http.Redirect(w, r, target.String(), http.StatusFound)
 	}

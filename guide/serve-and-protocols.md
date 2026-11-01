@@ -98,10 +98,11 @@ OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
    advertise PKCE `S256` is refused.
 3. The configured `oauth.clientId`, a stored dynamic registration, or a new RFC 7591
    registration as a public client.
-4. Authorization code with PKCE `S256`, a `state` check and the RFC 8707 `resource`
-   parameter in the authorization and token requests, returning to a loopback
-   listener on `127.0.0.1`. Scope is the challenge's `scope`, else `oauth.scopes`,
-   else the resource's `scopes_supported`.
+4. Authorization code with PKCE `S256`, a `state` check, the RFC 9207 `iss` check
+   (required when the authorization server advertises it) and the RFC 8707
+   `resource` parameter in the authorization and token requests, returning to a
+   loopback listener on `127.0.0.1`. Scope is the challenge's `scope`, else
+   `oauth.scopes`, else the resource's `scopes_supported`.
 
 ```sh
 tempest mcp login docs          # opens the browser; -no-browser prints the URL

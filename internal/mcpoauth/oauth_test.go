@@ -134,6 +134,24 @@ func TestLoginRefusesAuthorizationServerWithoutPKCE(t *testing.T) {
 	}
 }
 
+// RFC 9207 section 2.4: an authorization server that advertises the iss
+// response parameter must send it, so a response without it is refused.
+func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{OmitIss: true}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if _, err := h.flow.Login(ctx, challenge, h.fixture.Browse); err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("login with the advertised iss missing = %v, want the callback refused", err)
+	}
+	if h.fixture.VerifiedCodes() != 0 {
+		t.Fatal("the code was exchanged although the response lacked iss")
+	}
+}
+
 func TestLoginUsesConfiguredClientWithoutRegistering(t *testing.T) {
 	h := newHarness(t, mcpoauthtest.Options{StaticClient: "preregistered"}, &mcpconfig.OAuthClient{ClientID: "preregistered"})
 	record := h.login(t)
