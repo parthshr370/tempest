@@ -109,6 +109,10 @@ tempest mcp list                # servers, transports and sign-in state
 tempest mcp logout docs         # forget tokens, keep the client registration
 ```
 
+These commands take the run flags (`-mcp-config`, `-trust-project-hooks`, `-profile`,
+`-c` and the rest), so they see the servers a run with the same flags starts. A
+project server the trust rules drop is named in a warning on stderr.
+
 Tokens are stored per server in `<agent-dir>/mcp-oauth/<server>.json`, mode `0600`
 in a `0700` directory, written atomically and locked across processes. They are
 bound to the configured URL and are never sent to a server whose URL changed. An

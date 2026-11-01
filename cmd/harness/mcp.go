@@ -31,12 +31,13 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 }
 
 // runMCPClient runs the MCP client commands against the resolved server list.
+// They take the run flags, so trust, -profile and -c select the same servers
+// a run with those flags starts.
 func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("tempest mcp "+command, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var values config.FlagValues
-	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file")
-	fs.StringVar(&values.AgentDir.Value, "agent-dir", "", "agent data directory (holds the MCP OAuth token store)")
+	addConfigFlags(fs, &values)
 	noBrowser := false
 	if command == "login" {
 		fs.BoolVar(&noBrowser, "no-browser", false, "print the authorization URL without opening a browser")
@@ -44,14 +45,7 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return parseExitCode(usageFailure(err))
 	}
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "mcp-config":
-			values.MCPConfig.Set = true
-		case "agent-dir":
-			values.AgentDir.Set = true
-		}
-	})
+	fs.Visit(func(f *flag.Flag) { markConfigFlag(f.Name, &values) })
 	wantName := command != "list" && command != "prompts"
 	if (wantName && fs.NArg() != 1) || (!wantName && fs.NArg() != 0) {
 		if wantName {
@@ -65,6 +59,10 @@ func runMCPClient(command string, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1
+	}
+	// A project server the trust rules dropped is named here, not just missing.
+	for _, warning := range cfg.Warnings() {
+		fmt.Fprintln(stderr, "warning: "+warning)
 	}
 	store := mcpoauth.NewStore(mcpoauth.DefaultDir(cfg.AgentDir()))
 	servers := cfg.MCPServers()

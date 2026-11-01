@@ -547,7 +547,14 @@ func resolveCommandConfig(opts *commandOptions) error {
 		}
 	}
 	if (opts.resumeEnvironment.ID == "" || strings.HasPrefix(opts.resumeEnvironment.ID, "local:")) && resolved.Environment() == "" {
-		resolved, err = (config.Config{Flags: opts.flags}).Resolve()
+		// The session resumes in its journal's workspace, so that workspace's
+		// project settings and trust apply, not the directory the command
+		// started in; the SDK resolves a resumed session the same way.
+		workingDir := ""
+		if !environment.IsLocation(opts.resumeCwd) {
+			workingDir = opts.resumeCwd
+		}
+		resolved, err = (config.Config{Flags: opts.flags, WorkingDir: workingDir}).Resolve()
 		if err != nil {
 			return err
 		}
@@ -853,8 +860,6 @@ func markConfigFlag(name string, values *config.FlagValues) {
 		values.Attach.Set = true
 	case "enable-web":
 		values.EnableWeb.Set = true
-	case "web-search-url":
-		values.WebSearchURL.Set = true
 	case "agent-dir":
 		values.AgentDir.Set = true
 	case "session-dir":

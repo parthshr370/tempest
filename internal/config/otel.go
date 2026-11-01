@@ -175,7 +175,8 @@ func parseKeyValuePairs(text string) (map[string]string, error) {
 		key, value, found := strings.Cut(item, "=")
 		key = strings.TrimSpace(key)
 		if !found || key == "" {
-			return nil, errors.New("want comma-separated key=value pairs")
+			// "name", not "key": the redactor masks the text after "key=".
+			return nil, errors.New("want comma-separated name=value pairs")
 		}
 		decoded, err := url.PathUnescape(strings.TrimSpace(value))
 		if err != nil {

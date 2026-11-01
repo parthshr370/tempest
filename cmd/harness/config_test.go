@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -123,5 +124,99 @@ func TestConfigShowAttributesUntrustedDenyUnion(t *testing.T) {
 	}
 	if warnings := strings.Join(output.Warnings, "\n"); !strings.Contains(warnings, "permission_deny_tools") || !strings.Contains(warnings, projectPath) {
 		t.Fatalf("warnings %q do not name the dropped null", warnings)
+	}
+}
+
+// The MCP client commands resolve the same server list as a run with the
+// same flags: trust, -profile and -c apply, and the trust warning names a
+// project server they drop.
+func TestMCPClientCommandsSeeTheRunsSettingsLayers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	userPath := filepath.Join(home, ".config", config.ConfigDirName, "settings.json")
+	projectPath := filepath.Join(root, config.ProjectConfigDirName, "settings.json")
+	for path, content := range map[string]string{
+		userPath:    `{"profiles":{"review":{"mcp_servers":[{"name":"profiled","transport":"stdio","command":"profiled-mcp"}]}}}`,
+		projectPath: `{"mcp_servers":[{"name":"repo","transport":"stdio","command":"repo-mcp"}]}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(root)
+	list := func(args ...string) (string, string, int) {
+		var stdout, stderr bytes.Buffer
+		code := run(append([]string{"mcp", "list"}, args...), &stdout, &stderr)
+		return stdout.String(), stderr.String(), code
+	}
+
+	stdout, stderr, code := list()
+	if code != 0 || strings.Contains(stdout, "repo") || !strings.Contains(stderr, "mcp_servers") || !strings.Contains(stderr, projectPath) {
+		t.Fatalf("untrusted: exit=%d stdout=%q stderr=%q, want the project server dropped with a warning", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-trust-project-hooks"); code != 0 || !strings.Contains(stdout, "repo\tstdio repo-mcp") {
+		t.Fatalf("trusted: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-profile", "review"); code != 0 || !strings.Contains(stdout, "profiled\tstdio profiled-mcp") {
+		t.Fatalf("profile: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-c", `mcp_servers=[{"name":"inline","transport":"stdio","command":"inline-mcp"}]`); code != 0 || !strings.Contains(stdout, "inline\tstdio inline-mcp") {
+		t.Fatalf("-c: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+// -resume resolves the project settings of the session's workspace, where
+// the resumed session runs, as the SDK does; the directory the command
+// starts in contributes none.
+func TestResumeResolvesTheSessionsWorkspaceSettings(t *testing.T) {
+	for _, assignment := range os.Environ() {
+		key, _, _ := strings.Cut(assignment, "=")
+		if strings.HasPrefix(key, "HARNESS_") || strings.HasPrefix(key, "LYRA_") {
+			t.Setenv(key, "")
+		}
+	}
+	t.Setenv("HOME", t.TempDir())
+	sessionDir := t.TempDir()
+	script := filepath.Join(t.TempDir(), "provider.json")
+	if err := os.WriteFile(script, []byte(`[{"text":"done"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace, other := t.TempDir(), t.TempDir()
+	for dir, content := range map[string]string{workspace: `{"permission_deny_tools":["bash"]}`, other: `{"permission_deny_tools":["edit"]}`} {
+		path := filepath.Join(dir, config.ProjectConfigDirName, "settings.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(workspace)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"-session-dir", sessionDir, "-faux-script", script, "-output-format", "json", "-p", "hi"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit=%d stderr=%s", code, &stderr)
+	}
+	var report runReportOutput
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || report.SessionID == "" {
+		t.Fatalf("report %q: %v", stdout.String(), err)
+	}
+
+	t.Chdir(other)
+	opts, err := parseCommandOptions("", []string{"-session-dir", sessionDir, "-resume", report.SessionID, "-p", "again"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolveCommandConfig(&opts); err != nil {
+		t.Fatal(err)
+	}
+	if deny := opts.Config.PermissionDenyTools(); !slices.Equal(deny, []string{"bash"}) {
+		t.Fatalf("resumed deny list = %v, want the session workspace's [bash]", deny)
 	}
 }

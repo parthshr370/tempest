@@ -617,6 +617,77 @@ func TestInvalidEnvironmentValueFailsOnlyWhenItWins(t *testing.T) {
 	}
 }
 
+// An invalid variable for an object setting names the variable, and any flag
+// or -c override of that object, a member of it, or null replaces it.
+func TestInvalidObjectVariableNamesItselfAndYieldsToOverrides(t *testing.T) {
+	w := newLayerWorkspace(t)
+	w.env["OTEL_EXPORTER_OTLP_HEADERS"] = "no-pairs-here"
+	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "OTEL_EXPORTER_OTLP_HEADERS") {
+		t.Fatalf("err = %v, want it to name the variable", err)
+	}
+	for _, override := range []string{`otel.headers={"x-team":"a"}`, "otel.headers.x-team=a", "otel.headers=null", "otel=null"} {
+		w.flags.Overrides = StringsInput{Set: true, Values: []string{override}}
+		if _, err := w.resolve(); err != nil {
+			t.Errorf("-c %s: %v", override, err)
+		}
+	}
+}
+
+// A field name that contains "token" or "key" is not a credential label: the
+// message after it stays readable, while credentials inside it stay masked.
+func TestErrorMasksCredentialsNotTheMessage(t *testing.T) {
+	for _, test := range []struct {
+		err  *Error
+		want string
+	}{
+		{&Error{Field: "max_tokens", Err: errors.New("must be positive")}, "config max_tokens: must be positive"},
+		{&Error{Field: "mcp_sampling_max_tokens", Err: errors.New("must be positive")}, "config mcp_sampling_max_tokens: must be positive"},
+		{&Error{Field: "providers", Err: errors.New("relay: header Authorization: Bearer abcdefgh12345")}, "config providers: relay: header Authorization: [REDACTED]"},
+	} {
+		if got := test.err.Error(); got != test.want {
+			t.Errorf("Error() = %q, want %q", got, test.want)
+		}
+	}
+	w := newLayerWorkspace(t)
+	w.write(w.projectPath(), `{"max_tokens": 0}`)
+	if _, err := w.resolve(); err == nil || !strings.Contains(err.Error(), "max_tokens: must be positive") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// A value that fails validation names the layer that set it, so a bad value
+// in a repository file points at that file rather than looking like the
+// operator's own setting.
+func TestInvalidValueNamesTheLayerThatSetIt(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		setup  func(w *layerWorkspace)
+		field  string
+		source func(w *layerWorkspace) string
+	}{
+		{"project scalar", func(w *layerWorkspace) { w.write(w.projectPath(), `{"max_tokens": 0}`) }, "max_tokens", func(w *layerWorkspace) string { return "project " + w.projectPath() }},
+		{"project-local enum", func(w *layerWorkspace) { w.write(w.localPath(), `{"reasoning": "max"}`) }, "reasoning", func(w *layerWorkspace) string { return "project-local " + w.localPath() }},
+		{"user fallback entry", func(w *layerWorkspace) { w.write(w.user, `{"fallback_models": {"plan": ["nope:model"]}}`) }, "fallback_models.plan[0]", func(w *layerWorkspace) string { return "user " + w.user }},
+		{"environment", func(w *layerWorkspace) { w.env["HARNESS_BASH_TIMEOUT"] = "soon" }, "bash_timeout", func(*layerWorkspace) string { return "env HARNESS_BASH_TIMEOUT" }},
+		{"override", func(w *layerWorkspace) {
+			w.flags.Overrides = StringsInput{Set: true, Values: []string{"context_files.max_bytes=-1"}}
+		}, "context_files.max_bytes", func(*layerWorkspace) string { return "override -c" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			test.setup(w)
+			_, err := w.resolve()
+			var configErr *Error
+			if !errors.As(err, &configErr) || configErr.Field != test.field {
+				t.Fatalf("err = %v, want a %s error", err, test.field)
+			}
+			if want := "(set by " + test.source(w) + ")"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("err = %v, want it to name %q", err, want)
+			}
+		})
+	}
+}
+
 func TestConfigShowRedactsCredentials(t *testing.T) {
 	w := newLayerWorkspace(t)
 	w.write(w.user, `{

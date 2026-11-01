@@ -98,7 +98,6 @@ type FlagValues struct {
 	Plan                  BoolInput
 	Attach                StringsInput
 	EnableWeb             BoolInput
-	WebSearchURL          StringInput
 	AgentDir              StringInput
 	SessionDir            StringInput
 	AnthropicBaseURL      StringInput
@@ -421,9 +420,13 @@ type Error struct {
 	Err   error
 }
 
-// Error returns a stable, field-qualified configuration failure. Text that
-// looks like a credential is masked, whatever produced the error.
-func (e *Error) Error() string { return obs.Redact(fmt.Sprintf("config %s: %v", e.Field, e.Err)) }
+// Error returns a stable, field-qualified configuration failure. Text in the
+// message that looks like a credential is masked, whatever produced it. The
+// field is a settings key, never a value, and stays outside the redactor: a
+// key such as max_tokens followed by ": " would otherwise mask the message.
+func (e *Error) Error() string {
+	return fmt.Sprintf("config %s: %s", e.Field, obs.Redact(e.Err.Error()))
+}
 
 // Unwrap returns the underlying parsing or filesystem failure.
 func (e *Error) Unwrap() error { return e.Err }
@@ -515,7 +518,7 @@ func splitCommaList(value string) []string {
 }
 
 // Resolve merges every settings layer once and returns validated runtime values.
-func (c Config) Resolve() (*ResolvedConfig, error) {
+func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	lookup := c.LookupEnv
 	if lookup == nil {
 		lookup = os.Getenv
@@ -565,6 +568,8 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A value that fails validation below names the layer that set it.
+	defer func() { err = layered.withSource(err) }()
 	settings := layered.settings
 	environmentName, environments, err := resolveEnvironments(c.Flags, lookup, settings)
 	if err != nil {
@@ -574,8 +579,7 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, &Error{Field: "providers", Err: err}
 	}
-	// -mcp-config and HARNESS_MCP_CONFIG already reached settings as layers.
-	mcpServers, err := resolveMCP(StringInput{}, "", settings)
+	mcpServers, err := resolveMCP(settings)
 	if err != nil {
 		return nil, &Error{Field: "mcp_config", Err: err}
 	}

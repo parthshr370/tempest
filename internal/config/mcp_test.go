@@ -15,23 +15,24 @@ func TestMCPConfigSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := fileSettings{MCPServers: []mcpconfig.Server{{Name: "settings", Transport: "stdio", Command: "fixture"}}}
-	fromSettings, err := resolveMCP(StringInput{}, "", settings)
+	fromSettings, err := resolveMCP(settings)
 	if err != nil || fromSettings[0].Name != "settings" {
 		t.Fatalf("settings: %v %v", fromSettings, err)
 	}
-	fromEnv, err := resolveMCP(StringInput{}, path, settings)
-	if err != nil || fromEnv[0].Name != "file" || fromEnv[0].Command != filepath.Join(directory, "fixture") {
-		t.Fatalf("env: %v %v", fromEnv, err)
+	fromFile, err := resolveMCP(fileSettings{MCPConfig: &path})
+	if err != nil || fromFile[0].Name != "file" || fromFile[0].Command != filepath.Join(directory, "fixture") {
+		t.Fatalf("file: %v %v", fromFile, err)
 	}
-	disabled, err := resolveMCP(StringInput{Set: true, Value: ""}, path, settings)
+	empty := ""
+	disabled, err := resolveMCP(fileSettings{MCPConfig: &empty})
 	if err != nil || disabled == nil || len(disabled) != 0 {
 		t.Fatalf("explicit disable: %v %v", disabled, err)
 	}
 	settings.MCPConfig = &path
-	if _, err = resolveMCP(StringInput{}, "", settings); err == nil {
+	if _, err = resolveMCP(settings); err == nil {
 		t.Fatal("accepted conflicting settings")
 	}
-	resolved := &ResolvedConfig{mcpServers: fromEnv}
+	resolved := &ResolvedConfig{mcpServers: fromFile}
 	copy := resolved.MCPServers()
 	copy[0].Env["TOKEN"] = "mutated"
 	if resolved.MCPServers()[0].Env["TOKEN"] != "secret" {
@@ -44,7 +45,7 @@ func TestMCPConfigFileClaudeShapeResolvesRelativeCommand(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"mcpServers":{"local":{"command":"./bin/server","args":["--stdio"]}}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	servers, err := resolveMCP(StringInput{Set: true, Value: path}, "", fileSettings{})
+	servers, err := resolveMCP(fileSettings{MCPConfig: &path})
 	if err != nil || len(servers) != 1 || servers[0].Name != "local" || servers[0].Transport != "stdio" || servers[0].Command != filepath.Join(directory, "bin", "server") {
 		t.Fatalf("claude shape: %#v %v", servers, err)
 	}
@@ -56,7 +57,7 @@ func TestMCPConfigFileStrictness(t *testing.T) {
 			if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := resolveMCP(StringInput{Set: true, Value: path}, "", fileSettings{}); err == nil {
+			if _, err := resolveMCP(fileSettings{MCPConfig: &path}); err == nil {
 				t.Fatal("accepted malformed file")
 			}
 		})

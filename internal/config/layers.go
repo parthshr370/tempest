@@ -381,7 +381,7 @@ var settingInputs = []settingInput{
 	{key: "plan", env: "HARNESS_PLAN", flag: "plan", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.Plan }},
 	{key: "attach", env: "HARNESS_ATTACH", flag: "attach", kind: inputList, field: func(f *FlagValues) flagInput { return &f.Attach }},
 	{key: "enable_web", env: "HARNESS_ENABLE_WEB", flag: "enable-web", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.EnableWeb }},
-	{key: "web_search_url", env: "HARNESS_WEB_SEARCH_URL", flag: "web-search-url", field: func(f *FlagValues) flagInput { return &f.WebSearchURL }},
+	{key: "web_search_url", env: "HARNESS_WEB_SEARCH_URL"},
 	{key: "agent_dir", env: EnvAgentDir, flag: "agent-dir", field: func(f *FlagValues) flagInput { return &f.AgentDir }},
 	{key: "session_dir", env: EnvSessionDir, flag: "session-dir", field: func(f *FlagValues) flagInput { return &f.SessionDir }},
 	{key: "anthropic_base_url", env: "HARNESS_ANTHROPIC_BASE_URL", flag: "anthropic-base-url", field: func(f *FlagValues) flagInput { return &f.AnthropicBaseURL }},
@@ -490,7 +490,7 @@ func environmentLayer(lookup func(string) string) (*settingsLayer, map[string]er
 		}
 		node, err := parseEnvironmentValue(input.kind, value)
 		if err != nil {
-			invalid[input.key] = err
+			invalid[input.key] = fmt.Errorf("%s: %w", input.env, err)
 			continue
 		}
 
@@ -670,7 +670,7 @@ func namesModelEndpoint(value *settingsNode) bool {
 		return true
 	}
 	var spec string
-	return json.Unmarshal(value.scalar, &spec) == nil && (strings.Contains(spec, "@http://") || strings.Contains(spec, "@https://"))
+	return json.Unmarshal(value.scalar, &spec) == nil && adapter.HasModelBaseURL(spec)
 }
 
 // planModeNode is the strictest permission mode, which no lower mode is
@@ -1290,13 +1290,29 @@ func (r *layerResolver) resolve(root string) (*layeredSettings, error) {
 	}
 	result.attribute(merged, stack, r.set.requirements, r.options.managedPath, defaultOrigins)
 	for _, key := range slices.Sorted(maps.Keys(r.set.invalidEnvironment)) {
-		switch result.sources[key].Layer {
-		case LayerFlag, LayerOverride, LayerRequirement:
-		default:
+		if !r.set.replacesEnvironment(strings.Split(key, ".")) {
 			return nil, &Error{Field: key, Err: r.set.invalidEnvironment[key]}
 		}
 	}
 	return result, nil
+}
+
+// replacesEnvironment reports whether a flag, a -c override or a managed
+// requirement sets path, a member of it or an object above it, so an invalid
+// variable for path would not have taken effect.
+func (set *layerSet) replacesEnvironment(path []string) bool {
+	for _, layer := range append([]*settingsLayer{set.flags}, set.overrides...) {
+		if _, exact, shadowing := memberAt(layer.members, path); exact || shadowing {
+			return true
+		}
+	}
+	for _, requirement := range set.requirements {
+		common := min(len(path), len(requirement.path))
+		if slices.Equal(path[:common], requirement.path[:common]) {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeEffective merges the stack, applies requirements, then fills built-in
@@ -1367,6 +1383,33 @@ func (s *layeredSettings) reportDropped(dropped, kept []droppedSetting) {
 		parts = append(parts, fmt.Sprintf("%s: %s (%s)", setting.layer.where(nil), setting.key, setting.reason))
 	}
 	s.warnings = append(s.warnings, "project settings ignored: "+strings.Join(parts, "; "))
+}
+
+// withSource adds to a configuration error the layer and the file, variable
+// or flag that set its field, when one source set all of it. A bad value in
+// a repository file then names that file instead of reading like the
+// operator's own setting. An array index in the field names its array.
+func (s *layeredSettings) withSource(err error) error {
+	var configErr *Error
+	if !errors.As(err, &configErr) {
+		return err
+	}
+	field, _, _ := strings.Cut(configErr.Field, "[")
+	var from Setting
+	found := false
+	for _, setting := range s.list {
+		if setting.Key != field && !strings.HasPrefix(setting.Key, field+".") {
+			continue
+		}
+		if found && (setting.Layer != from.Layer || setting.Source != from.Source) {
+			return err
+		}
+		from, found = setting, true
+	}
+	if !found || from.Layer == LayerDefault {
+		return err
+	}
+	return &Error{Field: configErr.Field, Err: fmt.Errorf("%w (set by %s)", configErr.Err, strings.TrimSpace(from.Layer+" "+from.Source))}
 }
 
 // decodeMembers decodes merged settings into target.
