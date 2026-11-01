@@ -19,20 +19,34 @@ import (
 // PresetResolver resolves data against the provider request's pinned generation.
 type PresetResolver func(context.Context, string) (extension.AgentPreset, error)
 
-// PresetListing describes the actual preset names accepted by the task adapter.
+// builtinRoles describe the task tool's two built-in subagent types.
+var builtinRoles = map[string]string{
+	"explore": "read-only investigation on the smol model",
+	"general": "full child with edit and bash tools, in an isolated git worktree when eligible",
+}
+
+// PresetListing describes the actual preset names accepted by the task
+// adapter, beside the built-in roles the presets map does not redefine.
 func PresetListing(presets map[string]extension.AgentPreset) string {
 	if len(presets) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(presets))
-	for name := range presets {
+	descriptions := make(map[string]string, len(presets)+len(builtinRoles))
+	for name, description := range builtinRoles {
+		descriptions[name] = description
+	}
+	for name, preset := range presets {
+		descriptions[name] = preset.Description
+	}
+	names := make([]string, 0, len(descriptions))
+	for name := range descriptions {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	var listing strings.Builder
 	listing.WriteString("<available_subagents>\nDelegate with the task tool using ONLY these subagent_type values. There is no \"general-purpose\" type; never invent one.\n")
 	for _, name := range names {
-		fmt.Fprintf(&listing, "- %s: %s\n", name, presets[name].Description)
+		fmt.Fprintf(&listing, "- %s: %s\n", name, descriptions[name])
 	}
 	listing.WriteString("</available_subagents>")
 	return listing.String()

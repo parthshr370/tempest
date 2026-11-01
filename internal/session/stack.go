@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/agentfiles"
 	"go.harness.dev/harness/internal/checkpoint"
 	"go.harness.dev/harness/internal/compaction"
 	"go.harness.dev/harness/internal/config"
@@ -67,6 +68,10 @@ type StackConfig struct {
 	// ModelRole names the role this stack's model serves for model-request
 	// hooks; empty is "plan" for a plan stack and "default" otherwise.
 	ModelRole string
+	// ResolveModel routes a model spec an agent preset names, with its
+	// backups, when the host supplies its own StreamFn; nil leaves a host
+	// stream with only its role models.
+	ResolveModel func(spec string) (ptypes.Model, agent.StreamFn, []ptypes.Model, error)
 	// Reasoning is the default role's reasoning effort ("", "off", minimal,
 	// low, medium, high). PlanReasoning and SmolReasoning override it for
 	// the plan stack and smol (explore) children; empty inherits Reasoning.
@@ -146,6 +151,10 @@ type StackConfig struct {
 	BeforeToolCall func(context.Context, agent.BeforeToolCallContext) *agent.BeforeToolCallResult
 	Extensions     *extensionhost.Runtime
 	ResolvePreset  func(string) (extension.AgentPreset, error)
+	// AgentFiles are the agent types defined as files. The root's task tool
+	// offers them by name; with extensions they are listed beside bundle
+	// presets.
+	AgentFiles []agentfiles.Agent
 
 	// Plan selects a read-only stack. Zero PlanModel uses Model.
 	Plan bool
@@ -412,10 +421,28 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		return nil
 	}
 	var taskTool agent.AgentTool
+	// Without extensions the agent-file listing joins the system prompt
+	// here, once; with extensions the runtime lists file and bundle presets
+	// together on every request frame.
+	var fileListing string
 	if cfg.EnableTask && !cfg.Plan && !cfg.Child {
-		taskTool = subagent.NewTool(cfg.Controller)
-		if cfg.Extensions != nil {
+		switch {
+		case cfg.Extensions != nil:
 			taskTool = subagent.NewPresetTool(cfg.Controller, nil, cfg.Extensions.ResolvePresetContext)
+		case len(cfg.AgentFiles) > 0:
+			presets := agentfiles.Presets(cfg.AgentFiles)
+			names := make([]string, 0, len(presets))
+			listed := make(map[string]extension.AgentPreset, len(presets))
+			for _, preset := range presets {
+				names = append(names, preset.ID)
+				listed[preset.ID] = preset
+			}
+			taskTool = subagent.NewPresetTool(cfg.Controller, names, func(_ context.Context, id string) (extension.AgentPreset, error) {
+				return extensionhost.ResolveFilePreset(presets, id)
+			})
+			fileListing = subagent.PresetListing(listed)
+		default:
+			taskTool = subagent.NewTool(cfg.Controller)
 		}
 	}
 	// Internal URLs resolve against the root session, so a child shares
@@ -549,6 +576,9 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		RemoteEnvironment:  !local,
 		ActiveTools:        active,
 	})
+	if fileListing != "" && slices.ContainsFunc(active, func(tool agent.AgentTool) bool { return tool.Name == "task" }) {
+		systemPrompt += "\n\n" + fileListing
+	}
 	var agt *agent.Agent
 	var compact func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error)
 	runner := newCompactionRunner(model, cfg.StreamFn)

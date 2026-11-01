@@ -53,6 +53,15 @@ type Agent struct {
 	Source string
 }
 
+// Presets returns the agents' presets in load order.
+func Presets(agents []Agent) []extension.AgentPreset {
+	presets := make([]extension.AgentPreset, 0, len(agents))
+	for _, agent := range agents {
+		presets = append(presets, agent.Preset)
+	}
+	return presets
+}
+
 // FieldError is an invalid agent file; Field names the frontmatter key, or
 // "frontmatter" / "body" for the file's structure.
 type FieldError struct {

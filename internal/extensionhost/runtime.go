@@ -636,6 +636,15 @@ func FilePreset(presets []extension.AgentPreset, id string) (extension.AgentPres
 	return extension.AgentPreset{}, false
 }
 
+// ResolveFilePreset resolves an agent-file preset for a session without
+// extensions.
+func ResolveFilePreset(presets []extension.AgentPreset, id string) (extension.AgentPreset, error) {
+	if preset, ok := FilePreset(presets, id); ok {
+		return preset, nil
+	}
+	return extension.AgentPreset{}, fmt.Errorf("agent preset unavailable: %s", id)
+}
+
 var _ agent.ExtensionRuntime = (*Runtime)(nil)
 
 func cloneHookInput(input extension.HookInput) extension.HookInput {

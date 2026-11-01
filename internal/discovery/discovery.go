@@ -1,4 +1,4 @@
-// Package discovery collects the fixed V1 sources of session context, rules, and skills.
+// Package discovery collects the fixed V1 sources of session context, rules, skills and agent files.
 package discovery
 
 import (
@@ -11,6 +11,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/agentfiles"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/contextfile"
 	"go.harness.dev/harness/internal/prompt"
@@ -28,6 +30,9 @@ type Options struct {
 	// Files names context files and bounds their bytes; zero values take the
 	// built-in defaults.
 	Files config.ContextFileSettings
+	// Providers are the configured model routes an agent file's model spec
+	// may name.
+	Providers map[string]adapter.ProviderConfig
 }
 
 // DiagnosticCode classifies non-fatal discovery diagnostics.
@@ -38,6 +43,8 @@ const (
 	DiagnosticCollision DiagnosticCode = "collision"
 	DiagnosticImport    DiagnosticCode = "import"
 	DiagnosticTruncated DiagnosticCode = "truncated"
+	// DiagnosticAgent is an agent file skipped as invalid or shadowed.
+	DiagnosticAgent DiagnosticCode = "agent"
 )
 
 // Diagnostic is a non-fatal source warning.
@@ -58,6 +65,9 @@ type SessionInputs struct {
 	// ContextBytes counts the context file bytes kept, so nested discovery
 	// spends only what the total cap leaves.
 	ContextBytes int
+	// Agents are the agent files of the workspace and the agent dir, first
+	// definition of a name first.
+	Agents []agentfiles.Agent
 }
 
 // UserContextNames are the user-level context files, first hit wins.
@@ -88,6 +98,7 @@ const (
 	ExpandContext   ErrorCode = "expand_context"
 	ExpandRule      ErrorCode = "expand_rule"
 	LoadSkills      ErrorCode = "load_skills"
+	LoadAgents      ErrorCode = "load_agents"
 )
 
 // Error is a typed discovery failure.
@@ -247,6 +258,14 @@ func Discover(ctx context.Context, options Options) (SessionInputs, error) {
 			code = DiagnosticCollision
 		}
 		inputs.Diagnostics = append(inputs.Diagnostics, Diagnostic{Code: code, Path: diagnostic.Path, Message: diagnostic.Message, Collision: diagnostic.Collision})
+	}
+	agents, agentDiagnostics, err := agentfiles.Load(agentfiles.Options{ProjectDir: cwd, AgentDir: agentDir, Providers: options.Providers})
+	if err != nil {
+		return SessionInputs{}, &Error{Code: LoadAgents, Op: "load agents", Err: err}
+	}
+	inputs.Agents = agents
+	for _, diagnostic := range agentDiagnostics {
+		inputs.Diagnostics = append(inputs.Diagnostics, Diagnostic{Code: DiagnosticAgent, Path: diagnostic.Path, Message: diagnostic.Message})
 	}
 	return inputs, nil
 }

@@ -264,7 +264,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		cwd = EnvironmentLocation(lease.Reference())
 		cfg.Cwd = lease.Reference().Cwd
 		needsDiscovery = false
-		cfg.ContextFiles, cfg.Skills, cfg.Rules, cfg.GenericRules = nil, nil, nil, nil
+		cfg.ContextFiles, cfg.Skills, cfg.Rules, cfg.GenericRules, cfg.AgentFiles = nil, nil, nil, nil, nil
 	}
 	if loaded != nil && lease.Capabilities().Has(environment.Lookup) {
 		loaded, err = recoverEnvironmentResults(ctx, lease, store, loaded)
@@ -434,13 +434,14 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		if skillPaths == nil {
 			skillPaths = defaults.SkillPaths()
 		}
-		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: skillPaths, IncludeDefaultSkills: true, Files: cfg.ContextFileSettings})
+		inputs, e := discovery.Discover(ctx, discovery.Options{Cwd: cwd, AgentDir: defaults.AgentDir(), SkillPaths: skillPaths, IncludeDefaultSkills: true, Files: cfg.ContextFileSettings, Providers: providerConfig.Providers})
 		if e != nil {
 			return nil, e
 		}
 		cfg.ContextFiles = inputs.ContextFiles
 		cfg.Skills = inputs.Skills
 		cfg.GenericRules = inputs.GenericRules
+		cfg.AgentFiles = inputs.Agents
 		for _, d := range inputs.Diagnostics {
 			logger.Warn("discovery diagnostic", "code", d.Code, "path", d.Path, "message", d.Message)
 		}

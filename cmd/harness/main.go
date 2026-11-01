@@ -168,7 +168,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		resolvedRetry.Jitter = retry.Jitter{Min: settings.JitterMin, Max: settings.JitterMax}
 		retryConfig = &resolvedRetry
 	}
-	roles, err := adapter.ResolveRoles(adapter.RoleRoutingConfig{
+	roleRouting := adapter.RoleRoutingConfig{
 		DefaultModel:       opts.Config.Model(),
 		PlanModel:          opts.Config.PlanModel(),
 		SmolModel:          opts.Config.SmolModel(),
@@ -183,7 +183,8 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		SecretLookup:       opts.Secrets.Resolve,
 		Providers:          opts.Config.Providers(),
 		ChatGPTCredentials: adapter.OpenAIChatGPTCredentials(""),
-	})
+	}
+	roles, err := adapter.ResolveRoles(roleRouting)
 	if err != nil {
 		fmt.Fprintf(stderr, "provider config error: %v\n", err)
 		return 1
@@ -259,7 +260,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	var inputs discovery.SessionInputs
 	if !environment.IsLocation(cwd) {
 		inputs, err = discovery.Discover(runCtx, discovery.Options{
-			Cwd: cwd, AgentDir: opts.Config.AgentDir(), SkillPaths: opts.Config.SkillPaths(), IncludeDefaultSkills: true, Files: opts.Config.ContextFiles(),
+			Cwd: cwd, AgentDir: opts.Config.AgentDir(), SkillPaths: opts.Config.SkillPaths(), IncludeDefaultSkills: true, Files: opts.Config.ContextFiles(), Providers: opts.Config.Providers(),
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "context discovery error: %v\n", err)
@@ -296,6 +297,15 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.GenericRules = inputs.GenericRules
 	stack.AttachmentRegistry = attachRegistry
 	stack.AttachmentReader = attachReader
+	stack.AgentFiles = inputs.Agents
+	if opts.Config.FauxScript() == "" {
+		// Agent presets may name a model spec; route it like a role model,
+		// behind the default role's backups.
+		stack.ResolveModel = func(spec string) (ptypes.Model, agent.StreamFn, []ptypes.Model, error) {
+			router, err := adapter.RouteModel(spec, roleRouting.DefaultFallbacks, roleRouting)
+			return router.Model, router.StreamFn, router.Fallbacks, err
+		}
+	}
 	stack.AskUser = question.Terminal(os.Stdin, stderr)
 	processes, err := loadExtensionProcesses(opts.ExtensionConfig, stderr)
 	if err != nil {
