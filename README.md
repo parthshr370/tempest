@@ -30,6 +30,7 @@ agent protocols, or embeds in a Go application, without a Node runtime or interp
 - **Checkpoint and rewind**, restoring files and branching the conversation without touching your Git index.
 - **Persistent eval kernels** for Python and JavaScript, started only when needed.
 - **ACP, A2A, MCP, and a Go SDK**, sharing durable sessions, permissions, and cost budgets with billed cost.
+- **OpenTelemetry traces and metrics** over OTLP/HTTP, with GenAI span conventions, W3C trace propagation, and Prometheus `/metrics` on `serve`.
 
 ## Contents
 
@@ -146,8 +147,9 @@ pages do not imply disk indexing or a bounded memory working set.
 - **A2A 1.0** over HTTP for run-oriented tasks and discovery.
 - **MCP client tools** from explicitly configured, trusted servers.
 - **MCP server** over stdio, exposing `tempest_run` to other clients.
+- **OpenTelemetry** traces and metrics over OTLP/HTTP JSON, plus Prometheus text at `/metrics`.
 
-[Servers and protocols](guide/serve-and-protocols.md)
+[Servers and protocols](guide/serve-and-protocols.md) · [Telemetry](guide/telemetry.md)
 
 ## Configuration
 
