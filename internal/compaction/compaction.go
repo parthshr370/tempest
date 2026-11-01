@@ -15,11 +15,13 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/agent"
 	ptypes "go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/retry"
 )
 
 const (
@@ -874,138 +876,322 @@ Update that summary with these messages, preserving what it holds, in the same f
 
 Be concise. Focus on what's needed to understand the kept suffix.`
 
-// GenerateSummary runs one summarization turn over messages, returning the
-// model's structured summary. When previousSummary is non-empty it uses the
-// update prompt so the new summary supersedes the old one.
-func GenerateSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (string, error) {
-	return meterSummary(ctx, model, func() (SummaryResult, error) {
-		return GenerateSummaryResult(ctx, streamFn, model, settings, messages, previousSummary)
-	})
-}
-
-// SummaryResult retains usage even when the provider returns an error.
+// SummaryResult is what a summary produced and cost. Usage covers every
+// request it sent, retried and abandoned attempts included, also when one
+// failed. Model is the model its last request went to: the one it started
+// on, or a backup the fallback chain switched to during it.
 type SummaryResult struct {
 	Text  string
 	Usage ptypes.Usage
+	Model ptypes.Model
 }
 
-// GenerateSummaryResult returns a summary and its receipt data. Durable callers
-// hold shared admission until they've persisted and forwarded this receipt.
-// A conversation too large for one request to model is summarized in several,
-// each updating the summary so far (see summarizeInPieces).
-func GenerateSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (SummaryResult, error) {
-	return summarizeInPieces(ctx, streamFn, model, summaryMaxTokens(model, settings), serializeParts(messages), previousSummary, summarizationPrompt, updateSummarizationPrompt)
+// Meter sends one summarization request under the caller's cost admission
+// and accounting, as the agent loop sends a turn: it admits the request to
+// model before calling send, and records the receipt of what send returned
+// (its Usage, on its Model) before it returns, so the next request is
+// admitted against a spend that includes this one. A request it does not
+// admit is never sent, and its error ends the summary.
+type Meter func(ctx context.Context, model ptypes.Model, send func(context.Context) (SummaryResult, error)) (SummaryResult, error)
+
+// Summarizer writes summaries through Stream, one metered request at a time.
+type Summarizer struct {
+	Stream agent.StreamFn
+	// Meter wraps every request. Nil admits each one through the run's
+	// shared cost gate (agent.AdmitProvider) and charges it to the run
+	// (agent.AccountProviderUsage) before the gate opens again.
+	Meter Meter
+	// Settings gives the settings for a backup the fallback chain switches
+	// to during a summary. Nil keeps the summary's own settings.
+	Settings func(ptypes.Model) CompactionSettings
 }
 
-// GenerateTurnPrefixSummary summarizes the dropped prefix of a split turn.
-func GenerateTurnPrefixSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (string, error) {
-	return meterSummary(ctx, model, func() (SummaryResult, error) {
-		return GenerateTurnPrefixSummaryResult(ctx, streamFn, model, settings, messages)
-	})
+// Summary summarizes messages on model. When previousSummary is not empty
+// it uses the update prompt, so the new summary supersedes the old one.
+func (s Summarizer) Summary(ctx context.Context, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (SummaryResult, error) {
+	return s.summarize(ctx, model, settings, serializeParts(messages), previousSummary, summarizationPrompt, updateSummarizationPrompt)
 }
 
-// GenerateTurnPrefixSummaryResult retains the split-prefix call's usage.
-func GenerateTurnPrefixSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (SummaryResult, error) {
-	return summarizeInPieces(ctx, streamFn, model, summaryMaxTokens(model, settings), serializeParts(messages), "", turnPrefixSummarizationPrompt, updateTurnPrefixSummarizationPrompt)
+// TurnPrefix summarizes the dropped prefix of a split turn.
+func (s Summarizer) TurnPrefix(ctx context.Context, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (SummaryResult, error) {
+	return s.summarize(ctx, model, settings, serializeParts(messages), "", turnPrefixSummarizationPrompt, updateTurnPrefixSummarizationPrompt)
 }
 
-// summarizeInPieces summarizes the serialized conversation parts on model
-// in as few requests as its context window allows: each request, with the
-// maxTokens it may answer, fits the window by this package's estimate of
-// 4 bytes a token. The first uses prompt, or update when there is a previous
-// summary; each later one carries the next parts with the summary so far and
-// update. A part too long for a request on its own is cut at a rune
-// boundary and continued in the next. With no known window, or one too
-// small for the instructions alone, which no split can help, one request
-// carries everything. Usage adds up over the requests.
-func summarizeInPieces(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, parts []string, previous, prompt, update string) (SummaryResult, error) {
-	var total SummaryResult
-	for {
-		instructions := prompt
-		if strings.TrimSpace(previous) != "" {
-			instructions = update
-		}
-		room := -1
-		if model.ContextWindow > 0 {
-			room = (model.ContextWindow-maxTokens-ceilDiv(len(SummarizationSystemPrompt), 4))*4 - len(summaryPromptText("", previous, instructions))
+// bytesPerToken is this package's estimate of a token's size in text.
+const bytesPerToken = 4
+
+// errRefit marks a request whose switch to a backup was refused because it
+// does not fit the backup; it goes again, sized for the backup.
+var errRefit = errors.New("summary request does not fit the backup model")
+
+// summarize writes the summary of the serialized conversation parts in as
+// few requests as the window of the model they go to allows (see plan),
+// each request a Meter call. The first request uses prompt, or update when
+// there is a previous summary; each later one carries the next parts with
+// the summary so far and update. A part too long for a request on its own
+// is cut at a rune boundary and continued in the next.
+//
+// A switch to a backup sticks for the rest of the summary: later requests
+// go to the backup, planned for its window. The request that met the
+// switch goes to the backup only if it fits there; otherwise the switch is
+// refused and the request is sent again on the backup, sized for it.
+func (s Summarizer) summarize(ctx context.Context, model ptypes.Model, settings CompactionSettings, parts []string, previous, prompt, update string) (SummaryResult, error) {
+	meter := s.Meter
+	if meter == nil {
+		meter = admitAndCharge
+	}
+	total := SummaryResult{Model: model}
+	at := cursor{parts: parts}
+	plan := s.plan(model, settings, at, previous, prompt, update, 0)
+	for sent := 0; ; {
+		instructions := summaryInstructions(previous, prompt, update)
+		next := at.end()
+		if plan.split && !at.done() {
+			if sent == plan.limit {
+				return total, fmt.Errorf("compaction: summary needs more than its limit of %d requests to %s", plan.limit, modelName(plan.model))
+			}
+			room := plan.room(previous, instructions)
 			if room <= 0 {
-				room = -1
+				return total, fmt.Errorf("compaction: a %d-byte summary so far leaves no room for history in %s's window", len(previous), modelName(plan.model))
+			}
+			next = at.next(room)
+		}
+		text := summaryPromptText(at.text(next), previous, instructions)
+		attempted := false
+		result, err := meter(ctx, plan.model, func(ctx context.Context) (SummaryResult, error) {
+			attempted = true
+			return s.request(ctx, plan, settings, text)
+		})
+		if !attempted {
+			return total, fmt.Errorf("compaction: summary stopped before request %d of at most %d to %s; %d sent cost $%g: %w", sent+1, plan.limit, modelName(plan.model), sent, total.Usage.Cost.Total, err)
+		}
+		sent++
+		total.Usage.Add(result.Usage)
+		refit := errors.Is(err, errRefit)
+		if err != nil && !refit {
+			return total, fmt.Errorf("compaction: summary request %d to %s: %w", sent, modelName(plan.model), err)
+		}
+		switched := result.Model.ID != "" && !retry.SameModel(result.Model, plan.model)
+		if switched {
+			total.Model = result.Model
+		}
+		if !refit {
+			total.Text = result.Text
+			at, previous = next, result.Text
+			if at.done() {
+				return total, nil
 			}
 		}
-		conversation, rest := takeParts(parts, room)
-		result, err := runSummarizationResult(ctx, streamFn, model, maxTokens, summaryPromptText(conversation, previous, instructions))
-		total.Usage.Add(result.Usage)
-		if err != nil {
-			return total, err
+		if switched {
+			plan = s.plan(result.Model, s.settingsFor(result.Model, settings), at, previous, prompt, update, sent)
 		}
-		total.Text = result.Text
-		if len(rest) == 0 {
-			return total, nil
-		}
-		parts, previous = rest, result.Text
 	}
 }
+
+func (s Summarizer) settingsFor(model ptypes.Model, settings CompactionSettings) CompactionSettings {
+	if s.Settings == nil {
+		return settings
+	}
+	return s.Settings(model)
+}
+
+// request sends one summarization request as planned. A switch to a backup
+// it does not fit is refused, and the request ends with errRefit.
+func (s Summarizer) request(ctx context.Context, plan summaryPlan, settings CompactionSettings, text string) (SummaryResult, error) {
+	fits := func(backup ptypes.Model) bool {
+		if backup.ContextWindow <= 0 {
+			return true
+		}
+		output := summaryMaxTokens(backup, s.settingsFor(backup, settings))
+		return plan.maxTokens <= output && ceilDiv(len(SummarizationSystemPrompt), bytesPerToken)+ceilDiv(len(text), bytesPerToken)+plan.maxTokens <= backup.ContextWindow
+	}
+	return runSummarizationResult(ctx, s.Stream, plan.model, plan.maxTokens, text, fits)
+}
+
+// summaryPlan is how a summary's requests fit the window of the model they
+// go to, by this package's estimate of bytesPerToken.
+//
+// limit is the hard bound on the summary's requests, derived from the
+// history and the window rather than chosen: the number of requests the
+// rest of the history takes when every update carries a summary of the
+// largest size the model may answer (maxTokens), or the previous summary
+// if it is larger. A shorter summary leaves more room, so a summary that
+// stays within its output limit never reaches the bound; one that runs past
+// it (a model writing more than bytesPerToken a token) ends with an error
+// at the bound instead of sending ever smaller requests.
+//
+// split is false when one request carries everything: the window is
+// unknown, too small for the instructions, or too small for an update with
+// a full-size summary, so no split could be bounded. That request may not
+// fit; the provider then reports the overflow.
+type summaryPlan struct {
+	model     ptypes.Model
+	maxTokens int
+	// budget is the bytes a request's prompt text may take after the system
+	// prompt and maxTokens.
+	budget int
+	split  bool
+	limit  int
+}
+
+// plan plans the requests that summarize from at onward on model, sent
+// requests having already gone.
+func (s Summarizer) plan(model ptypes.Model, settings CompactionSettings, at cursor, previous, prompt, update string, sent int) summaryPlan {
+	plan := summaryPlan{model: model, maxTokens: summaryMaxTokens(model, settings), limit: sent + 1}
+	if model.ContextWindow <= 0 || at.done() {
+		return plan
+	}
+	plan.budget = (model.ContextWindow - plan.maxTokens - ceilDiv(len(SummarizationSystemPrompt), bytesPerToken)) * bytesPerToken
+	first := plan.room(previous, summaryInstructions(previous, prompt, update))
+	if first <= 0 {
+		return plan
+	}
+	rest := at.next(first)
+	least := plan.budget - summaryPromptBytes(max(summaryBytes(previous), plan.maxTokens*bytesPerToken), update)
+	if !rest.done() && least <= 0 {
+		return plan
+	}
+	plan.split = true
+	for ; !rest.done(); plan.limit++ {
+		rest = rest.next(least)
+	}
+	return plan
+}
+
+// room is the bytes of history a request updating previous with
+// instructions can carry.
+func (p summaryPlan) room(previous, instructions string) int {
+	return p.budget - summaryPromptBytes(summaryBytes(previous), instructions)
+}
+
+// summaryBytes is the size of previous as summaryPromptText carries it.
+func summaryBytes(previous string) int {
+	if strings.TrimSpace(previous) == "" {
+		return 0
+	}
+	return len(previous)
+}
+
+func modelName(model ptypes.Model) string { return model.Provider + "/" + model.ID }
+
+func admitAndCharge(ctx context.Context, model ptypes.Model, send func(context.Context) (SummaryResult, error)) (SummaryResult, error) {
+	release, err := agent.AdmitProvider(ctx, model)
+	defer release()
+	if err != nil {
+		return SummaryResult{}, err
+	}
+	result, sendErr := send(ctx)
+	if err := agent.AccountProviderUsage(ctx, "", result.Model.ID, result.Usage); err != nil {
+		return result, errors.Join(sendErr, err)
+	}
+	return result, sendErr
+}
+
+// summaryInstructions is update when there is a summary so far, else prompt.
+func summaryInstructions(previous, prompt, update string) string {
+	if strings.TrimSpace(previous) != "" {
+		return update
+	}
+	return prompt
+}
+
+const (
+	conversationOpen  = "<conversation>\n"
+	conversationClose = "\n</conversation>\n\n"
+	previousOpen      = "<previous-summary>\n"
+	previousClose     = "\n</previous-summary>\n\n"
+	partSeparator     = "\n\n"
+)
 
 // summaryPromptText is a summarization request: the conversation, the
 // summary it updates if any, and the instructions.
 func summaryPromptText(conversation, previous, instructions string) string {
 	var text strings.Builder
-	text.WriteString("<conversation>\n")
+	text.WriteString(conversationOpen)
 	text.WriteString(conversation)
-	text.WriteString("\n</conversation>\n\n")
+	text.WriteString(conversationClose)
 	if strings.TrimSpace(previous) != "" {
-		text.WriteString("<previous-summary>\n")
+		text.WriteString(previousOpen)
 		text.WriteString(previous)
-		text.WriteString("\n</previous-summary>\n\n")
+		text.WriteString(previousClose)
 	}
 	text.WriteString(instructions)
 	return text.String()
 }
 
-// takeParts joins the leading parts that fit in room bytes, as
-// SerializeConversation joins them, and returns the parts after them; a
-// first part longer than room is cut at a rune boundary, its rest left
-// first. A negative room takes everything.
-func takeParts(parts []string, room int) (string, []string) {
-	if room < 0 {
-		return strings.Join(parts, "\n\n"), nil
+// summaryPromptBytes is the size of summaryPromptText with no conversation
+// and a previous summary of previousBytes.
+func summaryPromptBytes(previousBytes int, instructions string) int {
+	size := len(conversationOpen) + len(conversationClose) + len(instructions)
+	if previousBytes > 0 {
+		size += len(previousOpen) + previousBytes + len(previousClose)
 	}
-	taken := 0
-	size := 0
-	for _, part := range parts {
-		next := size + len(part)
-		if taken > 0 {
-			next += len("\n\n")
+	return size
+}
+
+// cursor is a position in serialized conversation parts: the history not
+// yet summarized starts at parts[part][offset:].
+type cursor struct {
+	parts  []string
+	part   int
+	offset int
+}
+
+func (c cursor) done() bool { return c.part >= len(c.parts) }
+
+// end is the cursor past every part.
+func (c cursor) end() cursor { return cursor{parts: c.parts, part: len(c.parts)} }
+
+// next is where a request with room bytes of history, starting at c,
+// stops: after the whole parts that fit, joined as SerializeConversation
+// joins them, or else inside the first part, at its last rune boundary
+// that fits (after at least one rune). c must not be done.
+func (c cursor) next(room int) cursor {
+	size, part := 0, c.part
+	for ; part < len(c.parts); part++ {
+		grown := size + len(c.parts[part])
+		if part == c.part {
+			grown -= c.offset
+		} else {
+			grown += len(partSeparator)
 		}
-		if next > room {
+		if grown > room {
 			break
 		}
-		taken, size = taken+1, next
+		size = grown
 	}
-	if taken > 0 || len(parts) == 0 {
-		return strings.Join(parts[:taken], "\n\n"), parts[taken:]
+	if part > c.part {
+		return cursor{parts: c.parts, part: part}
 	}
+	rest := c.parts[c.part][c.offset:]
 	cut := room
-	for cut > 0 && !utf8.RuneStart(parts[0][cut]) {
+	for cut > 0 && !utf8.RuneStart(rest[cut]) {
 		cut--
 	}
 	if cut == 0 {
-		_, cut = utf8.DecodeRuneInString(parts[0])
+		_, cut = utf8.DecodeRuneInString(rest)
 	}
-	return parts[0][:cut], append([]string{parts[0][cut:]}, parts[1:]...)
+	if cut >= len(rest) {
+		return cursor{parts: c.parts, part: c.part + 1}
+	}
+	return cursor{parts: c.parts, part: c.part, offset: c.offset + cut}
 }
 
-func meterSummary(ctx context.Context, model ptypes.Model, call func() (SummaryResult, error)) (string, error) {
-	release, err := agent.AdmitProvider(ctx, model)
-	defer release()
-	if err != nil {
-		return "", err
+// text is the history from c to to, which is c.next or c.end.
+func (c cursor) text(to cursor) string {
+	if c.done() {
+		return ""
 	}
-	result, callErr := call()
-	if err := agent.AccountProviderUsage(ctx, "", model.ID, result.Usage); err != nil {
-		return "", err
+	if to.part == c.part {
+		return c.parts[c.part][c.offset:to.offset]
 	}
-	return result.Text, callErr
+	var text strings.Builder
+	text.WriteString(c.parts[c.part][c.offset:])
+	for _, part := range c.parts[c.part+1 : to.part] {
+		text.WriteString(partSeparator)
+		text.WriteString(part)
+	}
+	return text.String()
 }
 
 // summaryMaxTokens caps a summarization response at 80% of the reserve budget,
@@ -1018,39 +1204,55 @@ func summaryMaxTokens(model ptypes.Model, settings CompactionSettings) int {
 	return maxTokens
 }
 
-// runSummarization issues a single stateless summarization request and joins the
-// returned text blocks. An error stop reason surfaces as an error.
-func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, promptText string) (SummaryResult, error) {
+// runSummarizationResult issues a single stateless summarization request
+// and joins the returned text blocks. An error stop reason surfaces as an
+// error. The fallback chain switches to a backup only when fits accepts it;
+// a refused switch ends the request with errRefit. The result names the
+// model that answered.
+func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, promptText string, fits func(ptypes.Model) bool) (SummaryResult, error) {
+	result := SummaryResult{Model: model}
 	if streamFn == nil {
-		return SummaryResult{}, errors.New("compaction: streamFn is nil")
+		return result, errors.New("compaction: streamFn is nil")
 	}
 	reqCtx := ptypes.Context{SystemPrompt: SummarizationSystemPrompt, Messages: []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(promptText), Timestamp: time.Now().UnixMilli()}}}
 	opts := &ptypes.SimpleStreamOptions{}
 	opts.MaxTokens = maxTokens
+	var refused atomic.Bool
+	opts.AdmitFallback = func(_ context.Context, fallback ptypes.ModelFallback) error {
+		if fits(fallback.To) {
+			return nil
+		}
+		refused.Store(true)
+		return errRefit
+	}
 	streamCtx, cancel := context.WithCancel(ctx)
 	response := streamFn(streamCtx, model, reqCtx, opts)
 	if response == nil {
 		cancel()
-		return SummaryResult{}, errors.New("compaction: nil stream")
+		return result, errors.New("compaction: nil stream")
 	}
 	stop := context.AfterFunc(ctx, cancel)
 	defer func() { stop(); cancel() }()
 	// Attempts the retry or fallback layer abandoned can still be billed; count the usage they reported.
-	var discarded ptypes.Usage
 	for event := range response.Events() {
 		if (event.Type == ptypes.EvRetry || event.Type == ptypes.EvFallback) && event.Err != nil {
-			discarded.Add(event.Err.Usage)
+			result.Usage.Add(event.Err.Usage)
+		}
+		if event.Type == ptypes.EvFallback && event.Fallback != nil {
+			result.Model = event.Fallback.To
 		}
 	}
 	final, err := response.Result(context.WithoutCancel(ctx))
 	if err != nil {
-		return SummaryResult{}, err
+		return result, err
 	}
 	if final == nil {
-		return SummaryResult{}, errors.New("compaction: nil summarization result")
+		return result, errors.New("compaction: nil summarization result")
 	}
-	result := SummaryResult{Usage: discarded}
 	result.Usage.Add(final.Usage)
+	if refused.Load() {
+		return result, errRefit
+	}
 	if final.StopReason == ptypes.StopError || final.StopReason == ptypes.StopAborted {
 		msg := final.ErrorMessage
 		if msg == "" {
@@ -1079,36 +1281,34 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 
 // Compact runs the summarization turn(s) for a prepared compaction and returns
 // the merged summary: the history summary, a split-turn prefix summary when the
-// cut fell mid-turn, and the read/modified file lists.
+// cut fell mid-turn, and the read/modified file lists. Each request is admitted
+// and charged on its own (see Summarizer.Meter); a switch to a backup carries
+// over from the history summary to the prefix's.
 func Compact(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, prep *CompactionPreparation) (string, error) {
 	if prep == nil {
 		return "", errors.New("compaction: nil preparation")
 	}
-	var summary string
-	if prep.IsSplitTurn && len(prep.TurnPrefixMessages) > 0 {
-		history := "No prior history."
-		if len(prep.MessagesToSummarize) > 0 {
-			var err error
-			history, err = GenerateSummary(ctx, streamFn, model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
-			if err != nil {
-				return "", err
-			}
-		}
-		prefix, err := GenerateTurnPrefixSummary(ctx, streamFn, model, prep.Settings, prep.TurnPrefixMessages)
+	summarizer := Summarizer{Stream: streamFn}
+	if !prep.IsSplitTurn || len(prep.TurnPrefixMessages) == 0 {
+		history, err := summarizer.Summary(ctx, model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
 		if err != nil {
 			return "", err
 		}
-		summary = history + "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefix
-	} else {
+		return history.Text + FormatFileOperations(ComputeFileLists(prep.FileOps)), nil
+	}
+	history := SummaryResult{Text: "No prior history.", Model: model}
+	if len(prep.MessagesToSummarize) > 0 {
 		var err error
-		summary, err = GenerateSummary(ctx, streamFn, model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
+		history, err = summarizer.Summary(ctx, model, prep.Settings, prep.MessagesToSummarize, prep.PreviousSummary)
 		if err != nil {
 			return "", err
 		}
 	}
-	readFiles, modifiedFiles := ComputeFileLists(prep.FileOps)
-	summary += FormatFileOperations(readFiles, modifiedFiles)
-	return summary, nil
+	prefix, err := summarizer.TurnPrefix(ctx, history.Model, prep.Settings, prep.TurnPrefixMessages)
+	if err != nil {
+		return "", err
+	}
+	return history.Text + "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefix.Text + FormatFileOperations(ComputeFileLists(prep.FileOps)), nil
 }
 
 // ApplyCompaction rebuilds the conversation after a compaction: the summary as a

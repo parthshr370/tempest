@@ -71,11 +71,11 @@ func TestChatGPTCredentialSourceAllRoles(t *testing.T) {
 	}
 	for _, summarize := range []func(context.Context, types.Context) error{
 		func(ctx context.Context, history types.Context) error {
-			_, err := compaction.GenerateSummaryResult(ctx, roles.Default.StreamFn, roles.Default.Model, compaction.CompactionSettings{ReserveTokens: 16384}, history.Messages, "")
+			_, err := compaction.Summarizer{Stream: roles.Default.StreamFn}.Summary(ctx, roles.Default.Model, compaction.CompactionSettings{ReserveTokens: 16384}, history.Messages, "")
 			return err
 		},
 		func(ctx context.Context, history types.Context) error {
-			_, err := compaction.GenerateTurnPrefixSummaryResult(ctx, roles.Default.StreamFn, roles.Default.Model, compaction.CompactionSettings{ReserveTokens: 16384}, history.Messages)
+			_, err := compaction.Summarizer{Stream: roles.Default.StreamFn}.TurnPrefix(ctx, roles.Default.Model, compaction.CompactionSettings{ReserveTokens: 16384}, history.Messages)
 			return err
 		},
 	} {

@@ -183,7 +183,14 @@ budgets against the backup's context window, with thresholds derived from it as
 for the primary, so a smaller backup compacts sooner. A summary whose input is too
 large for one request to the model it goes to (history the primary's larger window
 held) is written in several requests that each fit, each updating the summary so
-far. The next prompt tries the primary again. Each switch is:
+far (see [compaction](conversations.md#background-and-manual-compaction) for how they
+are bounded and charged). A switch that first happens during such a summary sticks
+for the rest of that compaction: the request that met it goes to the backup only if
+it fits the backup's window and output limit, otherwise it is sent again on the
+backup, sized for it, and every later request goes straight to the backup, planned
+for its window. Its receipts name the backup. It is not a switch of the run: it has
+no `model_fallback` record, and the run's own turns keep their model. The next
+prompt tries the primary again. Each switch of the run is:
 
 - **Journaled** as a `model_fallback` record (`from`, `to`, `reason`, `attempts`,
   `fallback_index`) before the backup is called: the backup gets the request only

@@ -163,7 +163,7 @@ func TestSummaryInPiecesFitsTheModelsWindow(t *testing.T) {
 		steps[i] = step
 	}
 	f.SetResponses(steps...)
-	result, err := GenerateSummaryResult(context.Background(), f.StreamSimple, model, DefaultCompactionSettings, messages, "")
+	result, err := Summarizer{Stream: f.StreamSimple}.Summary(context.Background(), model, DefaultCompactionSettings, messages, "")
 	if err != nil {
 		t.Fatal(err)
 	}

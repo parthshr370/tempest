@@ -100,12 +100,12 @@ Returns a `*CompactionPreparation` carrying:
 ### Running the summarization
 
 ```go
-// compaction.go:954-970
-func GenerateSummary(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model,
-    settings CompactionSettings, messages []ptypes.Message, previousSummary string) (string, error)
+// compaction.go
+func (s Summarizer) Summary(ctx context.Context, model ptypes.Model,
+    settings CompactionSettings, messages []ptypes.Message, previousSummary string) (SummaryResult, error)
 ```
 
-Serializes `messages` with `SerializeConversation`, wraps in `<conversation>` tags, optionally includes `<previous-summary>`, appends the summarization or update prompt, and calls `runSummarization`. The returned string is the structured checkpoint summary.
+Serializes `messages` with `SerializeConversation`, wraps in `<conversation>` tags, optionally includes `<previous-summary>`, appends the summarization or update prompt, and sends it with `runSummarizationResult`. History too large for one request to the model's window goes in several, each updating the summary so far, up to a bound derived from the history and the window. Every request goes through the summarizer's `Meter`: admitted against the run's cost cap before it is sent and charged before the next one. The result carries the summary text, the usage of every request, and the model the last request went to.
 
 ```go
 // compaction.go:1032-1061
@@ -203,16 +203,15 @@ When the threshold is crossed:
           → extract cumulative file operations
           → return *CompactionPreparation
 
-        → context.WithTimeout(120s)
         → Compact(ctx, streamFn, model, prep)
-          → GenerateSummary(messagesToSummarize, previousSummary)
-            → SerializeConversation(messages)      ← text with truncated tool results
-            → wrap in <conversation> + prompt
-            → runSummarization(streamFn, model, maxTokens, promptText)
+          → Summarizer{Stream: streamFn}.Summary(messagesToSummarize, previousSummary)
+            → serialize the messages                  ← text with truncated tool results
+            → plan the requests for the model's window
+            → per request: Meter admits it, runSummarizationResult sends it, Meter charges it
               → build fresh types.Context{SystemPrompt: SummarizationSystemPrompt, ...}
-              → streamFn(ctx, model, reqCtx, opts).Result(ctx) ← BLOCKING oneshot
-              → join text blocks → summary string
-          → if split turn: GenerateTurnPrefixSummary(turnPrefixMessages)
+              → streamFn(ctx, model, reqCtx, opts).Result(ctx) ← BLOCKING oneshot, 120s each
+              → join text blocks → summary so far
+          → if split turn: Summarizer.TurnPrefix(turnPrefixMessages)
           → append FormatFileOperations(readFiles, modifiedFiles)
 
         → ApplyCompaction(entries, prep, summary)
@@ -300,13 +299,13 @@ TypeScript: the summarizer accesses `this.model`, `this.settings`, and `this.#cl
 
 Go: `CompactionSettings` is a plain struct with no methods. `Compact()` takes a `StreamFn` as a parameter — the same function signature used by the agent loop. The compaction runner is a thin adapter (`compactionRunner`) that bridges the loop's `PrepareNextTurnWithContext` signature to the stateless compaction functions. The `commit` closure (which calls `Agt.SetMessages`) is the only mutation boundary, and it's supplied by the caller, not discovered from ambient state.
 
-This is the "accept interfaces, return structs" pattern applied to compaction: `GenerateSummary` and `Compact` accept a `StreamFn` interface (the provider boundary), return concrete strings and errors. The compaction package has no dependency on session, agent, or any notion of "who owns the message list."
+This is the "accept interfaces, return structs" pattern applied to compaction: `Summarizer` and `Compact` take a `StreamFn` (the provider boundary) and return concrete results and errors. Cost admission comes in through the `Meter` seam, so the package has no dependency on session or any notion of "who owns the message list."
 
 ## Where it lives
 
 | File | Key symbols |
 |---|---|
-| `internal/compaction/compaction.go` | `ShouldCompact`, `PrepareCompaction`, `Compact`, `ApplyCompaction`, `GenerateSummary`, `runSummarization`, `SerializeConversation`, `EstimateContextTokens`, `FindCutPoint`, `FindTurnStartIndex`, `FormatFileOperations`, `CompactionSettings`, `CompactionPreparation`, `SessionEntry`, `CutPointResult` |
+| `internal/compaction/compaction.go` | `ShouldCompact`, `PrepareCompaction`, `Compact`, `ApplyCompaction`, `Summarizer`, `Meter`, `runSummarizationResult`, `SerializeConversation`, `EstimateContextTokens`, `FindCutPoint`, `FindTurnStartIndex`, `FormatFileOperations`, `CompactionSettings`, `CompactionPreparation`, `SessionEntry`, `CutPointResult` |
 | `internal/compaction/compaction_test.go` | threshold tests, cut-point tests, build-session-context tests |
 | `internal/compaction/compaction_apply_test.go` | `TestApplyCompactionMergesIntoKeptUser`, `TestApplyCompactionStandaloneBeforeAssistant`, `TestCompactGeneratesSummaryWithFileOps`, `TestCompactRejectsEmptySummary` |
 | `internal/compaction/compaction_ref_test.go` | reference parity tests |

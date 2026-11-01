@@ -165,7 +165,9 @@ Every run ends with one of these:
 Budgets are checked at turn boundaries: after a turn's tools finish and before the
 next model call. A budget-stopped run therefore ends on a complete turn, and
 `-continue` picks the session up from there. One long turn can overrun
-`-max-wall-time`.
+`-max-wall-time`. `-max-cost` is also checked before each request of a compaction
+summary, so a summary written in many requests stops at the cap too (see
+[compaction](conversations.md#background-and-manual-compaction)).
 
 | Flag | Cap |
 |---|---|

@@ -29,14 +29,16 @@ func TestCompactionPaidPhaseReusedAndUnknownNeverRetried(t *testing.T) {
 	r := newCompactionRunner(f.Model(), f.StreamSimple)
 	r.configureJournal(s, nil, a)
 	paid := 0
-	call := func(context.Context) (compaction.SummaryResult, error) {
-		paid++
-		return compaction.SummaryResult{Text: "cached paid history", Usage: types.Usage{Input: 9, TotalTokens: 9}}, nil
+	call := func(ctx context.Context, meter compaction.Meter) (compaction.SummaryResult, error) {
+		return meter(ctx, f.Model(), func(context.Context) (compaction.SummaryResult, error) {
+			paid++
+			return compaction.SummaryResult{Text: "cached paid history", Usage: types.Usage{Input: 9, TotalTokens: 9}, Model: f.Model()}, nil
+		})
 	}
 	source, preparation := strings.Repeat("a", 64), strings.Repeat("b", 64)
-	text, err := r.phase(ctx, r.model, "cmp_reuse", source, preparation, "history", call)
-	if err != nil || text != "cached paid history" {
-		t.Fatal(text, err)
+	result, err := r.phase(ctx, r.model, "cmp_reuse", source, preparation, "history", call)
+	if err != nil || result.Text != "cached paid history" {
+		t.Fatal(result.Text, err)
 	}
 	loaded, err := journal.Load(ctx, s.Path())
 	if err != nil {

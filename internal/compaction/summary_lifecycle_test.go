@@ -31,7 +31,7 @@ func TestSummaryCancellationJoinsAndRetainsReportedUsage(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		summary, err := GenerateSummaryResult(ctx, fn, types.Model{ID: "m"}, DefaultCompactionSettings, []types.Message{types.UserMessage{Content: types.StringContent("summarize")}}, "")
+		summary, err := Summarizer{Stream: fn}.Summary(ctx, types.Model{ID: "m"}, DefaultCompactionSettings, []types.Message{types.UserMessage{Content: types.StringContent("summarize")}}, "")
 		done <- result{summary, err}
 	}()
 	<-entered

@@ -126,9 +126,23 @@ finished receipt remains outcome unknown and isn't paid for again for that cut.
 A parked, failed or aborted task gets a durable disposition and releases the
 active cut. A later request can capture the grown conversation; neither failure
 nor restart pins all future compactions to the abandoned cut.
-Summary calls share the live root run's cost-admission gate. Their durable receipts
-charge its cost budget once, including CLI `-max-cost`, before another provider
-call can spend the same remaining budget.
+Summary calls share the live root run's cost-admission gate, one request at a time,
+as the run's own turns do. A summary too large for one request to its model's window
+is written in several, and each is admitted against what the earlier ones cost
+before it is sent, then journaled as its own usage receipt and charged to the run's
+cost budget once, including CLI `-max-cost`, before another provider call can spend
+the same remaining budget. When the cap is spent part way through, the summary stops
+before the next request, the run ends with `max_cost`, and the phase's finished
+receipt records the error, which names the requests sent and what they cost. The
+requests already paid for keep their receipts.
+
+The number of requests in one summary (the history, and the prefix of a split turn)
+is bounded by its history and the window, not by a fixed count: at most the
+requests the history takes when every update carries a summary as large as the
+model may answer. A model whose summaries run past that size stops at the bound with
+an error. When the window cannot hold the instructions and a full-size summary
+together, or is unknown, one request carries everything. Each request has its own
+120-second timeout.
 
 A provider context-overflow error may compact and retry once for the latest
 admitted input. The retry claim is durable. Continuing after restart does not
