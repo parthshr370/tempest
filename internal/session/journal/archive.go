@@ -362,7 +362,18 @@ func (s *Store) CaptureFork(ctx context.Context, entryID string, preceding bool)
 		header.Cwd = inherited.Header.Cwd
 	}
 	header.Version = 3
-	raw, _ := json.Marshal(header)
+	// The transcript reduced for the seed's messages is the journal of the
+	// session that wrote the selected entry, as that session would capture it:
+	// its header ID and its own records, with earlier sessions' records reached
+	// through its fork head's prefix. Inherited records belong to an ancestor,
+	// whose usage receipts name the ancestor's session in their source.
+	entryOwner := s.id
+	if inherited != nil {
+		entryOwner = records[end].SessionID
+	}
+	transcriptHeader := header
+	transcriptHeader.ID = entryOwner
+	raw, _ := json.Marshal(transcriptHeader)
 	var transcript bytes.Buffer
 	transcript.Write(raw)
 	transcript.WriteByte('\n')
@@ -423,8 +434,10 @@ func (s *Store) CaptureFork(ctx context.Context, entryID string, preceding bool)
 		segment.Records = append(segment.Records, record.Value)
 		segment.Cuts = append(segment.Cuts, record.Seq)
 		segment.Owners = append(segment.Owners, record.SessionID)
-		transcript.Write(record.Value)
-		transcript.WriteByte('\n')
+		if inherited == nil || record.SessionID == entryOwner {
+			transcript.Write(record.Value)
+			transcript.WriteByte('\n')
+		}
 	}
 	loaded, err := loadContentsResolved(ctx, s.path, transcript.Bytes(), true, nil, func(ref ArchiveRef) (archiveSegment, error) { return s.readArchive(ctx, ref) })
 	if err != nil {

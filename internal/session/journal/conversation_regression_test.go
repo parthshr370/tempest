@@ -222,3 +222,70 @@ func TestForkArchiveSyncDoesNotBlockParentAndSharesPayloads(t *testing.T) {
 		t.Fatal("different cuts didn't share immutable payloads")
 	}
 }
+
+// A fork may be taken again at an entry its parent inherited from an
+// ancestor. Each session's usage receipts name that session in their source,
+// so the inherited records must be read as their writer's, not the forking
+// session's: an ancestor's entry, and a parent's entry whose archive also
+// carries the grandparent's records.
+func TestReforkAtAnInheritedEntryWithUsageReceipts(t *testing.T) {
+	dir := t.TempDir()
+	// paidTurn appends a metered answer and its receipt, then the user
+	// message a fork is taken at, after the receipt so the cut carries it.
+	paidTurn := func(store *Store, question, answerText, next string) Meta {
+		t.Helper()
+		run := Meta{RunID: store.NewRunID()}
+		appendAll(t, store, RunStartedRecord{Meta: run, Model: "m"}, MessageEntry{Meta: run, Message: userMessage(question)})
+		answer := assistantMessage(answerText)
+		answer.Usage = types.Usage{Input: 7, TotalTokens: 7}
+		assigned, err := store.AppendAssigned(t.Context(), MessageEntry{Meta: run, Message: answer})
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendAll(t, store, UsageRecord{Meta: run, Model: "m", MessageID: assigned.ID, SourceRef: "message:" + store.ID() + ":" + assigned.ID, Usage: answer.Usage}, RunFinishedRecord{Meta: run})
+		point, err := store.AppendAssigned(t.Context(), MessageEntry{Message: userMessage(next)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return point
+	}
+	fork := func(parent *Store, entry, want string) *Store {
+		t.Helper()
+		seed, err := parent.CaptureFork(t.Context(), entry, false)
+		if err != nil {
+			t.Fatalf("fork of %s at %s: %v", parent.ID(), entry, err)
+		}
+		child, err := Create(t.Context(), dir, "/workspace/project", Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := child.InitializeFork(t.Context(), seed); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { closeStore(t, child) })
+		loaded, err := Load(t.Context(), child.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var texts []string
+		for _, message := range loaded.Messages {
+			texts = append(texts, messageText(message))
+		}
+		if got := strings.Join(texts, "|"); got != want {
+			t.Fatalf("fork of %s at %s = %q, want %q", parent.ID(), entry, got, want)
+		}
+		return child
+	}
+	a := newTestStore(t, dir)
+	defer closeStore(t, a)
+	conversationSelection(t, a)
+	aPoint := paidTurn(a, "a question", "a answer", "a next")
+	aView := "a question|a answer|a next"
+	b := fork(a, aPoint.ID, aView)
+	bPoint := paidTurn(b, "b question", "b answer", "b next")
+	bView := aView + "|b question|b answer|b next"
+	fork(b, aPoint.ID, aView)
+	c := fork(b, bPoint.ID, bView)
+	d := fork(c, bPoint.ID, bView)
+	fork(d, aPoint.ID, aView)
+}
