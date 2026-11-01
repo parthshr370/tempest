@@ -65,10 +65,11 @@ targets and child patches applied by `integrate`, even in bypass mode.
 Supported events:
 
 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`,
-`SubagentStop`, `PreCompact`, `Notification`, `SessionEnd`.
+`SubagentStop`, `PreCompact`, `Notification`, `SessionEnd`, `PreModelRequest`,
+`PostModelRequest`.
 
 The events are shared by CLI, ACP/serve and SDK. `SessionStart` and `SessionEnd` are
-root-only; task children use `SubagentStop`, prompt and tool hooks.
+root-only; task children use `SubagentStop`, prompt, tool and model-request hooks.
 
 Match actual **snake_case** tool names (`read`, `write`, `edit`, `bash`,
 `web_search`, `manifest_diff`, `lsp_definition`, `eval`), not Claude's `Read` or
@@ -80,5 +81,41 @@ process-group cancellation and bounded output.
 
 Replay never runs shell hooks. Interrupted effects are not retried automatically. See
 [sessions and durability](sessions-and-durability.md) for recovery rules.
+
+## Model-request hooks
+
+`PreModelRequest` and `PostModelRequest` observe every request the agent loop sends
+to a model, as in Codex. Each **attempt** counts: a retry or a switch to a
+[backup model](providers.md#backup-models) gets its own pair. They are
+**observation-only**: output and exit codes are logged and never interpreted, so they
+cannot block, rewrite or stop a request. Matchers are ignored.
+
+They never delay the request either. Tempest queues them and returns at once; one
+worker per session runs them in order, so an attempt's `PreModelRequest` runs before
+its `PostModelRequest`. Each command has the usual 600-second timeout. When 256
+observations are already waiting, new ones are dropped with a warning in the log.
+Queued observations run before `SessionEnd`, for at most the longest observation hook
+timeout; then the rest are dropped and a running command is killed.
+
+Both events receive `session_id`, `transcript_path`, `cwd`, `hook_event_name`,
+`turn_id` (the run ID), `model` (the model ID this attempt goes to), `agent_id` and
+`agent_type` for task children, and:
+
+| Field | Meaning |
+|---|---|
+| `role` | Model role: `default`, `plan` or `smol`. |
+| `attempt` | Attempt number on this model, from 1. |
+| `fallback_index` | The model's place in the role's backup chain: `0` for the role's own model, `1` for the first backup. |
+
+`PostModelRequest` adds `status` (`completed`, `failed` or `cancelled`), `error`
+(the failure text, or `null`), and `token_usage` (`null` unless completed):
+
+```json
+{"input_tokens": 1200, "cached_input_tokens": 1000, "cache_write_input_tokens": 0,
+ "output_tokens": 80, "reasoning_output_tokens": 32, "total_tokens": 1280}
+```
+
+`input_tokens` includes cached input. Compaction summaries are not agent-loop requests
+and fire no model-request hooks.
 
 [Guide index](README.md) · [Tempest](../README.md)

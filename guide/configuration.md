@@ -232,10 +232,17 @@ Reasoning effort follows the same pattern with `-reasoning`, `-plan-reasoning` a
 `HARNESS_SMOL_REASONING`. The settings keys are `reasoning`, `plan_reasoning` and
 `smol_reasoning`.
 
+Each role can also name backup models for when its model is unavailable, with
+settings `fallback_models` (`{"default": [...], "plan": [...], "smol": [...]}`),
+`-fallback-model` and `HARNESS_FALLBACK_MODELS` for the default role. Plan and smol
+use the default role's list unless they have their own. See
+[Backup models](providers.md#backup-models).
+
 ## Flags
 
 | Flag | Purpose |
 |---|---|
+| `-fallback-model <route>` | Backup model for the default role, tried in order when the model is unavailable; repeatable. Also on `serve` and `mcp`. See [Backup models](providers.md#backup-models). |
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](sessions-and-durability.md#runs). Zero means unlimited. |
 | `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
@@ -274,6 +281,7 @@ problem.
 | `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENROUTER_API_KEY` | Google and OpenRouter credentials. Point those routes elsewhere with `google:<id>@<base-url>` or `openrouter:<id>@<base-url>`. |
 | Preset and cloud credentials | `GROQ_API_KEY`, `MISTRAL_API_KEY`, `XAI_API_KEY`, `DEEPSEEK_API_KEY`, `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `CEREBRAS_API_KEY`, `PERPLEXITY_API_KEY`, `AZURE_OPENAI_API_KEY`, `AWS_BEARER_TOKEN_BEDROCK`, and the AWS and Google Cloud variables in [Providers](providers.md#protocol-adapters). |
 | `HARNESS_MODEL`, `HARNESS_PLAN_MODEL`, `HARNESS_SMOL_MODEL` | Model for each role. |
+| `HARNESS_FALLBACK_MODELS` | Comma-separated backup models for the default role (settings `fallback_models`). |
 | `HARNESS_REASONING`, `HARNESS_PLAN_REASONING`, `HARNESS_SMOL_REASONING` | Reasoning effort per role (settings `reasoning`, `plan_reasoning`, `smol_reasoning`). |
 | `HARNESS_PERMISSION_MODE` | Default tool gate mode. |
 | `HARNESS_PERMISSION_ALLOW_TOOLS`, `HARNESS_PERMISSION_DENY_TOOLS` | Per-tool allow and deny lists. |
@@ -302,6 +310,7 @@ each flag and variable above, names the same setting. The main keys:
 |---|---|
 | `model`, `plan_model`, `smol_model`, `max_tokens` | Role models and the output-token cap. |
 | `anthropic_base_url`, `openai_base_url` | Provider endpoints, overridden by flags and `HARNESS_*` variables. |
+| `fallback_models` | Backup models per role: `default`, `plan`, `smol`. A role without an entry uses `default`'s list; `[]` turns backups off for it. |
 | `reasoning`, `plan_reasoning`, `smol_reasoning` | Reasoning effort per role. |
 | `permission_mode_default`, `permission_allow_tools`, `permission_deny_tools` | Tool gate mode and per-tool lists. |
 | `bash_timeout` | Default shell-command timeout. |

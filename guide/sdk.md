@@ -39,7 +39,11 @@ owns their processes, and `Close` stops and joins them.
 `Options.Provider` (`tempest.ProviderConfig`) selects endpoint routing for the
 session. Its `Providers` map holds `tempest.ProviderDefinition` values, the same
 registry shape as settings. A nil map keeps the host defaults; a non-nil map replaces
-them for that session.
+them for that session. `FallbackModels` lists [backup models](providers.md#backup-models)
+for the session's model; nil takes `fallback_models.default` from the same host
+settings that supply a missing `ModelID`, and an empty slice turns backups off. A
+host that supplies its own `Stack.StreamFn` passes the chain's backups in
+`Stack.FallbackModels` so a resumed run can keep a recorded switch.
 
 [The complete example](../examples/embed/main.go) uses the faux provider by
 default, so it needs no API key. Pass `-model` to use a real provider:

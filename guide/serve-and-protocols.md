@@ -187,7 +187,10 @@ outcome before closing healthy task streams.
 
 Server flags include `-session-dir`, `-listen`, `-token`, `-idle-timeout` (30m),
 `-permission-timeout` (5m), and `-shutdown-timeout` (10s). Model, permission,
-budget, and bash-timeout flags supply defaults for new sessions.
+budget, and bash-timeout flags supply defaults for new sessions. Repeatable
+`-fallback-model` names [backup models](providers.md#backup-models) for every
+session; a switch reaches ACP watchers as `tempest/model_fallback` and A2A tasks as a
+status message naming both models.
 
 `serve` and `mcp` also take `-enable-task`, `-enable-web`, `-enable-lsp`,
 `-lsp-config`, `-cloud-policy` and repeatable `-skill` with the same meaning as in
