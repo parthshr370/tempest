@@ -288,9 +288,9 @@ func TestTokenMetricsCountCachedInputAndDiscardedAttempts(t *testing.T) {
 }
 
 // Time to first chunk runs from the attempt's send to its first output, not
-// to an empty block start or a tool call start carrying only its ID, and a
-// retried attempt's send time comes from the retrying stream, however late
-// its retry event is handled.
+// to an empty block start or a tool call start carrying only its ID. A
+// retried or backup attempt's send time is the one its model_attempt event
+// carries, however late that event, or the switch before it, is handled.
 func TestTimeToFirstChunkMeasuresOutputFromTheRealSend(t *testing.T) {
 	tel := New(Options{Settings: config.OTelSettings{ServiceName: "tempest"}})
 	agt := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: testModel}})
@@ -309,20 +309,68 @@ func TestTimeToFirstChunkMeasuresOutputFromTheRealSend(t *testing.T) {
 		update(200*time.Millisecond, types.StreamEvent{Type: types.EvTextDelta}),
 		update(300*time.Millisecond, types.StreamEvent{Type: types.EvToolCallStart, ToolCall: &types.ContentBlock{Type: types.BlockToolCall, ID: "call-early"}}),
 		update(700*time.Millisecond, types.StreamEvent{Type: types.EvTextDelta, Delta: "hi"}),
-		// The attempt fails at 1s and is sent again 2s later, at 3s; the
-		// loop only handles the retry event at 10s.
-		{Type: agent.EventModelRetry, At: at(10 * time.Second), FailedAt: at(time.Second), RetryDelay: 2 * time.Second, Attempt: 1, Message: types.AssistantMessage{StopReason: types.StopError}},
+		// The attempt fails at 1s and is sent again at 3s; the loop only
+		// handles the retry event at 10s.
+		{Type: agent.EventModelRetry, At: at(10 * time.Second), FailedAt: at(time.Second), RetryDelay: time.Second, Attempt: 1, Message: types.AssistantMessage{StopReason: types.StopError}},
 		{Type: agent.EventMessageEnd, At: at(10 * time.Second), Message: types.AssistantMessage{StopReason: types.StopError}},
+		{Type: agent.EventModelAttempt, At: at(10 * time.Second), SentAt: at(3 * time.Second), Attempt: 2},
 		{Type: agent.EventMessageStart, At: at(10500 * time.Millisecond), Message: types.AssistantMessage{}},
 		update(10500*time.Millisecond, types.StreamEvent{Type: types.EvTextStart}),
 		update(10500*time.Millisecond, types.StreamEvent{Type: types.EvToolCallStart, ToolCall: &types.ContentBlock{Type: types.BlockToolCall, ID: "call", Name: "read"}}),
+		// That attempt fails at 11s too; the backup it switches to at 12s is
+		// sent only at 14s, once the switch was admitted, and answers at 14.25s.
+		{Type: agent.EventModelRetry, At: at(11 * time.Second), FailedAt: at(11 * time.Second), Attempt: 2, Fallback: &types.ModelFallback{From: testModel, To: testModel}, Message: types.AssistantMessage{StopReason: types.StopError}},
+		{Type: agent.EventMessageEnd, At: at(11 * time.Second), Message: types.AssistantMessage{StopReason: types.StopError}},
+		{Type: agent.EventModelFallback, At: at(12 * time.Second), Fallback: &types.ModelFallback{From: testModel, To: testModel}},
+		{Type: agent.EventModelAttempt, At: at(14 * time.Second), SentAt: at(14 * time.Second), Attempt: 1},
+		update(14250*time.Millisecond, types.StreamEvent{Type: types.EvTextDelta, Delta: "backup"}),
 	} {
 		if err := listener.handle(ctx, event); err != nil {
 			t.Fatal(err)
 		}
 	}
 	chunks := collectedSeries(t, tel, "gen_ai.client.operation.time_to_first_chunk")
-	if len(chunks) != 1 || chunks[0].count != 2 || chunks[0].min != 0.7 || chunks[0].max != 7.5 {
-		t.Fatalf("time to first chunk = %+v, want 0.7s and 7.5s", chunks)
+	if len(chunks) != 1 || chunks[0].count != 3 || chunks[0].min != 0.25 || chunks[0].max != 7.5 {
+		t.Fatalf("time to first chunk = %+v, want 0.7s, 7.5s and 0.25s", chunks)
+	}
+}
+
+// lateSleeper oversleeps every backoff, as a loaded scheduler can: the retry
+// is sent well after its planned delay.
+type lateSleeper struct{ overrun time.Duration }
+
+func (s lateSleeper) Sleep(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay + s.overrun)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// A retry's time to first chunk runs from when the retrying stream actually
+// sent it, not from its failure plus the planned backoff.
+func TestRetryTimeToFirstChunkStartsAtTheActualSend(t *testing.T) {
+	const overrun = 300 * time.Millisecond
+	tel := New(Options{Settings: config.OTelSettings{ServiceName: "tempest"}})
+	provider := &scriptedProvider{attempts: []func(*stream.AssistantStream){partialFailedAttempt, textAttempt("done")}}
+	cfg := retry.DefaultConfig()
+	cfg.BaseDelay, cfg.BackoffCap = time.Millisecond, time.Millisecond
+	cfg.Jitter = retry.Jitter{Min: 1, Max: 1}
+	cfg.Sleeper = lateSleeper{overrun: overrun}
+	retrier, err := retry.New(provider, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agt := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: testModel}, StreamFn: retrier.Stream})
+	defer tel.Attach(agt, AgentInfo{})()
+	if result, err := agt.Prompt(context.Background(), types.UserMessage{Content: types.StringContent("run")}); err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run = %+v, %v", result, err)
+	}
+	chunks := collectedSeries(t, tel, "gen_ai.client.operation.time_to_first_chunk")
+	if len(chunks) != 1 || chunks[0].count != 2 || chunks[0].max >= overrun.Seconds()/2 {
+		t.Fatalf("time to first chunk = %+v; the retry's backoff overrun of %s was counted as waiting for output", chunks, overrun)
 	}
 }

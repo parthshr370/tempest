@@ -66,7 +66,7 @@ func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, m
 			return
 		}
 		if attempt > 1 {
-			output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: attempt})
+			output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: attempt, SentAt: time.Now()})
 		}
 		var response types.ProviderResponse
 		attemptOpts := cloneOptions(opts, func(received types.ProviderResponse, receivedModel types.Model) error {

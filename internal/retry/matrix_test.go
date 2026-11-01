@@ -197,7 +197,7 @@ func TestExactBackoffSequence(t *testing.T) {
 			}
 			for i := range tc.want {
 				retried, sent := events[2*i], events[2*i+1]
-				if sleeper.delays[i] != tc.want[i] || retried.Type != types.EvRetry || retried.Attempt != i+1 || retried.RetryDelay != tc.want[i] || sent.Type != types.EvAttempt || sent.Attempt != i+2 {
+				if sleeper.delays[i] != tc.want[i] || retried.Type != types.EvRetry || retried.Attempt != i+1 || retried.RetryDelay != tc.want[i] || sent.Type != types.EvAttempt || sent.Attempt != i+2 || sent.SentAt.Before(retried.FailedAt) {
 					t.Fatalf("delay[%d]=%v events=%+v %+v want %v", i, sleeper.delays[i], retried, sent, tc.want[i])
 				}
 			}

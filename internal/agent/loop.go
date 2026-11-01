@@ -866,7 +866,7 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 //
 // Every attempt is reported to the model-request hooks without waiting: the
 // first when the request starts, each later one at its [types.EvAttempt],
-// when it is actually sent.
+// when it is actually sent. Listeners get that as a model_attempt event.
 //
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
@@ -1015,6 +1015,9 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 
 		case types.EvAttempt:
 			request.begin()
+			if err := emit(ctx, AgentEvent{Type: EventModelAttempt, Attempt: event.Attempt, SentAt: event.SentAt}); err != nil {
+				return partialMessage, err
+			}
 
 		case types.EvDone, types.EvError:
 			// Use background ctx for Result: we want the terminal message even
