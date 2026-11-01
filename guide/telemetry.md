@@ -74,8 +74,10 @@ case variant is an unknown setting, ignored with a warning, in every file and in
 
 ## Span tree
 
-The span shape follows the OpenTelemetry GenAI semantic conventions and the Pydantic
-AI instrumentation (format 5):
+The span shape follows the OpenTelemetry GenAI semantic conventions as published in
+semantic conventions v1.41.0, where they have development status, and the Pydantic
+AI instrumentation (format 5). `gen_ai.agent.call.id` and `gen_ai.aggregated_usage.*`
+come from Pydantic AI, not from OpenTelemetry:
 
 ```
 invoke_agent <agent>              one per run (internal)
@@ -149,21 +151,28 @@ the turn loop, and is always valid JSON.
 
 ## Context propagation
 
-Tempest uses W3C Trace Context (`traceparent`):
+Tempest uses W3C Trace Context (`traceparent` and `tracestate`):
 
 - **Incoming.** A `traceparent` header on `serve` requests becomes the run's parent.
   This covers the `/acp` WebSocket upgrade, `/a2a`, and a prompt's
-  `_meta.traceparent` in ACP, which wins over the upgrade header.
+  `_meta.traceparent` in ACP, which wins over the upgrade header. A `tracestate`
+  header that comes with a valid `traceparent` is kept with it; repeated
+  `tracestate` headers are joined into one list. A malformed `tracestate` (a bad key
+  or value, a repeated key, or more than 32 entries) is dropped, and the
+  `traceparent` still applies.
 - **Outgoing.** Provider HTTP requests and MCP Streamable HTTP requests send the
-  current request span as their `traceparent` header.
-- **Subprocesses.** Hook commands and `bash` tool commands get `TRACEPARENT` in their
-  environment: foreground, background, named and `pty` commands alike, each with the
-  span of the `bash` call that started it.
+  current request span as their `traceparent` header, and the received `tracestate`
+  unchanged. Tempest adds no `tracestate` entry of its own.
+- **Subprocesses.** Hook commands and `bash` tool commands get `TRACEPARENT`, and
+  `TRACESTATE` when the trace has one, in their environment: foreground,
+  background, named and `pty` commands alike, each with the span of the `bash` call
+  that started it. Values inherited from tempest's own environment are replaced.
 - **Subagents.** A `task` call's child run starts under that call's `execute_tool
   task` span, though it runs as a background job.
 
-When a remote parent arrives with the sampled flag off, context is still propagated,
-but its spans are not exported.
+Exported spans carry the received `tracestate` as their OTLP `traceState`. When a
+remote parent arrives with the sampled flag off, context is still propagated, but
+its spans are not exported.
 
 ## Metrics
 
@@ -175,8 +184,15 @@ Each instrument keeps at most 2000 attribute sets, the OpenTelemetry SDK's defau
 cardinality limit. Measurements with a new attribute set beyond that, such as a
 model-invented tool name in a long-running server, are added to one overflow series
 labelled `otel.metric.overflow="true"`. Recording locks only the series it updates,
-and a scrape or push copies one series at a time, so a collection never stalls the
-turn loop.
+and a scrape or push copies one series at a time and never holds a lock across the
+whole set: a collection delays a recording only while it copies that series, or,
+for a new attribute set, that instrument's list of series.
+
+The `gen_ai.*` metric names are those of semantic conventions v1.41.0. The GenAI
+conventions have since moved to their own repository, which names the first-chunk
+metric `gen_ai.client.inference.time_to_first_chunk` and the cache-write attribute
+`gen_ai.usage.cache_write.input_tokens`; tempest keeps the v1.41.0 names.
+`gen_ai.client.operation.cost` is tempest's own.
 
 | OTLP name | Prometheus name | Type | Unit | Attributes |
 |---|---|---|---|---|

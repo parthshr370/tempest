@@ -87,6 +87,7 @@ const statusError statusCode = 2
 type span struct {
 	traceID    tracecontext.TraceID
 	spanID     tracecontext.SpanID
+	traceState string
 	parentID   tracecontext.SpanID
 	name       string
 	kind       spanKind
@@ -145,6 +146,7 @@ type wireSpanEvent struct {
 type wireSpan struct {
 	TraceID           string          `json:"traceId"`
 	SpanID            string          `json:"spanId"`
+	TraceState        string          `json:"traceState,omitempty"`
 	ParentSpanID      string          `json:"parentSpanId,omitempty"`
 	Name              string          `json:"name"`
 	Kind              spanKind        `json:"kind"`
@@ -250,6 +252,7 @@ func encodeTraces(res resource, spans []*span) ([]byte, error) {
 		entry := wireSpan{
 			TraceID:           finished.traceID.String(),
 			SpanID:            finished.spanID.String(),
+			TraceState:        finished.traceState,
 			Name:              finished.name,
 			Kind:              finished.kind,
 			StartTimeUnixNano: unixNano(finished.start),

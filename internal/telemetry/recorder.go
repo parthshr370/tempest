@@ -87,7 +87,9 @@ type requestTrace struct {
 	span *span
 	// model is the model attempts go to: the request's, then the backup a
 	// switch named.
-	model        types.Model
+	model types.Model
+	// attemptStart is when the current attempt was sent: the request's
+	// start, then each model_attempt's send time.
 	attemptStart time.Time
 	firstChunk   bool
 	// messageOpen is set between an attempt's message_start and its
@@ -108,9 +110,6 @@ type attemptFailure struct {
 	kind    string
 	attempt int
 	message types.AssistantMessage
-	// nextStart is when the next attempt is sent: the retrying stream sleeps
-	// the backoff from at, so this holds however late the event is handled.
-	nextStart time.Time
 }
 
 func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) error {
@@ -131,12 +130,13 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 		if at.IsZero() {
 			at = event.At
 		}
-		failure := attemptFailure{at: at, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: at.Add(event.RetryDelay)}
+		failure := attemptFailure{at: at, kind: attemptRetry, attempt: event.Attempt, message: failed}
 		if event.Fallback != nil {
-			// The backup's first attempt is timed from its switch event.
 			failure.kind = attemptFallback
 		}
 		l.attemptFailed(failure)
+	case agent.EventModelAttempt:
+		l.attemptSent(event)
 	case agent.EventModelFallback:
 		l.switched(event)
 	case agent.EventMessageEnd:
@@ -183,7 +183,7 @@ func assistantMessage(message types.Message) (types.AssistantMessage, bool) {
 // ctx gives a span with zero ids, which is timed but never exported.
 func newSpan(ctx context.Context, name string, kind spanKind, start time.Time) *span {
 	current := tracecontext.FromContext(ctx)
-	return &span{traceID: current.TraceID, spanID: current.SpanID, parentID: tracecontext.ParentFromContext(ctx).SpanID, name: name, kind: kind, start: start}
+	return &span{traceID: current.TraceID, spanID: current.SpanID, traceState: current.TraceState, parentID: tracecontext.ParentFromContext(ctx).SpanID, name: name, kind: kind, start: start}
 }
 
 func (l *agentListener) startRun(ctx context.Context, event agent.AgentEvent) {
@@ -248,8 +248,8 @@ func isModelAttribute(attr attribute) bool {
 // switched moves the open request to the backup model a switch named: the
 // backup answers it, so the request span and the metrics of its response
 // and later attempts are the backup's. The failed model's attempts already
-// closed as child spans under their own model. The backup is sent once the
-// switch event has been handled, so its first attempt is timed from it.
+// closed as child spans under their own model. The backup's first attempt is
+// timed from its model_attempt, sent once the switch was admitted.
 func (l *agentListener) switched(event agent.AgentEvent) {
 	if l.run == nil || event.Fallback == nil {
 		return
@@ -261,8 +261,6 @@ func (l *agentListener) switched(event agent.AgentEvent) {
 		request.model = fallback.To
 		request.span.name = "chat " + fallback.To.ID
 		request.span.attributes = append(slices.DeleteFunc(request.span.attributes, isModelAttribute), modelAttributes(fallback.To)...)
-		request.attemptStart = event.At
-		request.firstChunk = false
 	}
 	attrs := append(fallbackAttributes(fallback),
 		intAttribute("tempest.fallback.attempts", int64(fallback.Attempts)),
@@ -323,8 +321,9 @@ func carriesOutput(event *types.StreamEvent) bool {
 	return false
 }
 
-// attemptFailed closes one abandoned attempt as a child span of its request
-// and starts timing the next attempt.
+// attemptFailed closes one abandoned attempt as a child span of its request.
+// The next attempt is timed from its model_attempt; until then nothing is in
+// flight, so the failure is the earliest it can have been sent.
 func (l *agentListener) attemptFailed(failure attemptFailure) {
 	request := l.request()
 	if request == nil {
@@ -335,15 +334,16 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 		provider, model = request.model.Provider, request.model.ID
 	}
 	attemptSpan := &span{
-		traceID:  request.span.traceID,
-		spanID:   tracecontext.NewSpanID(),
-		parentID: request.span.spanID,
-		name:     "chat " + model,
-		kind:     spanKindClient,
-		start:    request.attemptStart,
-		end:      failure.at,
-		status:   statusError,
-		message:  obs.RedactTruncate(failure.message.ErrorMessage, maxErrorTextRunes),
+		traceID:    request.span.traceID,
+		spanID:     tracecontext.NewSpanID(),
+		traceState: request.span.traceState,
+		parentID:   request.span.spanID,
+		name:       "chat " + model,
+		kind:       spanKindClient,
+		start:      request.attemptStart,
+		end:        failure.at,
+		status:     statusError,
+		message:    obs.RedactTruncate(failure.message.ErrorMessage, maxErrorTextRunes),
 	}
 	attemptSpan.attributes = append(attemptSpan.attributes,
 		stringAttribute("gen_ai.operation.name", "chat"),
@@ -363,7 +363,21 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 	request.discardNextEnd = request.messageOpen
 	request.messageOpen = false
 	request.firstChunk = false
-	request.attemptStart = failure.nextStart
+	request.attemptStart = failure.at
+}
+
+// attemptSent starts timing the attempt the retrying stream just sent, from
+// when it was sent rather than when its event is handled.
+func (l *agentListener) attemptSent(event agent.AgentEvent) {
+	request := l.request()
+	if request == nil {
+		return
+	}
+	request.firstChunk = false
+	request.attemptStart = event.SentAt
+	if request.attemptStart.IsZero() {
+		request.attemptStart = event.At
+	}
 }
 
 func (l *agentListener) messageEnd(event agent.AgentEvent) {

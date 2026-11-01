@@ -136,7 +136,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 			output.Push(failedEvent(model, CodeCanceled, "fallback canceled"))
 			return
 		}
-		output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: 1})
+		output.Push(types.StreamEvent{Type: types.EvAttempt, Attempt: 1, SentAt: time.Now()})
 	}
 }
 

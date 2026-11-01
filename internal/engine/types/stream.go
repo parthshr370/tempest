@@ -33,8 +33,9 @@ const (
 	// its backoff, or a backup model's first attempt after a switch. It is
 	// pushed right before the provider is called, so an attempt cancelled
 	// during its backoff, or between a switch and the backup's call, is never
-	// announced. Attempt is its 1-based ordinal on the current model. A
-	// request's first attempt is not announced: it starts with the request.
+	// announced. Attempt is its 1-based ordinal on the current model and
+	// SentAt when the provider is called. A request's first attempt is not
+	// announced: it starts with the request.
 	EvAttempt StreamEventType = "attempt"
 )
 
@@ -57,11 +58,13 @@ type ModelFallback struct {
 // toolcall_end carries the assembled ToolCall. A retry carries the discarded
 // attempt in Err (its partial content, usage and error), its ordinal in
 // Attempt, the wait before the next attempt in RetryDelay and, in FailedAt,
-// when the retrying stream saw the attempt fail: the next attempt is sent
-// RetryDelay after FailedAt, however late a consumer reads the event. A
-// fallback carries the discarded attempt in Err, the model switch in Fallback
-// and, in FailedAt, when the fallback chain saw the model fail. An attempt
-// carries the ordinal of the attempt being sent in Attempt.
+// when the retrying stream saw the attempt fail. RetryDelay after FailedAt
+// is when the next attempt is due; the backoff can run late, so the
+// attempt's own event says when it was sent. A fallback carries the
+// discarded attempt in Err, the model switch in Fallback and, in FailedAt,
+// when the fallback chain saw the model fail. An attempt carries the ordinal
+// of the attempt being sent in Attempt and when it was sent in SentAt; it is
+// stamped where it is sent, so it holds however late a consumer reads it.
 type StreamEvent struct {
 	Type         StreamEventType
 	ContentIndex int
@@ -76,6 +79,7 @@ type StreamEvent struct {
 	RetryDelay   time.Duration     // retry: wait before the next attempt
 	Fallback     *ModelFallback    // fallback: the switch to the next model
 	FailedAt     time.Time         // retry / fallback: when the attempt failed
+	SentAt       time.Time         // attempt: when it was sent
 }
 
 // AssistantBuilder folds a stream of StreamEvents into an AssistantMessage. The

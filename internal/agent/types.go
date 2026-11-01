@@ -321,11 +321,17 @@ const (
 	// EventModelRetry reports a failed attempt that is sent again: Message is
 	// the discarded attempt (its error and any usage), Attempt its 1-based
 	// ordinal on its model and FailedAt when the stream saw it fail. Without
-	// Fallback the same model gets the request RetryDelay after FailedAt.
+	// Fallback the same model is due the request RetryDelay after FailedAt.
 	// With Fallback the model was unavailable and the request goes to
 	// Fallback.To, whose model_fallback event follows. When the attempt had
-	// opened a message, that message's message_end follows this event.
+	// opened a message, that message's message_end follows this event. A
+	// model_attempt event follows when the next attempt is sent.
 	EventModelRetry AgentEventType = "model_retry"
+	// EventModelAttempt reports that the request was sent again after a
+	// model_retry: Attempt is the attempt's 1-based ordinal on its model and
+	// SentAt when it was sent. A backoff or switch cancelled first reports
+	// none.
+	EventModelAttempt AgentEventType = "model_attempt"
 )
 
 // ModelRequest describes one logical model request: the model, the request
@@ -368,6 +374,7 @@ type AgentEvent struct {
 	Attempt               int
 	RetryDelay            time.Duration
 	FailedAt              time.Time
+	SentAt                time.Time
 	QueueID               string
 	UsageSource           string
 	ChildSessionID        string
