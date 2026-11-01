@@ -106,11 +106,16 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 		return types.AssistantMessage{}, errors.New("sampling model returned no stream")
 	}
 	// Attempts the retry layer or a fallback switch abandoned can still be
-	// billed.
+	// billed. The receipt names the model that answered: a backup after a
+	// switch.
 	var usage types.Usage
+	answered := m.model.ID
 	for event := range response.Events() {
 		if (event.Type == types.EvRetry || event.Type == types.EvFallback) && event.Err != nil {
 			usage.Add(event.Err.Usage)
+		}
+		if event.Type == types.EvFallback && event.Fallback != nil {
+			answered = event.Fallback.To.ID
 		}
 	}
 	final, err := response.Result(context.WithoutCancel(runCtx))
@@ -118,7 +123,7 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 		usage.Add(final.Usage)
 	}
 	// The receipt is journaled and charged even when the call failed.
-	if importErr := agt.ImportUsage(context.WithoutCancel(runCtx), request.Source(), m.model.ID, usage); importErr != nil {
+	if importErr := agt.ImportUsage(context.WithoutCancel(runCtx), request.Source(), answered, usage); importErr != nil {
 		return types.AssistantMessage{}, importErr
 	}
 	if err != nil {
@@ -135,7 +140,7 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 		return types.AssistantMessage{}, errors.New("sampling model failed: " + reason)
 	}
 	if final.Model == "" {
-		final.Model = m.model.ID
+		final.Model = answered
 	}
 	return *final, nil
 }
