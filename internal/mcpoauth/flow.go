@@ -493,7 +493,40 @@ func (c *Client) prepareClient(ctx context.Context, metadata ServerMetadata, iss
 		listener.Close()
 		return nil, registration{}, err
 	}
+	if err := c.keepRegistration(ctx, metadata, issuer, client); err != nil {
+		listener.Close()
+		return nil, registration{}, err
+	}
 	return listener, client, nil
+}
+
+// keepRegistration stores a new dynamic registration before the user is
+// asked, so a login nobody finishes (declined, unattended, abandoned in the
+// browser) does not register yet another client at the authorization server
+// next time. A record that holds tokens keeps its client until a login
+// replaces both: its refresh token belongs to that client.
+func (c *Client) keepRegistration(ctx context.Context, metadata ServerMetadata, issuer string, client registration) error {
+	unlock, err := c.store.Lock(ctx, c.server)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	r, err := c.store.Load(c.server)
+	if err != nil && !missing(err) {
+		return err
+	}
+	if missing(err) || !c.bound(r) {
+		r = Record{Server: c.server, Resource: c.resource}
+	}
+	if r.AccessToken != "" || r.RefreshToken != "" {
+		return nil
+	}
+	if r.Issuer != issuer {
+		r.Scope = ""
+	}
+	r.Issuer, r.AuthorizationEndpoint, r.TokenEndpoint = issuer, metadata.AuthorizationEndpoint, metadata.TokenEndpoint
+	r.ClientID, r.ClientSecret, r.TokenAuthMethod, r.Registered, r.RedirectURI = client.clientID, client.secret, client.method, true, client.redirect
+	return c.store.Save(r)
 }
 
 func loopback(address string) (net.Listener, string, error) {

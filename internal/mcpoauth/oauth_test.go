@@ -3,7 +3,10 @@ package mcpoauth_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"net/http"
+	"net/url"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -151,6 +154,61 @@ func TestSecondLoginReusesDynamicRegistration(t *testing.T) {
 	second := h.login(t)
 	if h.fixture.Registrations() != 1 || second.ClientID != first.ClientID {
 		t.Fatalf("registrations=%d first=%s second=%s", h.fixture.Registrations(), first.ClientID, second.ClientID)
+	}
+}
+
+// A login the user never finishes (declined, no user, closed browser) keeps
+// its registration, so the next attempt does not register another client.
+func TestAbandonedLoginKeepsItsDynamicRegistration(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{}, nil)
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declined := errors.New("declined")
+	for range 2 {
+		if _, err := h.flow.Login(t.Context(), challenge, func(context.Context, string) error { return declined }); !errors.Is(err, declined) {
+			t.Fatalf("abandoned login = %v", err)
+		}
+	}
+	if status, err := h.flow.Status(); err != nil || status.SignedIn {
+		t.Fatalf("status after abandoned logins = %#v %v", status, err)
+	}
+	h.login(t)
+	if h.fixture.Registrations() != 1 {
+		t.Fatalf("registrations = %d after two abandoned logins and one finished, want 1", h.fixture.Registrations())
+	}
+}
+
+// A step-up whose stored redirect port is taken registers a new client, but
+// an abandoned step-up must not swap it in under the stored refresh token,
+// which belongs to the old client.
+func TestAbandonedStepUpKeepsTheSignedInClient(t *testing.T) {
+	h := newHarness(t, mcpoauthtest.Options{TokenLifetime: 30 * time.Second}, nil)
+	first := h.login(t)
+	redirect, err := url.Parse(first.RedirectURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := net.Listen("tcp4", redirect.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	challenge, _, err := h.flow.Probe(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	declined := errors.New("declined")
+	if _, err := h.flow.Login(t.Context(), challenge, func(context.Context, string) error { return declined }); !errors.Is(err, declined) {
+		t.Fatalf("abandoned step-up = %v", err)
+	}
+	stored, err := h.store.Load("secure")
+	if err != nil || stored.ClientID != first.ClientID || stored.RefreshToken != first.RefreshToken {
+		t.Fatalf("stored client %q after abandoned step-up, want %q (%v)", stored.ClientID, first.ClientID, err)
+	}
+	if token, err := h.flow.Token(t.Context()); err != nil || token == "" || token == first.AccessToken {
+		t.Fatalf("refresh with the signed-in client = %q %v", token, err)
 	}
 }
 
