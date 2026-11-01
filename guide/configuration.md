@@ -110,7 +110,8 @@ value that parses but is invalid, such as `"max_tokens": 0` or an unknown `reaso
 level, stops startup in any layer; the error names the key and the layer and file,
 variable or flag that set it, and a `-c` override or flag replaces it.
 
-Project files are read from the working directory. With `-environment` set to a
+Project files are read from the working directory; `-resume` reads them from the
+resumed session's workspace, where it runs. With `-environment` set to a
 remote environment, project files on the host are not read.
 
 ## Profiles
