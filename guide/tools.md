@@ -414,9 +414,12 @@ can leave the target stopped or killed, so Tempest kills an attach adapter only
 after it answers the disconnect or exits. An attach adapter that doesn't answer
 in time has its connection closed, which Delve treats as a detach, and gets up to
 5 s more to exit; only an adapter that outlives that is killed. After the
-adapter exits, an attached process gets `SIGCONT`: a debugger's detach halts the
-target, and a halt `SIGSTOP` that loses a race with another signal is delivered
-after detach and would leave the program stopped. Tempest pins the process named
+adapter exits, a process it confirmed attaching to gets `SIGCONT`: a debugger's
+detach halts the target, and a halt `SIGSTOP` that loses a race with another
+signal is delivered after detach and would leave the program stopped. A process
+whose attach the adapter refused, or never answered before it exited or the
+start was abandoned, gets no `SIGCONT`, so a process its user stopped stays
+stopped. Tempest pins the process named
 by `processId` before starting the adapter (its start time, plus a pidfd on Linux
 when the kernel allows) and signals it only if the pid still names that process.
 On Linux with pidfds the signal can't reach another process. Without one (macOS,
@@ -424,7 +427,7 @@ FreeBSD, Linux before 5.3) the start time is compared just before `kill`, so a
 pid that exits and is reused inside that window could still receive the `SIGCONT`.
 Where the start time can't be read (OpenBSD, NetBSD, 32-bit FreeBSD, or Linux
 without `/proc`), attached processes get no `SIGCONT`. A target that handles
-`SIGCONT` sees one delivery even when it was never stopped.
+`SIGCONT` sees one delivery even when the detach left it running.
 Output previews are bounded to 32 KiB or 500 lines. Larger output spills beneath
 `<journal>.d/tool-output/`; retained adapter output has a 64 MiB disk cap.
 

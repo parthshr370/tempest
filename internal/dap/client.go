@@ -98,11 +98,13 @@ type client struct {
 	err             error
 	initialized     chan struct{}
 	initializedOnce sync.Once
-	onEvent         func(message)
+	// observe sees each event and each response as it is read, a response
+	// before its waiter does.
+	observe func(message)
 }
 
-func newClient(r io.Reader, w io.Writer, onEvent func(message)) *client {
-	c := &client{writer: w, pending: map[int]chan message{}, done: make(chan struct{}), initialized: make(chan struct{}), onEvent: onEvent}
+func newClient(r io.Reader, w io.Writer, observe func(message)) *client {
+	c := &client{writer: w, pending: map[int]chan message{}, done: make(chan struct{}), initialized: make(chan struct{}), observe: observe}
 	go c.read(r)
 	return c
 }
@@ -123,6 +125,9 @@ func (c *client) read(r io.Reader) {
 		}
 		switch m.Type {
 		case "response":
+			if c.observe != nil {
+				c.observe(m)
+			}
 			c.mu.Lock()
 			ch := c.pending[m.RequestSeq]
 			delete(c.pending, m.RequestSeq)
@@ -134,8 +139,8 @@ func (c *client) read(r io.Reader) {
 			if m.Event == "initialized" {
 				c.initializedOnce.Do(func() { close(c.initialized) })
 			}
-			if c.onEvent != nil {
-				c.onEvent(m)
+			if c.observe != nil {
+				c.observe(m)
 			}
 		case "request":
 			c.writeMu.Lock()

@@ -3,6 +3,7 @@ package dap
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,28 +47,72 @@ func (recorder *signalRecorder) signals() string {
 	return string(content)
 }
 
-// The adapter's exit observer runs cleanup as soon as the adapter is gone,
-// concurrently with Start. The attach target is pinned before that observer
-// exists, so even an adapter that dies before answering initialize leaves its
-// named target continued, and nothing writes the target after the observer
-// can read it.
-func TestDAPAttachTargetPinnedBeforeAdapterCanExit(t *testing.T) {
-	recorder := startSignalRecorder(t)
-	directory := t.TempDir()
-	owner, err := New(directory, directory, map[string]Adapter{"exiting": {Command: "/bin/sh", Args: []string{"-c", "exit 3"}}}, nil)
+// requireNoSIGCONT fails if recorder got a SIGCONT. Signals pend in the
+// kernel as kill returns, and the shell runs every pending trap together, so
+// a SIGCONT sent before this sentinel is recorded no later than it.
+func (recorder *signalRecorder) requireNoSIGCONT(t *testing.T) {
+	t.Helper()
+	if err := recorder.command.Process.Signal(syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	waitDAPCondition(t, "recorder didn't record the sentinel signal", func() bool {
+		return strings.Contains(recorder.signals(), "usr1")
+	})
+	if strings.Contains(recorder.signals(), "cont") {
+		t.Fatalf("SIGCONT reached the recorder: %q", recorder.signals())
+	}
+}
+
+// Cleanup continues an attach target only once the adapter confirmed the
+// attach: an adapter that dies before answering, or refuses the attach, never
+// stopped the target, which may be a process its user stopped on purpose.
+// The adapter's exit observer runs cleanup concurrently with Start, and the
+// target is pinned before that observer exists.
+func TestDAPAttachContinuesOnlyAConfirmedTarget(t *testing.T) {
+	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer owner.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	processID := json.RawMessage(strconv.Itoa(recorder.command.Process.Pid))
-	if _, err := owner.Start(ctx, "attach", "exiting", "", map[string]json.RawMessage{"processId": processID}); err == nil {
-		t.Fatal("attach succeeded against an adapter that exited")
+	adapters := map[string]Adapter{
+		"exiting": {Command: "/bin/sh", Args: []string{"-c", "exit 3"}},
+		"fake":    {Command: executable, Args: []string{"-test.run=^TestDAPAdapterProcess$", "--", "dap-helper", filepath.Join(t.TempDir(), "sequence")}},
 	}
-	waitDAPCondition(t, "attach target didn't get SIGCONT after its adapter exited", func() bool {
-		return strings.Contains(recorder.signals(), "cont")
-	})
+	for _, testCase := range []struct {
+		name, adapter string
+		arguments     map[string]json.RawMessage
+		confirmed     bool
+	}{
+		{"adapter exits before answering", "exiting", nil, false},
+		{"adapter refuses the attach", "fake", map[string]json.RawMessage{"fail": json.RawMessage(`true`)}, false},
+		{"adapter confirms the attach", "fake", nil, true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			recorder := startSignalRecorder(t)
+			directory := t.TempDir()
+			owner, err := New(directory, directory, adapters, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			arguments := map[string]json.RawMessage{"processId": json.RawMessage(strconv.Itoa(recorder.command.Process.Pid))}
+			maps.Copy(arguments, testCase.arguments)
+			_, startErr := owner.Start(ctx, "attach", testCase.adapter, "", arguments)
+			if (startErr == nil) != testCase.confirmed {
+				t.Fatalf("attach error = %v", startErr)
+			}
+			if err := owner.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !testCase.confirmed {
+				recorder.requireNoSIGCONT(t)
+				return
+			}
+			waitDAPCondition(t, "a confirmed attach target didn't get SIGCONT after its adapter exited", func() bool {
+				return strings.Contains(recorder.signals(), "cont")
+			})
+		})
+	}
 }
 
 // A reused pid names a different process; the attach target pinned at attach
@@ -85,18 +130,7 @@ func TestDAPAttachTargetSkipsChangedIdentity(t *testing.T) {
 	if err := reused.resume(); err != nil {
 		t.Fatal(err)
 	}
-	// Signals pend in the kernel as kill returns, and the shell runs every
-	// pending trap together, so a SIGCONT from resume would be recorded no
-	// later than this sentinel.
-	if err := recorder.command.Process.Signal(syscall.SIGUSR1); err != nil {
-		t.Fatal(err)
-	}
-	waitDAPCondition(t, "recorder didn't record the sentinel signal", func() bool {
-		return strings.Contains(recorder.signals(), "usr1")
-	})
-	if strings.Contains(recorder.signals(), "cont") {
-		t.Fatalf("SIGCONT reached a process with a different start identity: %q", recorder.signals())
-	}
+	recorder.requireNoSIGCONT(t)
 
 	same := pinAttachTarget(processID)
 	if same == nil {
