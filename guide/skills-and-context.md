@@ -133,8 +133,9 @@ turns on `ls` and `find`.
   paths (default 10000). Listing gets 2 seconds, a hard limit: rg or a walk
   that runs out of time lists what it found, matching included, and a slower
   `git` leaves the session without a listing. rg blocks on a FIFO named
-  `.ignore` or `.gitignore`; an rg that has listed no name by half the time
-  left is stopped, and the walk lists the workspace in the other half.
+  `.ignore` or `.gitignore`, so when rg has listed no name by half the time
+  left, the walk starts beside it: whichever finishes first is the listing, and
+  at the deadline rg's names are, or the walk's when rg has none.
 - **Size.** The listed names fit `workspace_listing_max_bytes` (default 4096).
   Past it the listing folds to per-directory file counts (`internal/tools/ (40
   files)`); if that still does not fit it is cut, and a final
