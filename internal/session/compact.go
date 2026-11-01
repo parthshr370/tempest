@@ -28,13 +28,17 @@ const compactionSummaryTimeout = 120 * time.Second
 // the model's window. It is wired into the agent loop's between-turn hook so a
 // long, tool-heavy build never silently overflows the context window.
 type compactionRunner struct {
+	// contextWindow and settings are the primary model's budget.
 	contextWindow int
 	model         ptypes.Model
 	// backups are the models behind streamFn after model, in chain order. A
 	// run that switched to one keeps it, and so does its compaction.
-	backups          []ptypes.Model
-	streamFn         agent.StreamFn
-	settings         compaction.CompactionSettings
+	backups  []ptypes.Model
+	streamFn agent.StreamFn
+	settings compaction.CompactionSettings
+	// overridden marks settings given by the host rather than derived from
+	// the primary; they then apply on every route.
+	overridden       bool
 	store            *journal.Store
 	agt              *agent.Agent
 	parts            map[string]journal.CompactionPart
@@ -99,6 +103,23 @@ func (r *compactionRunner) routeNamed(modelName string) (ptypes.Model, bool) {
 
 func compactionModelName(model ptypes.Model) string { return model.Provider + "/" + model.ID }
 
+// budget is the context window and settings compaction works within for a
+// request to model, the route: the primary's for the primary, and for a
+// backup with a known window, that window with settings derived from it as
+// they are for the primary (or the host's, when it gave them). A backup's
+// smaller window then compacts sooner, and its summary fits it.
+func (r *compactionRunner) budget(model ptypes.Model) (int, compaction.CompactionSettings) {
+	if model.ContextWindow <= 0 || retry.SameModel(model, r.model) {
+		return r.contextWindow, r.settings
+	}
+	if r.overridden {
+		return model.ContextWindow, r.settings
+	}
+	settings := compaction.ModelSettings(model.ContextWindow, model.MaxTokens)
+	settings.Enabled = r.settings.Enabled
+	return model.ContextWindow, settings
+}
+
 func (r *compactionRunner) hookE(commit func([]ptypes.Message)) func(context.Context, agent.ShouldStopAfterTurnContext) (*agent.AgentLoopTurnUpdate, error) {
 	if r == nil {
 		return nil
@@ -147,16 +168,18 @@ func (r *compactionRunner) summarize(ctx context.Context, messages []ptypes.Mess
 	if r == nil {
 		return messages, false, nil
 	}
-	return r.summarizeUsing(ctx, messages, force, persist, r.settings, model)
+	_, settings := r.budget(model)
+	return r.summarizeUsing(ctx, messages, force, persist, settings, model)
 }
 
-// summarizeUsing summarizes messages on model, the route (see route).
+// summarizeUsing summarizes messages on model, the route (see route), under
+// settings, unless they fit the route's budget and force is false.
 func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes.Message, force, persist bool, settings compaction.CompactionSettings, model ptypes.Model) ([]ptypes.Message, bool, error) {
 	if r == nil || len(messages) == 0 {
 		return messages, false, nil
 	}
 	tokens := compaction.EstimateContextTokens(messages).Tokens
-	if !force && !compaction.ShouldCompact(tokens, r.contextWindow, r.settings) {
+	if window, _ := r.budget(model); !force && !compaction.ShouldCompact(tokens, window, settings) {
 		return messages, false, nil
 	}
 	entries := messagesToEntries(messages)
@@ -320,7 +343,8 @@ func (r *compactionRunner) phase(ctx context.Context, model ptypes.Model, id, so
 	if err != nil {
 		return "", err
 	}
-	settings, _ := json.Marshal(r.settings)
+	_, routeSettings := r.budget(model)
+	settings, _ := json.Marshal(routeSettings)
 	start := journal.CompactionCall{CompactionID: id, SourceHash: source, Phase: phase, Model: model.ID, Settings: settings, PreparationHash: preparation}
 	runID := ""
 	if r.agt != nil {

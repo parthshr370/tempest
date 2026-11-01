@@ -178,9 +178,12 @@ are removed, its visible thinking becomes text, and tool-call IDs are normalized
 
 A switch lasts for the rest of the run, the prompt and every turn it causes, because
 changing models again would restart the provider's prompt cache. Compaction between
-the run's turns goes to the backup too, and its receipt names the backup. Compaction
-still budgets against the primary model's context window. The next prompt tries the
-primary again. Each switch is:
+the run's turns goes to the backup too, and its receipt names the backup. It also
+budgets against the backup's context window, with thresholds derived from it as
+for the primary, so a smaller backup compacts sooner. A summary whose input is too
+large for one request to the model it goes to (history the primary's larger window
+held) is written in several requests that each fit, each updating the summary so
+far. The next prompt tries the primary again. Each switch is:
 
 - **Journaled** as a `model_fallback` record (`from`, `to`, `reason`, `attempts`,
   `fallback_index`) before the backup is called: the backup gets the request only

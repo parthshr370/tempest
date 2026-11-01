@@ -590,6 +590,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 	if runner != nil {
 		if cfg.Compaction != nil {
 			runner.settings = *cfg.Compaction
+			runner.overridden = true
 		}
 		runner.hooks = hookRunner
 		runner.backups = cfg.FallbackModels

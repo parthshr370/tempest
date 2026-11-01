@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/agent"
 	ptypes "go.harness.dev/harness/internal/engine/types"
@@ -182,6 +183,12 @@ func FormatFileOperations(readFiles, modifiedFiles []string) string {
 
 // SerializeConversation serializes messages into a compact text representation for LLM summarization. Tool-result content is truncated to ToolResultMaxChars.
 func SerializeConversation(messages []ptypes.Message) string {
+	return strings.Join(serializeParts(messages), "\n\n")
+}
+
+// serializeParts is SerializeConversation's text for each message, the
+// assistant's split into its parts.
+func serializeParts(messages []ptypes.Message) []string {
 	parts := []string{}
 	for _, msg := range messages {
 		switch value := msg.(type) {
@@ -213,7 +220,7 @@ func SerializeConversation(messages []ptypes.Message) string {
 			}
 		}
 	}
-	return strings.Join(parts, "\n\n")
+	return parts
 }
 
 // CalculateContextTokens returns the total token count from a usage struct, preferring TotalTokens when nonzero and falling back to summing per-category fields.
@@ -850,6 +857,23 @@ Summarize the prefix to provide context for the retained suffix:
 
 Be concise. Focus on what's needed to understand the kept suffix.`
 
+// updateTurnPrefixSummarizationPrompt continues a turn-prefix summary when
+// the prefix needs more than one request to fit the model's window.
+const updateTurnPrefixSummarizationPrompt = `The messages above continue the PREFIX of a turn that was too large to keep; the summary in <previous-summary> tags covers the part of the prefix before them. The SUFFIX (recent work) is retained.
+
+Update that summary with these messages, preserving what it holds, in the same format:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`
+
 // GenerateSummary runs one summarization turn over messages, returning the
 // model's structured summary. When previousSummary is non-empty it uses the
 // update prompt so the new summary supersedes the old one.
@@ -867,22 +891,10 @@ type SummaryResult struct {
 
 // GenerateSummaryResult returns a summary and its receipt data. Durable callers
 // hold shared admission until they've persisted and forwarded this receipt.
+// A conversation too large for one request to model is summarized in several,
+// each updating the summary so far (see summarizeInPieces).
 func GenerateSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message, previousSummary string) (SummaryResult, error) {
-	basePrompt := summarizationPrompt
-	if strings.TrimSpace(previousSummary) != "" {
-		basePrompt = updateSummarizationPrompt
-	}
-	var promptText strings.Builder
-	promptText.WriteString("<conversation>\n")
-	promptText.WriteString(SerializeConversation(messages))
-	promptText.WriteString("\n</conversation>\n\n")
-	if strings.TrimSpace(previousSummary) != "" {
-		promptText.WriteString("<previous-summary>\n")
-		promptText.WriteString(previousSummary)
-		promptText.WriteString("\n</previous-summary>\n\n")
-	}
-	promptText.WriteString(basePrompt)
-	return runSummarizationResult(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText.String())
+	return summarizeInPieces(ctx, streamFn, model, summaryMaxTokens(model, settings), serializeParts(messages), previousSummary, summarizationPrompt, updateSummarizationPrompt)
 }
 
 // GenerateTurnPrefixSummary summarizes the dropped prefix of a split turn.
@@ -894,8 +906,93 @@ func GenerateTurnPrefixSummary(ctx context.Context, streamFn agent.StreamFn, mod
 
 // GenerateTurnPrefixSummaryResult retains the split-prefix call's usage.
 func GenerateTurnPrefixSummaryResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, settings CompactionSettings, messages []ptypes.Message) (SummaryResult, error) {
-	promptText := "<conversation>\n" + SerializeConversation(messages) + "\n</conversation>\n\n" + turnPrefixSummarizationPrompt
-	return runSummarizationResult(ctx, streamFn, model, summaryMaxTokens(model, settings), promptText)
+	return summarizeInPieces(ctx, streamFn, model, summaryMaxTokens(model, settings), serializeParts(messages), "", turnPrefixSummarizationPrompt, updateTurnPrefixSummarizationPrompt)
+}
+
+// summarizeInPieces summarizes the serialized conversation parts on model
+// in as few requests as its context window allows: each request, with the
+// maxTokens it may answer, fits the window by this package's estimate of
+// 4 bytes a token. The first uses prompt, or update when there is a previous
+// summary; each later one carries the next parts with the summary so far and
+// update. A part too long for a request on its own is cut at a rune
+// boundary and continued in the next. With no known window, or one too
+// small for the instructions alone, which no split can help, one request
+// carries everything. Usage adds up over the requests.
+func summarizeInPieces(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, parts []string, previous, prompt, update string) (SummaryResult, error) {
+	var total SummaryResult
+	for {
+		instructions := prompt
+		if strings.TrimSpace(previous) != "" {
+			instructions = update
+		}
+		room := -1
+		if model.ContextWindow > 0 {
+			room = (model.ContextWindow-maxTokens-ceilDiv(len(SummarizationSystemPrompt), 4))*4 - len(summaryPromptText("", previous, instructions))
+			if room <= 0 {
+				room = -1
+			}
+		}
+		conversation, rest := takeParts(parts, room)
+		result, err := runSummarizationResult(ctx, streamFn, model, maxTokens, summaryPromptText(conversation, previous, instructions))
+		total.Usage.Add(result.Usage)
+		if err != nil {
+			return total, err
+		}
+		total.Text = result.Text
+		if len(rest) == 0 {
+			return total, nil
+		}
+		parts, previous = rest, result.Text
+	}
+}
+
+// summaryPromptText is a summarization request: the conversation, the
+// summary it updates if any, and the instructions.
+func summaryPromptText(conversation, previous, instructions string) string {
+	var text strings.Builder
+	text.WriteString("<conversation>\n")
+	text.WriteString(conversation)
+	text.WriteString("\n</conversation>\n\n")
+	if strings.TrimSpace(previous) != "" {
+		text.WriteString("<previous-summary>\n")
+		text.WriteString(previous)
+		text.WriteString("\n</previous-summary>\n\n")
+	}
+	text.WriteString(instructions)
+	return text.String()
+}
+
+// takeParts joins the leading parts that fit in room bytes, as
+// SerializeConversation joins them, and returns the parts after them; a
+// first part longer than room is cut at a rune boundary, its rest left
+// first. A negative room takes everything.
+func takeParts(parts []string, room int) (string, []string) {
+	if room < 0 {
+		return strings.Join(parts, "\n\n"), nil
+	}
+	taken := 0
+	size := 0
+	for _, part := range parts {
+		next := size + len(part)
+		if taken > 0 {
+			next += len("\n\n")
+		}
+		if next > room {
+			break
+		}
+		taken, size = taken+1, next
+	}
+	if taken > 0 || len(parts) == 0 {
+		return strings.Join(parts[:taken], "\n\n"), parts[taken:]
+	}
+	cut := room
+	for cut > 0 && !utf8.RuneStart(parts[0][cut]) {
+		cut--
+	}
+	if cut == 0 {
+		_, cut = utf8.DecodeRuneInString(parts[0])
+	}
+	return parts[0][:cut], append([]string{parts[0][cut:]}, parts[1:]...)
 }
 
 func meterSummary(ctx context.Context, model ptypes.Model, call func() (SummaryResult, error)) (string, error) {

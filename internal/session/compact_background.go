@@ -208,10 +208,11 @@ func (r *compactionRunner) request(ctx context.Context, messages []types.Message
 	if err != nil {
 		return extension.Task{}, err
 	}
+	_, settings := r.budget(model)
 	identity, err := stableHash(struct {
 		Epoch, Source, Model string
 		Settings             compaction.CompactionSettings
-	}{epoch, source, compactionModelName(model), r.settings})
+	}{epoch, source, compactionModelName(model), settings})
 	if err != nil {
 		return extension.Task{}, err
 	}
@@ -219,7 +220,7 @@ func (r *compactionRunner) request(ctx context.Context, messages []types.Message
 	if err != nil {
 		return extension.Task{}, err
 	}
-	capture := compactionCapture{Epoch: epoch, Source: source, Snapshot: snapshot, Count: len(detached), Settings: r.settings, Model: compactionModelName(model)}
+	capture := compactionCapture{Epoch: epoch, Source: source, Snapshot: snapshot, Count: len(detached), Settings: settings, Model: compactionModelName(model)}
 	raw, err := json.Marshal(capture)
 	if err != nil {
 		return extension.Task{}, err
@@ -366,13 +367,15 @@ func (r *compactionRunner) backgroundTurn(ctx context.Context, c agent.ShouldSto
 	active := b.active
 	b.mu.Unlock()
 	messages := c.Context.Messages
+	model := r.route(c.Model)
+	window, settings := r.budget(model)
 	if active != "" {
 		task, err := b.tasks.Get(active)
 		if err != nil {
 			return nil, false, err
 		}
 		r.Start(active)
-		hard := compaction.ShouldCompact(compaction.EstimateContextTokens(messages).Tokens, r.contextWindow, r.settings)
+		hard := compaction.ShouldCompact(compaction.EstimateContextTokens(messages).Tokens, window, settings)
 		if hard && !taskstate.Terminal(task) {
 			task, err = r.Wait(ctx, active)
 			if err != nil {
@@ -385,11 +388,11 @@ func (r *compactionRunner) backgroundTurn(ctx context.Context, c agent.ShouldSto
 		return messages, false, nil
 	}
 	tokens := compaction.EstimateContextTokens(messages).Tokens
-	soft, hard := compaction.Thresholds(r.contextWindow, r.settings)
-	if !r.settings.Enabled || tokens < soft {
+	soft, hard := compaction.Thresholds(window, settings)
+	if !settings.Enabled || tokens < soft {
 		return messages, false, nil
 	}
-	task, err := r.request(ctx, messages, r.route(c.Model))
+	task, err := r.request(ctx, messages, model)
 	if err != nil {
 		return nil, false, err
 	}
