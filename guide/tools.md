@@ -381,7 +381,10 @@ test without adding the venv to `PATH`.
 The stack owns the adapter and launched target process groups. It holds its host
 process permit until both are gone. Close and unanswered adapter requests send a
 short bounded disconnect before killing owned groups; attached targets are
-detached with `terminateDebuggee:false` and are never killed by Tempest.
+detached with `terminateDebuggee:false` and are never killed by Tempest. After the
+adapter exits, an attached pid gets `SIGCONT`: a debugger's detach halts the
+target, and a halt `SIGSTOP` that loses a race with another signal is delivered
+after detach and would leave the program stopped.
 Output previews are bounded to 32 KiB or 500 lines. Larger output spills beneath
 `<journal>.d/tool-output/`; retained adapter output has a 64 MiB disk cap.
 
