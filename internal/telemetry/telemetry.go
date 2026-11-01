@@ -39,6 +39,10 @@ type Telemetry struct {
 	client   *otlpClient
 	spans    *spanBatcher
 	health   *exportHealth
+
+	metrics         *metricSet
+	live            liveSessions
+	metricsExporter *metricExporter
 }
 
 // New starts the exporters the settings ask for. It returns nil when
@@ -59,7 +63,10 @@ func New(opts Options) *Telemetry {
 		settings: opts.Settings,
 		resource: newResource(opts.Settings.ServiceName, opts.Version, opts.Settings.ResourceAttributes),
 		client:   &otlpClient{http: httpClient, headers: opts.Settings.Headers, gzip: opts.Settings.Gzip, timeout: opts.Settings.Timeout, userAgent: userAgent},
+		metrics:  newMetricSet(time.Now()),
+		live:     liveSessions{sessions: map[int]func() int{}},
 	}
+	t.registerObservedInstruments()
 	if opts.Settings.TracesEndpoint != "" {
 		queueSize := orDefault(opts.SpanQueueSize, defaultSpanQueueSize)
 		batchSize := orDefault(opts.SpanBatchSize, defaultSpanBatchSize)
@@ -70,8 +77,19 @@ func New(opts Options) *Telemetry {
 		t.health = &exportHealth{signal: "traces"}
 		t.spans = newSpanBatcher(queueSize, batchSize, interval, t.health, t.exportSpans)
 	}
+	if opts.Settings.MetricsEndpoint != "" {
+		interval := opts.Settings.MetricExportInterval
+		if interval <= 0 {
+			interval = defaultMetricExportInterval
+		}
+		t.metricsExporter = newMetricExporter(interval, &exportHealth{signal: "metrics"}, t.exportMetrics)
+	}
 	return t
 }
+
+// defaultMetricExportInterval is the OpenTelemetry SDK default for
+// OTEL_METRIC_EXPORT_INTERVAL, used when the settings leave it zero.
+const defaultMetricExportInterval = 60 * time.Second
 
 func orDefault(value, fallback int) int {
 	if value > 0 {
@@ -90,6 +108,14 @@ func (t *Telemetry) exportSpans(ctx context.Context, spans []*span) error {
 		return err
 	}
 	return t.client.post(ctx, t.settings.TracesEndpoint, body)
+}
+
+func (t *Telemetry) exportMetrics(ctx context.Context) error {
+	body, err := encodeMetrics(t.resource, t.metrics.collect(time.Now()))
+	if err != nil {
+		return err
+	}
+	return t.client.post(ctx, t.settings.MetricsEndpoint, body)
 }
 
 // record hands a finished span to the batcher. Spans under a remote parent
@@ -111,6 +137,9 @@ func (t *Telemetry) Shutdown(ctx context.Context) error {
 	var errs []error
 	if t.spans != nil {
 		errs = append(errs, t.spans.shutdown(ctx))
+	}
+	if t.metricsExporter != nil {
+		errs = append(errs, t.metricsExporter.shutdown(ctx))
 	}
 	return errors.Join(errs...)
 }

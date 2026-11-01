@@ -311,6 +311,19 @@ func (manager *Manager) Snapshot() []work.Job {
 	return result
 }
 
+// Unfinished counts the jobs that have not reached a terminal state.
+func (manager *Manager) Unfinished() int {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	count := 0
+	for _, record := range manager.entries {
+		if !terminal(record.recovery.Job.State) {
+			count++
+		}
+	}
+	return count
+}
+
 // Start binds children to the accounting-bearing root run context.
 func (manager *Manager) Start(ctx context.Context, run work.RunInfo) error {
 	if run.RunID == "" || run.SessionID != "" && run.SessionID != manager.host.SessionID {

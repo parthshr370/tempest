@@ -78,6 +78,7 @@ type requestTrace struct {
 	span         *span
 	request      *agent.ModelRequest
 	attemptStart time.Time
+	firstChunk   bool
 	// messageOpen is set between an attempt's message_start and its
 	// message_end; discardNextEnd marks that end as a failed attempt's.
 	messageOpen    bool
@@ -110,6 +111,8 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 		if request := l.request(); request != nil && isAssistant(event.Message) {
 			request.messageOpen = true
 		}
+	case agent.EventMessageUpdate:
+		l.chunk(event)
 	case agent.EventModelRetry:
 		failed, _ := assistantMessage(event.Message)
 		l.attemptFailed(attemptFailure{at: event.At, kind: attemptRetry, attempt: event.Attempt, message: failed, nextStart: event.At.Add(event.RetryDelay)})
@@ -119,6 +122,10 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 		l.tool(ctx, event)
 	case agent.EventToolExecutionEnd:
 		l.endTool(ctx, event)
+	case agent.EventHook:
+		if event.Hook != nil {
+			l.telemetry.recordHook(event.Hook)
+		}
 	case agent.EventAgentEnd:
 		l.endRun(event)
 	}
@@ -223,6 +230,16 @@ func serverAttributes(baseURL string) []attribute {
 	return attrs
 }
 
+// chunk notes the response's first content event for time-to-first-chunk.
+func (l *agentListener) chunk(event agent.AgentEvent) {
+	request := l.request()
+	if request == nil || request.firstChunk || event.AssistantMessageEvent == nil {
+		return
+	}
+	request.firstChunk = true
+	l.telemetry.recordFirstChunk(request.request.Model, event.At.Sub(request.attemptStart))
+}
+
 // attemptFailed closes one abandoned attempt as a child span of its request
 // and starts timing the next attempt.
 func (l *agentListener) attemptFailed(failure attemptFailure) {
@@ -257,8 +274,10 @@ func (l *agentListener) attemptFailed(failure attemptFailure) {
 	}
 	attemptSpan.attributes = append(attemptSpan.attributes, usageAttributes("gen_ai.usage.", failure.message.Usage)...)
 	l.telemetry.record(attemptSpan, l.run.sampled && request.span.spanID != tracecontext.SpanID{})
+	l.telemetry.recordAttemptFailure(failure.kind, request.request.Model, errorType(failure.message))
 	request.discardNextEnd = request.messageOpen
 	request.messageOpen = false
+	request.firstChunk = false
 	request.attemptStart = failure.nextStart
 }
 
@@ -298,6 +317,7 @@ func (l *agentListener) messageEnd(event agent.AgentEvent) {
 		requestSpan.attributes = append(requestSpan.attributes, deferredAttribute("gen_ai.output.messages", outputMessages(message)))
 	}
 	l.telemetry.record(requestSpan, l.run.sampled)
+	l.telemetry.recordRequest(request.request.Model, responseModel, message, event.At.Sub(requestSpan.start))
 }
 
 // abandonRequest ends a run's request that never reported its response,
@@ -365,6 +385,7 @@ func (l *agentListener) tool(ctx context.Context, event agent.AgentEvent) {
 			stringAttribute("tempest.permission.decision", decision),
 			stringAttribute("tempest.permission.source", event.Permission.Source),
 		)
+		l.telemetry.recordPermission(event.ToolName, decision, event.Permission.Source)
 	}
 	if event.Type == agent.EventToolExecutionStart && !event.Preparing && l.telemetry.settings.CaptureMessageContent {
 		if arguments := argumentsText(event.Args); arguments != "" {
@@ -411,6 +432,7 @@ func (l *agentListener) endTool(ctx context.Context, event agent.AgentEvent) {
 		call.span.attributes = append(call.span.attributes, deferredAttribute("gen_ai.tool.call.result", toolResultText(result)))
 	}
 	l.telemetry.record(call.span, l.run.sampled)
+	l.telemetry.recordToolCall(event.ToolName, outcome)
 }
 
 func (l *agentListener) endRun(event agent.AgentEvent) {
@@ -449,4 +471,5 @@ func (l *agentListener) endRun(event agent.AgentEvent) {
 		}
 	}
 	l.telemetry.record(runSpan, run.sampled)
+	l.telemetry.recordRun(l.info.Name, result)
 }

@@ -1,0 +1,416 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "deployment.environment",
+            "value": {
+              "stringValue": "test"
+            }
+          },
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "tempest"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "1.2.3"
+            }
+          },
+          {
+            "key": "telemetry.sdk.language",
+            "value": {
+              "stringValue": "go"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "tempest"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "1.2.3"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "go.harness.dev/harness",
+            "version": "1.2.3"
+          },
+          "metrics": [
+            {
+              "name": "gen_ai.client.token.usage",
+              "description": "Input and output tokens per model request.",
+              "unit": "{token}",
+              "histogram": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "gen_ai.operation.name",
+                        "value": {
+                          "stringValue": "chat"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.provider.name",
+                        "value": {
+                          "stringValue": "anthropic"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.request.model",
+                        "value": {
+                          "stringValue": "claude-test"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.response.model",
+                        "value": {
+                          "stringValue": "claude-test-20260101"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.token.type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1700000000000000000",
+                    "timeUnixNano": "1700000090000000000",
+                    "count": "1",
+                    "sum": 120,
+                    "bucketCounts": [
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "1",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0"
+                    ],
+                    "explicitBounds": [
+                      1,
+                      4,
+                      16,
+                      64,
+                      256,
+                      1024,
+                      4096,
+                      16384,
+                      65536,
+                      262144,
+                      1048576,
+                      4194304,
+                      16777216,
+                      67108864
+                    ],
+                    "min": 120,
+                    "max": 120
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "gen_ai.operation.name",
+                        "value": {
+                          "stringValue": "chat"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.provider.name",
+                        "value": {
+                          "stringValue": "anthropic"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.request.model",
+                        "value": {
+                          "stringValue": "claude-test"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.response.model",
+                        "value": {
+                          "stringValue": "claude-test-20260101"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.token.type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1700000000000000000",
+                    "timeUnixNano": "1700000090000000000",
+                    "count": "1",
+                    "sum": 8,
+                    "bucketCounts": [
+                      "0",
+                      "0",
+                      "1",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0"
+                    ],
+                    "explicitBounds": [
+                      1,
+                      4,
+                      16,
+                      64,
+                      256,
+                      1024,
+                      4096,
+                      16384,
+                      65536,
+                      262144,
+                      1048576,
+                      4194304,
+                      16777216,
+                      67108864
+                    ],
+                    "min": 8,
+                    "max": 8
+                  }
+                ],
+                "aggregationTemporality": 2
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.duration",
+              "description": "Model request duration, retries included.",
+              "unit": "s",
+              "histogram": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "gen_ai.operation.name",
+                        "value": {
+                          "stringValue": "chat"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.provider.name",
+                        "value": {
+                          "stringValue": "anthropic"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.request.model",
+                        "value": {
+                          "stringValue": "claude-test"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.response.model",
+                        "value": {
+                          "stringValue": "claude-test-20260101"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1700000000000000000",
+                    "timeUnixNano": "1700000090000000000",
+                    "count": "1",
+                    "sum": 1.5,
+                    "bucketCounts": [
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "1",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0"
+                    ],
+                    "explicitBounds": [
+                      0.01,
+                      0.02,
+                      0.04,
+                      0.08,
+                      0.16,
+                      0.32,
+                      0.64,
+                      1.28,
+                      2.56,
+                      5.12,
+                      10.24,
+                      20.48,
+                      40.96,
+                      81.92
+                    ],
+                    "min": 1.5,
+                    "max": 1.5
+                  }
+                ],
+                "aggregationTemporality": 2
+              }
+            },
+            {
+              "name": "gen_ai.client.operation.cost",
+              "description": "Model request cost in US dollars; requests with an unknown price are not recorded.",
+              "unit": "USD",
+              "histogram": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "gen_ai.operation.name",
+                        "value": {
+                          "stringValue": "chat"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.provider.name",
+                        "value": {
+                          "stringValue": "anthropic"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.request.model",
+                        "value": {
+                          "stringValue": "claude-test"
+                        }
+                      },
+                      {
+                        "key": "gen_ai.response.model",
+                        "value": {
+                          "stringValue": "claude-test-20260101"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1700000000000000000",
+                    "timeUnixNano": "1700000090000000000",
+                    "count": "1",
+                    "sum": 0.002,
+                    "bucketCounts": [
+                      "0",
+                      "0",
+                      "0",
+                      "1",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0",
+                      "0"
+                    ],
+                    "explicitBounds": [
+                      0.0001,
+                      0.0005,
+                      0.001,
+                      0.005,
+                      0.01,
+                      0.05,
+                      0.1,
+                      0.5,
+                      1,
+                      5,
+                      10
+                    ],
+                    "min": 0.002,
+                    "max": 0.002
+                  }
+                ],
+                "aggregationTemporality": 2
+              }
+            },
+            {
+              "name": "tempest.tool.calls",
+              "description": "Tool calls by tool and outcome.",
+              "unit": "{call}",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "gen_ai.tool.name",
+                        "value": {
+                          "stringValue": "echo"
+                        }
+                      },
+                      {
+                        "key": "tempest.tool.outcome",
+                        "value": {
+                          "stringValue": "success"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1700000000000000000",
+                    "timeUnixNano": "1700000090000000000",
+                    "asInt": "1"
+                  }
+                ],
+                "aggregationTemporality": 2,
+                "isMonotonic": true
+              }
+            },
+            {
+              "name": "tempest.sessions",
+              "description": "Open sessions.",
+              "unit": "{session}",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000090000000000",
+                    "asInt": "1"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "tempest.jobs",
+              "description": "Background jobs that have not finished, across open sessions.",
+              "unit": "{job}",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000090000000000",
+                    "asInt": "2"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

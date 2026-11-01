@@ -144,6 +144,8 @@ type sessionCore struct {
 	cancelTasks      context.CancelFunc
 	taskWorkers      sync.WaitGroup
 	stackClose       func() error
+	// untrack releases the session from the telemetry session and job gauges.
+	untrack func()
 	// irc is the session tree's message bus; nil without task children.
 	irc            *irc.Bus
 	checkpoints    *checkpoint.Manager
@@ -646,6 +648,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if err != nil {
 		return nil, err
 	}
+	c.untrack = cfg.Telemetry.TrackSession(c.jobs.Unfinished)
+	defer func() {
+		if err != nil {
+			c.untrack()
+		}
+	}()
 	if err = s.configureTasks(ctx, cfg, o.Tasks); err != nil {
 		return nil, err
 	}
@@ -1005,6 +1013,9 @@ func (c *sessionCore) finishClose() {
 		c.admission.Lock()
 		c.admission.Unlock()
 		c.taskWorkers.Wait()
+		if c.untrack != nil {
+			c.untrack()
+		}
 		c.closeErr = errors.Join(c.closeErr, c.jobs.Close(context.Background()))
 		if c.stackClose != nil {
 			c.closeErr = errors.Join(c.closeErr, c.stackClose())
