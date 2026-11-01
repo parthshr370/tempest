@@ -224,6 +224,14 @@ func decodeMessage(raw []byte) (httpMessage, error) {
 	}
 	return message, nil
 }
+
+// serverMessage handles a message the server sent on a stream. ctx is that
+// stream's lifetime, within the connection's: a call's, for a message on the
+// call's response stream, which relates to that call (MCP Streamable HTTP),
+// and the connection's for the GET stream. A server request ends with it:
+// once the call is answered, cancelled or past its deadline, the server no
+// longer waits for the answer, so its handler is cancelled and nothing more
+// is posted.
 func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) error {
 	if message.Method == "" {
 		return errors.New("mcp_protocol: unexpected response on notification stream")
@@ -243,7 +251,10 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 			}
 			return
 		}
-		result, rpcErr := h.handlers.Request(h.ctx, message.Method, message.Params)
+		result, rpcErr := h.handlers.Request(ctx, message.Method, message.Params)
+		if ctx.Err() != nil {
+			return
+		}
 		response := httpMessage{JSONRPC: "2.0", ID: message.ID, Error: rpcErr}
 		if rpcErr == nil {
 			var err error
@@ -252,24 +263,29 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 				response.Error = rpc.NewError(-32603, "internal_error", "unable to encode callback result")
 			}
 		}
-		callbackCtx, cancel := context.WithTimeout(h.ctx, mustDuration(h.cfg.CallTimeout))
+		callbackCtx, cancel := context.WithTimeout(ctx, mustDuration(h.cfg.CallTimeout))
 		defer cancel()
 		err := h.postAccepted(callbackCtx, response, false)
 		// A refused credential (the token died while the user answered)
 		// keeps the connection, as on the stream: calls in flight were
 		// authorized when sent. The answer goes once more, in one POST,
-		// after the next login or refresh, within its own call timeout;
-		// otherwise the server's request times out on its side.
+		// after the next login or refresh, while the server's request lasts
+		// and within the answer's own call timeout; otherwise the server's
+		// request times out on its side.
 		var authErr *AuthError
 		if errors.As(err, &authErr) {
 			select {
 			case <-h.handlers.Auth.Renewed(authErr.token):
-				err = h.postAccepted(callbackCtx, response, true)
 			case <-callbackCtx.Done():
+			}
+			if callbackCtx.Err() != nil {
 				return
 			}
+			err = h.postAccepted(callbackCtx, response, true)
 		}
-		if err != nil && !errors.As(err, &authErr) {
+		// An answer cut off because the server's request ended says nothing
+		// about the connection.
+		if err != nil && !errors.As(err, &authErr) && ctx.Err() == nil {
 			h.invalidate()
 		}
 	}()
