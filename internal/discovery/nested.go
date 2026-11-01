@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/contextfile"
@@ -38,27 +37,23 @@ type NestedOptions struct {
 	// StartupBytes is what the startup context files already spend of
 	// Files.MaxBytes.
 	StartupBytes int
-	// Surfaced are files delivered earlier in this session, from the journal.
-	Surfaced []NestedFile
 }
 
 // Nested surfaces the first context file of each directory between the
-// session root and a path a file tool read or listed, once per session,
-// shallowest first. Its output is tail content for that tool result; it
-// never touches the system prompt.
+// session root and a path a file tool read or listed, shallowest first,
+// skipping directories whose file the conversation already holds. Its
+// output is tail content for that tool result; it never touches the system
+// prompt.
 //
 // Its work is bounded by the context_files budgets: a file is read only up
 // to the bytes it may keep, imports only up to the same amount, and once
 // context_files.max_bytes is spent one notice names the next file and no
 // further directory is looked at.
 type Nested struct {
-	mu        sync.Mutex
-	roots     []string
-	names     []string
-	perFile   int
-	remaining int
-	exhausted bool
-	surfaced  map[string]bool
+	roots   []string
+	names   []string
+	perFile int
+	budget  int
 }
 
 // NewNested returns nil when context_files.nested is off.
@@ -69,20 +64,14 @@ func NewNested(options NestedOptions) *Nested {
 	}
 	root := filepath.Clean(options.Root)
 	nested := &Nested{
-		roots:     []string{root},
-		names:     ContextNames(files.Fallback),
-		perFile:   files.NestedMaxBytes,
-		remaining: files.MaxBytes - options.StartupBytes,
-		surfaced:  make(map[string]bool, len(options.Surfaced)),
+		roots:   []string{root},
+		names:   ContextNames(files.Fallback),
+		perFile: files.NestedMaxBytes,
+		budget:  files.MaxBytes - options.StartupBytes,
 	}
 	// Tools may report either spelling of a symlinked root (/var vs /private/var).
 	if resolved := canonicalPath(root); resolved != root {
 		nested.roots = append(nested.roots, resolved)
-	}
-	for _, file := range options.Surfaced {
-		nested.surfaced[file.Dir] = true
-		nested.remaining -= file.Bytes
-		nested.exhausted = nested.exhausted || file.Withheld
 	}
 	return nested
 }
@@ -93,10 +82,12 @@ func NewNested(options NestedOptions) *Nested {
 // the read showed the entire file at path: only then does a context file
 // that is itself the read target count as delivered without a block.
 //
-// Surface marks the files delivered at once. The caller makes that durable
-// in the same journal entry as the tool result, so a crash between the two
-// loses both and the resumed session surfaces the files again.
-func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool) ([]string, []NestedFile, error) {
+// shown are the files the conversation already holds: their directories are
+// skipped and their bytes spent, and a withheld one ends the lookup. The
+// caller owns that state, so it follows the conversation through rewinds,
+// resets and compaction, and passes the files returned here with the next
+// call that the same result will carry.
+func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool, shown []NestedFile) ([]string, []NestedFile, error) {
 	rel, ok := n.relative(path)
 	if !ok {
 		return nil, nil, nil
@@ -108,10 +99,14 @@ func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool) ([
 	if dir == "." {
 		return nil, nil, nil
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.exhausted {
-		return nil, nil, nil
+	remaining := n.budget
+	surfaced := make(map[string]bool, len(shown))
+	for _, file := range shown {
+		if file.Withheld {
+			return nil, nil, nil
+		}
+		surfaced[file.Dir] = true
+		remaining -= file.Bytes
 	}
 	root, err := os.OpenRoot(n.roots[0])
 	if err != nil {
@@ -131,10 +126,11 @@ func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool) ([
 		}
 		relDir := filepath.Join(parts[:depth+1]...)
 		key := filepath.ToSlash(relDir)
-		if n.surfaced[key] {
+		if surfaced[key] {
 			continue
 		}
-		found, err := n.find(root, relDir)
+		limit := min(n.perFile, remaining)
+		found, err := n.find(root, relDir, limit)
 		if err != nil {
 			slog.Warn("nested context file unreadable", "dir", key, "error", err)
 			continue
@@ -142,18 +138,16 @@ func (n *Nested) Surface(ctx context.Context, path string, isDir, whole bool) ([
 		if found == nil {
 			continue
 		}
-		block, file, err := n.render(ctx, root, *found, key, path, whole)
+		block, file, err := n.render(ctx, root, *found, key, path, whole, limit, remaining < n.perFile)
 		if err != nil {
 			return blocks, files, err
 		}
-		n.surfaced[key] = true
-		n.remaining -= file.Bytes
+		remaining -= file.Bytes
 		files = append(files, file)
 		if block != "" {
 			blocks = append(blocks, block)
 		}
 		if file.Withheld {
-			n.exhausted = true
 			break
 		}
 	}
@@ -170,9 +164,9 @@ type nestedCandidate struct {
 
 // find returns the first context file of relDir, read through root: a name
 // that is missing, not a regular file, or links outside the root is skipped,
-// as is a blank file. Nothing is read once the budget is spent.
-func (n *Nested) find(root *os.Root, relDir string) (*nestedCandidate, error) {
-	limit := min(n.perFile, n.remaining)
+// as is a blank file. limit is what the file may keep; nothing is read when
+// it is spent.
+func (n *Nested) find(root *os.Root, relDir string, limit int) (*nestedCandidate, error) {
 	for _, name := range n.names {
 		rel := filepath.Join(relDir, name)
 		info, err := root.Stat(rel)
@@ -207,14 +201,14 @@ func (n *Nested) find(root *os.Root, relDir string) (*nestedCandidate, error) {
 	return nil, nil
 }
 
-// render expands imports within the root, applies the per-file and
-// remaining budgets and frames the result. A context file that is itself
-// the read target and was shown whole, with nothing to import, is recorded
-// without a block: the model already has all of it.
-func (n *Nested) render(ctx context.Context, root *os.Root, found nestedCandidate, key, touched string, whole bool) (string, NestedFile, error) {
+// render expands imports within the root, applies limit, the bytes the file
+// may keep, and frames the result; totalCut names context_files.max_bytes
+// rather than the per-file cap in a cut notice. A context file that is
+// itself the read target and was shown whole, with nothing to import, is
+// recorded without a block: the model already has all of it.
+func (n *Nested) render(ctx context.Context, root *os.Root, found nestedCandidate, key, touched string, whole bool, limit int, totalCut bool) (string, NestedFile, error) {
 	rel := key + "/" + filepath.Base(found.rel)
 	file := NestedFile{Dir: key, Path: rel}
-	limit := min(n.perFile, n.remaining)
 	if limit <= 0 {
 		file.Withheld = true
 		return frameNested(rel, key, fmt.Sprintf("[harness: not loaded; context files already use context_files.max_bytes. Read %s directly if its rules matter; context files in other directories are no longer looked up.]", rel)), file, nil
@@ -232,7 +226,7 @@ func (n *Nested) render(ctx context.Context, root *os.Root, found nestedCandidat
 	file.Bytes = len(kept)
 	if len(kept) < len(content) || !readAll || !complete {
 		budget := "context_files.nested_max_bytes"
-		if n.remaining < n.perFile {
+		if totalCut {
 			budget = "context_files.max_bytes"
 		}
 		kept += fmt.Sprintf("\n\n[harness: cut at %d bytes by %s; read %s for the rest.]", len(kept), budget, rel)
