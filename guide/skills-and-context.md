@@ -47,8 +47,8 @@ bytes, counted after imports expand). The file that crosses it is cut and ends
 with a `[harness: context files exceed context_files.max_bytes ...]` notice that
 names the cut and every file left out, so the model knows its instructions are
 incomplete. The budget bounds the work as well: each context file is read only
-up to `context_files.max_bytes` bytes, and its imports only up to as many again,
-however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
+up to `context_files.max_bytes` bytes plus one, the extra byte telling whether it
+is cut, and its imports only up to as many again, however large the files are. `RULES.md` has no byte cap. `harness doctor` lists
 the files a run in the current directory would load, their sizes, and the
 notice if any.
 
@@ -88,8 +88,9 @@ first context file it finds there (same name order as above). Reading
 - Each file is cut at `context_files.nested_max_bytes` (default 16384 bytes),
   and nested files count against `context_files.max_bytes` together with the
   startup files. A cut file ends with a `[harness: cut at ...]` notice. The work
-  follows the same budget: a file is read only up to the bytes it may keep, and
-  its imports only up to as many again. Once the total is spent, the next file
+  follows the same budget: a file is read only up to the bytes it may keep plus
+  one, the extra byte telling whether it is cut, and its imports only up to as
+  many again. Once the total is spent, the next file
   is named but not loaded, and no further directory is looked at.
 - Files are read inside the working directory, imports included. A context
   file or an `@file` import that is a symlink pointing outside it, a `../` or

@@ -20,7 +20,8 @@ type ExpandOptions struct {
 	// HomeDir resolves ~ imports; they must still lie inside the root.
 	// Empty leaves them literal.
 	HomeDir string
-	// MaxBytes bounds what all imports read together; negative is no limit.
+	// MaxBytes bounds what all imports keep together; they read at most one
+	// byte more, to tell a cut. Negative is no limit.
 	MaxBytes int
 }
 
@@ -49,8 +50,9 @@ func (e *Error) Is(target error) bool {
 
 // Expand expands @file imports of filePath, a file inside root. Every
 // import is opened through root, so neither a ../ or absolute path nor a
-// symlink reaches a file outside it. Imports read at most options.MaxBytes
-// bytes together; complete is false when they were cut there. Imports that
+// symlink reaches a file outside it. Imports keep at most options.MaxBytes
+// bytes together, reading one byte more to tell a cut, and a cut ends on a
+// rune boundary; complete is false when they were cut. Imports that
 // cannot be read stay literal; only invalid options, source failures and
 // cancellation fail.
 func Expand(ctx context.Context, root *os.Root, filePath string, content []byte, options ExpandOptions) (text string, complete bool, err error) {

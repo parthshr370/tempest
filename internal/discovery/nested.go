@@ -46,9 +46,9 @@ type NestedOptions struct {
 // prompt.
 //
 // Its work is bounded by the context_files budgets: a file is read only up
-// to the bytes it may keep, imports only up to the same amount, and once
-// context_files.max_bytes is spent one notice names the next file and no
-// further directory is looked at.
+// to the bytes it may keep plus one byte to tell a cut, imports only up to
+// the same amount, and once context_files.max_bytes is spent one notice
+// names the next file and no further directory is looked at.
 type Nested struct {
 	roots   []string
 	names   []string

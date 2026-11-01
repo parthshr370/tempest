@@ -451,7 +451,8 @@ func TruncateUTF8(s string, limit int) string {
 }
 
 // expandContext expands a context file's imports through its source's
-// root, reading at most maxBytes of imports.
+// root, keeping at most maxBytes of imports and reading one byte more to
+// tell a cut.
 func expandContext(ctx context.Context, item candidate, maxBytes int) (loadedContext, error) {
 	content, complete, err := contextfile.Expand(ctx, item.from.root, item.path, item.content, contextfile.ExpandOptions{HomeDir: item.from.home, MaxBytes: maxBytes})
 	if err != nil {
