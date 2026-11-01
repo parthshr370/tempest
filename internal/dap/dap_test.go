@@ -178,7 +178,7 @@ func TestDAPRealDelve(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	process, err := debugger.spawn(ctx, Defaults()["dlv"], false)
+	process, err := debugger.spawn(ctx, Defaults()["dlv"], false, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

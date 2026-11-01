@@ -279,7 +279,25 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	if !ok {
 		return nil, fmt.Errorf("debug adapter %q is not configured", name)
 	}
-	process, err := m.spawn(ctx, adapter, action == "attach")
+	defaults := adapter.Launch
+	if action == "attach" {
+		defaults = adapter.Attach
+	}
+	merged := make(map[string]json.RawMessage, len(defaults)+len(arguments))
+	for key, value := range defaults {
+		merged[key] = value
+	}
+	for key, value := range arguments {
+		merged[key] = value
+	}
+	var attachedPID int
+	if action == "attach" {
+		// A local attach names its pid; cleanup leaves that program running.
+		// Read it before the adapter, and with it the exit observer that runs
+		// cleanup, exists.
+		_ = json.Unmarshal(merged["processId"], &attachedPID)
+	}
+	process, err := m.spawn(ctx, adapter, action == "attach", attachedPID)
 	if err != nil {
 		return nil, err
 	}
@@ -299,21 +317,6 @@ func (m *Manager) Start(ctx context.Context, action, name, program string, argum
 	capabilities, err := process.client.request(ctx, "initialize", json.RawMessage(`{"clientID":"tempest","adapterID":"tempest","pathFormat":"path","linesStartAt1":true,"columnsStartAt1":true,"supportsRunInTerminalRequest":false,"supportsVariableType":true}`))
 	if err != nil {
 		return nil, err
-	}
-	defaults := adapter.Launch
-	if action == "attach" {
-		defaults = adapter.Attach
-	}
-	merged := make(map[string]json.RawMessage, len(defaults)+len(arguments))
-	for key, value := range defaults {
-		merged[key] = value
-	}
-	for key, value := range arguments {
-		merged[key] = value
-	}
-	if action == "attach" {
-		// A local attach names its pid; cleanup leaves that program running.
-		_ = json.Unmarshal(merged["processId"], &process.attachedPID)
 	}
 	encoded, err := json.Marshal(merged)
 	if err != nil {
@@ -382,7 +385,9 @@ waitInitialized:
 	return body, nil
 }
 
-func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool) (*adapterProcess, error) {
+// spawn starts the adapter. An attached pid is stored before the exit
+// observer that runs cleanup starts, so cleanup always sees it.
+func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, attachedPID int) (*adapterProcess, error) {
 	release := func() {}
 	if m.admit != nil {
 		var err error
@@ -391,7 +396,7 @@ func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool) (*a
 			return nil, err
 		}
 	}
-	process := &adapterProcess{attached: attached, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
+	process := &adapterProcess{attached: attached, attachedPID: attachedPID, release: release, programGroups: map[int]bool{}, exited: make(chan struct{}), stateChanged: make(chan struct{}, 1), output: toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{MaxBytes: outputPreviewBytes, MaxLines: outputPreviewLines, MaxTotalBytes: outputDiskLimit, TempDir: m.outputDir, TempFilePrefix: "debug-"})}
 	args := append([]string(nil), adapter.Args...)
 	var listener net.Listener
 	if adapter.Transport == "reverse_tcp" {
