@@ -375,14 +375,17 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	}
 	authorization.RawQuery = query.Encode()
 	// The first callback decides the login: a valid one carries the code,
-	// a refused one ends the wait with its reason at once. Each answer is
-	// written before Login can return and close the listener.
+	// a refused one ends the login with its reason at once, also while
+	// present still waits for the user. Each answer is written before Login
+	// can return and close the listener.
 	type outcome struct {
 		values url.Values
 		err    error
 	}
 	callbacks := make(chan outcome, 1)
 	var decided atomic.Bool
+	presentCtx, stopPresent := context.WithCancelCause(ctx)
+	defer stopPresent(nil)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -395,7 +398,9 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 			http.Error(w, reason, http.StatusBadRequest)
 			_ = http.NewResponseController(w).Flush()
 			if decided.CompareAndSwap(false, true) {
-				callbacks <- outcome{err: fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason)}
+				refusal := fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason)
+				callbacks <- outcome{err: refusal}
+				stopPresent(refusal)
 			}
 		}
 		values := r.URL.Query()
@@ -425,7 +430,11 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	callbackServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	defer callbackServer.Close()
 	go func() { _ = callbackServer.Serve(listener) }()
-	if err := present(ctx, authorization.String()); err != nil {
+	if err := present(presentCtx, authorization.String()); err != nil {
+		if presentCtx.Err() != nil && ctx.Err() == nil {
+			// A refused callback cut the question short.
+			return Record{}, context.Cause(presentCtx)
+		}
 		return Record{}, err
 	}
 	var values url.Values

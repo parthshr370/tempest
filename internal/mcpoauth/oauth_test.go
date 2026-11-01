@@ -144,7 +144,7 @@ func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	if _, err := h.flow.Login(ctx, challenge, h.fixture.Browse); err == nil || !strings.Contains(err.Error(), "400") {
+	if _, err := h.flow.Login(ctx, challenge, h.fixture.Browse); err == nil || !strings.Contains(err.Error(), "lacks the issuer") {
 		t.Fatalf("login with the advertised iss missing = %v, want the callback refused", err)
 	}
 	if h.fixture.VerifiedCodes() != 0 {
@@ -152,17 +152,20 @@ func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
 	}
 }
 
-// A refused callback ends the login at once with its reason, also when
-// present returned before the browser came back, as a terminal does once
-// the user pressed Enter; the user does not wait out the login timeout.
+// A refused callback ends the login at once with its reason: after present
+// returned, as a terminal does once the user pressed Enter, and also while
+// present still waits for the user. The user does not wait out the login
+// timeout.
 func TestRefusedCallbackEndsTheLogin(t *testing.T) {
 	for name, test := range map[string]struct {
 		options mcpoauthtest.Options
 		tamper  func(url.Values)
+		waiting bool
 		want    string
 	}{
-		"missing iss": {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
-		"wrong state": {tamper: func(values url.Values) { values.Set("state", "forged") }, want: "state did not match"},
+		"missing iss":             {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
+		"wrong state":             {tamper: func(values url.Values) { values.Set("state", "forged") }, want: "state did not match"},
+		"wrong state while asked": {tamper: func(values url.Values) { values.Set("state", "forged") }, waiting: true, want: "state did not match"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, test.options, nil)
@@ -173,6 +176,10 @@ func TestRefusedCallbackEndsTheLogin(t *testing.T) {
 			browsed := make(chan struct{})
 			present := func(ctx context.Context, authorizationURL string) error {
 				go func() { defer close(browsed); _ = browseWith(ctx, authorizationURL, test.tamper) }()
+				if test.waiting {
+					<-ctx.Done()
+					return ctx.Err()
+				}
 				return nil
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
