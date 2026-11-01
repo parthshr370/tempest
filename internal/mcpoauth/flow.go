@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/mcpconfig"
@@ -373,7 +374,15 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 		query.Set("scope", scope)
 	}
 	authorization.RawQuery = query.Encode()
-	callbacks := make(chan url.Values, 1)
+	// The first callback decides the login: a valid one carries the code,
+	// a refused one ends the wait with its reason at once. Each answer is
+	// written before Login can return and close the listener.
+	type outcome struct {
+		values url.Values
+		err    error
+	}
+	callbacks := make(chan outcome, 1)
+	var decided atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -382,28 +391,36 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		refuse := func(reason string) {
+			http.Error(w, reason, http.StatusBadRequest)
+			_ = http.NewResponseController(w).Flush()
+			if decided.CompareAndSwap(false, true) {
+				callbacks <- outcome{err: fmt.Errorf("mcp_auth: authorization callback for server %s refused: %s", c.server, reason)}
+			}
+		}
 		values := r.URL.Query()
 		if len(values["state"]) != 1 || subtle.ConstantTimeCompare([]byte(values.Get("state")), []byte(state)) != 1 {
-			http.Error(w, "Authorization state did not match", http.StatusBadRequest)
+			refuse("Authorization state did not match")
 			return
 		}
 		// RFC 9207: a returned issuer must be the one this request went to,
 		// and a server that advertises the parameter must return it.
 		iss := values.Get("iss")
 		if iss == "" && metadata.IssParameterSupported {
-			http.Error(w, "Authorization response lacks the issuer its server promised", http.StatusBadRequest)
+			refuse("Authorization response lacks the issuer its server promised")
 			return
 		}
 		if iss != "" && strings.TrimSuffix(iss, "/") != strings.TrimSuffix(metadata.Issuer, "/") {
-			http.Error(w, "Authorization issuer did not match", http.StatusBadRequest)
+			refuse("Authorization issuer did not match")
 			return
 		}
-		select {
-		case callbacks <- values:
-			fmt.Fprintln(w, "Authorization received. Return to Tempest.")
-		default:
+		if !decided.CompareAndSwap(false, true) {
 			http.Error(w, "Authorization callback already received", http.StatusConflict)
+			return
 		}
+		fmt.Fprintln(w, "Authorization received. Return to Tempest.")
+		_ = http.NewResponseController(w).Flush()
+		callbacks <- outcome{values: values}
 	})
 	callbackServer := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	defer callbackServer.Close()
@@ -413,7 +430,11 @@ func (c *Client) Login(ctx context.Context, challenge Challenge, present func(co
 	}
 	var values url.Values
 	select {
-	case values = <-callbacks:
+	case callback := <-callbacks:
+		if callback.err != nil {
+			return Record{}, callback.err
+		}
+		values = callback.values
 	case <-ctx.Done():
 		return Record{}, fmt.Errorf("mcp_auth: authorization for server %s was not completed: %w", c.server, ctx.Err())
 	}

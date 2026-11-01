@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/url"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +150,76 @@ func TestLoginRefusesResponseWithoutAdvertisedIssuer(t *testing.T) {
 	if h.fixture.VerifiedCodes() != 0 {
 		t.Fatal("the code was exchanged although the response lacked iss")
 	}
+}
+
+// A refused callback ends the login at once with its reason, also when
+// present returned before the browser came back, as a terminal does once
+// the user pressed Enter; the user does not wait out the login timeout.
+func TestRefusedCallbackEndsTheLogin(t *testing.T) {
+	for name, test := range map[string]struct {
+		options mcpoauthtest.Options
+		tamper  func(url.Values)
+		want    string
+	}{
+		"missing iss": {options: mcpoauthtest.Options{OmitIss: true}, want: "lacks the issuer"},
+		"wrong state": {tamper: func(values url.Values) { values.Set("state", "forged") }, want: "state did not match"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, test.options, nil)
+			challenge, _, err := h.flow.Probe(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			browsed := make(chan struct{})
+			present := func(ctx context.Context, authorizationURL string) error {
+				go func() { defer close(browsed); _ = browseWith(ctx, authorizationURL, test.tamper) }()
+				return nil
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			_, err = h.flow.Login(ctx, challenge, present)
+			<-browsed
+			if err == nil || ctx.Err() != nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("login after a refused callback = %v (deadline: %v), want it ended with %q", err, ctx.Err(), test.want)
+			}
+			if h.fixture.VerifiedCodes() != 0 {
+				t.Fatal("a refused callback's code was exchanged")
+			}
+		})
+	}
+}
+
+// browseWith approves the authorization URL like the fixture's Browse and
+// lets tamper change the callback's query before the browser follows it.
+func browseWith(ctx context.Context, authorizationURL string, tamper func(url.Values)) error {
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, authorizationURL, nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	response.Body.Close()
+	callback, err := url.Parse(response.Header.Get("Location"))
+	if err != nil {
+		return err
+	}
+	if tamper != nil {
+		query := callback.Query()
+		tamper(query)
+		callback.RawQuery = query.Encode()
+	}
+	request, err = http.NewRequestWithContext(ctx, http.MethodGet, callback.String(), nil)
+	if err != nil {
+		return err
+	}
+	answer, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	return answer.Body.Close()
 }
 
 func TestLoginUsesConfiguredClientWithoutRegistering(t *testing.T) {

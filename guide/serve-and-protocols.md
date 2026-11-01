@@ -101,8 +101,9 @@ OAuth 2.1 as the MCP `2025-11-25` authorization specification describes:
 4. Authorization code with PKCE `S256`, a `state` check, the RFC 9207 `iss` check
    (required when the authorization server advertises it) and the RFC 8707
    `resource` parameter in the authorization and token requests, returning to a
-   loopback listener on `127.0.0.1`. Scope is the challenge's `scope`, else
-   `oauth.scopes`, else the resource's `scopes_supported`.
+   loopback listener on `127.0.0.1`. A callback that fails the `state` or `iss`
+   check ends the login at once with that reason. Scope is the challenge's `scope`,
+   else `oauth.scopes`, else the resource's `scopes_supported`.
 
 ```sh
 tempest mcp login docs          # opens the browser; -no-browser prints the URL
