@@ -125,3 +125,48 @@ func TestConfigShowAttributesUntrustedDenyUnion(t *testing.T) {
 		t.Fatalf("warnings %q do not name the dropped null", warnings)
 	}
 }
+
+// The MCP client commands resolve the same server list as a run with the
+// same flags: trust, -profile and -c apply, and the trust warning names a
+// project server they drop.
+func TestMCPClientCommandsSeeTheRunsSettingsLayers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	userPath := filepath.Join(home, ".config", config.ConfigDirName, "settings.json")
+	projectPath := filepath.Join(root, config.ProjectConfigDirName, "settings.json")
+	for path, content := range map[string]string{
+		userPath:    `{"profiles":{"review":{"mcp_servers":[{"name":"profiled","transport":"stdio","command":"profiled-mcp"}]}}}`,
+		projectPath: `{"mcp_servers":[{"name":"repo","transport":"stdio","command":"repo-mcp"}]}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(root)
+	list := func(args ...string) (string, string, int) {
+		var stdout, stderr bytes.Buffer
+		code := run(append([]string{"mcp", "list"}, args...), &stdout, &stderr)
+		return stdout.String(), stderr.String(), code
+	}
+
+	stdout, stderr, code := list()
+	if code != 0 || strings.Contains(stdout, "repo") || !strings.Contains(stderr, "mcp_servers") || !strings.Contains(stderr, projectPath) {
+		t.Fatalf("untrusted: exit=%d stdout=%q stderr=%q, want the project server dropped with a warning", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-trust-project-hooks"); code != 0 || !strings.Contains(stdout, "repo\tstdio repo-mcp") {
+		t.Fatalf("trusted: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-profile", "review"); code != 0 || !strings.Contains(stdout, "profiled\tstdio profiled-mcp") {
+		t.Fatalf("profile: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout, stderr, code = list("-c", `mcp_servers=[{"name":"inline","transport":"stdio","command":"inline-mcp"}]`); code != 0 || !strings.Contains(stdout, "inline\tstdio inline-mcp") {
+		t.Fatalf("-c: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
