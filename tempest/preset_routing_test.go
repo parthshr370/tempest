@@ -78,6 +78,31 @@ func TestPlanAliasKeepsThePlanEndpoint(t *testing.T) {
 	}
 }
 
+// model: plan runs behind the plan role's backup models even when the plan
+// role has no model of its own, as a -plan run does.
+func TestPlanAliasUsesThePlanBackupsWithoutAPlanModel(t *testing.T) {
+	preset := extension.AgentPreset{ID: "planner", Version: 3, Description: "d", Instructions: "plan", Model: "plan"}
+	model := types.Model{Provider: "openai", ID: "gpt", BaseURL: "https://default.example/v1"}
+	planBackup := types.Model{Provider: "anthropic", ID: "plan-backup"}
+	none := func(context.Context, types.Model, types.Context, *types.SimpleStreamOptions) *stream.AssistantStream { return nil }
+	cfg := StackConfig{
+		Model:              model,
+		PlanModel:          model,
+		StreamFn:           none,
+		FallbackModels:     []types.Model{{Provider: "anthropic", ID: "default-backup"}},
+		PlanStreamFn:       none,
+		PlanFallbackModels: []types.Model{planBackup},
+		ResolvePreset:      func(string) (extension.AgentPreset, error) { return preset, nil },
+	}
+	got, err := (&sessionCore{customStream: true}).presetConfig(cfg, work.TaskSpec{PresetID: "planner", PresetVersion: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.FallbackModels) != 1 || got.FallbackModels[0].ID != planBackup.ID || got.ModelRole != "plan" {
+		t.Fatalf("plan alias backups %v role %q, want the plan role's %s", got.FallbackModels, got.ModelRole, planBackup.ID)
+	}
+}
+
 // startRecorder is a task controller that keeps the spec it was asked to start.
 type startRecorder struct {
 	work.Controller
