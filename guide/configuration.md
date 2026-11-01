@@ -58,7 +58,7 @@ trusts the workspace:
 | Keys | Applied when |
 |---|---|
 | `hooks`, `mcp_config`, `mcp_servers`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `session_dir`, `log_file`, `faux_script` | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
-| `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model` or `smol_model` with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
+| `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, and a `model`, `plan_model`, `smol_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
 An untrusted workspace still gets every other project setting. The keys that were
@@ -234,8 +234,10 @@ Reasoning effort follows the same pattern with `-reasoning`, `-plan-reasoning` a
 
 Each role can also name backup models for when its model is unavailable, with
 settings `fallback_models` (`{"default": [...], "plan": [...], "smol": [...]}`),
-`-fallback-model` and `HARNESS_FALLBACK_MODELS` for the default role. Plan and smol
-use the default role's list unless they have their own. See
+`-fallback-model` and `HARNESS_FALLBACK_MODELS` for the default role. The flag and
+variable set `fallback_models.default` in their layers, so they replace the default
+role's list and leave the other roles' entries from lower layers in place. Plan and
+smol use the default role's list unless they have their own. See
 [Backup models](providers.md#backup-models).
 
 ## Flags
