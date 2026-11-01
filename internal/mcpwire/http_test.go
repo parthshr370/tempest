@@ -3,6 +3,7 @@ package mcpwire
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -275,6 +276,61 @@ func TestMCPSSEFailureNeverReplaysPOST(t *testing.T) {
 				t.Fatalf("POST replayed %d times", posts.Load())
 			}
 		})
+	}
+}
+
+// stubAuth hands out one token and refuses every rejection.
+type stubAuth struct{}
+
+func (stubAuth) Token(context.Context) (string, error) { return "token", nil }
+func (stubAuth) Rejected(context.Context, Rejection) error {
+	return errors.New("mcp_auth: login required")
+}
+func (stubAuth) Renewed(string) <-chan struct{} { return nil }
+
+// An authorization failure on the GET that resumes a POST's response stream
+// is not an AuthError: the server already processed the POST, so a caller
+// must not log in and send it again.
+func TestMCPSSEResumeRefusedForAuthorizationIsNotRetryable(t *testing.T) {
+	var posts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case r.Method == http.MethodGet && r.Header.Get("Last-Event-ID") == "":
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		case r.Method == http.MethodGet:
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var message httpMessage
+		_ = json.NewDecoder(r.Body).Decode(&message)
+		switch message.Method {
+		case "initialize":
+			writeRPC(t, w, message.ID, json.RawMessage(`{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"auth","version":"1"}}`))
+		case "notifications/initialized", "notifications/cancelled":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			posts.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, "id: cursor\nretry: 0\ndata:\n\n")
+		}
+	}))
+	defer server.Close()
+	client, err := Dial(context.Background(), mcpconfig.Server{Name: "auth", Transport: "http", URL: server.URL}, t.TempDir(), Handlers{Auth: stubAuth{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeWire(t, client)
+	_, err = client.Call(context.Background(), "tools/call", struct{}{})
+	var authErr *AuthError
+	if err == nil || errors.As(err, &authErr) || !strings.Contains(err.Error(), "remote outcome may be unknown") {
+		t.Fatalf("refused resume = %v, want an unknown outcome that is not an AuthError", err)
+	}
+	if posts.Load() != 1 {
+		t.Fatalf("POST sent %d times", posts.Load())
 	}
 }
 func TestMCPHTTPNoCredentialRetry(t *testing.T) {

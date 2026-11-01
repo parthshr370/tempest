@@ -437,6 +437,13 @@ func (h *httpTransport) readLogical(ctx context.Context, response *http.Response
 			return httpMessage{}, err
 		}
 		resumed, err := h.request(ctx, http.MethodGet, nil, false, cursor)
+		var authErr *AuthError
+		if errors.As(err, &authErr) {
+			// The server already processed the POST; only reading its
+			// answer was refused, so this is no AuthError to retry after a
+			// login.
+			return httpMessage{}, fmt.Errorf("mcp_disconnected: resuming the response was refused: %v; remote outcome may be unknown", authErr.Err)
+		}
 		if err != nil {
 			return httpMessage{}, err
 		}
