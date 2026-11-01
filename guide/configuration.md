@@ -105,7 +105,10 @@ object, a value of the wrong type, not a regular file, or larger than 4 MiB) is
 skipped with a warning naming the file and the reason, and the run goes on with the
 other layers. A trusted workspace's file, any user or managed file, and any file under
 `-strict-config` stops startup with an error that names the file instead. A key the
-trust rules drop is never type-checked, so its value cannot invalidate the file.
+trust rules drop is never type-checked, so its value cannot invalidate the file. A
+value that parses but is invalid, such as `"max_tokens": 0` or an unknown `reasoning`
+level, stops startup in any layer; the error names the key and the layer and file,
+variable or flag that set it, and a `-c` override or flag replaces it.
 
 Project files are read from the working directory. With `-environment` set to a
 remote environment, project files on the host are not read.

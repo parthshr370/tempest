@@ -425,7 +425,9 @@ type Error struct {
 // message that looks like a credential is masked, whatever produced it. The
 // field is a settings key, never a value, and stays outside the redactor: a
 // key such as max_tokens followed by ": " would otherwise mask the message.
-func (e *Error) Error() string { return fmt.Sprintf("config %s: %s", e.Field, obs.Redact(e.Err.Error())) }
+func (e *Error) Error() string {
+	return fmt.Sprintf("config %s: %s", e.Field, obs.Redact(e.Err.Error()))
+}
 
 // Unwrap returns the underlying parsing or filesystem failure.
 func (e *Error) Unwrap() error { return e.Err }
@@ -517,7 +519,7 @@ func splitCommaList(value string) []string {
 }
 
 // Resolve merges every settings layer once and returns validated runtime values.
-func (c Config) Resolve() (*ResolvedConfig, error) {
+func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	lookup := c.LookupEnv
 	if lookup == nil {
 		lookup = os.Getenv
@@ -567,6 +569,8 @@ func (c Config) Resolve() (*ResolvedConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A value that fails validation below names the layer that set it.
+	defer func() { err = layered.withSource(err) }()
 	settings := layered.settings
 	environmentName, environments, err := resolveEnvironments(c.Flags, lookup, settings)
 	if err != nil {

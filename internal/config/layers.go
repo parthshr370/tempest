@@ -1369,6 +1369,33 @@ func (s *layeredSettings) reportDropped(dropped, kept []droppedSetting) {
 	s.warnings = append(s.warnings, "project settings ignored: "+strings.Join(parts, "; "))
 }
 
+// withSource adds to a configuration error the layer and the file, variable
+// or flag that set its field, when one source set all of it. A bad value in
+// a repository file then names that file instead of reading like the
+// operator's own setting. An array index in the field names its array.
+func (s *layeredSettings) withSource(err error) error {
+	var configErr *Error
+	if !errors.As(err, &configErr) {
+		return err
+	}
+	field, _, _ := strings.Cut(configErr.Field, "[")
+	var from Setting
+	found := false
+	for _, setting := range s.list {
+		if setting.Key != field && !strings.HasPrefix(setting.Key, field+".") {
+			continue
+		}
+		if found && (setting.Layer != from.Layer || setting.Source != from.Source) {
+			return err
+		}
+		from, found = setting, true
+	}
+	if !found || from.Layer == LayerDefault {
+		return err
+	}
+	return &Error{Field: configErr.Field, Err: fmt.Errorf("%w (set by %s)", configErr.Err, strings.TrimSpace(from.Layer+" "+from.Source))}
+}
+
 // decodeMembers decodes merged settings into target.
 func decodeMembers(members map[string]*settingsNode, target *fileSettings) error {
 	if err := decodeSettings(members, target); err != nil {
