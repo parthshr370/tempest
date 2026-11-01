@@ -72,6 +72,9 @@ func NewPresetTool(controller work.Controller, names []string, resolve PresetRes
 				}
 				spec.PresetID, spec.PresetVersion = spec.SubagentType, preset.Version
 				spec.SubagentType = "general"
+				if len(spec.OutputSchema) == 0 {
+					spec.OutputSchema = preset.OutputSchema
+				}
 			}
 			job, err := controller.StartTask(ctx, spec)
 			if err != nil {

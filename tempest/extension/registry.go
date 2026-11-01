@@ -166,6 +166,9 @@ func validateDefinition(d Definition) error {
 		if p.Version == 0 {
 			return errors.New("preset version required")
 		}
+		if _, err := outputschema.Compile(p.OutputSchema); err != nil {
+			return fmt.Errorf("preset %s output schema: %w", p.ID, err)
+		}
 	}
 	for _, document := range d.Documents {
 		if document.Namespace != d.ID && !strings.HasPrefix(document.Namespace, d.ID+".") {
@@ -206,6 +209,7 @@ func cloneDefinition(d Definition) Definition {
 	d.Presets = append([]AgentPreset(nil), d.Presets...)
 	for i := range d.Presets {
 		d.Presets[i].AllowedTools = slices.Clone(d.Presets[i].AllowedTools)
+		d.Presets[i].OutputSchema = slices.Clone(d.Presets[i].OutputSchema)
 	}
 	d.Documents = append(d.Documents[:0:0], d.Documents...)
 	for i := range d.Documents {

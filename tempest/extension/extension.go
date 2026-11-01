@@ -191,11 +191,16 @@ type Invocation interface {
 }
 
 // AgentPreset is data. It cannot launch executables or increase a child's authority.
+// Model is a role alias (default, plan, smol) or a model spec. Reasoning sets
+// the child's effort; OutputSchema is the child's final-answer schema when
+// the task call names none.
 type AgentPreset struct {
-	ID           string   `json:"id"`
-	Version      uint32   `json:"version"`
-	Description  string   `json:"description"`
-	Instructions string   `json:"instructions"`
-	Model        string   `json:"model,omitempty"`
-	AllowedTools []string `json:"allowedTools"`
+	ID           string          `json:"id"`
+	Version      uint32          `json:"version"`
+	Description  string          `json:"description"`
+	Instructions string          `json:"instructions"`
+	Model        string          `json:"model,omitempty"`
+	AllowedTools []string        `json:"allowedTools"`
+	Reasoning    string          `json:"reasoning,omitempty"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 }

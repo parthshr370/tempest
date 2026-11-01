@@ -44,13 +44,16 @@ type Runtime struct {
 	Environment   environment.Lease
 	Counter       atomic.Uint64
 	CommandHooks  bool
-	CallTool      func(context.Context, string, string, json.RawMessage) (extension.Result, error)
-	AllowTool     func(string, extension.EffectClass) bool
-	ExecuteTool   func(context.Context, []agent.AgentTool, types.ContentBlock) (agent.AgentToolResult, error)
-	TaskOutput    func(context.Context, extension.Task, extension.OutputChunk) error
-	resumeMu      sync.Mutex
-	nestedMu      sync.Mutex
-	nestedCalls   map[string]*nestedCall
+	// FilePresets are agent-file presets, listed beside bundle presets under
+	// their bare names; bundle presets keep their bundle/id names.
+	FilePresets []extension.AgentPreset
+	CallTool    func(context.Context, string, string, json.RawMessage) (extension.Result, error)
+	AllowTool   func(string, extension.EffectClass) bool
+	ExecuteTool func(context.Context, []agent.AgentTool, types.ContentBlock) (agent.AgentToolResult, error)
+	TaskOutput  func(context.Context, extension.Task, extension.OutputChunk) error
+	resumeMu    sync.Mutex
+	nestedMu    sync.Mutex
+	nestedCalls map[string]*nestedCall
 }
 type requestKey struct{}
 type requestContext struct {
@@ -191,6 +194,10 @@ func (r *Runtime) Prepare(ctx context.Context, current agent.AgentContext) (cont
 	current.Tools = append([]agent.AgentTool(nil), req.baseTools...)
 	presets := map[string]extension.AgentPreset{}
 	var presetNames []string
+	for _, preset := range r.FilePresets {
+		presets[preset.ID] = preset
+		presetNames = append(presetNames, preset.ID)
+	}
 	for _, d := range req.definitions {
 		for _, preset := range d.Presets {
 			id := d.ID + "/" + preset.ID
@@ -601,6 +608,9 @@ func (r *Runtime) BeforeCompactionSource(ctx context.Context, source string) err
 
 // ResolvePreset resolves one selected immutable preset, never executable configuration.
 func (r *Runtime) ResolvePreset(id string) (extension.AgentPreset, error) {
+	if preset, ok := FilePreset(r.FilePresets, id); ok {
+		return preset, nil
+	}
 	lease, err := r.Registry.Acquire(r.Selected)
 	if err != nil {
 		return extension.AgentPreset{}, err
@@ -614,6 +624,16 @@ func (r *Runtime) ResolvePreset(id string) (extension.AgentPreset, error) {
 		}
 	}
 	return extension.AgentPreset{}, fmt.Errorf("agent preset unavailable: %s", id)
+}
+
+// FilePreset finds an agent-file preset by its bare name.
+func FilePreset(presets []extension.AgentPreset, id string) (extension.AgentPreset, bool) {
+	for _, preset := range presets {
+		if preset.ID == id {
+			return preset, true
+		}
+	}
+	return extension.AgentPreset{}, false
 }
 
 var _ agent.ExtensionRuntime = (*Runtime)(nil)
