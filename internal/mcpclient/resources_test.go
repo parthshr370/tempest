@@ -67,7 +67,7 @@ func TestMCPResourcesListReadAndRefresh(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if len(manager.Tools()) != 9 {
+	if len(manager.Tools()) != 10 {
 		t.Fatalf("refresh lost tools: %d", len(manager.Tools()))
 	}
 }

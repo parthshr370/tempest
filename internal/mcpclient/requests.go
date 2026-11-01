@@ -10,11 +10,14 @@ import (
 )
 
 // request answers requests the server sends to Tempest. ping and
-// roots/list are answered by the wire layer.
+// roots/list are answered by the wire layer; sampling/createMessage only
+// for a server whose sampling capability was declared.
 func (s *server) request(ctx context.Context, method string, params json.RawMessage) (any, *rpc.Error) {
-	switch method {
-	case "elicitation/create":
+	switch {
+	case method == "elicitation/create":
 		return s.elicitation(ctx, params)
+	case method == "sampling/createMessage" && s.config.Sampling && s.manager.sample != nil:
+		return s.sampling(ctx, params)
 	default:
 		return nil, rpc.NewError(-32601, "method_not_found", "unsupported MCP server request")
 	}

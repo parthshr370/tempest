@@ -17,6 +17,18 @@ func (c *ResolvedConfig) MCPServers() []mcpconfig.Server {
 	return s
 }
 
+// MCPSamplingModel returns the model spec that answers MCP server sampling
+// requests; empty uses the smol role.
+func (c *ResolvedConfig) MCPSamplingModel() string { return c.mcpSamplingModel }
+
+// MCPSamplingMaxTokens caps the output of one MCP sampling request; it
+// defaults to max_tokens.
+func (c *ResolvedConfig) MCPSamplingMaxTokens() int { return c.mcpSamplingMaxTokens }
+
+// MCPSamplingAllowHeadless reports whether opted-in servers may sample
+// without asking when the session has no user to ask.
+func (c *ResolvedConfig) MCPSamplingAllowHeadless() bool { return c.mcpSamplingHeadless }
+
 func resolveMCP(flag StringInput, env string, settings fileSettings) ([]mcpconfig.Server, error) {
 	if settings.MCPConfig != nil && settings.MCPServers != nil {
 		return nil, errors.New("mcp_config and mcp_servers conflict")

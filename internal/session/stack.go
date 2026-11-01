@@ -180,6 +180,25 @@ type StackConfig struct {
 type MCPClientSettings struct {
 	// CredentialDir stores OAuth tokens per server; empty disables OAuth.
 	CredentialDir string
+	// Sampling answers sampling/createMessage from servers configured with
+	// sampling: true.
+	Sampling MCPSamplingSettings
+}
+
+// MCPSamplingSettings choose the model and limits for MCP server sampling.
+type MCPSamplingSettings struct {
+	// Model and StreamFn answer sampling requests. A nil StreamFn uses
+	// ModelSpec routed like the default model, or the smol role when
+	// ModelSpec is empty.
+	Model     ptypes.Model
+	StreamFn  agent.StreamFn
+	ModelSpec string
+	// MaxTokens caps the output of one request; zero uses the model's
+	// own output limit.
+	MaxTokens int
+	// AllowHeadless lets opted-in servers sample without asking when the
+	// session has no user to ask; otherwise those requests are refused.
+	AllowHeadless bool
 }
 
 // StackConfigFromConfig keeps config-backed tool options together across hosts.
@@ -203,7 +222,9 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 		ListingPolicy:        cfg.WorkspaceListing(),
-		MCP:                  MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir())},
+		MCP: MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir()), Sampling: MCPSamplingSettings{
+			ModelSpec: cfg.MCPSamplingModel(), MaxTokens: cfg.MCPSamplingMaxTokens(), AllowHeadless: cfg.MCPSamplingAllowHeadless(),
+		}},
 	}
 }
 

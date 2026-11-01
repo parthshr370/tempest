@@ -32,7 +32,8 @@ type Server struct {
 	Auth  string       `json:"auth,omitempty"`
 	OAuth *OAuthClient `json:"oauth,omitempty"`
 	// Sampling declares the sampling capability so the server may request
-	// model completions; each first use is still approved by the user.
+	// model completions; the session's user approves the first request,
+	// and without a user mcp_sampling_allow_headless decides.
 	Sampling bool `json:"sampling,omitempty"`
 }
 

@@ -50,6 +50,10 @@ type Options struct {
 	// OnPromptsChanged receives every server's prompts after a refresh
 	// changed one server's list, including the first discovery.
 	OnPromptsChanged func([]Prompt)
+	// Sample answers sampling/createMessage. The sampling capability is
+	// declared only to servers configured with sampling: true, and only
+	// when Sample is set.
+	Sample Sampler
 }
 
 // Manager owns connections and complete catalogs for one Tempest session.
@@ -66,6 +70,7 @@ type Manager struct {
 	elicit       question.Elicitor
 	// onPromptsChanged is Options.OnPromptsChanged.
 	onPromptsChanged func([]Prompt)
+	sample           Sampler
 }
 
 type progressCall struct {
@@ -118,7 +123,7 @@ func Open(ctx context.Context, configs []mcpconfig.Server, options Options) (*Ma
 		logger = slog.Default()
 	}
 	lifetime, cancel := context.WithCancel(context.Background())
-	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger, admitProcess: options.AdmitProcess, elicit: options.Elicit, onPromptsChanged: options.OnPromptsChanged}
+	manager := &Manager{ctx: lifetime, cancel: cancel, cwd: cwd, spillDir: spillDir, logger: logger, admitProcess: options.AdmitProcess, elicit: options.Elicit, onPromptsChanged: options.OnPromptsChanged, sample: options.Sample}
 	var store *mcpoauth.Store
 	if options.CredentialDir != "" {
 		store = mcpoauth.NewStore(options.CredentialDir)

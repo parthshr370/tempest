@@ -175,6 +175,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		DefaultFallbacks:   opts.Config.FallbackModels(config.RoleDefault),
 		PlanFallbacks:      opts.Config.FallbackModels(config.RolePlan),
 		SmolFallbacks:      opts.Config.FallbackModels(config.RoleSmol),
+		SamplingModel:      opts.Config.MCPSamplingModel(),
 		AnthropicBaseURL:   opts.Config.AnthropicBaseURL(),
 		OpenAIBaseURL:      opts.Config.OpenAIBaseURL(),
 		MaxTokens:          opts.Config.MaxTokens(),
@@ -286,6 +287,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	stack.SmolStreamFn = roles.Smol.StreamFn
 	stack.FallbackModels = stackFallbacks
 	stack.SmolFallbackModels = smolFallbacks
+	stack.MCP.Sampling.Model, stack.MCP.Sampling.StreamFn = roles.Sampling.Model, roles.Sampling.StreamFn
 	stack.PermissionMode = permissionMode
 	stack.PermissionPolicy = permissionPolicy
 	stack.ExcludeTools = splitCSV(opts.ExcludeTools)

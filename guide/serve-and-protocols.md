@@ -61,6 +61,7 @@ Claude Desktop and Cursor shape), or Tempest's array of named servers:
 | `permission` | Tool permission for the server. |
 | `auth` | `"oauth"` lets `tempest mcp login` find the authorization server through well-known metadata even when the server answers without a 401. HTTP only. |
 | `oauth` | Pre-registered OAuth client: `{"clientId": "...", "clientSecret": "...", "scopes": ["..."]}`. Without it the client registers itself. HTTP only. |
+| `sampling` | `true` lets the server ask Tempest's model for completions; see [Sampling](#sampling). Default `false`. |
 
 Unknown fields are errors that list the supported ones. Every configured server
 must start: one that fails aborts startup with an error naming the server. Fix it,
@@ -172,6 +173,41 @@ field by field. Every surface names the asking server. A form schema outside the
 flat primitive subset the specification allows is refused with `-32602` before
 anyone is asked. With no user to ask (headless runs, `serve` without such a
 client), the reply is `{"action":"decline"}`.
+
+### Sampling
+
+A server may use Tempest's model only when its entry sets `"sampling": true`.
+Tempest declares the `sampling` capability to that server alone, and without the
+`tools` or `context` sub-capabilities. Every other server's
+`sampling/createMessage` gets `-32601`.
+
+- **Model.** Requests go to the `smol` role model. Settings
+  `mcp_sampling_model` (or `HARNESS_MCP_SAMPLING_MODEL`) names another model for
+  sampling only. The server's `modelPreferences`, `temperature` and
+  `stopSequences` are ignored; reasoning effort is the smol role's.
+- **What the model sees.** The server's `systemPrompt` and `messages` (text and
+  images), nothing else. `includeContext` is treated as `none`, so no part of the
+  session's conversation is shared. A request with `tools`, `toolChoice`,
+  `tool_use` or `tool_result` content, or audio, gets `-32602`.
+- **Cap.** The server's `maxTokens` is lowered to `mcp_sampling_max_tokens`, which
+  defaults to `max_tokens`.
+- **Approval.** A server's first request asks the session's user through the same
+  prompter as tool permissions: an ACP `session/request_permission` whose title
+  names the server, the model and the capped limit, and whose `rawInput` holds the
+  messages. *Allow always* and *reject always* hold for that server until the
+  session closes; the once-choices ask again on the next request. With no user to
+  ask (one-shot runs, `serve` without an approving client) the request is refused
+  unless `mcp_sampling_allow_headless` is `true`. A refusal reaches the server as
+  error `-1` with the reason, naming that setting when it applies.
+- **Spend.** Sampling is answered only while a run is in progress, normally
+  during the server's own tool call; at other times it is refused. The call
+  shares the run's cost budget, and its usage is journaled as a receipt named
+  `mcp-sampling:<server>:<id>` and added to the session's usage, so it survives
+  resume and shows in `tempest/usage` updates with that `sourceRef`.
+
+```json
+{"mcpServers": {"notes": {"command": "notes-mcp", "sampling": true}}}
+```
 
 ### Progress and server logs
 

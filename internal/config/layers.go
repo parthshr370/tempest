@@ -401,6 +401,9 @@ var settingInputs = []settingInput{
 	{key: "workspace_listing_max_files", env: "HARNESS_WORKSPACE_LISTING_MAX_FILES", kind: inputInt},
 	{key: "workspace_listing_max_bytes", env: "HARNESS_WORKSPACE_LISTING_MAX_BYTES", kind: inputInt},
 	{key: "mcp_config", env: "HARNESS_MCP_CONFIG", flag: "mcp-config", field: func(f *FlagValues) flagInput { return &f.MCPConfig }},
+	{key: "mcp_sampling_model", env: "HARNESS_MCP_SAMPLING_MODEL"},
+	{key: "mcp_sampling_max_tokens", env: "HARNESS_MCP_SAMPLING_MAX_TOKENS", kind: inputInt},
+	{key: "mcp_sampling_allow_headless", env: "HARNESS_MCP_SAMPLING_ALLOW_HEADLESS", kind: inputBool},
 	{key: "enable_lsp", env: "HARNESS_ENABLE_LSP", flag: "enable-lsp", kind: inputBool, field: func(f *FlagValues) flagInput { return &f.EnableLSP }},
 	{key: "lsp_config", env: "HARNESS_LSP_CONFIG", flag: "lsp-config", field: func(f *FlagValues) flagInput { return &f.LSPConfig }},
 	{key: "cloud_policy", env: "HARNESS_CLOUD_POLICY", flag: "cloud-policy", field: func(f *FlagValues) flagInput { return &f.CloudPolicy }},
@@ -600,6 +603,7 @@ var projectGates = map[string]trustGate{
 	"hooks":                       gateExecutable,
 	"mcp_config":                  gateExecutable,
 	"mcp_servers":                 gateExecutable,
+	"mcp_sampling_allow_headless": gateExecutable,
 	"lsp_config":                  gateExecutable,
 	"enable_lsp":                  gateExecutable,
 	"debug_adapters":              gateExecutable,
@@ -638,7 +642,7 @@ var projectGates = map[string]trustGate{
 // settings, nil for none.
 func projectGate(key string, value *settingsNode, operator *fileSettings) trustGate {
 	switch key {
-	case "model", "plan_model", "smol_model", "fallback_models":
+	case "model", "plan_model", "smol_model", "fallback_models", "mcp_sampling_model":
 		if namesModelEndpoint(value) {
 			return gateCredentials
 		}
@@ -686,7 +690,7 @@ func narrowsPermissions(key string, value *settingsNode, operator *fileSettings)
 	switch key {
 	case "plan":
 		return equalSettings(value, boolNode(true))
-	case "enable_web":
+	case "enable_web", "mcp_sampling_allow_headless":
 		return equalSettings(value, boolNode(false))
 	case "permission_mode_default":
 		return equalSettings(value, planModeNode)
@@ -1001,6 +1005,7 @@ func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[
 		"workspace_listing":           boolNode(true),
 		"workspace_listing_max_files": numberNode(strconv.Itoa(DefaultWorkspaceListingMaxFiles)),
 		"workspace_listing_max_bytes": numberNode(strconv.Itoa(DefaultWorkspaceListingMaxBytes)),
+		"mcp_sampling_allow_headless": boolNode(false),
 	}
 	origins := map[string]string{}
 	for key, value := range map[string]string{
@@ -1302,6 +1307,10 @@ func mergeEffective(stack []*settingsLayer, requirements []managedRequirement, l
 		if _, set := merged[key]; !set {
 			merged[key] = value
 		}
+	}
+	if _, set := merged["mcp_sampling_max_tokens"]; !set {
+		// Sampling inherits the effective output cap when no layer sets its own.
+		merged["mcp_sampling_max_tokens"] = merged["max_tokens"].clone()
 	}
 	if _, set := merged["session_dir"]; !set {
 		// The session directory follows the effective agent directory.

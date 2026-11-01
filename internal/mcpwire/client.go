@@ -40,6 +40,10 @@ type Handlers struct {
 	// Elicitation declares the elicitation capability (form and URL
 	// modes); Request must then answer elicitation/create.
 	Elicitation bool
+	// Sampling declares the sampling capability without its tools or
+	// context sub-capabilities; Request must then answer
+	// sampling/createMessage.
+	Sampling bool
 }
 
 type transport interface {
@@ -154,7 +158,8 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 			Roots struct {
 				ListChanged bool `json:"listChanged"`
 			} `json:"roots"`
-			Elicitation *modes `json:"elicitation,omitempty"`
+			Elicitation *modes    `json:"elicitation,omitempty"`
+			Sampling    *struct{} `json:"sampling,omitempty"`
 		} `json:"capabilities"`
 		ClientInfo struct {
 			Name    string `json:"name"`
@@ -163,6 +168,9 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 	}{ProtocolVersion: PreferredVersion}
 	if handlers.Elicitation {
 		params.Capabilities.Elicitation = &modes{}
+	}
+	if handlers.Sampling {
+		params.Capabilities.Sampling = &struct{}{}
 	}
 	params.ClientInfo.Name = "tempest"
 	params.ClientInfo.Version = build.Current().Version

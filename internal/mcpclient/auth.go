@@ -64,7 +64,7 @@ func (a *serverAuth) Rejected(ctx context.Context, rejection mcpwire.Rejection) 
 
 // handlers wires this server's callbacks into a new connection.
 func (s *server) handlers() mcpwire.Handlers {
-	handlers := mcpwire.Handlers{Notify: s.notification, Request: s.request, AdmitProcess: s.manager.admitProcess, Elicitation: true}
+	handlers := mcpwire.Handlers{Notify: s.notification, Request: s.request, AdmitProcess: s.manager.admitProcess, Elicitation: true, Sampling: s.config.Sampling && s.manager.sample != nil}
 	if s.auth != nil {
 		handlers.Auth = s.auth
 	}
@@ -85,7 +85,7 @@ func (s *server) authorize(ctx context.Context, required *mcpoauth.LoginRequired
 		return s.loginUnavailable(ctx, required)
 	}
 	present := func(ctx context.Context, authorizationURL string) error {
-		id, err := elicitationID()
+		id, err := randomID()
 		if err != nil {
 			return err
 		}
@@ -119,7 +119,8 @@ func (s *server) loginUnavailable(ctx context.Context, required *mcpoauth.LoginR
 	return required
 }
 
-func elicitationID() (string, error) {
+// randomID returns 128 random bits in hex: elicitation and sampling ids.
+func randomID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return "", err

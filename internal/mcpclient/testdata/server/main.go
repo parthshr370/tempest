@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -135,7 +136,7 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				Cursor string `json:"cursor"`
 			}
 			_ = json.Unmarshal(params, &page)
-			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change", "elicit"}
+			names := []string{"echo", "count", "block", "error", "mixed", "large", "crash", "change", "elicit", "sample"}
 			if f.generation.Load() > 0 {
 				names = append(names, "added")
 			}
@@ -214,6 +215,8 @@ func (f *fixture) handle(ctx context.Context, method string, params json.RawMess
 				text = "changed"
 			case "elicit":
 				text = f.elicit(callCtx, call.Arguments)
+			case "sample":
+				text = f.sample(callCtx, call.Arguments)
 			case "mixed":
 				return map[string]any{"content": []map[string]any{{"type": "text", "text": "first"}, {"type": "image", "data": pixelPNG, "mimeType": "image/png"}, {"type": "resource", "resource": map[string]string{"uri": "file:///do-not-open", "mimeType": "text/plain", "text": "embedded"}}, {"type": "resource_link", "uri": "https://do-not-fetch.example", "name": "link", "description": "reference"}, {"type": "audio", "data": base64.StdEncoding.EncodeToString([]byte("audio")), "mimeType": "audio/wav"}, {"type": "unknown", "value": "kept"}}, "structuredContent": map[string]string{"value": "structured"}, "isError": true}, nil
 			}
@@ -323,6 +326,35 @@ func (f *fixture) elicit(ctx context.Context, arguments json.RawMessage) string 
 	var reply json.RawMessage
 	if err := f.conn.Call(ctx, "elicitation/create", request, &reply); err != nil {
 		return "elicitation error: " + err.Error()
+	}
+	return string(reply)
+}
+
+// sample sends sampling/createMessage with the call's value as the request
+// params (a default request when empty) and returns the client's raw reply,
+// or why there is none.
+func (f *fixture) sample(ctx context.Context, arguments json.RawMessage) string {
+	var args struct {
+		Value string `json:"value"`
+	}
+	_ = json.Unmarshal(arguments, &args)
+	f.mu.Lock()
+	_, declared := f.clientCaps["sampling"]
+	f.mu.Unlock()
+	if !declared {
+		return "sampling not declared"
+	}
+	request := json.RawMessage(`{"messages":[{"role":"user","content":{"type":"text","text":"Summarize the fixture"}}],"systemPrompt":"You are terse.","includeContext":"allServers","maxTokens":100}`)
+	if args.Value != "" && args.Value != "ok" {
+		request = json.RawMessage(args.Value)
+	}
+	var reply json.RawMessage
+	if err := f.conn.Call(ctx, "sampling/createMessage", request, &reply); err != nil {
+		var rpcErr *rpc.Error
+		if errors.As(err, &rpcErr) {
+			return fmt.Sprintf("sampling error: %d %s", rpcErr.Code, rpcErr.Message)
+		}
+		return "sampling error: " + err.Error()
 	}
 	return string(reply)
 }

@@ -5,7 +5,8 @@
 // "openai:gpt-5.1@https://host/v1" and hands them here. We parse the provider
 // out of each spec, look up the right credential, and bind a stream function
 // against the provider layer. [ResolveRoles] does this for all three roles (the
-// default agent, the read-only plan model, and the small smol helper), so each
+// default agent, the read-only plan model, and the small smol helper), plus the
+// model that answers MCP sampling (the smol router unless overridden), so each
 // role can point at a different provider while sharing one retry policy and
 // token budget. An unknown provider is a hard error, never a silent fallback.
 package adapter
@@ -23,12 +24,15 @@ import (
 // The fallback lists are the backup models of each role, tried in order when
 // the role's model is unavailable; config resolves role inheritance.
 type RoleRoutingConfig struct {
-	DefaultModel       string
-	PlanModel          string
-	SmolModel          string
-	DefaultFallbacks   []string
-	PlanFallbacks      []string
-	SmolFallbacks      []string
+	DefaultModel     string
+	PlanModel        string
+	SmolModel        string
+	DefaultFallbacks []string
+	PlanFallbacks    []string
+	SmolFallbacks    []string
+	// SamplingModel answers MCP server sampling requests; empty uses the
+	// smol role's router.
+	SamplingModel      string
 	AnthropicBaseURL   string
 	OpenAIBaseURL      string
 	MaxTokens          int
@@ -40,9 +44,10 @@ type RoleRoutingConfig struct {
 
 // RoleRouters contains a fully routed provider for each agent role.
 type RoleRouters struct {
-	Default ProviderRouter
-	Plan    ProviderRouter
-	Smol    ProviderRouter
+	Default  ProviderRouter
+	Plan     ProviderRouter
+	Smol     ProviderRouter
+	Sampling ProviderRouter
 }
 
 // ResolveRoles routes the default, plan, and smol role models through the
@@ -64,7 +69,13 @@ func ResolveRoles(cfg RoleRoutingConfig) (RoleRouters, error) {
 	if err != nil {
 		return RoleRouters{}, err
 	}
-	return RoleRouters{Default: defaultRouter, Plan: planRouter, Smol: smolRouter}, nil
+	samplingRouter := smolRouter
+	if spec := strings.TrimSpace(cfg.SamplingModel); spec != "" {
+		if samplingRouter, err = newRoleRoute(spec, cfg); err != nil {
+			return RoleRouters{}, err
+		}
+	}
+	return RoleRouters{Default: defaultRouter, Plan: planRouter, Smol: smolRouter, Sampling: samplingRouter}, nil
 }
 
 // newRoleRouter routes one role model and its backups, each with the

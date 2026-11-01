@@ -115,7 +115,7 @@ func TestMCPVersionNegotiation(t *testing.T) {
 	for _, mode := range []string{"normal", "june"} {
 		t.Run(mode, func(t *testing.T) {
 			manager, _ := openFixture(t, mode)
-			if len(manager.Tools()) != 9 {
+			if len(manager.Tools()) != 10 {
 				t.Fatalf("tools %d", len(manager.Tools()))
 			}
 		})
