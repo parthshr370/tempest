@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/hashline"
 	"go.harness.dev/harness/internal/pathutil"
+	"go.harness.dev/harness/internal/refs"
 	"go.harness.dev/harness/internal/schema"
 	"go.harness.dev/harness/internal/toolio"
 )
@@ -272,6 +273,37 @@ func verifyEditTag(store *hashline.Store, canonicalPath, path, tag string, raw [
 		return &editdiff.StaleAnchorError{Path: path, Expected: strings.ToUpper(tag), Actual: current}
 	}
 	return nil
+}
+
+// headerAnchorTag returns the tag of an edit anchor given as the
+// [path#TAG] header the tools display. The header must name the file being
+// edited: a tag minted for another file says nothing about this one.
+func headerAnchorTag(cwd string, options ToolsOptions, target mutationTarget, path, header string) (string, error) {
+	named, tag, err := hashline.ParseHeader(header)
+	if err != nil {
+		return "", fmt.Errorf("anchor: %w", err)
+	}
+	if !namesTarget(cwd, options, target, named) {
+		return "", fmt.Errorf("anchor %s is the header of %s, but this edit changes %s; pass the [path#TAG] header of %s from your latest read of it", header, named, path, path)
+	}
+	return tag, nil
+}
+
+// namesTarget reports whether path resolves to the file target changes,
+// so `./a.go`, `a.go` and a symlink to it name the same file.
+func namesTarget(cwd string, options ToolsOptions, target mutationTarget, path string) bool {
+	if refs.IsURL(path) {
+		if target.canonicalPath != "" || options.Refs == nil {
+			return false
+		}
+		location, err := options.Refs.LocalTarget(path)
+		return err == nil && location.Abs() == target.queueKey
+	}
+	if target.canonicalPath == "" {
+		return false
+	}
+	_, canonical, err := rootRelPaths(cwd, pathutil.ResolveToCwd(path, cwd))
+	return err == nil && canonical == target.canonicalPath
 }
 
 // taggedResult renders the [path#TAG] header and changed-line preview that

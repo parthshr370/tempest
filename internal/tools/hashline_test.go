@@ -217,6 +217,66 @@ func TestEditAndWriteAcceptAndReturnTags(t *testing.T) {
 	}
 }
 
+// TestEditAcceptsDisplayedHeaderAnchor covers the anchor contract: edit
+// takes the [path#TAG] header exactly as read prints it, only for the file
+// it names, and still rejects stale content.
+func TestEditAcceptsDisplayedHeaderAnchor(t *testing.T) {
+	dir := t.TempDir()
+	all := hashlineTools(t, dir, nil)
+	if err := os.MkdirAll(filepath.Join(dir, "calc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const source = "package calc\n\nfunc Multiply(a, b int) int {\n\treturn a*b + 1\n}\n"
+	writeFile(t, filepath.Join(dir, "calc", "calc.go"), source)
+	writeFile(t, filepath.Join(dir, "other.go"), "package other\n")
+	contents := func() string {
+		data, err := os.ReadFile(filepath.Join(dir, "calc", "calc.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	edit := func(path, anchor, oldText, newText string) error {
+		_, err := executeTool(t, all[EditTool], map[string]any{"path": path, "edits": []map[string]string{{"old_text": oldText, "new_text": newText, "anchor": anchor}}})
+		return err
+	}
+	header := strings.SplitN(readThrough(t, all, "calc/calc.go"), "\n", 2)[0]
+	if header != "[calc/calc.go#"+hashline.Tag([]byte(source))+"]" {
+		t.Fatalf("read header = %q", header)
+	}
+	if err := edit("calc/calc.go", header, "a*b + 1", "a * b"); err != nil {
+		t.Fatalf("displayed header rejected: %v", err)
+	}
+	if got := contents(); !strings.Contains(got, "\treturn a * b\n") {
+		t.Fatalf("file after header-anchored edit = %q", got)
+	}
+
+	// The header that named the old content is stale now.
+	before := contents()
+	if err := edit("calc/calc.go", header, "a * b", "b * a"); !errors.Is(err, editdiff.ErrStaleAnchor) {
+		t.Fatalf("stale header: %v", err)
+	}
+	// Another file's header never vouches for this one, even when current.
+	otherHeader := strings.SplitN(readThrough(t, all, "other.go"), "\n", 2)[0]
+	err := edit("calc/calc.go", otherHeader, "a * b", "b * a")
+	if err == nil || errors.Is(err, editdiff.ErrStaleAnchor) || !strings.Contains(err.Error(), "header of other.go") || !strings.Contains(err.Error(), "changes calc/calc.go") {
+		t.Fatalf("path mismatch: %v", err)
+	}
+	// A tag that is not hex is rejected, not treated as stale or accepted.
+	if err := edit("calc/calc.go", "[calc/calc.go#ZZZZ]", "a * b", "b * a"); err == nil || !strings.Contains(err.Error(), "not a section tag") {
+		t.Fatalf("malformed header: %v", err)
+	}
+	if got := contents(); got != before {
+		t.Fatalf("rejected edits changed the file: %q", got)
+	}
+
+	// A fresh header works through another spelling of the same path.
+	header = strings.SplitN(readThrough(t, all, "calc/calc.go"), "\n", 2)[0]
+	if err := edit("./calc/calc.go", header, "a * b", "b * a"); err != nil {
+		t.Fatalf("same file, other spelling: %v", err)
+	}
+}
+
 func TestHashlineConcurrentCrossFilePatchesDoNotDeadlock(t *testing.T) {
 	dir := t.TempDir()
 	all := hashlineTools(t, dir, nil)

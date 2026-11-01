@@ -208,21 +208,36 @@ func parseSectionHeader(trimmed string, lineNum int) (*Section, error) {
 	if !strings.HasSuffix(trimmed, "]") {
 		return nil, fmt.Errorf("line %d: section header must be [PATH#TAG] on its own line; got %q", lineNum, trimmed)
 	}
-	inner := trimmed[1 : len(trimmed)-1]
+	path, tag, err := ParseHeader(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: %w", lineNum, err)
+	}
+	return &Section{Path: path, Tag: tag, Line: lineNum}, nil
+}
+
+// ParseHeader splits a `[PATH#TAG]` header, the form read, grep, write and
+// edit display, into its path and upper-case 4-hex tag. Patch section
+// headers and edit anchors share it, so both accept exactly what the tools
+// show.
+func ParseHeader(header string) (path, tag string, err error) {
+	if !strings.HasPrefix(header, "[") || !strings.HasSuffix(header, "]") {
+		return "", "", fmt.Errorf("header must be [PATH#TAG]; got %q", header)
+	}
+	inner := header[1 : len(header)-1]
 	hash := strings.LastIndexByte(inner, '#')
 	if hash < 0 {
-		path := strings.TrimSpace(inner)
-		return nil, fmt.Errorf("line %d: section [%s] has no snapshot tag; use [%s#TAG] with the 4-hex tag from your latest read or grep of that file. To create a new file, use the write tool", lineNum, path, path)
+		name := strings.TrimSpace(inner)
+		return "", "", fmt.Errorf("section [%s] has no snapshot tag; use [%s#TAG] with the 4-hex tag from your latest read or grep of that file. To create a new file, use the write tool", name, name)
 	}
-	path := strings.TrimSpace(inner[:hash])
-	tag := strings.TrimSpace(inner[hash+1:])
+	path = strings.TrimSpace(inner[:hash])
+	tag = strings.TrimSpace(inner[hash+1:])
 	if path == "" {
-		return nil, fmt.Errorf("line %d: section header %q has an empty path", lineNum, trimmed)
+		return "", "", fmt.Errorf("section header %q has an empty path", header)
 	}
 	if !IsTag(tag) {
-		return nil, fmt.Errorf("line %d: %q is not a section tag; the tag is the 4 hex digits after # in read/grep headers, e.g. [%s#1A2B]", lineNum, tag, path)
+		return "", "", fmt.Errorf("%q is not a section tag; the tag is the 4 hex digits after # in read/grep headers, e.g. [%s#1A2B]", tag, path)
 	}
-	return &Section{Path: path, Tag: strings.ToUpper(tag), Line: lineNum}, nil
+	return path, strings.ToUpper(tag), nil
 }
 
 func parseMoveDest(rest string, lineNum int) (string, error) {

@@ -59,9 +59,14 @@ section of a patch is validated before any file is written.
 
 Each result returns the new tag and a numbered preview of the changed lines, so the
 next edit can chain from it. A stale tag is rejected with the current tag and the
-rows around the lines you named. LF/CRLF endings and a UTF-8 BOM are preserved. `edit`
-(exact-text replacement) accepts the same 4-hex tag as its anchor, as well as the full
-anchor an `lsp_rename` plan carries.
+rows around the lines you named. LF/CRLF endings and a UTF-8 BOM are preserved.
+
+`edit` (exact-text replacement) takes the same snapshot as its `anchor`: the whole
+`[path#TAG]` header exactly as `read`, `grep`, `write` or `edit` displayed it, the
+4-hex tag alone, or the full anchor an `lsp_rename` plan carries. A header must name
+the file being edited (`./a.go` and `a.go` are the same file); a header of another
+file is rejected with both paths named, and a stale tag is rejected as for
+`hashline`. Any other anchor text is rejected, never ignored.
 
 ## Atomic writes and rollback
 
@@ -420,7 +425,7 @@ debug session is gone and requires an explicit new launch or attach.
 
 - `read`: files, directories, archives and their members, office documents, PDF text, SQLite, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`, `issue://`, `pr://`). Numbered content when the file fits one read, a structural outline for a Go file that does not. `paths` reads up to 20 files in one call, each with its own selector.
 - `write`: create or overwrite a file, or a `local://` scratch file.
-- `edit`: exact-text replacement, guarded by the `[path#TAG]` tag (or an `lsp_rename` anchor). Also edits `local://` files.
+- `edit`: exact-text replacement, guarded by the file's `[path#TAG]` header, its tag, or an `lsp_rename` anchor. Also edits `local://` files.
 - `hashline`: line-anchored `PUT`/`CUT`/`REM`/`MV` patches over one or many files, with block targets and clipboard registers. See [Hashline edits](#hashline-edits).
 - `grep`: regex search across the tree, under up to 20 `paths` at once, or under an internal URL.
 - `find`: glob-based path lookup.
