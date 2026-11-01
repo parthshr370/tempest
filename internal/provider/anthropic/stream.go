@@ -27,6 +27,7 @@ import (
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/engine/util"
 	"go.harness.dev/harness/internal/provider/base"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 // Stream sends a streaming request to the Anthropic Messages API and returns an
@@ -172,6 +173,7 @@ func runStream(parent context.Context, s *stream.AssistantStream, model types.Mo
 		req.Header.Set(key, value)
 	}
 
+	tracecontext.Inject(req.Context(), req.Header)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		pushError(s, output, watchdog.Err(parent.Err(), err), parent.Err() != nil)

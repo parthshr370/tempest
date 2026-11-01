@@ -18,6 +18,7 @@ import (
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/tempest"
 	"go.harness.dev/harness/tempest/extension"
 )
@@ -330,9 +331,12 @@ func (s *Server) reap(now time.Time) {
 
 // ServeStdio serves one client. EOF doesn't cancel its accepted runs.
 func (s *Server) ServeStdio(stream io.ReadWriteCloser) error {
-	return s.serveConn(rpc.NewStream(stream))
+	return s.serveConn(rpc.NewStream(stream), tracecontext.SpanContext{})
 }
-func (s *Server) serveConn(c *rpc.Conn) error {
+
+// serveConn serves one ACP connection; parent is the trace context its
+// transport arrived with, if any.
+func (s *Server) serveConn(c *rpc.Conn, parent tracecontext.SpanContext) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -342,7 +346,7 @@ func (s *Server) serveConn(c *rpc.Conn) error {
 	s.connections[c] = struct{}{}
 	s.mu.Unlock()
 	defer func() { _ = c.Close(); s.mu.Lock(); delete(s.connections, c); s.mu.Unlock() }()
-	return acp.NewClient(c, s, s.broker).Serve()
+	return acp.NewClient(c, s, s.broker).WithRemoteParent(parent).Serve()
 }
 
 // Handler exposes the authenticated /acp upgrade and unauthenticated /healthz.
@@ -362,11 +366,12 @@ func (s *Server) Handler() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]int{"sessions": sessions, "running": running})
 	})
 	mux.Handle("/acp", s.authorize(true, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parent, _ := tracecontext.Extract(r.Header)
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 		if err != nil {
 			return
 		}
-		_ = s.serveConn(rpc.NewWebSocket(ws))
+		_ = s.serveConn(rpc.NewWebSocket(ws), parent)
 	})))
 	mux.Handle("/a2a", s.authorize(false, true, http.HandlerFunc(s.handleA2A)))
 	mux.Handle("/.well-known/agent-card.json", s.publicCard())

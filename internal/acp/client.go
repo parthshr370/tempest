@@ -23,6 +23,7 @@ import (
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/tempest"
 	"go.harness.dev/harness/tempest/durable"
 	"go.harness.dev/harness/tempest/environment"
@@ -68,11 +69,31 @@ type Client struct {
 	notices     bool
 	watches     map[string]*watch
 	closed      bool
+	// remoteParent is the trace context the connection arrived with, the
+	// parent of runs whose prompt names none.
+	remoteParent tracecontext.SpanContext
 }
 
 // NewClient binds a connection to the process-wide registry and permission broker.
 func NewClient(c *rpc.Conn, backend Backend, broker *Broker) *Client {
 	return &Client{conn: c, backend: backend, broker: broker, watches: make(map[string]*watch)}
+}
+
+// WithRemoteParent makes span the parent of the runs this connection starts,
+// for a transport whose handshake carried a W3C traceparent (the HTTP upgrade
+// of a WebSocket). A prompt's own _meta.traceparent wins over it.
+func (c *Client) WithRemoteParent(span tracecontext.SpanContext) *Client {
+	c.remoteParent = span
+	return c
+}
+
+// traced puts the run's remote parent in ctx: the prompt's _meta.traceparent
+// when it is valid, else the connection's.
+func (c *Client) traced(ctx context.Context, traceparent string) context.Context {
+	if parent, ok := tracecontext.Parse(traceparent); ok {
+		return tracecontext.WithRemoteParent(ctx, parent)
+	}
+	return tracecontext.WithRemoteParent(ctx, c.remoteParent)
 }
 
 // Serve disconnects subscriptions without cancelling session-owned runs.
@@ -241,7 +262,10 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		Report               string   `json:"report"`
 		Force                bool     `json:"force"`
 		Meta                 struct {
-			Tempest struct {
+			// Traceparent is the W3C trace context ACP reserves at the
+			// root of _meta; the prompt's run becomes its child span.
+			Traceparent string `json:"traceparent"`
+			Tempest     struct {
 				// OutputSchema is the session/prompt run's final-answer
 				// JSON Schema; the response's _meta.tempest.output carries
 				// the validated answer.
@@ -301,13 +325,14 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		if method == "session/prompt" && p.Meta.Tempest.RequestID != "" {
 			remove := c.broker.add(s.ID(), c.conn)
-			submission, err := s.Submit(ctx, tempest.Input{RequestID: p.Meta.Tempest.RequestID, Prompt: prompt, Placement: tempest.PlacementInput})
+			submitCtx := c.traced(ctx, p.Meta.Traceparent)
+			submission, err := s.Submit(submitCtx, tempest.Input{RequestID: p.Meta.Tempest.RequestID, Prompt: prompt, Placement: tempest.PlacementInput})
 			if err != nil {
 				remove()
 				return nil, failure(err)
 			}
 			if submission.State == "accepted" {
-				if err := s.ResumePending(ctx); err != nil {
+				if err := s.ResumePending(submitCtx); err != nil {
 					remove()
 					return nil, failure(err)
 				}
@@ -326,10 +351,11 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		remove := c.broker.add(s.ID(), c.conn)
 		var run *tempest.Run
+		runCtx := c.traced(c.backend.RunContext(), p.Meta.Traceparent)
 		if method == "session/prompt" {
-			run, err = s.Begin(c.backend.RunContext(), prompt)
+			run, err = s.Begin(runCtx, prompt)
 		} else {
-			run, err = s.BeginContinue(c.backend.RunContext())
+			run, err = s.BeginContinue(runCtx)
 		}
 		if err != nil {
 			remove()

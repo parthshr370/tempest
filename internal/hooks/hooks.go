@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/procgroup"
+	"go.harness.dev/harness/internal/tracecontext"
 )
 
 // Events is the supported command-hook lifecycle, in display order.
@@ -519,7 +520,7 @@ func execute(ctx context.Context, command Command, event, cwd string, payload []
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command.Command)
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TEMPEST_PROJECT_DIR="+cwd, "CLAUDE_PROJECT_DIR="+cwd)
+	cmd.Env = tracecontext.Environ(ctx, append(os.Environ(), "TEMPEST_PROJECT_DIR="+cwd, "CLAUDE_PROJECT_DIR="+cwd))
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }

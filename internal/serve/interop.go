@@ -17,6 +17,7 @@ import (
 	model "github.com/a2aproject/a2a-go/v2/a2a"
 	"go.harness.dev/harness/internal/a2a"
 	"go.harness.dev/harness/internal/mcpconfig"
+	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/tempest"
 )
 
@@ -135,6 +136,11 @@ func (s *Server) handleA2A(w http.ResponseWriter, r *http.Request) {
 	if server == nil {
 		http.Error(w, "A2A advertised address is not configured", 503)
 		return
+	}
+	// A2A tasks start their runs under the request context, so a W3C
+	// traceparent header makes the run its child span.
+	if parent, ok := tracecontext.Extract(r.Header); ok {
+		r = r.WithContext(tracecontext.WithRemoteParent(r.Context(), parent))
 	}
 	server.Handler().ServeHTTP(w, r)
 }
