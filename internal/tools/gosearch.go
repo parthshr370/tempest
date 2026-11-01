@@ -188,25 +188,60 @@ func matchGlobPattern(glob string, name string) bool {
 // matchSegments matches a glob split on `/` against a path split on `/`,
 // with `**` matching zero or more segments.
 func matchSegments(pattern []string, name []string) bool {
-	for len(pattern) > 0 {
-		if pattern[0] == "**" {
-			if len(pattern) == 1 {
+	matcher := segmentMatcher{pattern: pattern, name: name}
+	return matcher.match(0, 0)
+}
+
+// segmentMatcher is one matchSegments call. Each `**` tries every split of
+// the remaining path, so repeated `**` would retry the same (pattern, path)
+// offsets exponentially often; as in wildmatch, results are memoised once a
+// match has recursed wildmatchMemoAfter times. Ordinary globs never get there.
+type segmentMatcher struct {
+	pattern []string
+	name    []string
+	calls   int
+	memo    map[int]bool
+}
+
+// match matches pattern[p:] against name[n:].
+func (m *segmentMatcher) match(p int, n int) bool {
+	for p < len(m.pattern) {
+		if m.pattern[p] == "**" {
+			if p == len(m.pattern)-1 {
 				return true
 			}
-			for i := range len(name) + 1 {
-				if matchSegments(pattern[1:], name[i:]) {
+			for split := n; split <= len(m.name); split++ {
+				if m.recurse(p+1, split) {
 					return true
 				}
 			}
 			return false
 		}
-		if len(name) == 0 {
+		if n == len(m.name) {
 			return false
 		}
-		if ok, err := path.Match(pattern[0], name[0]); err != nil || !ok {
+		if ok, err := path.Match(m.pattern[p], m.name[n]); err != nil || !ok {
 			return false
 		}
-		pattern, name = pattern[1:], name[1:]
+		p, n = p+1, n+1
 	}
-	return len(name) == 0
+	return n == len(m.name)
+}
+
+// recurse is a recursive match call, memoised past wildmatchMemoAfter.
+func (m *segmentMatcher) recurse(p int, n int) bool {
+	m.calls++
+	if m.calls <= wildmatchMemoAfter {
+		return m.match(p, n)
+	}
+	key := p*(len(m.name)+1) + n
+	if result, ok := m.memo[key]; ok {
+		return result
+	}
+	if m.memo == nil {
+		m.memo = map[int]bool{}
+	}
+	result := m.match(p, n)
+	m.memo[key] = result
+	return result
 }

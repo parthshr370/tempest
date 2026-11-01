@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/toolio"
 )
@@ -325,6 +326,44 @@ func TestGoGrepGlobFilter(t *testing.T) {
 	matches, _, err := goGrep(context.Background(), root, ".", "needle", "*.go", false, false, 100)
 	if err != nil || len(matches) != 2 {
 		t.Fatalf("go grep glob = %v, %v", matches, err)
+	}
+}
+
+// A glob with `/` matches the whole relative path with `**` spanning zero or
+// more segments, and repeated `**` costs polynomial time, not one attempt per
+// way of splitting the path among them.
+func TestGlobPatternDoubleStar(t *testing.T) {
+	for _, test := range []struct {
+		glob, name string
+		want       bool
+	}{
+		{"**/*.go", "a/b/c.go", true},
+		{"**/*.go", "c.go", true},
+		{"src/**/x.go", "src/x.go", true},
+		{"src/**/x.go", "src/a/b/x.go", true},
+		{"src/**/x.go", "lib/a/x.go", false},
+		{"**/a/**/b", "a/c/b", true},
+		{"**/a/**/b", "c/b", false},
+		{"a/**", "a", true},
+		{"a/**/**/b", "a/b", true},
+		{"a/*/b", "a/x/y/b", false},
+	} {
+		if got := matchGlobPattern(test.glob, test.name); got != test.want {
+			t.Errorf("matchGlobPattern(%q, %q) = %t, want %t", test.glob, test.name, got, test.want)
+		}
+	}
+
+	glob := strings.Repeat("**/", 40) + "x"
+	name := strings.Repeat("a/", 40) + "b"
+	done := make(chan bool, 1)
+	go func() { done <- matchGlobPattern(glob, name) }()
+	select {
+	case matched := <-done:
+		if matched {
+			t.Fatal("pathological glob matched a path without its last segment")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a glob of 40 consecutive ** took more than 5 s on a 41-segment path")
 	}
 }
 
