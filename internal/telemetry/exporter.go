@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +29,12 @@ const (
 	// maxResponseDrain bounds how much of a collector's reply is read so the
 	// connection can be reused; OTLP partial-success bodies are small.
 	maxResponseDrain = 64 << 10
+	// An export the collector answers with a retryable status is sent again
+	// after about this delay, doubled each time up to exportRetryMaxDelay,
+	// and never sooner than the answer's Retry-After; all within the
+	// export's timeout.
+	exportRetryInitialDelay = time.Second
+	exportRetryMaxDelay     = 5 * time.Second
 )
 
 // otlpClient posts OTLP/HTTP JSON requests to one collector.
@@ -37,8 +46,12 @@ type otlpClient struct {
 	userAgent string
 }
 
-// post sends one export request. The request carries no traceparent: the
-// exporter's own traffic is not part of any run's trace.
+// post sends one export request, again after a retryable answer while its
+// timeout allows (OTLP/HTTP: 429, 502, 503 and 504 are retryable, and a
+// Retry-After header names the delay). The request carries no traceparent:
+// the exporter's own traffic is not part of any run's trace. A collector
+// that accepted the request but rejected part of it returns a
+// *partialSuccess error naming how much.
 func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -54,9 +67,36 @@ func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) err
 		}
 		payload = compressed.Bytes()
 	}
+	backoff := exportRetryInitialDelay
+	for {
+		retryAfter, retryable, err := c.send(ctx, endpoint, payload)
+		if !retryable {
+			return err
+		}
+		// Full jitter in the upper half keeps clients that failed together
+		// from retrying together; a Retry-After the collector named is the
+		// least it waits.
+		delay := max(backoff/2+rand.N(backoff/2+1), retryAfter)
+		backoff = min(2*backoff, exportRetryMaxDelay)
+		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < delay {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return err
+		}
+	}
+}
+
+// send makes one export request. retryable reports a status OTLP/HTTP lets
+// a client retry, and retryAfter the delay its Retry-After header names.
+func (c *otlpClient) send(ctx context.Context, endpoint string, payload []byte) (retryAfter time.Duration, retryable bool, err error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("OTLP endpoint %s: invalid URL", redactEndpoint(endpoint))
+		return 0, false, fmt.Errorf("OTLP endpoint %s: invalid URL", redactEndpoint(endpoint))
 	}
 	for key, value := range c.headers {
 		request.Header.Set(key, value)
@@ -68,17 +108,82 @@ func (c *otlpClient) post(ctx context.Context, endpoint string, body []byte) err
 	}
 	response, err := c.http.Do(request)
 	if err != nil {
-		return redactRequestError(err, endpoint)
+		return 0, false, redactRequestError(err, endpoint)
 	}
 	defer response.Body.Close()
-	// Draining lets the transport reuse the connection; a short read only
-	// costs that reuse, so its error does not change the export outcome.
-	_, drainErr := io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseDrain))
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return fmt.Errorf("collector answered %s", response.Status)
+	// Reading the reply to its end lets the transport reuse the connection;
+	// a short read only costs that reuse and a partial-success count.
+	reply, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseDrain))
+	switch response.StatusCode {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return parseRetryAfter(response.Header.Get("Retry-After"), time.Now()), true, fmt.Errorf("collector answered %s", response.Status)
 	}
-	if drainErr != nil {
-		slog.Debug("otlp response drain failed", "error", drainErr)
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return 0, false, fmt.Errorf("collector answered %s", response.Status)
+	}
+	if readErr != nil {
+		slog.Debug("otlp response drain failed", "error", readErr)
+	}
+	return 0, false, parsePartialSuccess(reply)
+}
+
+// parseRetryAfter reads a Retry-After value, delay seconds or an HTTP date,
+// as a delay from now; 0 when it is absent or unreadable.
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.Atoi(value); err == nil {
+		return max(0, time.Duration(seconds)*time.Second)
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		return max(0, at.Sub(now))
+	}
+	return 0
+}
+
+// partialSuccess is a collector's answer that it accepted an export but
+// rejected part of it (OTLP "Partial Success"). Rejected counts the spans,
+// data points or log records it dropped; they must not be sent again.
+type partialSuccess struct {
+	Rejected int64
+	Message  string
+}
+
+func (p *partialSuccess) Error() string {
+	if p.Message == "" {
+		return fmt.Sprintf("collector rejected %d items", p.Rejected)
+	}
+	return fmt.Sprintf("collector rejected %d items: %s", p.Rejected, p.Message)
+}
+
+// otlpCount is an OTLP/JSON int64: a decimal string, or a number from a
+// lenient collector.
+type otlpCount int64
+
+func (c *otlpCount) UnmarshalJSON(raw []byte) error {
+	value, err := strconv.ParseInt(strings.Trim(string(raw), `"`), 10, 64)
+	*c = otlpCount(value)
+	return err
+}
+
+// parsePartialSuccess returns a *partialSuccess for a success reply that
+// rejected items, nil otherwise. An empty or unreadable reply is a full
+// success: the body is optional.
+func parsePartialSuccess(reply []byte) error {
+	var answer struct {
+		PartialSuccess struct {
+			RejectedSpans      otlpCount `json:"rejectedSpans"`
+			RejectedDataPoints otlpCount `json:"rejectedDataPoints"`
+			ErrorMessage       string    `json:"errorMessage"`
+		} `json:"partialSuccess"`
+	}
+	if len(reply) == 0 || json.Unmarshal(reply, &answer) != nil {
+		return nil
+	}
+	partial := answer.PartialSuccess
+	if rejected := int64(partial.RejectedSpans + partial.RejectedDataPoints); rejected > 0 {
+		return &partialSuccess{Rejected: rejected, Message: partial.ErrorMessage}
+	}
+	if partial.ErrorMessage != "" {
+		slog.Warn("otlp collector warned about an export", "message", partial.ErrorMessage)
 	}
 	return nil
 }
@@ -145,12 +250,15 @@ func origin(target *url.URL) string {
 
 // exportHealth logs an exporter's first failure as a warning and later ones
 // at debug level, so an unreachable collector produces one visible line, not
-// one per batch. A success re-arms the warning.
+// one per batch. A success re-arms the warning. failed counts the items of
+// exports that failed, rejected the items a collector refused in an export
+// it otherwise accepted.
 type exportHealth struct {
-	signal  string
-	mu      sync.Mutex
-	failing bool
-	failed  atomic.Uint64
+	signal   string
+	mu       sync.Mutex
+	failing  bool
+	failed   atomic.Uint64
+	rejected atomic.Uint64
 }
 
 func (h *exportHealth) record(err error, items int) {
@@ -163,7 +271,12 @@ func (h *exportHealth) record(err error, items int) {
 		h.failing = false
 		return
 	}
-	h.failed.Add(uint64(items))
+	var partial *partialSuccess
+	if errors.As(err, &partial) {
+		h.rejected.Add(uint64(partial.Rejected))
+	} else {
+		h.failed.Add(uint64(items))
+	}
 	if h.failing {
 		slog.Debug("otlp export failed", "signal", h.signal, "items", items, "error", err)
 		return

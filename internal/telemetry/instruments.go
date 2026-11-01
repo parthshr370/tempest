@@ -70,6 +70,7 @@ func (t *Telemetry) observeSpanLoss() []observation {
 	return []observation{
 		{attributes: []attribute{stringAttribute("reason", "queue_full")}, value: int64(t.spans.dropped.Load())},
 		{attributes: []attribute{stringAttribute("reason", "export_failed")}, value: int64(t.health.failed.Load())},
+		{attributes: []attribute{stringAttribute("reason", "rejected")}, value: int64(t.health.rejected.Load())},
 	}
 }
 
