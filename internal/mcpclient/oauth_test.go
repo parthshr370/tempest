@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -167,4 +169,118 @@ func TestMCPOAuthStepUpWithoutUserFailsTheCallAndKeepsTheScope(t *testing.T) {
 	if read, err := secureTool(t, manager, "read").Execute(t.Context(), "call-read", json.RawMessage(`{}`), nil); err != nil || read.IsError {
 		t.Fatalf("connection retired by an authorization refusal: %#v %v", read, err)
 	}
+}
+
+// serverLogs collects the data of MCP server log messages.
+type serverLogs chan string
+
+func (serverLogs) Enabled(context.Context, slog.Level) bool { return true }
+func (l serverLogs) Handle(_ context.Context, record slog.Record) error {
+	if record.Message == "MCP server log" {
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "data" {
+				l <- attr.Value.String()
+			}
+			return true
+		})
+	}
+	return nil
+}
+func (l serverLogs) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l serverLogs) WithGroup(string) slog.Handler      { return l }
+
+func (l serverLogs) expect(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-l:
+		if got != want {
+			t.Fatalf("server log %q, want %q", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("server log %q never arrived", want)
+	}
+}
+
+func eventually(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !condition(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+}
+
+// The GET stream is optional. When its reconnect is refused for
+// authorization, only the stream stops: a call in flight, authorized when
+// sent, still gets its answer, nothing polls the server meanwhile, and
+// server notifications flow again after the next login.
+func TestMCPOAuthStreamRefusalKeepsCallsAndResumesAfterLogin(t *testing.T) {
+	fixture := mcpoauthtest.New(t, mcpoauthtest.Options{Stream: true})
+	setup := oauthSetup{fixture: fixture, server: mcpconfig.Server{Name: "secure", Transport: "http", URL: fixture.URL, StartupTimeout: "10s", CallTimeout: "10s"}, dir: filepath.Join(t.TempDir(), "mcp-oauth")}
+	logs := make(serverLogs, 16)
+	user := &browser{fixture: fixture}
+	manager, err := Open(t.Context(), []mcpconfig.Server{setup.server}, Options{Cwd: t.TempDir(), SpillDir: t.TempDir(), CredentialDir: setup.dir, Elicit: user.elicit, Logger: slog.New(logs)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := manager.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := manager.Prepare(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the stream", func() bool { return fixture.OpenStreams() == 1 })
+	fixture.Notify(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"before"}}`)
+	logs.expect(t, "before")
+
+	held, abandoned, release := fixture.Hold()
+	defer release()
+	type outcome struct {
+		result agent.AgentToolResult
+		err    error
+	}
+	inFlight := make(chan outcome, 1)
+	read := secureTool(t, manager, "read")
+	go func() {
+		result, err := read.Execute(t.Context(), "call-held", json.RawMessage(`{}`), nil)
+		inFlight <- outcome{result, err}
+	}()
+	<-held
+	// The server forgets every token, then its stream drops; the reconnect
+	// is refused and its refresh token too, so only a login can help.
+	fixture.ExpireAccessTokens()
+	fixture.RevokeRefreshTokens()
+	refusedGET := fixture.StreamRequests() + 1
+	fixture.DropStreams()
+	eventually(t, "the refused refresh", func() bool {
+		return slices.ContainsFunc(fixture.TokenRequests(), func(form url.Values) bool { return form.Get("grant_type") == "refresh_token" })
+	})
+	select {
+	case <-abandoned:
+		t.Fatal("the stream's authorization failure cancelled a call in flight")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	if got := <-inFlight; got.err != nil || got.result.IsError || got.result.Content[0].Text != "did read" {
+		t.Fatalf("call in flight: %#v %v", got.result, got.err)
+	}
+	if got := fixture.StreamRequests(); got != refusedGET {
+		t.Fatalf("%d GET requests after the refusal, want %d: the stream must wait for a login, not poll", got, refusedGET)
+	}
+
+	// The next call needs a login; the stream follows it.
+	result, err := secureTool(t, manager, "read").Execute(t.Context(), "call-after", json.RawMessage(`{}`), nil)
+	if err != nil || result.IsError {
+		t.Fatalf("call after the refusal: %#v %v", result, err)
+	}
+	if len(user.asked) != 2 {
+		t.Fatalf("user asked %d times, want the initial login and one more", len(user.asked))
+	}
+	eventually(t, "the stream after login", func() bool { return fixture.OpenStreams() == 1 })
+	fixture.Notify(`{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"after"}}`)
+	logs.expect(t, "after")
 }

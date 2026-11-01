@@ -27,6 +27,13 @@ type serverAuth struct {
 	// generation counts completed logins so a caller that waited behind
 	// another login does not ask the user a second time.
 	generation atomic.Uint64
+	// mu guards current and renewed.
+	mu sync.Mutex
+	// current is the token last handed out or obtained by a login, "" when
+	// the last Token found none or failed.
+	current string
+	// renewed is closed, and replaced, when current becomes a new token.
+	renewed chan struct{}
 }
 
 func newServerAuth(cfg mcpconfig.Server, store *mcpoauth.Store) (*serverAuth, error) {
@@ -34,10 +41,38 @@ func newServerAuth(cfg mcpconfig.Server, store *mcpoauth.Store) (*serverAuth, er
 	if err != nil {
 		return nil, fmt.Errorf("mcp_config: server %s: %w", cfg.Name, err)
 	}
-	return &serverAuth{name: cfg.Name, flow: flow}, nil
+	return &serverAuth{name: cfg.Name, flow: flow, renewed: make(chan struct{})}, nil
 }
 
-func (a *serverAuth) Token(ctx context.Context) (string, error) { return a.flow.Token(ctx) }
+// Token sees every token the server gets, including one another process
+// stored, so Renewed learns of each refresh and login.
+func (a *serverAuth) Token(ctx context.Context) (string, error) {
+	token, err := a.flow.Token(ctx)
+	a.observe(token)
+	return token, err
+}
+
+func (a *serverAuth) observe(token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if token != "" && token != a.current {
+		close(a.renewed)
+		a.renewed = make(chan struct{})
+	}
+	a.current = token
+}
+
+// Renewed implements mcpwire.Auth.
+func (a *serverAuth) Renewed(refused string) <-chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current != "" && a.current != refused {
+		renewed := make(chan struct{})
+		close(renewed)
+		return renewed
+	}
+	return a.renewed
+}
 
 // Rejected refreshes a rejected token once; otherwise a 401 needs a login
 // and a 403 insufficient_scope needs a step-up login (MCP authorization,
@@ -99,13 +134,15 @@ func (s *server) authorize(ctx context.Context, required *mcpoauth.LoginRequired
 		}
 		return nil
 	}
-	if _, err := auth.flow.Login(ctx, required.Challenge, present); err != nil {
+	record, err := auth.flow.Login(ctx, required.Challenge, present)
+	if err != nil {
 		if errors.Is(err, question.Unavailable) {
 			return s.loginUnavailable(ctx, required)
 		}
 		return err
 	}
 	auth.generation.Add(1)
+	auth.observe(record.AccessToken)
 	return nil
 }
 

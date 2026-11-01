@@ -124,7 +124,10 @@ dynamic registration is stored as soon as it exists, so a login nobody finishes
 does not register another client next time; one the authorization server no
 longer knows (`invalid_client`) is dropped and the next login registers again. A
 `403` with `insufficient_scope` asks for authorization again with the granted and
-challenged scopes together, then retries the request once.
+challenged scopes together, then retries the request once. When the server refuses
+the token on its optional notification stream (the `GET`), only that stream stops:
+calls in flight keep running, and the stream reconnects once Tempest holds a new
+token from a login or refresh, without polling the server meanwhile.
 
 Every URL in discovery other than the server's own origin (`resource_metadata`,
 authorization servers and their endpoints) is named by the server, so Tempest

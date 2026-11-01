@@ -14,6 +14,11 @@ type Auth interface {
 	// Rejected decides what follows a 401 or 403. A nil error retries the
 	// request once with a fresh Token.
 	Rejected(ctx context.Context, rejection Rejection) error
+	// Renewed returns a channel that is closed once Token has a token
+	// other than refused, the one an authorization failure last sent ("" for
+	// none): after a login or a refresh. The optional GET stream waits on it
+	// after such a failure instead of retrying on a timer.
+	Renewed(refused string) <-chan struct{}
 }
 
 // Rejection describes one 401 or 403 answer.
@@ -32,7 +37,11 @@ type Rejection struct {
 
 // AuthError is an authorization failure. The server rejected the request
 // before processing it, so sending it again after authorization is safe.
-type AuthError struct{ Err error }
+type AuthError struct {
+	Err error
+	// token is the bearer the failed request last carried, "" for none.
+	token string
+}
 
 func (e *AuthError) Error() string { return e.Err.Error() }
 

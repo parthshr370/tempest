@@ -40,6 +40,11 @@ type Options struct {
 	// OmitIss leaves the RFC 9207 iss parameter out of authorization
 	// responses although the metadata advertises it.
 	OmitIss bool
+	// Stream answers an authorized GET with a server-to-client SSE stream,
+	// which Notify writes to and DropStreams ends, instead of 405.
+	Stream bool
+	// Resources offers the resource fixture://note.
+	Resources bool
 }
 
 // Server is one authorization server and its protected MCP endpoint. Tool
@@ -62,6 +67,11 @@ type Server struct {
 	tokenRequests  []url.Values
 	verified       int
 	calls          []string
+	streams        map[chan string]bool
+	streamRequests int
+	held           chan string
+	abandoned      chan string
+	release        chan struct{}
 }
 
 type grant struct {
@@ -76,7 +86,7 @@ type issued struct {
 // New starts both servers; they stop with the test.
 func New(t testing.TB, options Options) *Server {
 	t.Helper()
-	s := &Server{Options: options, clients: map[string][]string{}, codes: map[string]grant{}, access: map[string]issued{}, refresh: map[string]issued{}}
+	s := &Server{Options: options, clients: map[string][]string{}, codes: map[string]grant{}, access: map[string]issued{}, refresh: map[string]issued{}, streams: map[chan string]bool{}}
 	if options.TokenLifetime == 0 {
 		s.Options.TokenLifetime = time.Hour
 	}
@@ -84,6 +94,8 @@ func New(t testing.TB, options Options) *Server {
 	s.MCP = httptest.NewServer(http.HandlerFunc(s.resource))
 	t.Cleanup(s.AS.Close)
 	t.Cleanup(s.MCP.Close)
+	// Open streams end before the server's Close waits for its handlers.
+	t.Cleanup(s.DropStreams)
 	s.Issuer = s.AS.URL + options.IssuerPath
 	s.URL = s.MCP.URL + "/mcp"
 	return s
@@ -285,6 +297,11 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if r.Method == http.MethodGet {
+		s.mu.Lock()
+		s.streamRequests++
+		s.mu.Unlock()
+	}
 	challenge := func(status int, parameters string) {
 		header := "Bearer " + parameters
 		if !s.Options.NoChallengeMetadata {
@@ -303,6 +320,10 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if s.Options.Stream {
+			s.stream(w, r)
+			return
+		}
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	case http.MethodDelete:
@@ -328,7 +349,17 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request) {
 	switch message.Method {
 	case "initialize":
 		w.Header().Set("Mcp-Session-Id", "oauth-session")
-		result = map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]string{"name": "oauth-fixture", "version": "1"}}
+		capabilities := map[string]any{"tools": map[string]any{}}
+		if s.Options.Resources {
+			capabilities["resources"] = map[string]any{}
+		}
+		result = map[string]any{"protocolVersion": "2025-11-25", "capabilities": capabilities, "serverInfo": map[string]string{"name": "oauth-fixture", "version": "1"}}
+	case "resources/list":
+		result = map[string]any{"resources": []map[string]string{{"uri": "fixture://note", "name": "note"}}}
+	case "resources/templates/list":
+		result = map[string]any{"resourceTemplates": []any{}}
+	case "resources/read":
+		result = map[string]any{"contents": []map[string]string{{"uri": "fixture://note", "text": "note text"}}}
 	case "tools/list":
 		schema := json.RawMessage(`{"type":"object"}`)
 		result = map[string]any{"tools": []map[string]any{{"name": "read", "inputSchema": schema}, {"name": "write", "inputSchema": schema}}}
@@ -339,7 +370,17 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		s.calls = append(s.calls, message.Params.Name)
+		held, abandoned, release := s.held, s.abandoned, s.release
 		s.mu.Unlock()
+		if held != nil {
+			held <- message.Params.Name
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				abandoned <- message.Params.Name
+				return
+			}
+		}
 		result = map[string]any{"content": []map[string]string{{"type": "text", "text": "did " + message.Params.Name}}}
 	default:
 		writeJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": message.ID, "error": map[string]any{"code": -32601, "message": "method not found"}})
@@ -349,6 +390,69 @@ func (s *Server) resource(w http.ResponseWriter, r *http.Request) {
 }
 
 func hasScope(granted, want string) bool { return slices.Contains(strings.Fields(granted), want) }
+
+// Hold makes every later tools/call wait after it ran, before it answers,
+// until release is called. held receives each waiting call's tool name, and
+// abandoned the name of one whose client gave up while it waited.
+func (s *Server) Hold() (held, abandoned <-chan string, release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.held, s.abandoned, s.release = make(chan string, 16), make(chan string, 16), make(chan struct{})
+	gate := s.release
+	return s.held, s.abandoned, sync.OnceFunc(func() { close(gate) })
+}
+
+// StreamRequests counts GET requests to the MCP endpoint, refused ones
+// included.
+func (s *Server) StreamRequests() int { s.mu.Lock(); defer s.mu.Unlock(); return s.streamRequests }
+
+// OpenStreams counts the SSE streams currently open.
+func (s *Server) OpenStreams() int { s.mu.Lock(); defer s.mu.Unlock(); return len(s.streams) }
+
+// Notify sends one JSON-RPC message to every open stream.
+func (s *Server) Notify(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for events := range s.streams {
+		events <- message
+	}
+}
+
+// DropStreams ends every open stream, as a server restart or proxy does.
+func (s *Server) DropStreams() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for events := range s.streams {
+		close(events)
+		delete(s.streams, events)
+	}
+}
+
+func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
+	events := make(chan string, 16)
+	s.mu.Lock()
+	s.streams[events] = true
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); delete(s.streams, events); s.mu.Unlock() }()
+	flusher := http.NewResponseController(w)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	// A short retry keeps the client's reconnect after DropStreams quick.
+	fmt.Fprint(w, "retry: 10\n\n")
+	_ = flusher.Flush()
+	for {
+		select {
+		case message, open := <-events:
+			if !open {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", message)
+			_ = flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
