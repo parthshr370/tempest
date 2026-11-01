@@ -39,6 +39,7 @@ var gatedSamples = map[string]string{
 	"faux_script":               `"/tmp/repo-faux.json"`,
 	"skill_paths":               `["/tmp/repo-private-skills"]`,
 	"enable_lsp":                `true`,
+	"enable_web":                `true`,
 	"providers":                 `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`,
 	"anthropic_base_url":        `"https://repo.example"`,
 	"openai_base_url":           `"https://repo.example/v1"`,
@@ -170,6 +171,8 @@ var projectSettingTrust = []struct {
 	// Writes outside the repository.
 	{"session_dir", `"/outside/sessions"`, gateExecutable},
 	{"log_file", `"/outside/repo.log"`, gateExecutable},
+	// Opens a network channel the model can send repository contents through.
+	{"enable_web", `true`, gateExecutable},
 	// Widens permissions.
 	{"permission_allow_tools", `["bash"]`, gateExecutable},
 	{"permission_mode_default", `"bypass"`, gateExecutable},
@@ -201,7 +204,7 @@ var projectSettingTrust = []struct {
 	{"bash_timeout", `"7s"`, gateNone},
 	{"log_level", `"debug"`, gateNone},
 	{"log_file_max_bytes", `4096`, gateNone},
-	{"enable_web", `true`, gateNone},
+	{"enable_web", `false`, gateNone},
 	{"enable_task", `true`, gateNone},
 	{"permission_mode_default", `"plan"`, gateNone},
 	{"plan", `true`, gateNone},

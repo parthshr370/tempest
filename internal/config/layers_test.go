@@ -532,11 +532,11 @@ func TestProfileUnset(t *testing.T) {
 		w := newLayerWorkspace(t)
 		w.write(w.user, `{"profiles":{"review":{"model":"anthropic:user-profile"}}}`)
 		w.write(w.projectPath(), `{"profiles":{"review":null}}`)
-		w.write(w.localPath(), `{"profiles":{"review":{"enable_web":true}}}`)
+		w.write(w.localPath(), `{"profiles":{"review":{"enable_task":true}}}`)
 		w.flags.Profile = StringInput{Value: "review", Set: true}
 		resolved := w.mustResolve()
-		if resolved.Model() != defaultModel || !resolved.EnableWeb() {
-			t.Fatalf("model=%q enable_web=%t", resolved.Model(), resolved.EnableWeb())
+		if resolved.Model() != defaultModel || !resolved.EnableTask() {
+			t.Fatalf("model=%q enable_task=%t", resolved.Model(), resolved.EnableTask())
 		}
 	})
 	t.Run("untrusted repository keeps gated keys", func(t *testing.T) {

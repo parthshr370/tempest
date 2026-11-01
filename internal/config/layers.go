@@ -549,7 +549,8 @@ type trustGate int
 const (
 	gateNone trustGate = iota
 	// gateExecutable settings run code, read local files into the model
-	// context, write outside the repository, or widen permissions.
+	// context, write outside the repository, widen permissions, or open a
+	// network channel the model can send repository contents through.
 	gateExecutable
 	// gateCredentials settings choose where credentials are sent.
 	gateCredentials
@@ -571,6 +572,7 @@ var projectGates = map[string]trustGate{
 	"permission_allow_tools":    gateExecutable,
 	"permission_deny_tools":     gateExecutable,
 	"plan":                      gateExecutable,
+	"enable_web":                gateExecutable,
 	"attach":                    gateExecutable,
 	"skill_paths":               gateExecutable,
 	"agent_dir":                 gateExecutable,
@@ -610,14 +612,16 @@ func projectGate(key string, value *settingsNode) trustGate {
 var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
 
 // narrowsPermissions reports whether a repository value can only tighten the
-// permissions the layers below it set, so it applies without trust: plan
-// mode, and a deny list, which an untrusted repository adds to the lists
-// below it (unionProjectDenies). Every other value of these keys, null
-// included, could lift an operator's restriction.
+// permissions and capabilities the layers below it set, so it applies without
+// trust: plan mode, web tools off, and a deny list, which an untrusted
+// repository adds to the lists below it (unionProjectDenies). Every other
+// value of these keys, null included, could lift an operator's restriction.
 func narrowsPermissions(key string, value *settingsNode) bool {
 	switch key {
 	case "plan":
 		return equalSettings(value, boolNode(true))
+	case "enable_web":
+		return equalSettings(value, boolNode(false))
 	case "permission_mode_default":
 		return equalSettings(value, planModeNode)
 	case "permission_deny_tools":
