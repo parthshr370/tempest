@@ -297,3 +297,14 @@ func TestMCPHTTPNoCredentialRetry(t *testing.T) {
 		})
 	}
 }
+
+// A 404 means an expired session only when the request named one (MCP
+// Streamable HTTP, session management); a 404 to initialize is a wrong URL.
+func TestMCPHTTPNotFoundWithoutSessionIsNotAnExpiredSession(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	_, err := Dial(context.Background(), mcpconfig.Server{Name: "missing", Transport: "http", URL: server.URL + "/wrong"}, t.TempDir(), Handlers{})
+	if err == nil || strings.Contains(err.Error(), "session expired") || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("initialize answered 404 = %v, want an error naming the 404 and not a session", err)
+	}
+}

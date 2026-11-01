@@ -155,6 +155,10 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 		case http.StatusNotFound:
 			response.Body.Close()
 			h.invalidate()
+			// Only a request that named a session can have outlived it.
+			if req.Header.Get("Mcp-Session-Id") == "" {
+				return nil, fmt.Errorf("mcp_protocol: MCP HTTP %s answered 404 Not Found; check the server URL", method)
+			}
 			return nil, errors.New("mcp_disconnected: HTTP session expired; remote outcome may be unknown")
 		}
 		return response, nil
