@@ -57,6 +57,11 @@ applies if the live content hashes to it. Hunks may touch only lines a `read`, `
 or edit result actually displayed under that tag, and hunks may not overlap. Every
 section of a patch is validated before any file is written.
 
+Body rows are the file's exact text after the `+`. The patch travels as one JSON
+string that is decoded once and never unescaped again: a JSON `\t` writes a tab, and a
+JSON `\\t` writes a backslash followed by `t`. Indent with the characters the file
+uses.
+
 Each result returns the new tag and a numbered preview of the changed lines, so the
 next edit can chain from it. A stale tag is rejected with the current tag and the
 rows around the lines you named. LF/CRLF endings and a UTF-8 BOM are preserved.

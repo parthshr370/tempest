@@ -37,6 +37,7 @@ const hashlineDescription = "Edit existing files with a line-anchored patch. `in
 	"MV DEST    move the file (quote paths with spaces); the section's edits apply first\n" +
 	"\n" +
 	"Body rows are `+TEXT`, verbatim, indentation after the `+`; a lone `+` is a blank line. There are no `-` or context rows: the range removes the old lines and the body is their complete final content. A literal line starting with `-` or `+` is written `+- item` / `++x`.\n" +
+	"Body text is written byte for byte: indent with the file's own tab or space characters. Inside the JSON argument a tab is `\\t`; `\\\\t` writes a backslash and a `t` into the file.\n" +
 	"\n" +
 	"Rules:\n" +
 	"- Touch only lines read or grep displayed under the tag; edits to other lines are rejected (re-read them).\n" +

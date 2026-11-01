@@ -277,6 +277,32 @@ func TestEditAcceptsDisplayedHeaderAnchor(t *testing.T) {
 	}
 }
 
+// TestHashlineBodyIsDecodedOnce pins the transport: the patch is one JSON
+// string decoded once, so a JSON \t writes a tab and a JSON \\t writes a
+// backslash and a t. The tool never reinterprets escapes in file text.
+func TestHashlineBodyIsDecodedOnce(t *testing.T) {
+	dir := t.TempDir()
+	all := hashlineTools(t, dir, nil)
+	for _, test := range []struct{ body, want string }{
+		{"\treturn a * b", "\treturn a * b"},
+		{`\treturn a * b`, `\treturn a * b`},
+	} {
+		writeFile(t, filepath.Join(dir, "calc.go"), "func Multiply(a, b int) int {\n\treturn a*b + 1\n}\n")
+		tag := tagOf(t, readThrough(t, all, "calc.go"), "calc.go")
+		raw := mustJSON(t, map[string]any{"input": fmt.Sprintf("[calc.go#%s]\nPUT 2.=2:\n+%s\n", tag, test.body)})
+		if _, err := all[HashlineTool].Execute(t.Context(), "id", raw, nil); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "calc.go"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Split(string(data), "\n")[1]; got != test.want {
+			t.Fatalf("args %s wrote line %q, want %q", raw, got, test.want)
+		}
+	}
+}
+
 func TestHashlineConcurrentCrossFilePatchesDoNotDeadlock(t *testing.T) {
 	dir := t.TempDir()
 	all := hashlineTools(t, dir, nil)
