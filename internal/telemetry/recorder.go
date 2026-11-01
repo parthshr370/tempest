@@ -31,8 +31,7 @@ const (
 	defaultAgentName  = "tempest"
 	maxErrorTextRunes = 1024
 	// attemptRetry marks an attempt the retrying stream sent again to the
-	// same model; a switch to a backup model is another kind of abandoned
-	// attempt and goes through the same attemptFailed path.
+	// same model.
 	attemptRetry = "retry"
 )
 
