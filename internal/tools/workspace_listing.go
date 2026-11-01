@@ -36,6 +36,13 @@ const workspaceListingTimeout = 2 * time.Second
 // remoteListingMaxBytes bounds the names one environment reply carries.
 const remoteListingMaxBytes = 64 << 10
 
+// remoteListingTransit is the part of workspaceListingTimeout an environment
+// leaves for its reply to reach the session. The session's budget starts
+// before it sends the request, so an environment that spent the whole budget
+// would answer after the session stopped waiting, and the names it found by
+// its deadline would be lost.
+const remoteListingTransit = 500 * time.Millisecond
+
 // workspaceListingOperation lists the workspace on the environment's host.
 const workspaceListingOperation = "workspace_listing"
 
@@ -363,7 +370,7 @@ func bindWorkspaceListing(local *envlocal.Local) {
 		if request.MaxFiles < 1 {
 			return nil, errors.New("workspace listing needs a positive file cap")
 		}
-		ctx, cancel := context.WithTimeout(ctx, workspaceListingTimeout)
+		ctx, cancel := context.WithTimeout(ctx, workspaceListingTimeout-remoteListingTransit)
 		defer cancel()
 		files, err := localWorkspaceFiles(ctx, root, request.MaxFiles)
 		if err != nil {

@@ -498,6 +498,35 @@ func TestWorkspaceListingRemoteWalksNonGitWorkspace(t *testing.T) {
 	}
 }
 
+// An environment that runs out of listing time still answers in time for the
+// session to use the names it found: here its rg names one file and then
+// never finishes, and git is not installed.
+func TestWorkspaceListingRemoteDeadlineKeepsPartialNames(t *testing.T) {
+	bin := t.TempDir()
+	rg := filepath.Join(bin, "rg")
+	script := "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\nprintf 'a.go\\0'\nexec /bin/sleep 10\n"
+	if err := os.WriteFile(rg, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// macOS assesses a new executable on its first run, which can take a
+	// second; take that before the timed listing.
+	if err := exec.Command(rg, "warm").Run(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	workspace := t.TempDir()
+	writeListingFiles(t, workspace, map[string]string{"a.go": "package a\n"})
+	lease := remoteListingLease(t, workspace, environment.Capabilities{environment.Files, environment.Search})
+
+	listing, err := WorkspaceListing(context.Background(), lease, t.TempDir(), config.WorkspaceListing{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(listing, `<workspace_files source="rg --files" paths="1+">`) || !strings.HasPrefix(strings.Join(listedLines(t, listing), ","), "a.go,[truncated: ") {
+		t.Fatalf("remote listing:\n%s", listing)
+	}
+}
+
 func TestWorkspaceListingRemoteWithoutSearchIsSkipped(t *testing.T) {
 	workspace := t.TempDir()
 	writeListingFiles(t, workspace, map[string]string{"remote.go": "package remote\n"})
