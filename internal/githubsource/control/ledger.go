@@ -185,24 +185,24 @@ func (s *Store) reservingLedger(id model.DispatchID) *model.Ledger {
 
 // settleDispatch settles or releases a dispatch's reservation on both
 // ledgers. A nil outcome releases without charge (the dispatch never ran).
-func (s *Store) settleDispatch(d *model.DispatchIntent, outcome *model.RunOutcome) {
-	ticket := s.ticketLedger(d.Ticket)
-	repo := s.reservingLedger(d.ID)
+func (s *Store) settleDispatch(dispatch *model.DispatchIntent, outcome *model.RunOutcome) {
+	ticket := s.ticketLedger(dispatch.Ticket)
+	repo := s.reservingLedger(dispatch.ID)
 	if outcome == nil {
-		release(ticket, d.ID)
+		release(ticket, dispatch.ID)
 		if repo != nil {
-			release(repo, d.ID)
+			release(repo, dispatch.ID)
 		}
 		return
 	}
-	spend, estimated := charge(*outcome, d.Reservation)
-	settle(ticket, d.ID, spend, estimated)
+	spend, estimated := charge(*outcome, dispatch.Reservation)
+	settle(ticket, dispatch.ID, spend, estimated)
 	if repo != nil {
-		settle(repo, d.ID, spend, estimated)
+		settle(repo, dispatch.ID, spend, estimated)
 	} else {
 		// The reservation's period ledger is gone only if it was never
 		// written; charge the current period so spend is never lost.
-		settle(s.repoLedger(s.clock.Now()), d.ID, spend, estimated)
+		settle(s.repoLedger(s.clock.Now()), dispatch.ID, spend, estimated)
 	}
-	d.Settled = &spend
+	dispatch.Settled = &spend
 }

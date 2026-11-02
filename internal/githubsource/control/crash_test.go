@@ -159,10 +159,20 @@ func crashScenario() []crashStep {
 	}
 }
 
+// crashMode says how a commit fails and how the caller recovers.
+type crashMode struct {
+	// durable makes the failed commit durable with its acknowledgment lost.
+	durable bool
+	// restart reopens the journal file as a new process would; otherwise
+	// the same Store is called again, relying on its reload after an
+	// ambiguous commit failure.
+	restart bool
+}
+
 // runCrashScenario runs the scenario against a fresh journal, failing the
-// failAt-th commit (0: never). After the failure the process "restarts":
-// the journal is reopened from its file and the failed step re-issued.
-func runCrashScenario(t *testing.T, failAt int, durableFail bool) (map[string]string, int) {
+// failAt-th commit (0: never), recovering per mode, and re-issuing the
+// failed step.
+func runCrashScenario(t *testing.T, failAt int, mode crashMode) (map[string]string, int) {
 	t.Helper()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "control.jsonl")
@@ -175,7 +185,7 @@ func runCrashScenario(t *testing.T, failAt int, durableFail bool) (map[string]st
 		var store durable.Store = log
 		var crash *crashStore
 		if wrap {
-			crash = &crashStore{Store: log, failAt: failAt, durable: durableFail}
+			crash = &crashStore{Store: log, failAt: failAt, durable: mode.durable}
 			store = crash
 		}
 		s, err := Open(ctx, Options{Store: store, Config: testConfig(), Repo: testRepo(), Clock: clock})
@@ -188,6 +198,9 @@ func runCrashScenario(t *testing.T, failAt int, durableFail bool) (map[string]st
 	store, crash, err := open(true)
 	restart := func() {
 		crashed = true
+		if store != nil && !mode.restart {
+			return
+		}
 		if store != nil {
 			store.Close(ctx)
 		}
@@ -211,7 +224,7 @@ func runCrashScenario(t *testing.T, failAt int, durableFail bool) (map[string]st
 			err = step.run(ctx, store, now)
 		}
 		if err != nil {
-			t.Fatalf("step %d %q (crash at %d, durable %v): %v", index, step.name, failAt, durableFail, err)
+			t.Fatalf("step %d %q (crash at %d, %+v): %v", index, step.name, failAt, mode, err)
 		}
 	}
 	defer store.Close(ctx)
@@ -222,20 +235,23 @@ func runCrashScenario(t *testing.T, failAt int, durableFail bool) (map[string]st
 }
 
 // TestRestartAtEveryCommitBoundary fails each commit of a scenario that
-// exercises every transition, once before the write and once after it is
-// durable with the acknowledgment lost, restarts from the journal file and
-// re-issues the step. The final journal must equal the uninterrupted run's.
+// exercises every transition: before the write with a process restart,
+// after it is durable with the acknowledgment lost and a restart, and after
+// it is durable with the same process retrying. The failed step is
+// re-issued each time. The final journal must equal the uninterrupted
+// run's.
 func TestRestartAtEveryCommitBoundary(t *testing.T) {
-	want, commits := runCrashScenario(t, 0, false)
+	want, commits := runCrashScenario(t, 0, crashMode{})
 	if commits < 40 {
 		t.Fatalf("scenario made only %d commits", commits)
 	}
 	checkScenarioOutcome(t, want)
+	modes := []crashMode{{restart: true}, {durable: true, restart: true}, {durable: true}}
 	for failAt := 1; failAt <= commits; failAt++ {
-		for _, durableFail := range []bool{false, true} {
-			got, _ := runCrashScenario(t, failAt, durableFail)
+		for _, mode := range modes {
+			got, _ := runCrashScenario(t, failAt, mode)
 			if diff := diffJournals(want, got); diff != "" {
-				t.Fatalf("crash at commit %d (durable %v) diverged:\n%s", failAt, durableFail, diff)
+				t.Fatalf("crash at commit %d (%+v) diverged:\n%s", failAt, mode, diff)
 			}
 		}
 	}

@@ -364,6 +364,7 @@ func (s *Store) applyThread(update model.ThreadUpdate, readAt time.Time) {
 	if fresh {
 		if update.Title != "" {
 			thread.Title = update.Title
+			s.titleTickets(thread)
 		}
 		if update.State != "" {
 			thread.State = update.State
@@ -392,6 +393,17 @@ func (s *Store) applyThread(update model.ThreadUpdate, readAt time.Time) {
 			// A notification newer than this read keeps the flag: the read
 			// may have started before the thread changed.
 			thread.NeedsReconcile = false
+		}
+	}
+}
+
+// titleTickets names subscribed Tickets created before their thread's title
+// was read (a request in an earlier part of a split batch).
+func (s *Store) titleTickets(thread *model.Thread) {
+	for _, id := range thread.Tickets {
+		ticket, ok := s.tickets.get(string(id))
+		if ok && ticket.Title == "" && ticket.Thread.Number == thread.Ref.Number {
+			s.tickets.edit(string(id)).Title = thread.Title
 		}
 	}
 }
