@@ -252,10 +252,18 @@ func TestNotificationsPaginateAndOnlyFlagThreads(t *testing.T) {
 		t.Fatalf("pull request flag ref = %+v", ref)
 	}
 	cursor, _, _ := e.intake.Cursor(context.Background(), model.CursorNotifications)
-	if !cursor.Since.Equal(start.Add(threads*time.Second)) || cursor.LastModified == "" {
-		t.Fatalf("cursor = %+v", cursor)
+	if !cursor.Since.Equal(start.Add(threads*time.Second)) || cursor.LastModified != "" {
+		t.Fatalf("cursor = %+v: a moved cursor changes the URL, so no validator is kept", cursor)
 	}
 
+	// The next round repeats the same URL and keeps its validator; the one
+	// after sends it and gets 304, committing nothing.
+	e.repo.Advance(time.Minute)
+	e.pollClean()
+	cursor, _, _ = e.intake.Cursor(context.Background(), model.CursorNotifications)
+	if cursor.LastModified == "" {
+		t.Fatalf("stable listing kept no validator: %+v", cursor)
+	}
 	changes := e.intake.changeCount()
 	e.repo.Advance(time.Minute)
 	e.pollClean()

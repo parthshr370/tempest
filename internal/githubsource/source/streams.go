@@ -73,12 +73,19 @@ func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 	}
 	cursor := stored
 	cursor.Key = model.CursorNotifications
-	if complete {
-		cursor.Since, cursor.LastModified = newest, lastModified
-	} else {
-		// Unread older pages stay inside the window: keep the position and
-		// validator so the next round lists them again.
-		cursor.Since = base
+	switch {
+	case !complete:
+		// Unread older pages stay inside the window: keep the position so
+		// the next round lists them again, without a validator.
+		cursor.Since, cursor.LastModified = base, ""
+	case newest.Equal(base):
+		// Last-Modified validates this exact request; it is reused only
+		// while the since parameter, and so the URL, stays the same. GitHub
+		// answers 304 only if that listing did not change, which includes a
+		// late-indexed notification appearing with an older updated_at.
+		cursor.Since, cursor.LastModified = base, lastModified
+	default:
+		cursor.Since, cursor.LastModified = newest, ""
 	}
 	updates := make([]model.ThreadUpdate, 0, len(flags))
 	for _, update := range flags {
