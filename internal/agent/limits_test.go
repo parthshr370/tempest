@@ -9,7 +9,9 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/retry"
 )
 
 // metered gives message usage: 100 prompt tokens (60 uncached, 30 cache
@@ -104,6 +106,150 @@ func TestTokenCapRefusesUnmeasuredResponse(t *testing.T) {
 	script = &scriptedRequests{script: []types.AssistantMessage{textAnswer()}}
 	if result, err = newLimitAgent(script, Budget{MaxToolCalls: 5}).PromptText(context.Background(), "go"); err != nil || result.StopReason != StopCompleted {
 		t.Fatalf("without a token cap: result = %+v err = %v", result, err)
+	}
+}
+
+// A child's response without usage fails the root run when the root has a
+// token cap, even when the delegating tool turns the child's error into an
+// ordinary result: the root sends nothing more. A cap the child alone has
+// fails only the child.
+func TestUnmeasuredChildResponseStopsATokenCappedRoot(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		root, child      Budget
+		wantRootErr      bool
+		wantRootRequests int
+	}{
+		{"root cap", Budget{MaxTotalTokens: 1000}, Budget{}, true, 1},
+		{"child cap only", Budget{}, Budget{MaxTotalTokens: 1000}, false, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var childUnknown atomic.Bool
+			delegate := executorTool("delegate", "", ExecParallel, func(ctx context.Context, _ string, _ json.RawMessage, _ AgentToolUpdateCallback) (AgentToolResult, error) {
+				child := newLimitAgent(&scriptedRequests{script: []types.AssistantMessage{textAnswer()}}, test.child)
+				result, err := child.PromptText(ctx, "go")
+				childUnknown.Store(errors.Is(result.Err, ErrUnknownUsage))
+				// The child's failure reaches the root only as tool output.
+				return AgentToolResult{Content: []types.ContentBlock{types.NewText(fmt.Sprint(result.Err))}}, err
+			})
+			script := meteredScript(toolCallMessage("delegate"), textAnswer())
+			result, err := newLimitAgent(script, test.root, delegate).PromptText(context.Background(), "go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !childUnknown.Load() {
+				t.Fatal("child run did not fail with ErrUnknownUsage")
+			}
+			if got := errors.Is(result.Err, ErrUnknownUsage); got != test.wantRootErr || len(script.requests) != test.wantRootRequests {
+				t.Fatalf("root result = %+v after %d requests, want ErrUnknownUsage=%v after %d", result, len(script.requests), test.wantRootErr, test.wantRootRequests)
+			}
+		})
+	}
+}
+
+// failedAfterUsage is an attempt that streams, reports usage, then drops:
+// what a provider bills for although its stream failed.
+func failedAfterUsage(usage types.Usage) func(context.Context, *stream.AssistantStream) {
+	return func(_ context.Context, events *stream.AssistantStream) {
+		events.Push(types.StreamEvent{Type: types.EvStart})
+		events.Push(types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{
+			StopReason: types.StopError, ErrorCode: string(retry.CodeStreamInterrupted), ErrorMessage: "stream dropped", Usage: usage,
+		}})
+	}
+}
+
+// A request is sent again, as a retry or to a backup, only while the run is
+// under its caps: an attempt that failed after its usage reached a cost or
+// token cap ends the run at that cap instead of paying for another attempt.
+func TestRetryAndBackupAreReadmittedAfterAFailedAttempt(t *testing.T) {
+	spent := types.Usage{Input: 100, TotalTokens: 100, Cost: types.Cost{Total: 0.01}}
+	for _, test := range []struct {
+		name     string
+		budget   Budget
+		backup   bool
+		wantStop StopReason
+		wantSent int
+	}{
+		{"retry: input cap", Budget{MaxInputTokens: 100}, false, StopMaxInputTokens, 1},
+		{"retry: cost cap", Budget{MaxCostUSD: 0.01}, false, StopMaxCost, 1},
+		{"retry: under the caps", Budget{MaxInputTokens: 101, MaxCostUSD: 0.02}, false, StopCompleted, 2},
+		{"backup: input cap", Budget{MaxInputTokens: 100}, true, StopMaxInputTokens, 1},
+		{"backup: total cap", Budget{MaxTotalTokens: 100}, true, StopMaxTotalTokens, 1},
+		{"backup: cost cap", Budget{MaxCostUSD: 0.01}, true, StopMaxCost, 1},
+		{"backup: under the caps", Budget{MaxInputTokens: 101, MaxCostUSD: 0.02}, true, StopCompleted, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			policy := retry.DefaultConfig()
+			policy.Sleeper = instantSleeper{}
+			primary := &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){failedAfterUsage(spent), answeredAttempt}}
+			model := types.Model{API: "test", Provider: "test", ID: "primary"}
+			providers := []*scriptedProvider{primary}
+			var streamFn StreamFn
+			if test.backup {
+				policy.MaxAttempts = 1
+				primary.attempts = primary.attempts[:1]
+				providers = append(providers, &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){answeredAttempt}})
+				var candidates []retry.Candidate
+				for i, provider := range providers {
+					retrier, err := retry.New(provider, policy)
+					if err != nil {
+						t.Fatal(err)
+					}
+					candidate := model
+					if i > 0 {
+						candidate.ID = "backup"
+					}
+					candidates = append(candidates, retry.Candidate{Model: candidate, Stream: retrier})
+				}
+				chain, err := retry.NewFallback(candidates)
+				if err != nil {
+					t.Fatal(err)
+				}
+				streamFn = chain.Stream
+			} else {
+				policy.MaxAttempts = 2
+				retrier, err := retry.New(primary, policy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				streamFn = retrier.Stream
+			}
+			a := NewAgent(AgentOptions{InitialState: &AgentState{Model: model}, StreamFn: streamFn, Budget: test.budget})
+			result, err := a.PromptText(context.Background(), "go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			sent := 0
+			for _, provider := range providers {
+				sent += provider.calls()
+			}
+			if result.Err != nil || result.StopReason != test.wantStop || sent != test.wantSent {
+				t.Fatalf("result = %+v after %d attempts, want %q after %d", result, sent, test.wantStop, test.wantSent)
+			}
+			if want := 100 * test.wantSent; promptTokens(result.Usage) != want {
+				t.Fatalf("prompt tokens = %d, want %d", promptTokens(result.Usage), want)
+			}
+		})
+	}
+}
+
+// Lowering the budget while a run is active changes runs started after the
+// call; the active run keeps the budget it started with.
+func TestSetBudgetDuringARunAppliesToTheNextRun(t *testing.T) {
+	var a *Agent
+	var calls atomic.Int32
+	work := executorTool("work", "", ExecParallel, func(context.Context, string, json.RawMessage, AgentToolUpdateCallback) (AgentToolResult, error) {
+		calls.Add(1)
+		a.SetBudget(Budget{MaxToolCalls: 1})
+		return AgentToolResult{}, nil
+	})
+	a = newLimitAgent(meteredScript(toolCallMessage("work"), toolCallMessage("work"), textAnswer(), toolCallMessage("work", "work")), Budget{MaxToolCalls: 10}, work)
+	result, err := a.PromptText(context.Background(), "go")
+	if err != nil || result.StopReason != StopCompleted || calls.Load() != 2 {
+		t.Fatalf("active run: result = %+v err = %v after %d calls, want completed after 2", result, err, calls.Load())
+	}
+	if result, err = a.PromptText(context.Background(), "again"); err != nil || result.StopReason != StopMaxToolCalls || calls.Load() != 2 {
+		t.Fatalf("next run: result = %+v err = %v after %d calls, want max_tool_calls with none run", result, err, calls.Load())
 	}
 }
 
@@ -301,5 +447,20 @@ func TestBudgetValidateRejectsNegativeTokenAndToolCallLimits(t *testing.T) {
 		if err := budget.Validate(types.Model{}); err == nil {
 			t.Errorf("Validate(%+v) = nil, want an error", budget)
 		}
+	}
+}
+
+// Two parallel children race for the one tool call the root's cap has left
+// after its two delegate calls: exactly one child's call runs.
+func TestParallelChildrenShareTheLastToolCall(t *testing.T) {
+	var childCalls atomic.Int32
+	delegate := executorTool("delegate", "", ExecParallel, func(ctx context.Context, _ string, _ json.RawMessage, _ AgentToolUpdateCallback) (AgentToolResult, error) {
+		child := newLimitAgent(meteredScript(toolCallMessage("work"), textAnswer()), Budget{}, countingTool("work", &childCalls))
+		_, err := child.PromptText(ctx, "go")
+		return AgentToolResult{}, err
+	})
+	result, err := newLimitAgent(meteredScript(toolCallMessage("delegate", "delegate"), textAnswer()), Budget{MaxToolCalls: 3}, delegate).PromptText(context.Background(), "go")
+	if err != nil || result.Err != nil || childCalls.Load() != 1 || result.Usage.ToolCalls != 3 {
+		t.Fatalf("child calls = %d, result = %+v, err = %v; want 1 child call and 3 charged", childCalls.Load(), result, err)
 	}
 }

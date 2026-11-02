@@ -183,11 +183,18 @@ summary, so a summary written in many requests stops at the cap too (see
 The cost and token caps count every model call the run pays for: its turns,
 retried and backup attempts, compaction summaries, MCP sampling, and the calls of
 subagents started with `task`. Before each request the run stops if a cap is
-already reached; after it, the response's exact usage is added. So these caps are
-soft by one request: the last request admitted can go past the cap by its own
-size, and the run then stops at the next boundary. Under a token cap, a model
-response that reports no token usage ends the run with an error, as an unknown
-price does under `-max-cost`.
+already reached, and so before each retry and each switch to a backup, counting
+what the failed attempts reported; after it, the response's exact usage is added.
+So these caps are soft by one request: the last request admitted can go past the
+cap by its own size, and the run then stops at the next boundary. Under a token
+cap, a completed model response that reports no token usage (a turn, a compaction
+summary, MCP sampling, or a subagent's response under the run's cap) ends the run
+with an error, as an unknown price does under `-max-cost`; the run stops even when
+the `task` that ran the subagent reports its failure as an ordinary result.
+
+Changing the budget with `tempest/set_budget` or `Session.SetBudget` applies to
+runs started after the call. A run already in progress keeps the budget it started
+with; to stop it now, cancel it.
 
 The tool-call cap is checked before a response's tool calls run, for all of them
 at once. When the calls fit in what is left, they all run and count, including
@@ -367,7 +374,9 @@ naming the attempt count and the last cause, unless the role has
 [backup models](providers.md#backup-models): then the next backup gets the same
 request, and the run stays on it until it ends. The switch is journaled as
 `model_fallback` before the backup is called, so a crash at any later point resumes
-on the backup, and a switch the journal cannot record stops the run instead.
+on the backup, and a switch the journal cannot record stops the run instead. A
+retry or backup is not sent once the run's spend has reached a cost or token cap;
+the run stops at that cap instead.
 
 ## Output formats
 

@@ -269,7 +269,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 		// Joined outside work must account before the run's total is final.
 		run.accounting.settle()
 	}
-	err = errors.Join(err, run.accounting.failure())
+	err = withFailure(err, run.accounting.failure())
 	var budgetStop *providerBudgetStop
 	switch {
 	case err == nil:
@@ -303,7 +303,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 	}
 	if failure := run.accounting.failure(); failure != nil {
 		run.result.StopReason = StopError
-		run.result.Err = errors.Join(run.result.Err, failure)
+		run.result.Err = withFailure(run.result.Err, failure)
 	}
 	run.result.ElapsedMS = time.Since(run.started).Milliseconds()
 	if run.root {
@@ -421,18 +421,10 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 	if stop, err := run.accounting.capStop(); stop != "" || err != nil {
 		return stop, err
 	}
-	if budget.MaxCostUSD > 0 {
-		// PrepareNextTurn can switch to a model whose price is unknown; the
-		// budget can no longer be enforced, which is a failure, not free.
-		if run.result.Usage.Cost.Unknown {
-			return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", budget.MaxCostUSD, ErrUnknownPrice)
-		}
-		if run.result.Usage.Cost.Total >= budget.MaxCostUSD {
-			return StopMaxCost, nil
-		}
-	}
-	if stop := tokenStop(budget, run.result.Usage); stop != "" {
-		return stop, nil
+	// The run's own caps: a child's, or the root's when PrepareNextTurn
+	// switched to a model whose price is unknown, which is a failure, not free.
+	if stop, err := spendStop(budget, run.result.Usage); stop != "" || err != nil {
+		return stop, err
 	}
 	if budget.MaxWallTime > 0 && time.Since(run.started) >= budget.MaxWallTime {
 		return StopMaxWallTime, nil
@@ -579,8 +571,16 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					run.fallbackIndex = fallback.Index
 					return run.emit(ctx, AgentEvent{Type: EventModelFallback, Fallback: &fallback})
 				}
+				// The request is sent again, as a retry or to a backup, only
+				// while the spend, the discarded attempts' included, leaves
+				// the run under its cost and token caps.
+				admit := func() error { return run.accounting.attemptStop(run, types.Usage{}) }
 				request := newModelRequest(*config, run.config.bindings.snapshot().RunID, run.fallbackIndex)
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, switched: switched, request: request}, tail)
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, admit: admit, switched: switched, request: request}, tail)
+				if stop := (*providerBudgetStop)(nil); errors.As(err, &stop) {
+					// The refused attempt was accounted as discarded.
+					return message, err
+				}
 				return message, errors.Join(err, run.accountUsage(ctx, message))
 			}()
 			if err != nil {
@@ -920,6 +920,9 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // same way and reports the switch; the backup is called only after that
 // report returned (it journals the switch), through the stream's
 // AdmitFallback, so the switch is durable before the backup can spend.
+// Neither a retry (through AdmitRetry) nor a backup is sent when admit,
+// asked once the failed attempt is accounted, refuses: the request then
+// ends with admit's error.
 //
 // Every attempt is reported to the model-request hooks without waiting: the
 // first when the request starts, each later one at its [types.EvAttempt],
@@ -969,17 +972,10 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 	if config.GetAPIKey != nil {
 		options.APIKeyFor = config.GetAPIKey
 	}
-	// admitted carries the outcome of reporting each switch to the fallback
-	// chain, which waits for it before calling the backup.
-	admitted := make(chan error, 1)
-	options.AdmitFallback = func(admitCtx context.Context, _ types.ModelFallback) error {
-		select {
-		case err := <-admitted:
-			return err
-		case <-admitCtx.Done():
-			return admitCtx.Err()
-		}
-	}
+	// The retry and fallback layers wait for each failed attempt to be
+	// answered before they send the request again; a switch is answered
+	// once it is reported.
+	gate := gateAttempts(&options)
 	// The request's span is a sibling of the run's tool spans; providers send
 	// it as the traceparent of their HTTP requests.
 	requestCtx := tracecontext.StartChild(ctx)
@@ -1070,8 +1066,14 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 					return attempt, err
 				}
 			}
+			if err := observers.admit(); err != nil {
+				request.end(requestFailed, &attempt)
+				gate.answer(event, err)
+				return attempt, err
+			}
 			if event.Type == types.EvRetry || event.Fallback == nil {
 				request.end(requestFailed, &attempt)
+				gate.answer(event, nil)
 				continue
 			}
 			fallback := *event.Fallback
@@ -1079,7 +1081,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			request.switchModel(fallback, &attempt)
 			config.Model = fallback.To
 			err := observers.switched(fallback)
-			admitted <- err
+			gate.answer(event, err)
 			if err != nil {
 				return attempt, err
 			}
@@ -1146,6 +1148,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 // model-request hooks.
 type responseObservers struct {
 	discarded func(types.AssistantMessage) error
+	admit     func() error
 	switched  func(types.ModelFallback) error
 	request   *modelRequest
 }

@@ -32,19 +32,157 @@ func tokenStop(b Budget, u types.Usage) StopReason {
 	return ""
 }
 
-// checkMeasured fails a token-capped run on a completed response that
-// reported no tokens, which the caps could otherwise never count.
+// spendStop names the cost or token cap of b that usage u has reached. A
+// cost cap the usage cannot be priced against is an error, not free.
+func spendStop(b Budget, u types.Usage) (StopReason, error) {
+	if b.MaxCostUSD > 0 {
+		if u.Cost.Unknown {
+			return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", b.MaxCostUSD, ErrUnknownPrice)
+		}
+		if u.Cost.Total >= b.MaxCostUSD {
+			return StopMaxCost, nil
+		}
+	}
+	return tokenStop(b, u), nil
+}
+
 func (run *loopRun) checkMeasured(message types.AssistantMessage) error {
+	return run.accounting.checkMeasured(run.config.Budget, message)
+}
+
+// CheckMeasured holds a provider response made for ctx's run outside its
+// loop, such as a compaction summary, to the same rule as the run's own
+// responses (see runAccounting.checkMeasured).
+func CheckMeasured(ctx context.Context, message types.AssistantMessage) error {
+	a, _ := ctx.Value(accountingKey{}).(*runAccounting)
+	if a == nil {
+		return nil
+	}
+	var own Budget
+	if run, _ := ctx.Value(localRunKey{}).(*loopRun); run != nil {
+		own = run.config.Budget
+	}
+	return a.checkMeasured(own, message)
+}
+
+// checkMeasured fails a run on a completed response that reported no tokens
+// while a token cap applies, as the cap could otherwise never count it.
+// The root run's caps bind its children, so under them the failure is
+// latched on the shared accounting: the root and every child stop before
+// their next request, whatever a delegating tool does with a child's error.
+// A cap only the run itself has (own) fails only that run.
+func (a *runAccounting) checkMeasured(own Budget, message types.AssistantMessage) error {
 	if message.StopReason == types.StopError || message.StopReason == types.StopAborted {
 		return nil
 	}
 	if promptTokens(message.Usage)+message.Usage.Output > 0 {
 		return nil
 	}
-	if !tokenCapped(run.accounting.limits) && !tokenCapped(run.config.Budget) {
-		return nil
+	err := fmt.Errorf("token budget cannot be enforced for %s/%s: %w", message.Provider, message.Model, ErrUnknownUsage)
+	switch {
+	case tokenCapped(a.limits):
+		return a.fail(err)
+	case tokenCapped(own):
+		return err
 	}
-	return fmt.Errorf("token budget cannot be enforced for %s/%s: %w", message.Provider, message.Model, ErrUnknownUsage)
+	return nil
+}
+
+// attemptStop decides whether a request may be sent again after attempts
+// that failed, as a retry or to a backup: not once the spend, with pending
+// (those attempts' usage not yet charged), has reached a cost or token cap,
+// the root run's shared ones or run's own (run may be nil). A reached cap
+// is a *providerBudgetStop, which ends the run at that cap.
+func (a *runAccounting) attemptStop(run *loopRun, pending types.Usage) error {
+	if err := a.failure(); err != nil {
+		return err
+	}
+	shared := a.total()
+	shared.Add(pending)
+	stop, err := spendStop(a.limits, shared)
+	if stop == "" && err == nil && run != nil {
+		own := run.result.Usage
+		own.Add(pending)
+		stop, err = spendStop(run.config.Budget, own)
+	}
+	if stop != "" {
+		return &providerBudgetStop{reason: stop}
+	}
+	return err
+}
+
+// attemptGate makes a stream's retry and fallback layers wait, before they
+// send a request again, for its consumer to answer the EvRetry or
+// EvFallback event that announced the failed attempt.
+type attemptGate struct{ retry, fallback chan error }
+
+// gateAttempts installs a gate in opts. A fallback hook already in opts runs
+// once the gate admits the switch.
+func gateAttempts(opts *types.SimpleStreamOptions) *attemptGate {
+	g := &attemptGate{retry: make(chan error, 1), fallback: make(chan error, 1)}
+	switched := opts.AdmitFallback
+	opts.AdmitRetry = func(ctx context.Context, _ int) error { return g.wait(ctx, g.retry) }
+	opts.AdmitFallback = func(ctx context.Context, fallback types.ModelFallback) error {
+		if err := g.wait(ctx, g.fallback); err != nil || switched == nil {
+			return err
+		}
+		return switched(ctx, fallback)
+	}
+	return g
+}
+
+func (g *attemptGate) wait(ctx context.Context, answer chan error) error {
+	select {
+	case err := <-answer:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// answer admits (nil) or refuses the attempt announced by event. An answer
+// nobody waited for, from a stream that announces without asking, is
+// replaced by the next one.
+func (g *attemptGate) answer(event types.StreamEvent, err error) {
+	answer := g.retry
+	if event.Type == types.EvFallback && event.Fallback != nil {
+		answer = g.fallback
+	}
+	select {
+	case <-answer:
+	default:
+	}
+	answer <- err
+}
+
+// GateAttempts holds provider work admitted with AdmitProvider to the caps
+// of ctx's run between its attempts. opts's retry and fallback layers then
+// send the request again, as a retry or to a backup, only once observe has
+// seen the EvRetry or EvFallback event announcing the failed attempt and the
+// usage of the attempts failed so far leaves the run under its cost and
+// token caps. The caller passes observe every event it reads; observe
+// returns the refusal, a *providerBudgetStop or the run's failure, which
+// the caller returns once the stream has ended. A fallback hook already in
+// opts runs once the gate admits the switch.
+func GateAttempts(ctx context.Context, opts *types.SimpleStreamOptions) (observe func(types.StreamEvent) error) {
+	a, _ := ctx.Value(accountingKey{}).(*runAccounting)
+	if a == nil {
+		return func(types.StreamEvent) error { return nil }
+	}
+	run, _ := ctx.Value(localRunKey{}).(*loopRun)
+	gate := gateAttempts(opts)
+	var pending types.Usage
+	return func(event types.StreamEvent) error {
+		if event.Type != types.EvRetry && event.Type != types.EvFallback {
+			return nil
+		}
+		if event.Err != nil {
+			pending.Add(event.Err.Usage)
+		}
+		err := a.attemptStop(run, pending)
+		gate.answer(event, err)
+		return err
+	}
 }
 
 // admitToolCalls charges a response's tool calls to the run before any of

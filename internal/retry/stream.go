@@ -96,6 +96,14 @@ func (r *Retrier) produce(ctx context.Context, output *stream.AssistantStream, m
 		retry := types.StreamEvent{Type: types.EvRetry, Err: discarded, Attempt: attempt, RetryDelay: delay, FailedAt: time.Now()}
 		logical.Fold(retry)
 		output.Push(retry)
+		// The caller decides on the next attempt once it has seen this one
+		// fail; a refusal ends the request, here and in any fallback chain.
+		if opts != nil && opts.AdmitRetry != nil {
+			if err := opts.AdmitRetry(ctx, attempt+1); err != nil && ctx.Err() == nil {
+				output.Push(failedEvent(model, CodeNotAdmitted, "retry not admitted: "+err.Error()))
+				return
+			}
+		}
 		if err := r.cfg.Sleeper.Sleep(ctx, delay); err != nil || ctx.Err() != nil {
 			r.pushCanceled(output, model, ctx.Err())
 			return

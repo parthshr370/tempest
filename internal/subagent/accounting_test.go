@@ -51,7 +51,7 @@ func TestDelegatedUsageAndSharedCostAdmission(t *testing.T) {
 					if event.Type == agent.EventMessageEnd {
 						if message, ok := event.Message.(ptypes.AssistantMessage); ok {
 							usageMu.Lock()
-							childUsage.Add(message.Usage)
+							childUsage.Add(withToolCalls(message))
 							usageMu.Unlock()
 						}
 					}
@@ -92,7 +92,7 @@ func TestDelegatedUsageAndSharedCostAdmission(t *testing.T) {
 			usageMu.Unlock()
 			for _, message := range parent.State().Messages {
 				if assistant, ok := message.(ptypes.AssistantMessage); ok {
-					want.Add(assistant.Usage)
+					want.Add(withToolCalls(assistant))
 				}
 			}
 			if !reflect.DeepEqual(result.Usage, want) {
@@ -115,6 +115,22 @@ func TestDelegatedUsageAndSharedCostAdmission(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withToolCalls is a response's usage with the tool calls it had admitted:
+// every call of a finished response runs under these tests' budgets, which
+// set no tool-call cap.
+func withToolCalls(message ptypes.AssistantMessage) ptypes.Usage {
+	usage := message.Usage
+	if message.StopReason == ptypes.StopError || message.StopReason == ptypes.StopAborted {
+		return usage
+	}
+	for _, block := range message.Content {
+		if block.Type == ptypes.BlockToolCall {
+			usage.ToolCalls++
+		}
+	}
+	return usage
 }
 
 func TestTaskAdmissionErrorIsToolFailure(t *testing.T) {

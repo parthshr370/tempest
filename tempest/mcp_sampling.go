@@ -99,6 +99,9 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 	}
 	options := &types.SimpleStreamOptions{Reasoning: m.reasoning}
 	options.MaxTokens = maxTokens
+	// A retry or a switch to a backup is sent only while the run, with the
+	// usage of the attempts that failed so far, is under its caps.
+	observe := agent.GateAttempts(runCtx, options)
 	streamCtx, cancel := context.WithCancel(runCtx)
 	defer cancel()
 	response := m.stream(streamCtx, m.model, types.Context{SystemPrompt: request.SystemPrompt, Messages: request.Messages}, options)
@@ -109,10 +112,15 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 	// billed. The receipt names the model that answered: a backup after a
 	// switch.
 	var usage types.Usage
+	var notAdmitted error
 	answered := m.model.ID
 	for event := range response.Events() {
 		if (event.Type == types.EvRetry || event.Type == types.EvFallback) && event.Err != nil {
 			usage.Add(event.Err.Usage)
+		}
+		if err := observe(event); err != nil {
+			notAdmitted = err
+			continue
 		}
 		if event.Type == types.EvFallback && event.Fallback != nil {
 			answered = event.Fallback.To.ID
@@ -129,6 +137,9 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 	if err != nil {
 		return types.AssistantMessage{}, err
 	}
+	if notAdmitted != nil {
+		return types.AssistantMessage{}, notAdmitted
+	}
 	if final == nil {
 		return types.AssistantMessage{}, errors.New("sampling model returned no message")
 	}
@@ -138,6 +149,9 @@ func (m *mcpSampling) sample(ctx context.Context, request mcpclient.SamplingRequ
 			reason = string(final.StopReason)
 		}
 		return types.AssistantMessage{}, errors.New("sampling model failed: " + reason)
+	}
+	if err := agent.CheckMeasured(runCtx, *final); err != nil {
+		return types.AssistantMessage{}, err
 	}
 	if final.Model == "" {
 		final.Model = answered

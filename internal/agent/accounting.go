@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 
@@ -111,21 +111,21 @@ func (a *runAccounting) fail(err error) error {
 	return err
 }
 
+// withFailure joins the shared accounting's failure to err unless err
+// already carries it, as when the failing call returned it too.
+func withFailure(err, failure error) error {
+	if failure == nil || errors.Is(err, failure) {
+		return err
+	}
+	return errors.Join(err, failure)
+}
+
 // capStop names the shared cost or token cap the run's usage has reached.
 func (a *runAccounting) capStop() (StopReason, error) {
 	if err := a.failure(); err != nil {
 		return "", err
 	}
-	usage := a.total()
-	if maxCost := a.limits.MaxCostUSD; maxCost > 0 {
-		if usage.Cost.Unknown {
-			return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", maxCost, ErrUnknownPrice)
-		}
-		if usage.Cost.Total >= maxCost {
-			return StopMaxCost, nil
-		}
-	}
-	return tokenStop(a.limits, usage), nil
+	return spendStop(a.limits, a.total())
 }
 
 // admit holds the cost and token gate until the caller has accounted for

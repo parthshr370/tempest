@@ -433,9 +433,22 @@ func TestCrashAtEveryJournalBoundaryResumesHonestly(t *testing.T) {
 				t.Run(boundary, func(t *testing.T) {
 					path, ledger := crashRun(t, mode, crashAfter, tail)
 					before, _ := ledger.snapshot()
+					crashed, err := journal.Load(context.Background(), path)
+					if err != nil {
+						t.Fatal(err)
+					}
 					loaded, err := resume(t, path, mode, ledger)
 					if err != nil {
 						t.Fatalf("boundary %s: %v", boundary, err)
+					}
+					// Resume charges no admitted batch twice and charges no
+					// batch it does not run.
+					resumed, err := journal.Load(context.Background(), path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if resumed.UsageTotal.ToolCalls != crashed.UsageTotal.ToolCalls {
+						t.Fatalf("boundary %s: tool calls charged %d before resume, %d after", boundary, crashed.UsageTotal.ToolCalls, resumed.UsageTotal.ToolCalls)
 					}
 					after, violations := ledger.snapshot()
 					for _, call := range crashCalls {

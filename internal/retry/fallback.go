@@ -128,7 +128,7 @@ func (f *Fallback) produce(ctx context.Context, output *stream.AssistantStream, 
 		// meanwhile; only then is its first attempt announced.
 		if opts != nil && opts.AdmitFallback != nil {
 			if err := opts.AdmitFallback(ctx, fallback); err != nil && ctx.Err() == nil {
-				output.Push(failedEvent(model, CodeProviderFailure, "switch to backup model "+next.Provider+":"+next.ID+" not admitted: "+err.Error()))
+				output.Push(failedEvent(model, CodeNotAdmitted, "switch to backup model "+next.Provider+":"+next.ID+" not admitted: "+err.Error()))
 				return
 			}
 		}
@@ -205,6 +205,9 @@ func Availability(message *types.AssistantMessage, status int, ctxErr error) (Co
 		failure.Message, failure.ProviderCode, failure.StopReason = message.ErrorMessage, message.ErrorCode, message.StopReason
 	}
 	switch Code(strings.TrimSpace(failure.ProviderCode)) {
+	case CodeNotAdmitted:
+		// The caller refused another attempt; a backup is one too.
+		return CodeNotAdmitted, false
 	case CodeAttemptsExhausted, CodeRetryDelayExceeded:
 		if ctxErr != nil {
 			return CodeCanceled, false

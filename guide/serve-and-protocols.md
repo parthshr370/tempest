@@ -479,6 +479,8 @@ The snapshot's `budget` and the `tempest/set_budget` result use the request shap
 maxTotalTokens, maxToolCalls}`; the last four are omitted when zero (unlimited), and
 `session/new` takes the same object in `_meta.tempest.budget`. Builds before this one
 sent Go field names (`MaxTurns`, `MaxCostUSD`, and `MaxWallTime` in nanoseconds).
+`tempest/set_budget` applies to runs started after it; a run in progress keeps the
+budget it started with, so use `session/cancel` to stop one now.
 
 ### Permissions
 

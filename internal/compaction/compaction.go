@@ -1222,8 +1222,10 @@ func summaryMaxTokens(model ptypes.Model, settings CompactionSettings) int {
 // runSummarizationResult issues a single stateless summarization request
 // and joins the returned text blocks. An error stop reason surfaces as an
 // error. The fallback chain switches to a backup only when fits accepts it;
-// a refused switch ends the request with errRefit. The result names the
-// model that answered.
+// a refused switch ends the request with errRefit. A retry or switch the
+// run's caps refuse ends it with that refusal, and a completed answer that
+// reports no tokens under a token cap fails it (agent.CheckMeasured). The
+// result names the model that answered.
 func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, maxTokens int, promptText string, fits func(ptypes.Model) bool) (SummaryResult, error) {
 	result := SummaryResult{Model: model}
 	if streamFn == nil {
@@ -1240,6 +1242,10 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 		refused.Store(true)
 		return errRefit
 	}
+	// The retry and fallback layers send the request again only while the
+	// run, with the usage of the attempts that failed so far, is under its
+	// cost and token caps.
+	observe := agent.GateAttempts(ctx, opts)
 	streamCtx, cancel := context.WithCancel(ctx)
 	response := streamFn(streamCtx, model, reqCtx, opts)
 	if response == nil {
@@ -1249,9 +1255,14 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 	stop := context.AfterFunc(ctx, cancel)
 	defer func() { stop(); cancel() }()
 	// Attempts the retry or fallback layer abandoned can still be billed; count the usage they reported.
+	var notAdmitted error
 	for event := range response.Events() {
 		if (event.Type == ptypes.EvRetry || event.Type == ptypes.EvFallback) && event.Err != nil {
 			result.Usage.Add(event.Err.Usage)
+		}
+		if err := observe(event); err != nil {
+			notAdmitted = err
+			continue
 		}
 		if event.Type == ptypes.EvFallback && event.Fallback != nil {
 			result.Model = event.Fallback.To
@@ -1265,6 +1276,9 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 		return result, errors.New("compaction: nil summarization result")
 	}
 	result.Usage.Add(final.Usage)
+	if notAdmitted != nil {
+		return result, notAdmitted
+	}
 	if refused.Load() {
 		return result, errRefit
 	}
@@ -1274,6 +1288,9 @@ func runSummarizationResult(ctx context.Context, streamFn agent.StreamFn, model 
 			msg = string(final.StopReason)
 		}
 		return result, fmt.Errorf("compaction: summarization failed: %s", msg)
+	}
+	if err := agent.CheckMeasured(ctx, *final); err != nil {
+		return result, err
 	}
 	var b strings.Builder
 	for _, block := range final.Content {

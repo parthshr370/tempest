@@ -55,6 +55,12 @@ type StreamOptions struct {
 	CacheRetention string                              `json:"cacheRetention,omitempty"`
 	OnPayload      func(any, Model) (any, error)       `json:"-"`
 	OnResponse     func(ProviderResponse, Model) error `json:"-"`
+	// AdmitRetry, when set, is called by a retrier after it announced a
+	// failed attempt with an EvRetry event and before it sends the request
+	// again as the given attempt. The request is sent again only when it
+	// returns nil; an error ends the stream instead. The agent loop uses it to
+	// stop once the failed attempts' usage has reached one of the run's caps.
+	AdmitRetry func(ctx context.Context, attempt int) error `json:"-"`
 	// AdmitFallback, when set, is called by a fallback chain after it
 	// announced a switch with an EvFallback event and before the backup
 	// model gets the request. The backup is called only when it returns nil;

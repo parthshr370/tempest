@@ -30,6 +30,9 @@ const (
 	// It is terminal for the model but not a configuration error of the
 	// request, so a fallback chain moves past it.
 	CodeModelNotFound Code = "model_not_found"
+	// CodeNotAdmitted ends a request whose caller refused its next attempt
+	// (a retry or a switch to a backup). It is terminal for the whole chain.
+	CodeNotAdmitted Code = "not_admitted"
 )
 
 var (
