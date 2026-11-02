@@ -186,12 +186,19 @@ func (d *Dispatcher) settle(ctx context.Context, execution *execution, admitted 
 	}
 	if launched.State == submissionAccepted {
 		// Accepted but never dispatched: a restart before the run began,
-		// or a recovery steer waiting for its continuation.
-		if err := session.SetBudget(runBudget(admitted.Budget)); err != nil {
-			return err
-		}
-		if err := d.continueRun(ctx, execution, session); err != nil {
-			return err
+		// or a recovery steer waiting for its continuation. A stopped
+		// Ticket's input is withdrawn instead of started.
+		if execution.isStopped() {
+			if err := withdraw(ctx, session, []string{requestID}); err != nil {
+				return err
+			}
+		} else {
+			if err := session.SetBudget(runBudget(admitted.Budget)); err != nil {
+				return err
+			}
+			if err := d.continueRun(ctx, execution, session); err != nil {
+				return err
+			}
 		}
 	}
 	if err := d.point("running"); err != nil {

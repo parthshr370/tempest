@@ -18,7 +18,7 @@ import (
 func TestHostExtensionsSelectPerSession(t *testing.T) {
 	provider := faux.New(faux.Options{})
 	sessionDir := t.TempDir()
-	document := durable.DocumentDefinition{Namespace: "worker.ticket", Version: 1, Schema: json.RawMessage(`{"type":"object"}`), Initial: json.RawMessage(`{}`), History: durable.HistoryLatest}
+	document := durable.DocumentDefinition{Namespace: "worker.ticket", Version: 1, Schema: json.RawMessage(`{"type":"object"}`), Initial: json.RawMessage(`{}`), History: durable.HistoryLatest, Fork: durable.ForkInitial, Reset: durable.ResetPreserve}
 	registry := extension.NewRegistry()
 	if err := registry.Install(t.Context(), extension.Definition{ID: "worker", Revision: "1", Documents: []durable.DocumentDefinition{document}}); err != nil {
 		t.Fatal(err)
