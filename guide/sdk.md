@@ -50,6 +50,12 @@ host that supplies its own `Stack.StreamFn` passes the chain's backups in
 keeps `Stack.Reminders`, or the settings' `reminders` when `Stack` is nil, and
 an empty slice turns them off. `Open` rejects an invalid list.
 
+`tempest.Budget` caps each run: `MaxTurns`, `MaxCostUSD`, `MaxWallTime`, and the
+cumulative `MaxInputTokens`, `MaxOutputTokens`, `MaxTotalTokens` and
+`MaxToolCalls`, with zero as unlimited. `Session.SetBudget` changes it between runs.
+A run's `Usage.ToolCalls` counts the tool calls it ran; see
+[Budgets](sessions-and-durability.md#budgets) for how each cap is enforced.
+
 ```go
 session, err := tempest.Open(ctx, tempest.Options{
     Cwd: cwd,

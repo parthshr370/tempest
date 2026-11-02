@@ -296,7 +296,7 @@ MCP HTTP endpoint. Initialize with `2025-11-25` or `2025-06-18`, then send
 `notifications/initialized`.
 
 Its one tool, `tempest_run`, accepts `prompt`, optional absolute `cwd`, `sessionId`,
-`requestId`, `model`, and a `budget` (`maxTurns`, `maxCostUsd`, `maxWallSeconds`). A caller's
+`requestId`, `model`, and a `budget` (`maxTurns`, `maxCostUsd`, `maxWallSeconds`, `maxInputTokens`, `maxOutputTokens`, `maxTotalTokens`, `maxToolCalls`). A caller's
 `model` cannot override an endpoint with `@<base-url>`; endpoints come from the
 server's provider configuration. Per-call budgets may tighten but not relax host
 caps. Results include final text, structured run and session ids, usage, stop reason
@@ -412,8 +412,9 @@ even if a stdio client keeps stdin open. A second signal exits with code 130;
 
 Initialize first, create or load a session, then prompt. A `session/prompt` response
 waits for the run to finish; `session/update` and `tempest/*` notifications carry
-progress while it runs. ACP reports `end_turn`, `cancelled`, or
-`max_turn_requests`; `_meta.tempest.stopReason` preserves the exact Tempest reason.
+progress while it runs. ACP reports `end_turn`, `cancelled`, `max_tokens` (a token
+cap) or `max_turn_requests` (any other budget); `_meta.tempest.stopReason` preserves
+the exact Tempest reason.
 
 `session/new`, `session/load` and `session/resume` take an absolute `cwd` that must
 be an existing directory. Anything else fails with `-32602` before a session opens.
@@ -474,8 +475,10 @@ use the same SDK controls. See [conversation controls](conversations.md) for the
 parameters, document policies and context-epoch rules.
 
 The snapshot's `budget` and the `tempest/set_budget` result use the request shape
-`{maxTurns, maxCostUsd, maxWallSeconds}`. Builds before this one sent Go field names
-(`MaxTurns`, `MaxCostUSD`, and `MaxWallTime` in nanoseconds).
+`{maxTurns, maxCostUsd, maxWallSeconds, maxInputTokens, maxOutputTokens,
+maxTotalTokens, maxToolCalls}`; the last four are omitted when zero (unlimited), and
+`session/new` takes the same object in `_meta.tempest.budget`. Builds before this one
+sent Go field names (`MaxTurns`, `MaxCostUSD`, and `MaxWallTime` in nanoseconds).
 
 ### Permissions
 
