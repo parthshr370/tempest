@@ -214,3 +214,37 @@ func TestExtensionCompactionHookOnlyRunsAtActualBoundary(t *testing.T) {
 		t.Fatalf("unapproved summary sent: calls=%d provider=%d err=%v", calls, provider.CallCount(), err)
 	}
 }
+
+// A cut on a conversation reminder rebuilds the context behind a separate
+// summary message; its timestamp must not be the wall clock, or a sidecar
+// written before a crash would not match the replacement on retry.
+func TestCompactionSummaryBeforeKeptReminderHasDeterministicTimestamp(t *testing.T) {
+	f := faux.New(faux.Options{})
+	f.SetResponses(smartSteps(4)...)
+	r := &compactionRunner{
+		contextWindow: 100,
+		model:         f.Model(),
+		streamFn:      f.StreamSimple,
+		settings:      compaction.CompactionSettings{Enabled: true, ReserveTokens: 10, KeepRecentTokens: 10},
+	}
+	assistant := cAssistant(strings.Repeat("B", 400))
+	assistant.Timestamp = 2000
+	reminder := ptypes.UserMessage{Content: ptypes.StringContent("<system-reminder>\nrule\n</system-reminder>"), Reminder: "rule", Timestamp: 3000}
+	recent := cUser("recent ask")
+	recent.Timestamp = 3001
+	messages := []ptypes.Message{cUser(strings.Repeat("A", 400)), assistant, reminder, recent}
+	if prep := compaction.PrepareCompaction(messagesToEntries(messages), r.settings); prep == nil || prep.FirstKeptEntryID != messagesToEntries(messages)[2].ID {
+		t.Fatalf("cut does not land on the reminder: %+v", prep)
+	}
+
+	out, changed, err := r.summarize(context.Background(), messages, true, false, r.model)
+	if err != nil || !changed {
+		t.Fatalf("summarize: changed=%t err=%v", changed, err)
+	}
+	if kept, ok := out[1].(ptypes.UserMessage); !ok || kept.Reminder != "rule" {
+		t.Fatalf("kept reminder does not follow the summary: %+v", out)
+	}
+	if summary := out[0].(ptypes.UserMessage); summary.Timestamp != 2000 {
+		t.Fatalf("summary timestamp = %d, want the newest assistant's 2000", summary.Timestamp)
+	}
+}
