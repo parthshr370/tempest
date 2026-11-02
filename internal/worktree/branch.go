@@ -257,8 +257,8 @@ func unpushed(ctx context.Context, spec BranchSpec) (int, error) {
 }
 
 // RemoveBranch removes the branch worktree at spec.Path and deletes the
-// local branch. Without force it refuses a checkout with uncommitted or
-// untracked changes (ErrDirty) and a branch with commits that no
+// local branch. Without force it refuses a checkout with uncommitted,
+// untracked or ignored files (ErrDirty) and a branch with commits that no
 // remote-tracking ref of the remote contains (ErrUnpushed); force is the
 // operator's decision to discard them. A path that is not the registered
 // checkout of the branch is ErrBranchMismatch even with force.
@@ -285,7 +285,9 @@ func RemoveBranch(ctx context.Context, spec BranchSpec, force bool) error {
 	}
 	if !force {
 		if present {
-			dirty, err := hasStatus(ctx, spec.Path, false)
+			// Ignored files are local data too (notes, build state,
+			// secrets): only the operator's force discards them.
+			dirty, err := hasStatus(ctx, spec.Path, true)
 			if err != nil {
 				return err
 			}
@@ -306,7 +308,11 @@ func RemoveBranch(ctx context.Context, spec BranchSpec, force bool) error {
 	if _, registered, err := registration(ctx, spec); err != nil {
 		return err
 	} else if registered {
-		if _, err := git(ctx, spec.Clone, nil, "worktree", "remove", "--force", spec.Path); err != nil {
+		args := []string{"worktree", "remove"}
+		if force {
+			args = append(args, "--force")
+		}
+		if _, err := git(ctx, spec.Clone, nil, append(args, spec.Path)...); err != nil {
 			return err
 		}
 	}

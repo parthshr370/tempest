@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,7 @@ func (d *Dispatcher) render(ctx context.Context, admitted model.AdmittedDispatch
 		return "", err
 	}
 	var text strings.Builder
+	title := ""
 	switch dispatch.Kind {
 	case model.DispatchRecovery:
 		fmt.Fprintf(&text, "Restart notice for GitHub ticket %s: this is generation %d.\n", ticket.ID, dispatch.Gen)
@@ -36,11 +38,16 @@ func (d *Dispatcher) render(ctx context.Context, admitted model.AdmittedDispatch
 	case model.DispatchWake:
 		fmt.Fprintf(&text, "New GitHub input for ticket %s (generation %d).\n\n", ticket.ID, dispatch.Gen)
 	default:
-		fmt.Fprintf(&text, "GitHub ticket %s in %s: %s\n", ticket.ID, d.config.Repository, ticket.Title)
+		fmt.Fprintf(&text, "GitHub ticket %s in %s.\n", ticket.ID, d.config.Repository)
 		fmt.Fprintf(&text, "Thread: %s\nBranch: %s, from %s.\n", threadURL(d.config.Repository, ticket.Thread), model.TicketBranch(ticket.ID), d.base)
 		fmt.Fprintf(&text, "Generation %d, authorized by @%s.\n\n", dispatch.Gen, admitted.Mandate.Actor.Login)
+		title = ticket.Title
 	}
 	text.WriteString(untrustedNotice + "\n\n")
+	if title != "" {
+		// The title is GitHub text: quoted on one line, after the notice.
+		fmt.Fprintf(&text, "Thread title: %s\n\n", strconv.Quote(title))
+	}
 	if len(views) == 0 {
 		text.WriteString("No inputs arrived since the last handled one.\n")
 		return text.String(), nil
@@ -94,9 +101,10 @@ func (d *Dispatcher) renderDelivery(ticket model.TicketID, view model.InputView)
 	return fmt.Sprintf("New GitHub input for ticket %s.\n%s\n\n%s", ticket, untrustedNotice, renderInput(view))
 }
 
-// renderInput is one Input block: a header line, the event's facts, then
-// its body in a fence longer than any backtick run inside it, so the quoted
-// text cannot close the fence.
+// renderInput is one Input block: a controller-written header and facts,
+// then everything GitHub users wrote (title, file path, check names, body)
+// in one fence longer than any backtick run inside it, so the quoted text
+// cannot close the fence or pose as controller lines.
 func renderInput(view model.InputView) string {
 	input, event := view.Input, view.Event
 	var block strings.Builder
@@ -108,23 +116,40 @@ func renderInput(view model.InputView) string {
 	for _, fact := range eventFacts(event) {
 		block.WriteString(fact + "\n")
 	}
-	if event.Body != "" {
-		fence := strings.Repeat("`", max(minFence, longestRun(event.Body, '`')+1))
-		fmt.Fprintf(&block, "%s\n%s\n%s\n", fence, event.Body, fence)
+	if quoted := untrustedText(event); quoted != "" {
+		fence := strings.Repeat("`", max(minFence, longestRun(quoted, '`')+1))
+		fmt.Fprintf(&block, "%s\n%s\n%s\n", fence, quoted, fence)
 	}
 	block.WriteString("\n")
 	return block.String()
 }
 
-// eventFacts are the structured fields of an event, pinned to commits.
-func eventFacts(event model.Event) []string {
-	var facts []string
+// untrustedText is the event's user-written text: labelled metadata lines,
+// a blank line, then the body.
+func untrustedText(event model.Event) string {
+	var lines []string
 	if event.Title != "" {
-		facts = append(facts, "title: "+event.Title)
+		lines = append(lines, "title: "+event.Title)
 	}
 	if event.Path != "" {
-		facts = append(facts, fmt.Sprintf("file: %s:%d", event.Path, event.Line))
+		lines = append(lines, fmt.Sprintf("file: %s:%d", event.Path, event.Line))
 	}
+	if ci := event.CI; ci != nil && len(ci.Failing) > 0 {
+		lines = append(lines, "failing checks: "+strings.Join(ci.Failing, ", "))
+	}
+	if event.Body != "" {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, event.Body)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// eventFacts are the controller-checked fields of an event: numbers, enums
+// and commit SHAs, pinned to commits.
+func eventFacts(event model.Event) []string {
+	var facts []string
 	if event.InReplyTo != 0 {
 		facts = append(facts, fmt.Sprintf("in reply to review comment %d", event.InReplyTo))
 	}
@@ -134,7 +159,7 @@ func eventFacts(event model.Event) []string {
 		facts = append(facts, "commit: "+event.CommitSHA)
 	}
 	if ci := event.CI; ci != nil {
-		facts = append(facts, fmt.Sprintf("checks at %s: %d passing, %d skipped, failing: %s", ci.SHA, ci.Passing, ci.Skipped, strings.Join(ci.Failing, ", ")))
+		facts = append(facts, fmt.Sprintf("checks at %s: %d passing, %d skipped, %d failing", ci.SHA, ci.Passing, ci.Skipped, len(ci.Failing)))
 	}
 	if event.Truncated {
 		facts = append(facts, fmt.Sprintf("body truncated from %d bytes; read it whole with ext__github__%s", event.BodyBytes, model.ToolThread))

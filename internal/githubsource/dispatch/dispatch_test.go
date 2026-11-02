@@ -75,6 +75,8 @@ func TestDispatchLaunchRunsWorkerOnTicketBranch(t *testing.T) {
 	if dispatch.State != model.DispatchFinished || dispatch.Outcome == nil || dispatch.Outcome.StopReason != "completed" || !dispatch.Outcome.UsageKnown {
 		t.Fatalf("dispatch = %+v", dispatch)
 	}
+	// Settling closed the idle worker; its receipts are read by reopening.
+	session = w.session(detail.Ticket.SessionID)
 	submission, err := session.Submission(w.ctx, dispatch.RequestID)
 	if err != nil {
 		t.Fatal(err)

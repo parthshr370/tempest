@@ -95,7 +95,7 @@ func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted 
 		}
 	}
 	if execution.isStopped() {
-		return nil, permanentFailure("ticket stopped before its worker started", nil)
+		return d.launchStopped(ctx, admitted)
 	}
 	checkout, err := d.worktree(ctx, admitted)
 	if err != nil {
@@ -114,7 +114,7 @@ func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted 
 		return nil, err
 	}
 	if execution.isStopped() {
-		return nil, permanentFailure("ticket stopped before its worker started", nil)
+		return d.adoptSubmitted(ctx, session, admitted)
 	}
 	submission, err := d.submit(ctx, session, admitted)
 	if err != nil {
@@ -123,11 +123,54 @@ func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted 
 	if err := d.point("submit"); err != nil {
 		return nil, err
 	}
-	receipt := model.SubmissionReceipt{RequestID: admitted.Dispatch.RequestID, SubmissionID: submission.ID, RunID: submission.RunID, ThroughInput: admitted.Dispatch.ThroughInput, At: d.clock.Now()}
-	if err := d.store.Submitted(ctx, admitted.Dispatch.ID, receipt); err != nil {
+	if err := d.recordSubmitted(ctx, admitted, submission); err != nil {
 		return nil, err
 	}
 	return session, nil
+}
+
+// errStoppedBeforeStart abandons a stopped Ticket's dispatch once the
+// worker session proves it holds no submission for it.
+var errStoppedBeforeStart = permanentFailure("ticket stopped before its worker started", nil)
+
+// launchStopped handles a Ticket stopped before control recorded its
+// dispatch's receipt. Control saying "preparing" does not prove nothing was
+// submitted: a process can stop between the worker accepting the
+// submission and control recording it. A bound session is asked first; only
+// an unbound Ticket, which cannot have submitted, is abandoned outright.
+func (d *Dispatcher) launchStopped(ctx context.Context, admitted model.AdmittedDispatch) (*tempest.Session, error) {
+	if admitted.Ticket.SessionID == "" {
+		return nil, errStoppedBeforeStart
+	}
+	session, err := d.host.Open(ctx, admitted.Ticket.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("open worker session %s: %w", admitted.Ticket.SessionID, err)
+	}
+	return d.adoptSubmitted(ctx, session, admitted)
+}
+
+// adoptSubmitted records the dispatch's existing submission in control and
+// returns its session, so settle cancels or withdraws it and charges what it
+// spent, unknown included. When the session proves no submission exists the
+// stopped dispatch is abandoned.
+func (d *Dispatcher) adoptSubmitted(ctx context.Context, session *tempest.Session, admitted model.AdmittedDispatch) (*tempest.Session, error) {
+	existing, err := session.Submission(ctx, admitted.Dispatch.RequestID)
+	if errors.Is(err, tempest.ErrQueueNotFound) {
+		return nil, errStoppedBeforeStart
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read worker submission: %w", err)
+	}
+	if err := d.recordSubmitted(ctx, admitted, existing); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// recordSubmitted records the worker's receipt for the dispatch's launch.
+func (d *Dispatcher) recordSubmitted(ctx context.Context, admitted model.AdmittedDispatch, submission tempest.Submission) error {
+	receipt := model.SubmissionReceipt{RequestID: admitted.Dispatch.RequestID, SubmissionID: submission.ID, RunID: submission.RunID, ThroughInput: admitted.Dispatch.ThroughInput, At: d.clock.Now()}
+	return d.store.Submitted(ctx, admitted.Dispatch.ID, receipt)
 }
 
 // submit returns the dispatch's existing receipt, or applies the run
@@ -156,16 +199,29 @@ func (d *Dispatcher) submit(ctx context.Context, session *tempest.Session, admit
 		input.Placement = tempest.PlacementSteer
 		submission, err = session.Submit(ctx, input)
 	}
-	switch {
-	case err == nil:
+	if err == nil {
 		return submission, nil
-	case ctx.Err() != nil:
-		return tempest.Submission{}, ctx.Err()
-	case errors.Is(err, tempest.ErrHostLimit), errors.Is(err, tempest.ErrRunActive), errors.Is(err, tempest.ErrQueueFull):
-		return tempest.Submission{}, transientFailure("worker submission", err)
-	default:
-		return tempest.Submission{}, permanentFailure("worker submission", err)
 	}
+	if ctx.Err() != nil {
+		return tempest.Submission{}, ctx.Err()
+	}
+	// The session commits acceptance before it starts the run and rereads
+	// the receipt, so an error does not prove the input was refused: the
+	// acceptance write may have landed with its acknowledgement lost. Only
+	// the receipt decides. An unreadable one leaves the dispatch live, with
+	// its reservation, for a later pass to look up again.
+	existing, lookupErr := session.Submission(ctx, requestID)
+	if lookupErr == nil {
+		d.log.Warn("github dispatch: worker submission failed after it was accepted; settling the accepted submission", "dispatch", admitted.Dispatch.ID, "state", existing.State, "error", err)
+		return existing, nil
+	}
+	if !errors.Is(lookupErr, tempest.ErrQueueNotFound) {
+		return tempest.Submission{}, fmt.Errorf("worker submission: %w; receipt lookup: %w", err, lookupErr)
+	}
+	if errors.Is(err, tempest.ErrHostLimit) || errors.Is(err, tempest.ErrRunActive) || errors.Is(err, tempest.ErrQueueFull) {
+		return tempest.Submission{}, transientFailure("worker submission", err)
+	}
+	return tempest.Submission{}, permanentFailure("worker submission", err)
 }
 
 // settle waits for the dispatch's runs to end and reports them. Inputs that
@@ -183,6 +239,10 @@ func (d *Dispatcher) settle(ctx context.Context, execution *execution, admitted 
 	}
 	if err != nil {
 		return err
+	}
+	launchedThrough, err := d.launchedThrough(ctx, session, admitted)
+	if err != nil {
+		return fmt.Errorf("read worker receipts: %w", err)
 	}
 	if launched.State == submissionAccepted {
 		// Accepted but never dispatched: a restart before the run began,
@@ -216,7 +276,7 @@ func (d *Dispatcher) settle(ctx context.Context, execution *execution, admitted 
 			return err
 		}
 		execution.close()
-		receipts, err := d.readReceipts(ctx, session, admitted, launched, through)
+		receipts, err := d.readReceipts(ctx, session, admitted, launched, launchedThrough)
 		if err != nil {
 			return err
 		}
@@ -271,12 +331,26 @@ func (d *Dispatcher) continueRun(ctx context.Context, execution *execution, sess
 	}
 }
 
-// finish cancels jobs the worker still owns, so the released slot holds no
-// process, then reports the outcome to control.
+// finish cancels the background tasks and jobs the worker still owns, so
+// nothing it started runs outside the lease, closes the idle session, then
+// reports the outcome to control. The session is closed while the lease is
+// still held, so no next dispatch of the Ticket can have opened it; that
+// one reopens it by ID.
 func (d *Dispatcher) finish(ctx context.Context, execution *execution, admitted model.AdmittedDispatch, session *tempest.Session, outcome model.RunOutcome) error {
 	execution.close()
+	// CancelAll also aborts session-background task roots, which Cancel
+	// and run ends leave in place and which a task drain or an alarm could
+	// otherwise run with no lease.
+	if err := session.CancelAll(ctx); err != nil {
+		return fmt.Errorf("cancel worker tasks: %w", err)
+	}
 	if err := cancelJobs(ctx, session); err != nil {
 		return err
+	}
+	if err := d.host.CloseSession(ctx, session.ID()); err != nil {
+		// The Host keeps closing it in the background; an open session
+		// only costs memory, so settlement goes on.
+		d.log.Warn("github dispatch: close finished worker session", "session", session.ID(), "error", err)
 	}
 	if err := d.store.Finished(ctx, admitted.Dispatch.ID, outcome, d.clock.Now()); err != nil {
 		return err

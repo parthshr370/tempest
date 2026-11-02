@@ -247,6 +247,8 @@ func TestDispatchStopCancelsRunAndOwnedJobs(t *testing.T) {
 	if dispatch.State != model.DispatchFinished || dispatch.Outcome == nil || dispatch.Outcome.StopReason != "aborted" {
 		t.Fatalf("stopped dispatch = %+v outcome %+v", dispatch, dispatch.Outcome)
 	}
+	// Settling closed the idle worker; its jobs are read by reopening.
+	session = w.session(w.detail(ticket).Ticket.SessionID)
 	if live := liveJobs(t, w, session); live != 0 {
 		t.Fatalf("%d jobs outlived the released slot", live)
 	}

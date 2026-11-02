@@ -8,6 +8,7 @@ import (
 
 	"go.harness.dev/harness/internal/githubsource/model"
 	"go.harness.dev/harness/tempest"
+	"go.harness.dev/harness/tempest/durable"
 )
 
 // Worker submission states (tempest.Submission.State).
@@ -75,16 +76,65 @@ func (r *dispatchReceipts) addRun(submission tempest.Submission) {
 	r.runs = append(r.runs, run)
 }
 
-// readReceipts reads the dispatch's launch receipt and the receipts of the
-// Inputs delivered after through. Delivery keys are written in seq order and
-// a run consumes queued items in that order, so the scan stops at the first
-// key the session never saw. A key a vanished run had claimed is settled as
+// submissionNamespace is where a tempest session journals its submission
+// receipts, one record per request ID, revised as the submission advances.
+const submissionNamespace = "_tempest/submissions"
+
+// acceptedAt is the journal position where the session first accepted
+// requestID: the seq of the receipt's first revision.
+func acceptedAt(ctx context.Context, session *tempest.Session, requestID string) (uint64, error) {
+	page, err := session.Read(ctx, durable.Query{Kind: durable.SubmissionKind, Namespace: submissionNamespace, ID: requestID, History: true, Limit: 1})
+	if err != nil {
+		return 0, err
+	}
+	if len(page.Records) == 0 {
+		return 0, tempest.ErrQueueNotFound
+	}
+	return page.Records[0].Seq, nil
+}
+
+// launchedThrough is the last Input the dispatch's launch prompt carried;
+// the dispatch's deliveries are the Inputs after it. Control's ThroughInput
+// is a consumption cursor that continuation receipts advance, so it cannot
+// say where the dispatch's runs began. Every delivery at or below the
+// cursor that the session accepted after the launch belongs to this
+// dispatch, and they are contiguous: walking down from the cursor, the
+// first key the session never saw, or saw before the launch (a delivery an
+// earlier dispatch of the generation withdrew), ends them.
+func (d *Dispatcher) launchedThrough(ctx context.Context, session *tempest.Session, admitted model.AdmittedDispatch) (uint64, error) {
+	launchAt, err := acceptedAt(ctx, session, admitted.Dispatch.RequestID)
+	if err != nil {
+		return 0, err
+	}
+	through := admitted.Dispatch.ThroughInput
+	for through > 0 {
+		at, err := acceptedAt(ctx, session, model.DeliveryRequestID(admitted.Ticket.ID, through, admitted.Dispatch.Gen))
+		if errors.Is(err, tempest.ErrQueueNotFound) {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		if at < launchAt {
+			break
+		}
+		through--
+	}
+	return through, nil
+}
+
+// readReceipts reads every run of the dispatch: the launch receipt and the
+// receipts of all its deliveries, the Inputs after launchedThrough. Each
+// call rereads the whole set, so the runs, their usage and the consumption
+// cursor are derived the same way on every pass and after a restart.
+// Delivery keys are written in seq order, so the scan stops at the first key
+// the session never saw. A key a vanished run had claimed is settled as
 // unknown here, before any later run could adopt it.
-func (d *Dispatcher) readReceipts(ctx context.Context, session *tempest.Session, admitted model.AdmittedDispatch, launched tempest.Submission, through uint64) (dispatchReceipts, error) {
-	receipts := dispatchReceipts{through: through}
+func (d *Dispatcher) readReceipts(ctx context.Context, session *tempest.Session, admitted model.AdmittedDispatch, launched tempest.Submission, launchedThrough uint64) (dispatchReceipts, error) {
+	receipts := dispatchReceipts{through: launchedThrough}
 	receipts.addRun(launched)
 	contiguous := true
-	for seq := through + 1; ; seq++ {
+	for seq := launchedThrough + 1; ; seq++ {
 		key := model.DeliveryRequestID(admitted.Ticket.ID, seq, admitted.Dispatch.Gen)
 		delivery, err := session.Submission(ctx, key)
 		if errors.Is(err, tempest.ErrQueueNotFound) {

@@ -171,3 +171,35 @@ func TestBranchRemoveRefusesDirtyAndUnpushed(t *testing.T) {
 		t.Fatalf("worktrees left: %+v %v", entries, err)
 	}
 }
+
+// TestBranchRemoveKeepsIgnoredData: an ignored file is local data a clean,
+// pushed checkout can still hold; only force may discard it.
+func TestBranchRemoveKeepsIgnoredData(t *testing.T) {
+	ctx := branchContext(t)
+	f := newBranchFixture(t)
+	spec := f.spec("i40-abcdef")
+	if _, err := EnsureBranch(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	writeTest(t, filepath.Join(spec.Path, ".gitignore"), []byte("private/\n"))
+	gitTest(t, spec.Path, "add", ".gitignore")
+	gitTest(t, spec.Path, "commit", "-m", "ignore private")
+	gitTest(t, spec.Path, "push", "origin", spec.Branch)
+	notes := filepath.Join(spec.Path, "private", "operator-notes")
+	writeTest(t, notes, []byte("irreplaceable local data\n"))
+	if err := RemoveBranch(ctx, spec, false); !errors.Is(err, ErrDirty) {
+		t.Fatalf("RemoveBranch(force=false) with ignored data: %v", err)
+	}
+	if _, err := os.Stat(notes); err != nil {
+		t.Fatalf("ignored data lost: %v", err)
+	}
+	if exists, err := branchExists(ctx, f.clone, spec.Branch); err != nil || !exists {
+		t.Fatalf("local branch deleted on refusal: %v %v", exists, err)
+	}
+	if err := RemoveBranch(ctx, spec, true); err != nil {
+		t.Fatalf("operator force: %v", err)
+	}
+	if _, err := os.Stat(spec.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree still present: %v", err)
+	}
+}
