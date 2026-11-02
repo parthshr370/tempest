@@ -112,11 +112,37 @@ func (t *tools) reply(ctx context.Context, c extension.Call, invocation extensio
 	if input.InReplyTo != 0 {
 		request.Kind, request.Payload.ReplyTo = model.EffectReviewReply, input.InReplyTo
 	}
-	intent, err := t.enqueue(ctx, call(c, invocation), request)
+	worker := call(c, invocation)
+	earlier, found, err := t.earlierIntent(ctx, worker)
 	if err != nil {
 		return refuse(err)
 	}
-	return t.settled(ctx, invocation.Identity().SessionID, intent)
+	if found {
+		return t.settled(ctx, worker.SessionID, earlier)
+	}
+	intent, err := t.enqueue(ctx, worker, request)
+	if err != nil {
+		return refuse(err)
+	}
+	return t.settled(ctx, worker.SessionID, intent)
+}
+
+// earlierIntent finds the intent a call committed under an earlier
+// generation of its Ticket. reply is ReplaySafe: a call replayed after
+// recovery started a new generation must return its original intent, but
+// the gateway keys intents by the current generation.
+func (t *tools) earlierIntent(ctx context.Context, worker model.WorkerCall) (model.OutboxIntent, bool, error) {
+	detail, err := t.gateway.Status(ctx, worker.SessionID)
+	if err != nil {
+		return model.OutboxIntent{}, false, err
+	}
+	ticket := detail.Ticket
+	for _, intent := range detail.Outbox {
+		if intent.Gen < ticket.Gen && intent.ID == model.NewOutboxID(ticket.ID, intent.Gen, worker.ToolCallID) {
+			return intent, true, nil
+		}
+	}
+	return model.OutboxIntent{}, false, nil
 }
 
 // head is the worktree's committed HEAD on the Ticket's branch, resolved

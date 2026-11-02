@@ -8,14 +8,19 @@
 //  3. the request is sent once;
 //  4. Settle records what GitHub returned.
 //
-// A write whose reply is lost (gh printed no status, a 5xx, a timeout, a
-// crash after step 2) may have reached GitHub. It is never sent again on
-// that suspicion: reconciliation looks for it first. Comments and pull
-// requests carry the marker <!-- tempest:<OutboxID> --> and are searched
-// for by marker, author and thread; a push is checked against the branch's
-// SHA on GitHub. Found settles confirmed, proven absent goes back to
-// pending for a later attempt, and a search that cannot finish or a branch
-// moved by someone else settles unknown, which only an operator resolves.
+// A write whose reply is lost (gh printed no status, a 5xx, a 408, a
+// timeout, a crash after step 2) may have reached GitHub. Reconciliation
+// looks for it: comments and pull requests end with the marker
+// <!-- tempest:<OutboxID> --> and are searched for by marker, author and
+// thread; a push is checked against the branch's SHA on GitHub.
+//
+// Found settles confirmed. Not finding a comment or pull request proves
+// nothing: GitHub's listings are mutable and eventually consistent, and a
+// human may have edited the marker away. Such a write is never sent again
+// automatically; it settles unknown and only an operator resolves it. Only
+// a write proven not sent (GitHub refused it before writing, or nothing
+// was sent yet) goes back to pending. A push is the exception: it carries
+// an exact lease and is repeatable, so a branch still at the lease retries.
 package outbox
 
 import (
@@ -38,15 +43,11 @@ type Options struct {
 	Client model.GHClient
 	// Store is the control journal's effect side.
 	Store model.EffectStore
-	// Config supplies the repository, the account (its ID scopes
-	// reconciliation; GHPath and GHConfigDir are git's credential) and the
-	// push remote.
+	// Config supplies the repository (the push destination), the account
+	// (its ID scopes reconciliation; GHPath and GHConfigDir are git's
+	// credential) and StateDir, which holds the outbox's push repository.
 	Config model.Config
 	Clock  model.Clock
-	// GitEnv is added to git push's environment after the inherited one,
-	// from which GH_*, GitHub token and git routing variables are dropped;
-	// the account's credential selection is added last and always wins.
-	GitEnv []string
 	Logger *slog.Logger
 	// Interval bounds how long a due retry waits without a Wake. Default
 	// 15 seconds.
@@ -55,20 +56,19 @@ type Options struct {
 
 const (
 	defaultInterval = 15 * time.Second
-	defaultRemote   = "origin"
-	// retryBackoff is the delay after the first failed attempt; each later
-	// attempt doubles it up to maxRetryBackoff.
+	// maxInFlight bounds how many Tickets publish at once. Each Ticket has
+	// at most one operation in flight, so its writes keep their order; a
+	// slow push or scan holds only its own Ticket.
+	maxInFlight = 4
+	// retryBackoff is the delay after the first refused attempt; each
+	// later attempt doubles it up to maxRetryBackoff.
 	retryBackoff    = 30 * time.Second
 	maxRetryBackoff = 15 * time.Minute
 	// maxReconcileReads bounds how often one process tries to read an
 	// attempting write's outcome before settling it unknown.
 	maxReconcileReads = 3
 	reconcileBackoff  = 30 * time.Second
-	// reconcileSkew widens a marker search below the intent's creation
-	// time: the intent carries the controller clock, comments GitHub's.
-	reconcileSkew = time.Hour
-	// maxScanPages bounds one marker search; past it the search cannot
-	// prove absence.
+	// maxScanPages bounds one listing search; past it the search fails.
 	maxScanPages = 100
 	scanPageSize = 100
 )
@@ -88,11 +88,22 @@ type Outbox struct {
 
 	wake    chan struct{}
 	running atomic.Bool
+	// flights counts operations still running, so Run returns after them.
+	flights sync.WaitGroup
 
 	mu sync.Mutex
 	// reads counts failed outcome reads of attempting intents in this
 	// process; next delays the following read.
 	reads map[model.OutboxID]readState
+	// busy holds the Tickets with an operation in flight; released holds
+	// the ones whose operation ended since the current pass listed due
+	// intents, whose listed intent may already be settled.
+	busy, released map[model.TicketID]bool
+	// deferred is set when a due intent waited for a free slot.
+	deferred bool
+	// coolUntil is the account's rate-limit wait: no request is sent before
+	// it, by any Ticket.
+	coolUntil time.Time
 
 	// hook, when set by tests, runs at named crash points; an error stops
 	// processing there as a process death would.
@@ -122,6 +133,10 @@ func New(options Options) (*Outbox, error) {
 	if config.Account.GHPath == "" || config.Account.GHConfigDir == "" {
 		return nil, errors.New("outbox: account ghPath and ghConfigDir are required for pushes")
 	}
+	git, err := newGitRunner(config, owner, name)
+	if err != nil {
+		return nil, err
+	}
 	logger := options.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -130,16 +145,12 @@ func New(options Options) (*Outbox, error) {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-	remote := config.Workers.Remote
-	if remote == "" {
-		remote = defaultRemote
-	}
 	return &Outbox{
 		client: options.Client, store: options.Store, clock: options.Clock, log: logger, interval: interval,
-		repo: config.Repository, owner: owner, account: config.Account.ID,
-		git:   newGitRunner(config.Account, remote, options.GitEnv),
+		repo: config.Repository, owner: owner, account: config.Account.ID, git: git,
 		wake:  make(chan struct{}, 1),
 		reads: make(map[model.OutboxID]readState),
+		busy:  make(map[model.TicketID]bool), released: make(map[model.TicketID]bool),
 	}, nil
 }
 
@@ -158,10 +169,11 @@ func (o *Outbox) Run(ctx context.Context) error {
 		return errors.New("outbox: Run is already running")
 	}
 	defer o.running.Store(false)
+	defer o.flights.Wait()
 	timer := time.NewTimer(o.interval)
 	defer timer.Stop()
 	for {
-		if err := o.publish(ctx); err != nil && ctx.Err() == nil {
+		if err := o.pass(ctx, nil); err != nil && ctx.Err() == nil {
 			o.log.Warn("github outbox: publish", "error", err)
 		}
 		timer.Reset(o.interval)
@@ -174,28 +186,144 @@ func (o *Outbox) Run(ctx context.Context) error {
 	}
 }
 
-// publish works once on every due intent: at most one per Ticket, in the
-// Ticket's order. A settled intent may make the Ticket's next one due, so
-// it wakes Run for another pass.
+// publish runs one pass and waits for the operations it started.
 func (o *Outbox) publish(ctx context.Context) error {
+	var collected errorList
+	err := o.pass(ctx, &collected)
+	return errors.Join(err, collected.join())
+}
+
+// errorList collects the errors of concurrent operations.
+type errorList struct {
+	mu   sync.Mutex
+	errs []error
+	done sync.WaitGroup
+}
+
+func (l *errorList) add(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.errs = append(l.errs, err)
+}
+
+func (l *errorList) join() error {
+	l.done.Wait()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return errors.Join(l.errs...)
+}
+
+// pass starts one operation on each due intent whose Ticket is idle, up to
+// maxInFlight. A finished operation wakes Run, which starts the Ticket's
+// next intent and any skipped here. With collect set, operation errors are
+// gathered for the caller instead of logged.
+func (o *Outbox) pass(ctx context.Context, collect *errorList) error {
+	if o.cooling() {
+		return nil
+	}
+	o.mu.Lock()
+	clear(o.released)
+	o.mu.Unlock()
 	due, err := o.store.Due(ctx, o.clock.Now())
 	if err != nil {
 		return fmt.Errorf("outbox: list due intents: %w", err)
 	}
-	var errs []error
 	for _, intent := range due {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		settled, err := o.process(ctx, intent)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("outbox: intent %s: %w", intent.ID, err))
+		if !o.claim(intent.Ticket) {
+			continue
 		}
-		if settled {
-			o.Wake()
+		o.flights.Add(1)
+		if collect != nil {
+			collect.done.Add(1)
 		}
+		go func() {
+			defer o.flights.Done()
+			if collect != nil {
+				defer collect.done.Done()
+			}
+			settled, err := o.process(ctx, intent)
+			deferred := o.release(intent.Ticket)
+			switch {
+			case err != nil && collect != nil:
+				collect.add(fmt.Errorf("outbox: intent %s: %w", intent.ID, err))
+			case err != nil && ctx.Err() == nil:
+				o.log.Warn("github outbox: publish", "intent", intent.ID, "error", err)
+			}
+			if settled || deferred {
+				o.Wake()
+			}
+		}()
 	}
-	return errors.Join(errs...)
+	return nil
+}
+
+// claim marks a Ticket busy unless it already is, its operation ended since
+// the listing (the listed intent is stale), or maxInFlight is reached.
+func (o *Outbox) claim(ticket model.TicketID) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	switch {
+	case o.busy[ticket] || o.released[ticket]:
+		return false
+	case len(o.busy) >= maxInFlight:
+		o.deferred = true
+		return false
+	}
+	o.busy[ticket] = true
+	return true
+}
+
+// release frees a Ticket and reports whether a pass skipped a due intent
+// for want of a free slot, which needs another pass now.
+func (o *Outbox) release(ticket model.TicketID) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	delete(o.busy, ticket)
+	o.released[ticket] = true
+	deferred := o.deferred
+	o.deferred = false
+	return deferred
+}
+
+// cooling reports whether the account is inside a rate-limit wait.
+func (o *Outbox) cooling() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.clock.Now().Before(o.coolUntil)
+}
+
+// do sends one REST request as the account. Inside a rate-limit wait it
+// sends nothing and returns the refusal GitHub would; a reply carrying
+// Retry-After starts or extends the wait for every Ticket.
+func (o *Outbox) do(ctx context.Context, request model.GHRequest) (model.GHResponse, error) {
+	o.mu.Lock()
+	wait := o.coolUntil.Sub(o.clock.Now())
+	o.mu.Unlock()
+	if wait > 0 {
+		return model.GHResponse{}, &model.GHError{Status: http.StatusTooManyRequests, Message: fmt.Sprintf("%s %s: not sent: the account is rate limited", request.Method, request.Path), RetryAfter: wait}
+	}
+	response, err := o.client.Do(ctx, request)
+	if after := retryAfter(err); after > 0 {
+		o.mu.Lock()
+		if until := o.clock.Now().Add(after); until.After(o.coolUntil) {
+			o.coolUntil = until
+		}
+		o.mu.Unlock()
+		o.log.Warn("github outbox: account rate limited", "retryAfter", after)
+	}
+	return response, err
+}
+
+// retryAfter is GitHub's requested wait carried by err, zero without one.
+func retryAfter(err error) time.Duration {
+	var ghErr *model.GHError
+	if errors.As(err, &ghErr) {
+		return ghErr.RetryAfter
+	}
+	return 0
 }
 
 // process attempts a pending intent or reconciles an attempting one, and
@@ -243,8 +371,14 @@ func failed(err error) step { return step{state: model.EffectFailed, err: err} }
 
 func unknown(err error) step { return step{state: model.EffectUnknown, err: err} }
 
-// absent is a proven non-write: the intent goes back to pending.
-func (o *Outbox) absent(intent model.OutboxIntent, reason error, retryAfter time.Duration) step {
+// unsure settles a comment or pull request whose request may have reached
+// GitHub but which no listing shows: unknown, for an operator.
+func unsure(what string, err error) step {
+	return unknown(fmt.Errorf("%s may have been sent and is not found; it is not sent again until an operator resolves it: %w", what, err))
+}
+
+// retry sends a write proven not sent back to pending.
+func (o *Outbox) retry(intent model.OutboxIntent, reason error, retryAfter time.Duration) step {
 	delay := retryBackoff
 	for range max(intent.Attempts-1, 0) {
 		delay = min(delay*2, maxRetryBackoff)
@@ -263,7 +397,7 @@ func (o *Outbox) settle(ctx context.Context, intent model.OutboxIntent, decided 
 		return false, ctx.Err()
 	}
 	if decided.keep {
-		if !o.readFailed(intent.ID) {
+		if !o.readFailed(intent.ID, retryAfter(decided.err)) {
 			o.log.Warn("github outbox: outcome unread; reading again later", "intent", intent.ID, "error", decided.err)
 			return false, nil
 		}
@@ -300,14 +434,14 @@ func (o *Outbox) readDue(id model.OutboxID) bool {
 	return !o.clock.Now().Before(o.reads[id].next)
 }
 
-// readFailed records a failed outcome read and reports whether the limit
-// is reached.
-func (o *Outbox) readFailed(id model.OutboxID) bool {
+// readFailed records a failed outcome read, delayed at least by GitHub's
+// requested wait, and reports whether the limit is reached.
+func (o *Outbox) readFailed(id model.OutboxID, wait time.Duration) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	state := o.reads[id]
 	state.failures++
-	delay := reconcileBackoff << (state.failures - 1)
+	delay := max(reconcileBackoff<<(state.failures-1), wait)
 	state.next = o.clock.Now().Add(delay)
 	o.reads[id] = state
 	return state.failures >= maxReconcileReads
@@ -357,7 +491,7 @@ const (
 	// sent: GitHub accepted the write.
 	sent verdict = iota
 	// maybeSent: the write may have reached GitHub (no status, 5xx,
-	// timeout); its outcome must be read, never assumed.
+	// 408, timeout); its outcome must be read, never assumed.
 	maybeSent
 	// refusedRetry: GitHub refused it for now (rate limit, 404 that may
 	// be lost access); nothing was written.
@@ -406,7 +540,14 @@ func bound(text string) string {
 	return text[:cut] + "…"
 }
 
-// marked appends the intent's marker to a body it posts.
+// marked appends the intent's marker line to a body it posts.
 func marked(body string, id model.OutboxID) string {
 	return strings.TrimRight(body, "\n") + "\n\n" + model.OutboxMarker(id)
+}
+
+// carries reports whether body ends with the intent's marker line, as
+// marked leaves it. A marker quoted anywhere else in a body does not count.
+func carries(body string, id model.OutboxID) bool {
+	rest, found := strings.CutSuffix(strings.TrimRight(body, " \t\r\n"), model.OutboxMarker(id))
+	return found && strings.HasSuffix(rest, "\n")
 }

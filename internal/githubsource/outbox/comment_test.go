@@ -86,21 +86,19 @@ func TestCommentRestartAtEveryBoundary(t *testing.T) {
 			t.Fatalf("state = %s, want attempting", got.State)
 		}
 		w.restart()
-		// The search proves the comment absent: pending, retried later.
+		// Nothing was sent, but a death after the request leaves the same
+		// journal and the same listing: unknown, for an operator.
 		if err := w.publish(); err != nil {
 			t.Fatal(err)
 		}
 		got := w.intent(ticket, intent.ID)
-		if got.State != model.EffectPending || got.RetryAt.IsZero() || len(w.requests(http.MethodPost, "/comments")) != 0 {
-			t.Fatalf("after reconcile: %+v, want pending with nothing posted", got)
+		if got.State != model.EffectUnknown || !strings.Contains(got.LastError, "operator") {
+			t.Fatalf("after reconcile: %+v, want unknown", got)
 		}
-		w.clock.Advance(time.Hour)
+		w.clock.Advance(24 * time.Hour)
 		w.drain()
-		if got := w.intent(ticket, intent.ID); got.State != model.EffectConfirmed || got.Attempts != 2 {
-			t.Fatalf("intent = %+v, want confirmed on attempt 2", got)
-		}
-		if posted := w.marked(thread.Number, intent.ID); len(posted) != 1 {
-			t.Fatalf("comments = %d, want 1", len(posted))
+		if n := len(w.requests(http.MethodPost, "/comments")); n != 0 {
+			t.Fatalf("POSTs = %d, want none: unknown is never resent", n)
 		}
 	})
 	t.Run("after request before settle", func(t *testing.T) {
@@ -182,9 +180,9 @@ func TestCommentUnreadableOutcomeBecomesUnknown(t *testing.T) {
 	}
 }
 
-// §13 marker search: it pages the target thread, counts only the account's
-// comments, and is not fooled by a human quoting the marker or by the
-// marker on another thread.
+// §13 marker search: it pages the whole target thread with no time bound,
+// counts only the account's comments ending with the marker, and is not
+// fooled by a human quoting the marker or by the marker on another thread.
 func TestCommentReconcilePagesAndScopes(t *testing.T) {
 	w := newWorld(t)
 	thread := issueThread(w)
@@ -211,26 +209,27 @@ func TestCommentReconcilePagesAndScopes(t *testing.T) {
 	if err := w.publish(); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.intent(ticket, intent.ID); got.State != model.EffectPending {
-		t.Fatalf("state = %s, want pending: absence proven over every page", got.State)
+	if got := w.intent(ticket, intent.ID); got.State != model.EffectUnknown {
+		t.Fatalf("state = %s, want unknown: the forged markers are not the write", got.State)
 	}
 	pages := 0
 	for _, request := range w.requests(http.MethodGet, "/issues/1/comments") {
 		if request.Query.Get("page") == "2" {
 			pages++
 		}
-		if request.Query.Get("since") == "" {
-			t.Fatalf("search without a since bound: %+v", request.Query)
+		if request.Query.Has("since") {
+			t.Fatalf("search bounded by the controller clock: %+v", request.Query)
 		}
 	}
 	if pages == 0 {
 		t.Fatal("the search did not read the second page")
 	}
 
-	// Now the real comment lands after 150 others; its reply is lost. The
+	// Now a real comment lands after 150 others; its reply is lost. The
 	// search finds it on the second page.
 	w.clock.Advance(time.Hour)
 	w.writes.LoseAck(http.MethodPost, "/repos/"+repoName+"/issues/1/comments", 0, 1)
+	intent = w.enqueue(ticket, "call-2", model.EffectComment, model.EffectPayload{Body: "hello"})
 	w.drain()
 	got := w.intent(ticket, intent.ID)
 	posted := w.marked(thread.Number, intent.ID)

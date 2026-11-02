@@ -51,7 +51,8 @@ type Options struct {
 	// state. Zero means 20 seconds; negative returns at once.
 	SettleWait time.Duration
 	// GitEnv is added to the environment of the read-only git commands
-	// that resolve the worktree's HEAD.
+	// that resolve the worktree's HEAD. GIT_* entries are dropped, here
+	// and from the controller's environment.
 	GitEnv []string
 }
 

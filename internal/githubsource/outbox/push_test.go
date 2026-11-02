@@ -115,7 +115,7 @@ func TestPushRefusesUnknownCommit(t *testing.T) {
 	ticket := w.launch(issueThread(w))
 	intent := w.push(ticket, "push-1", strings.Repeat("ab", 20))
 	w.drain()
-	if got := w.intent(ticket, intent.ID); got.State != model.EffectFailed || !strings.Contains(got.LastError, "not in the ticket worktree") {
+	if got := w.intent(ticket, intent.ID); got.State != model.EffectFailed || !strings.Contains(got.LastError, "could not be imported from the ticket worktree") {
 		t.Fatalf("intent = %+v, want failed", got)
 	}
 }

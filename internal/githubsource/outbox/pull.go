@@ -56,7 +56,7 @@ func (o *Outbox) attemptOpenPR(ctx context.Context, intent model.OutboxIntent) s
 	sha, exists, err := o.branchHead(ctx, payload.Branch)
 	switch {
 	case err != nil:
-		return o.absent(intent, fmt.Errorf("check branch before opening the pull request: %w", err), 0)
+		return o.retry(intent, fmt.Errorf("check branch before opening the pull request: %w", err), retryAfter(err))
 	case !exists:
 		return failed(fmt.Errorf("branch %s is not on GitHub; push it before opening a pull request", payload.Branch))
 	case payload.SHA != "" && sha != payload.SHA:
@@ -71,7 +71,7 @@ func (o *Outbox) attemptOpenPR(ctx context.Context, intent model.OutboxIntent) s
 		return failed(err)
 	}
 	path := fmt.Sprintf("repos/%s/pulls", o.repo)
-	response, err := o.client.Do(ctx, model.GHRequest{Method: http.MethodPost, Path: path, Body: raw})
+	response, err := o.do(ctx, model.GHRequest{Method: http.MethodPost, Path: path, Body: raw})
 	if err == nil {
 		var opened pull
 		if json.Unmarshal(response.Body, &opened) != nil || opened.Number == 0 {
@@ -85,17 +85,17 @@ func (o *Outbox) attemptOpenPR(ctx context.Context, intent model.OutboxIntent) s
 		// or an earlier open_pr of this Ticket may already have opened it.
 		return o.existingPR(ctx, intent, err)
 	}
-	verdict, retryAfter := classify(err)
+	verdict, wait := classify(err)
 	switch verdict {
 	case refusedRetry:
-		return o.absent(intent, err, retryAfter)
+		return o.retry(intent, err, wait)
 	case refused:
 		return failed(err)
 	}
 	if ctx.Err() != nil {
 		return unread(ctx.Err())
 	}
-	return o.reconcileOpenPR(ctx, intent)
+	return o.searchPR(ctx, intent, err)
 }
 
 // existingPR settles a 422: this intent's PR (by marker) or the open PR
@@ -105,7 +105,7 @@ func (o *Outbox) existingPR(ctx context.Context, intent model.OutboxIntent, refu
 	var marked, open *pull
 	err := o.scanPulls(ctx, intent, func(p pull) bool {
 		switch {
-		case strings.Contains(p.Body, model.OutboxMarker(intent.ID)):
+		case carries(p.Body, intent.ID):
 			marked = &p
 			return true
 		case p.State == "open" && open == nil:
@@ -124,14 +124,24 @@ func (o *Outbox) existingPR(ctx context.Context, intent model.OutboxIntent, refu
 	return failed(refusal)
 }
 
-// reconcileOpenPR searches the branch's PRs for the intent's marker.
+// reconcileOpenPR decides a PR open found attempting after a restart.
 func (o *Outbox) reconcileOpenPR(ctx context.Context, intent model.OutboxIntent) step {
+	return o.searchPR(ctx, intent, errors.New("the process stopped after the attempt was recorded"))
+}
+
+// searchPR looks for the PR whose open may have reached GitHub by its
+// marker. Not found settles unknown, never pending: a human may have
+// rewritten the body of the very PR the attempt opened. The account's other
+// PRs from the branch are named for the operator.
+func (o *Outbox) searchPR(ctx context.Context, intent model.OutboxIntent, cause error) step {
 	var found *pull
+	var others []string
 	err := o.scanPulls(ctx, intent, func(p pull) bool {
-		if strings.Contains(p.Body, model.OutboxMarker(intent.ID)) {
+		if carries(p.Body, intent.ID) {
 			found = &p
 			return true
 		}
+		others = append(others, fmt.Sprintf("#%d (%s)", p.Number, p.State))
 		return false
 	})
 	switch {
@@ -139,8 +149,10 @@ func (o *Outbox) reconcileOpenPR(ctx context.Context, intent model.OutboxIntent)
 		return unread(err)
 	case found != nil:
 		return confirmed(found.reply(true))
+	case len(others) > 0:
+		cause = fmt.Errorf("%w; the account's pull requests from %s without the marker: %s", cause, intent.Payload.Branch, strings.Join(others, ", "))
 	}
-	return o.absent(intent, errors.New("reconciled: the pull request was not opened"), 0)
+	return unsure("the pull request", cause)
 }
 
 // scanPulls pages every PR from the Ticket's branch to the intent's base,
@@ -183,8 +195,8 @@ func (o *Outbox) attemptUpdatePR(ctx context.Context, intent model.OutboxIntent)
 		return failed(err)
 	}
 	path := fmt.Sprintf("repos/%s/pulls/%d", o.repo, payload.Number)
-	response, err := o.client.Do(ctx, model.GHRequest{Method: http.MethodPatch, Path: path, Body: raw})
-	verdict, retryAfter := classify(err)
+	response, err := o.do(ctx, model.GHRequest{Method: http.MethodPatch, Path: path, Body: raw})
+	verdict, wait := classify(err)
 	switch verdict {
 	case sent:
 		var updated pull
@@ -192,7 +204,7 @@ func (o *Outbox) attemptUpdatePR(ctx context.Context, intent model.OutboxIntent)
 			return confirmed(updated.reply(false))
 		}
 	case refusedRetry:
-		return o.absent(intent, err, retryAfter)
+		return o.retry(intent, err, wait)
 	case refused:
 		return failed(err)
 	}
@@ -206,7 +218,7 @@ func (o *Outbox) attemptUpdatePR(ctx context.Context, intent model.OutboxIntent)
 // confirm the edit, otherwise it is proven not applied.
 func (o *Outbox) reconcileUpdatePR(ctx context.Context, intent model.OutboxIntent) step {
 	payload := intent.Payload
-	response, err := o.client.Do(ctx, model.GHRequest{Method: http.MethodGet, Path: fmt.Sprintf("repos/%s/pulls/%d", o.repo, payload.Number)})
+	response, err := o.do(ctx, model.GHRequest{Method: http.MethodGet, Path: fmt.Sprintf("repos/%s/pulls/%d", o.repo, payload.Number)})
 	if err != nil {
 		return unread(fmt.Errorf("read pull request #%d: %w", payload.Number, err))
 	}
@@ -217,5 +229,5 @@ func (o *Outbox) reconcileUpdatePR(ctx context.Context, intent model.OutboxInten
 	if (payload.Title == "" || current.Title == payload.Title) && (payload.Body == "" || current.Body == payload.Body) {
 		return confirmed(current.reply(true))
 	}
-	return o.absent(intent, errors.New("reconciled: the pull request was not updated"), 0)
+	return o.retry(intent, errors.New("reconciled: the pull request was not updated"), 0)
 }

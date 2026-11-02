@@ -191,10 +191,12 @@ func (w *world) open() {
 	}
 	w.store = store
 	client := gh.New(gh.Options{Path: ghfake.Executable(), ConfigDir: w.config.Account.GHConfigDir, Env: w.server.Env(), Clock: w.repo})
-	outbox, err := New(Options{Client: client, Store: store, Config: w.config, Clock: w.clock, GitEnv: w.gitEnv, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	outbox, err := New(Options{Client: client, Store: store, Config: w.config, Clock: w.clock, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		w.t.Fatalf("new outbox: %v", err)
 	}
+	// GitHub's git storage is the local bare repository.
+	outbox.git.url, outbox.git.protocol = w.bare, "file"
 	w.outbox = outbox
 }
 

@@ -165,8 +165,9 @@ func (w *Writes) createComment(rw http.ResponseWriter, request *http.Request) {
 	WriteJSON(rw, http.StatusCreated, comment)
 }
 
-// createReply answers an inline comment in its thread. GitHub threads hang
-// off a root comment, so a reply to a reply joins the root's thread.
+// createReply answers a top-level inline comment in its thread. Like
+// GitHub, it refuses a reply to a reply: "Replies to replies are not
+// supported" (docs.github.com/en/rest/pulls/comments).
 func (w *Writes) createReply(rw http.ResponseWriter, request *http.Request) {
 	var input struct {
 		Body string `json:"body"`
@@ -189,16 +190,19 @@ func (w *Writes) createReply(rw http.ResponseWriter, request *http.Request) {
 		notFound(rw)
 		return
 	}
-	if strings.TrimSpace(input.Body) == "" {
+	target := r.reviewComment[index]
+	switch {
+	case strings.TrimSpace(input.Body) == "":
 		invalid(rw, "Validation Failed: body is missing")
 		return
+	case target.InReplyToID != 0:
+		invalid(rw, "Validation Failed: replies to replies are not supported")
+		return
 	}
-	target := r.reviewComment[index]
-	root := cmp.Or(target.InReplyToID, target.ID)
 	id := r.newID()
 	reply := &ReviewComment{
 		ID: id, Body: input.Body, User: r.account, Path: target.Path, Line: target.Line, OriginalLine: target.OriginalLine,
-		CommitID: target.CommitID, InReplyToID: root, CreatedAt: r.now, UpdatedAt: r.now,
+		CommitID: target.CommitID, InReplyToID: target.ID, CreatedAt: r.now, UpdatedAt: r.now,
 		HTMLURL: fmt.Sprintf("%s#discussion_r%d", found.issue.HTMLURL, id), PullRequestURL: r.pullURL(found.issue.Number),
 		number: found.issue.Number, visibleAt: r.now.Add(r.indexDelay),
 	}

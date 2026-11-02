@@ -87,20 +87,17 @@ func TestWritesReviewReplies(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply := decodeInto[ReviewComment](t, response)
-	// A reply to a reply joins the root's thread.
-	response, err = f.write(http.MethodPost, "repos/o/r/pulls/1/comments/"+itoa(reply.ID)+"/replies", map[string]string{"body": "again"})
-	if err != nil {
-		t.Fatal(err)
+	if reply.InReplyToID != root || reply.Path != "a.go" || reply.User.ID != account.ID {
+		t.Fatalf("reply = %+v, want it in root %d's thread", reply, root)
 	}
-	nested := decodeInto[ReviewComment](t, response)
-	if reply.InReplyToID != root || nested.InReplyToID != root || nested.Path != "a.go" || nested.User.ID != account.ID {
-		t.Fatalf("replies = %+v %+v, want both in root %d's thread", reply, nested, root)
-	}
+	// GitHub answers only top-level comments: a reply to a reply is 422.
+	_, err = f.write(http.MethodPost, "repos/o/r/pulls/1/comments/"+itoa(reply.ID)+"/replies", map[string]string{"body": "again"})
+	wantStatus(t, "reply to a reply", err, http.StatusUnprocessableEntity)
 	f.repo.DeleteReviewComment(root)
 	_, err = f.write(http.MethodPost, "repos/o/r/pulls/1/comments/"+itoa(root)+"/replies", map[string]string{"body": "late"})
 	wantStatus(t, "reply to a deleted comment", err, http.StatusNotFound)
-	if got := len(f.repo.ReviewComments(number)); got != 2 {
-		t.Fatalf("review comments = %d, want 2", got)
+	if got := len(f.repo.ReviewComments(number)); got != 1 {
+		t.Fatalf("review comments = %d, want 1", got)
 	}
 }
 
