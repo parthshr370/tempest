@@ -330,7 +330,9 @@ func (c *crashStore) Commit(ctx context.Context, commit durable.Commit) (durable
 	return durable.Receipt{}, errCrash
 }
 
-// journal dumps every current record as namespace/id -> canonical JSON.
+// journal dumps every current record as namespace/id -> its JSON value.
+// Values are json.Marshal output of the same structs, so equal state has
+// equal bytes.
 func journal(t *testing.T, store durable.Store) map[string]string {
 	t.Helper()
 	out := make(map[string]string)
@@ -342,11 +344,7 @@ func journal(t *testing.T, store durable.Store) map[string]string {
 				t.Fatalf("read journal: %v", err)
 			}
 			for _, record := range page.Records {
-				canonical, err := durable.CanonicalJSON(record.Value)
-				if err != nil {
-					t.Fatalf("canonical %s/%s: %v", record.Namespace, record.ID, err)
-				}
-				out[record.Namespace+"/"+record.ID] = string(canonical)
+				out[record.Namespace+"/"+record.ID] = string(record.Value)
 			}
 			if page.NextCursor == "" {
 				break
