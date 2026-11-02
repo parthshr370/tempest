@@ -180,6 +180,19 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			}
 			out = append(out, update("usage_update", p, at))
 			return out
+		case types.ToolResultMessage:
+			// A guard's notice is added to the result after its
+			// tool_execution_end went out (a batch is judged once all its
+			// results are in), so the completed call's content is sent
+			// again with the notice. Results without one need nothing more.
+			if !agent.HostNoticed(msg.Content) {
+				return nil
+			}
+			status := "completed"
+			if msg.IsError {
+				status = "failed"
+			}
+			return []Update{update("tool_call_update", map[string]any{"toolCallId": msg.ToolCallID, "status": status, "content": toolContent(msg)}, at)}
 		}
 	case agent.EventUsage:
 		m.usage.Total.Add(ev.Usage)

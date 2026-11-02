@@ -125,3 +125,59 @@ func TestLoopGuardLetsJobToolsPoll(t *testing.T) {
 		t.Fatalf("notices: %d nudges, %d stops; want none for polling", nudges, stops)
 	}
 }
+
+// TestHostNoticesReachToolCallUpdates: a guard judges a batch after its
+// results' tool_execution_end went out, so the notice it adds reaches
+// clients as a further tool_call_update for that call carrying the full
+// content. Both guards' notices do; a result without one sends no extra
+// update.
+func TestHostNoticesReachToolCallUpdates(t *testing.T) {
+	ctx := t.Context()
+	provider := faux.New(faux.Options{})
+	owner := openFaux(t, provider, nil)
+	cwd := owner.Snapshot().Cwd
+	if err := os.WriteFile(filepath.Join(cwd, "notes.txt"), []byte("unchanged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, updates, stopWatch := owner.Watch(ctx, WatchOptions{Buffer: 512})
+	defer stopWatch()
+	script := append(repeatedToolCalls("read", `{"path":"notes.txt"}`, 3), repeatedToolCalls("read", `{"path":"missing.txt"}`, 2)...)
+	provider.SetResponses(append(script, faux.Respond(faux.Text("done")))...)
+	if result, err := owner.Prompt(ctx, Prompt{Text: "read the notes"}); err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run=%+v %v", result, err)
+	}
+	if err := owner.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completed := map[string]int{}
+	var noticed []string
+	for update := range updates {
+		if update.Kind != "tool_call_update" {
+			continue
+		}
+		var payload struct {
+			Status  string `json:"status"`
+			Content []struct {
+				Content struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"content"`
+		}
+		if err := json.Unmarshal(update.Update, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Status == "completed" || payload.Status == "failed" {
+			completed[payload.Status]++
+		}
+		if n := len(payload.Content); n > 1 {
+			noticed = append(noticed, payload.Status+": "+payload.Content[n-1].Content.Text)
+		}
+	}
+	if len(noticed) != 2 || !strings.HasPrefix(noticed[0], "completed: [Loop notice from the host]") || !strings.HasPrefix(noticed[1], "failed: [Repeated failure notice from the host]") {
+		t.Fatalf("updates carrying a notice = %q, want the loop notice then the failure notice", noticed)
+	}
+	// Five ends, plus one update per notice.
+	if completed["completed"] != 4 || completed["failed"] != 3 {
+		t.Fatalf("completed/failed tool_call_updates = %v", completed)
+	}
+}
