@@ -902,7 +902,15 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	if timeoutDefault <= 0 {
 		timeoutDefault = 10 * time.Minute
 	}
-	parameters := schema.JSON{"command": schema.String(), "timeout_seconds": schema.JSON{"type": "integer", "minimum": 1, "maximum": maxTimeoutSeconds, "description": fmt.Sprintf("seconds before the command is killed, default %d", int(timeoutDefault/time.Second))}}
+	defaultSeconds := int(timeoutDefault / time.Second)
+	timeoutSchema := schema.JSON{"type": "integer", "minimum": 1, "maximum": maxTimeoutSeconds, "description": fmt.Sprintf("seconds before the command is killed, default %d", defaultSeconds)}
+	// Only a whole number of seconds fits the integer default. Root bash
+	// replaces this property below without one, because there a ready
+	// service that omits timeout_seconds has no limit.
+	if time.Duration(defaultSeconds)*time.Second == timeoutDefault {
+		timeoutSchema["default"] = defaultSeconds
+	}
+	parameters := schema.JSON{"command": schema.String(), "timeout_seconds": timeoutSchema}
 	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
 	if options.Work != nil && !options.Child {
 		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, pty, stdin, ready_log, ready_port and ready_timeout_ms already imply it"}

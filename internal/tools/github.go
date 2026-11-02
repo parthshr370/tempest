@@ -39,7 +39,7 @@ var githubReadOps = []string{"issue_view", "pr_view", "pr_diff", "repo_view", "f
 var githubSearchScope = regexp.MustCompile(`(?:^|\s)-?(?:repo|org|user|owner):\S`)
 
 func newGitHubTool(name ToolName, cwd string, options ToolsOptions) agent.AgentTool {
-	props := schema.JSON{"op": schema.JSON{"type": "string", "enum": githubReadOps}, "repo": schema.String(), "number": schema.String(), "query": schema.String(), "path": schema.String(), "branch": schema.String(), "run": schema.String(), "limit": schema.JSON{"type": "integer", "minimum": 1, "maximum": 100}, "timeout_seconds": schema.JSON{"type": "integer", "minimum": 1, "maximum": 300}}
+	props := schema.JSON{"op": schema.JSON{"type": "string", "enum": githubReadOps}, "repo": schema.String(), "number": schema.String(), "query": schema.String(), "path": schema.String(), "branch": schema.String(), "run": schema.String(), "limit": schema.JSON{"type": "integer", "minimum": 1, "maximum": 100}, "timeout_seconds": schema.JSON{"type": "integer", "minimum": 1, "maximum": 300, "default": 30}}
 	required := []string{"op"}
 	description := "Read GitHub issues, PRs, full PR diffs, repositories, files, search results and Actions logs through the gh CLI. repo is owner/repo (default current workspace repository). number and run are positive decimal strings. Search uses the GitHub API JSON protocol. run_watch polls until completed, for up to timeout_seconds (1..300, default 30). run_logs reads failed job logs. For paged PR diffs use read pr://<number>/diff. Requires authenticated gh; never changes GitHub or workspace state."
 	if name == GHCheckoutTool {

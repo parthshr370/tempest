@@ -443,7 +443,9 @@ Every argument that is a duration names its unit: `timeout_seconds` on `bash`,
 `wait`, `eval`, `debug` and `gh`; `ready_timeout_ms` on `bash`; `wait_ms` on
 `write_stdin` and `lsp_diagnostics`; `await_reply_ms` on `message`. `bash`,
 `wait`, `eval`, `debug` and `gh` reject arguments their schema does not declare,
-so a bare `timeout` fails with a validation error instead of being ignored.
+so a bare `timeout` fails with a validation error instead of being ignored. Every
+provider is sent that `additionalProperties: false`, so the model sees the rule
+before it calls.
 
 ### Files and search
 

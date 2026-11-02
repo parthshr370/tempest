@@ -133,3 +133,36 @@ func TestDurationArgumentsNameTheirUnit(t *testing.T) {
 		}
 	}
 }
+
+// TestTimeoutDefaultsInSchema checks the JSON Schema default keyword where a
+// tool's default timeout is one fixed number. Root bash omits it: a
+// ready_log/ready_port service left without timeout_seconds has no limit, so
+// the default depends on the other arguments.
+func TestTimeoutDefaultsInSchema(t *testing.T) {
+	gh, _ := NewTool(GHTool, t.TempDir(), ToolsOptions{})
+	for _, test := range []struct {
+		name string
+		tool types.Tool
+		want any
+	}{
+		{"child bash", newBashTool(t.TempDir(), ToolsOptions{BashTimeout: 90 * time.Second}).Tool, float64(90)},
+		{"child bash, unset", newBashTool(t.TempDir(), ToolsOptions{}).Tool, float64(600)},
+		{"child bash, fractional", newBashTool(t.TempDir(), ToolsOptions{BashTimeout: 1500 * time.Millisecond}).Tool, nil},
+		{"root bash", newBashTool(t.TempDir(), ToolsOptions{Work: &serviceController{}}).Tool, nil},
+		{"gh", gh.Tool, float64(30)},
+	} {
+		var document struct {
+			Properties map[string]map[string]any `json:"properties"`
+		}
+		if err := json.Unmarshal(test.tool.Parameters, &document); err != nil {
+			t.Fatalf("%s: %v", test.name, err)
+		}
+		timeout, ok := document.Properties["timeout_seconds"]
+		if !ok {
+			t.Fatalf("%s: no timeout_seconds property", test.name)
+		}
+		if got := timeout["default"]; got != test.want {
+			t.Errorf("%s: default = %#v, want %#v", test.name, got, test.want)
+		}
+	}
+}
