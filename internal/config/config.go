@@ -244,6 +244,7 @@ type ResolvedConfig struct {
 	contextFiles           ContextFileSettings
 	reminders              []agent.Reminder
 	loopDetection          agent.LoopThresholds
+	toolSearch             agent.ToolSearch
 	mcpServers             []mcpconfig.Server
 	mcpSamplingModel       string
 	mcpSamplingMaxTokens   int
@@ -397,6 +398,9 @@ func (c *ResolvedConfig) ContextFiles() ContextFileSettings {
 // LoopDetection returns the loop guard's thresholds.
 func (c *ResolvedConfig) LoopDetection() agent.LoopThresholds { return c.loopDetection }
 
+// ToolSearch returns when MCP and extension tool schemas are deferred.
+func (c *ResolvedConfig) ToolSearch() agent.ToolSearch { return c.toolSearch }
+
 // SkillPaths returns a defensive copy of explicit skill locations.
 func (c *ResolvedConfig) SkillPaths() []string {
 	return append([]string(nil), c.skillPaths...)
@@ -520,6 +524,7 @@ type fileSettings struct {
 	ContextFiles            *contextFilesSettings             `json:"context_files"`
 	Reminders               []agent.Reminder                  `json:"reminders"`
 	LoopDetection           *loopDetectionSettings            `json:"loop_detection"`
+	ToolSearch              *toolSearchSettings               `json:"tool_search"`
 }
 
 // contextFilesSettings is the context_files object; built-in defaults fill
@@ -538,6 +543,14 @@ type loopDetectionSettings struct {
 	RepeatedResult *int `json:"repeated_result"`
 	RepeatedPoll   *int `json:"repeated_poll"`
 	RepeatedText   *int `json:"repeated_text"`
+}
+
+// toolSearchSettings is the tool_search object: when MCP and extension tool
+// schemas wait behind the tool_search tool. Built-in defaults fill every
+// member a layer leaves unset.
+type toolSearchSettings struct {
+	Mode            *string `json:"mode"`
+	ThresholdTokens *int    `json:"threshold_tokens"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -711,6 +724,10 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	if err != nil {
 		return nil, err
 	}
+	toolSearch, err := resolveToolSearch(settings.ToolSearch)
+	if err != nil {
+		return nil, err
+	}
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
@@ -773,6 +790,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		contextFiles:           contextFiles,
 		reminders:              slices.Clone(settings.Reminders),
 		loopDetection:          loopDetection,
+		toolSearch:             toolSearch,
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,
@@ -836,6 +854,25 @@ func resolveLoopDetection(raw *loopDetectionSettings) (agent.LoopThresholds, err
 		return agent.LoopThresholds{}, &Error{Field: "loop_detection", Err: err}
 	}
 	return thresholds, nil
+}
+
+// resolveToolSearch validates tool_search after defaults filled it: a known
+// mode and a positive threshold.
+func resolveToolSearch(raw *toolSearchSettings) (agent.ToolSearch, error) {
+	if raw == nil {
+		raw = &toolSearchSettings{}
+	}
+	resolved := agent.ToolSearch{Mode: agent.ToolSearchMode(settingString(raw.Mode)), ThresholdTokens: settingValue(raw.ThresholdTokens)}
+	if resolved.Mode == "" {
+		resolved.Mode = agent.ToolSearchAuto
+	}
+	if err := resolved.Validate(); err != nil {
+		return agent.ToolSearch{}, &Error{Field: "tool_search", Err: err}
+	}
+	if resolved.ThresholdTokens < 1 {
+		return agent.ToolSearch{}, &Error{Field: "tool_search", Err: errors.New("threshold_tokens must be at least 1")}
+	}
+	return resolved, nil
 }
 
 // settingString trims a merged string setting; unset is empty.

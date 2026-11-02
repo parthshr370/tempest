@@ -652,6 +652,7 @@ var projectGates = map[string]trustGate{
 	"bash_timeout":                gateExecutable,
 	"log_file_max_bytes":          gateExecutable,
 	"loop_detection":              gateExecutable,
+	"tool_search":                 gateExecutable,
 	"max_input_tokens":            gateExecutable,
 	"max_output_tokens":           gateExecutable,
 	"max_total_tokens":            gateExecutable,
@@ -706,8 +707,9 @@ var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
 // applies without trust: plan mode, web tools off, a deny list, which an
 // untrusted repository adds to the lists below it (unionProjectDenies), the
 // session-start listing or retries off, each cost or resource cap at most at
-// the operator's value, and loop-detection thresholds no looser than the
-// operator's. Every other value of these keys, null included, could lift an
+// the operator's value, loop-detection thresholds no looser than the
+// operator's, and tool schemas deferred at least as much as the operator
+// defers them. Every other value of these keys, null included, could lift an
 // operator's restriction.
 func narrowsPermissions(key string, value *settingsNode, operator *fileSettings) bool {
 	if operator == nil {
@@ -765,6 +767,53 @@ func narrowsPermissions(key string, value *settingsNode, operator *fileSettings)
 		return err == nil && timeout > 0 && timeout <= ceiling
 	case "loop_detection":
 		return tightensLoopDetection(value, operator.LoopDetection)
+	case "tool_search":
+		return defersMoreTools(value, operator.ToolSearch)
+	}
+	return false
+}
+
+// defersMoreTools reports whether a repository's tool_search object defers
+// tool schemas at least as much as the operator's settings: mode "always";
+// "auto" with a threshold at most the operator's, or under an operator's
+// "never"; "never" only under an operator's "never". A member the object
+// leaves unset keeps the operator's value, the built-in default when the
+// operator set none.
+func defersMoreTools(value *settingsNode, operator *toolSearchSettings) bool {
+	if value == nil || value.object == nil {
+		return false
+	}
+	if operator == nil {
+		operator = &toolSearchSettings{}
+	}
+	operatorMode := agent.ToolSearchMode(cmp.Or(settingString(operator.Mode), string(agent.ToolSearchAuto)))
+	operatorThreshold := cmp.Or(settingValue(operator.ThresholdTokens), agent.DefaultToolSearchThreshold)
+	mode, threshold := operatorMode, operatorThreshold
+	for name, member := range value.object {
+		switch name {
+		case "mode":
+			var spec string
+			if member.isNull() || json.Unmarshal(member.scalar, &spec) != nil {
+				return false
+			}
+			mode = agent.ToolSearchMode(strings.TrimSpace(spec))
+		case "threshold_tokens":
+			limit, whole := wholeNumber[int](member)
+			if !whole || limit < 1 {
+				return false
+			}
+			threshold = limit
+		default:
+			return false
+		}
+	}
+	switch mode {
+	case agent.ToolSearchAlways:
+		return true
+	case agent.ToolSearchAuto:
+		return operatorMode == agent.ToolSearchNever || operatorMode == agent.ToolSearchAuto && threshold <= operatorThreshold
+	case agent.ToolSearchNever:
+		return operatorMode == agent.ToolSearchNever
 	}
 	return false
 }
@@ -1143,6 +1192,10 @@ func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[
 			"repeated_result": numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedResult)),
 			"repeated_poll":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedPoll)),
 			"repeated_text":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedText)),
+		}},
+		"tool_search": {object: map[string]*settingsNode{
+			"mode":             {scalar: json.RawMessage(`"` + agent.ToolSearchAuto + `"`)},
+			"threshold_tokens": numberNode(strconv.Itoa(agent.DefaultToolSearchThreshold)),
 		}},
 	}
 	fallback, err := stringsNode(DefaultContextFallback)
