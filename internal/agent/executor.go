@@ -372,6 +372,9 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	if !found {
 		return nil, &immediateOutcome{result: createErrorToolResult(unknownToolMessage(toolCall.Name, currentContext.Tools)), isError: true}
 	}
+	if tool.unloaded {
+		return nil, &immediateOutcome{result: createErrorToolResult(notLoadedMessage(toolCall.Name)), isError: true}
+	}
 
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -671,15 +674,18 @@ func createErrorToolResult(message string) AgentToolResult {
 	return AgentToolResult{Content: []types.ContentBlock{types.NewText(message)}, IsError: true}
 }
 
-// unknownToolMessage names the tools the session does have, so a call to a
-// tool that isn't there can be redirected instead of retried.
+// unknownToolMessage names the tools the session offers, so a call to a
+// tool that isn't there can be redirected instead of retried. Deferred
+// tools not loaded yet are listed in tool_search's description instead.
 func unknownToolMessage(name string, tools []AgentTool) string {
-	if len(tools) == 0 {
-		return "Tool " + name + " not found: this session has no tools, so answer without calling one."
-	}
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
-		names = append(names, tool.Name)
+		if !tool.unloaded {
+			names = append(names, tool.Name)
+		}
+	}
+	if len(names) == 0 {
+		return "Tool " + name + " not found: this session has no tools, so answer without calling one."
 	}
 	return "Tool " + name + " not found. The tools in this session are: " + strings.Join(names, ", ") + "."
 }

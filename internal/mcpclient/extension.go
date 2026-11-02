@@ -85,7 +85,7 @@ func (manager *Manager) bundleTools() []agent.AgentTool {
 				defer grant.Revoke()
 				result, err := tool.Execute(ctx, extension.Call{ID: id, Name: tool.Name, Arguments: args}, grant)
 				return agent.AgentToolResult{Content: agentContent(result.Content), Details: result.Details, StructuredContent: result.StructuredContent, IsError: result.IsError, Terminate: result.Control == "terminate"}, err
-			}})
+			}, Deferrable: true})
 		}
 	}
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })

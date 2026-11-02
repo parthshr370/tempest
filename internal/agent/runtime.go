@@ -131,6 +131,9 @@ type AgentOptions struct {
 	// LoopThresholds configures the loop guard; nil means
 	// [DefaultLoopThresholds].
 	LoopThresholds *LoopThresholds
+	// ToolSearch configures deferred tool loading; nil means automatic
+	// deferral at [DefaultToolSearchThreshold].
+	ToolSearch *ToolSearch
 }
 
 // ErrRunActive is returned by Prompt and Continue while a run is in progress.
@@ -203,6 +206,7 @@ type Agent struct {
 	ToolExecution              ToolExecutionMode
 	Reminders                  []Reminder
 	LoopThresholds             *LoopThresholds
+	ToolSearch                 *ToolSearch
 }
 
 var defaultModel = types.Model{
@@ -301,6 +305,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		ToolExecution:              toolExecution,
 		Reminders:                  append([]Reminder(nil), opts.Reminders...),
 		LoopThresholds:             opts.LoopThresholds,
+		ToolSearch:                 opts.ToolSearch,
 		budget:                     opts.Budget,
 	}
 }
@@ -618,6 +623,11 @@ func (a *Agent) startableLocked() error {
 			return err
 		}
 	}
+	if a.ToolSearch != nil {
+		if err := a.ToolSearch.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -686,6 +696,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		OutputSchema:     a.outputSchema,
 		Reminders:        a.Reminders,
 		LoopThresholds:   a.LoopThresholds,
+		ToolSearch:       a.ToolSearch,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

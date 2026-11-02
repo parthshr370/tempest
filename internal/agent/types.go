@@ -97,6 +97,14 @@ type AgentTool struct {
 	// state outside the workspace. Nil, the default for commands, MCP and
 	// extension tools, means every call may change things and see such state.
 	ReadsWorkspace func(arguments json.RawMessage) bool
+	// Deferrable marks a tool whose schema the loop may hold back behind
+	// tool_search when the tool set is large (see [ToolSearch]). MCP and
+	// extension tools set it; built-in tools do not.
+	Deferrable bool
+	// unloaded marks a deferred tool in a request's tool view that the
+	// model has not loaded: it is not sent to the provider and a call to it
+	// fails (see toolsearch.go).
+	unloaded bool
 }
 
 // AgentContext is the context snapshot passed into the low-level agent loop.
@@ -232,6 +240,9 @@ type AgentLoopConfig struct {
 	// LoopThresholds configures the loop guard; nil means
 	// [DefaultLoopThresholds].
 	LoopThresholds *LoopThresholds
+	// ToolSearch configures deferred tool loading; nil means the zero
+	// [ToolSearch], automatic deferral at the default threshold.
+	ToolSearch *ToolSearch
 }
 
 // Budget caps one run. Zero fields are unlimited. The loop checks the budget
