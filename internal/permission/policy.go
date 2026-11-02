@@ -141,7 +141,10 @@ type Outcome struct {
 func ClassifyTool(toolName string) Tier {
 	switch toolName {
 	case "ask", "search_history", "read", "grep", "find", "ls", "web_search", "web_fetch", "attachment", "skill", "wait", "logs",
-		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image", "ast_grep", "gh":
+		"lsp_definition", "lsp_references", "lsp_rename", "lsp_diagnostics", "manifest_diff", "view_image", "ast_grep", "gh",
+		// tool_search only shows deferred tools' names and descriptions and
+		// offers their schemas; calling one is gated by its own name.
+		"tool_search":
 		return TierRead
 	case "write", "edit", "hashline", "integrate", "todo_write", "checkpoint", "rewind", "ast_edit":
 		return TierWrite

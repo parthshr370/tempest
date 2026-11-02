@@ -52,10 +52,16 @@ type Message interface {
 // UserMessage is a user turn. Reminder names the conversation-scope reminder
 // whose firing this message is (see agent.Reminder); it is empty for every
 // other message and never sent to a provider.
+//
+// LoadedTools is set on a compaction's summary message: the tools the
+// summarized messages showed loaded (agent.LoadedTools), in the order they
+// were first loaded, so the tools a request offers survive the checkpoint.
+// It is never sent to a provider.
 type UserMessage struct {
-	Content   UserContent `json:"content"`
-	Timestamp int64       `json:"timestamp"`
-	Reminder  string      `json:"reminder,omitempty"`
+	Content     UserContent `json:"content"`
+	Timestamp   int64       `json:"timestamp"`
+	Reminder    string      `json:"reminder,omitempty"`
+	LoadedTools []string    `json:"loadedTools,omitempty"`
 }
 
 func (UserMessage) Role() string { return "user" }

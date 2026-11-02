@@ -66,6 +66,7 @@ var gatedSamples = map[string]string{
 	"bash_timeout":                `"1h"`,
 	"log_file_max_bytes":          `1`,
 	"loop_detection":              `{"repeated_poll":0}`,
+	"tool_search":                 `{"mode":"never"}`,
 	"max_input_tokens":            `1000`,
 	"max_output_tokens":           `1000`,
 	"max_total_tokens":            `1000`,
@@ -239,6 +240,11 @@ var projectSettingTrust = []struct {
 	{"loop_detection", `{"repeated_result":2,"repeated_poll":11}`, gateExecutable},
 	{"loop_detection", `{"repeated_result":null}`, gateExecutable},
 	{"loop_detection", `null`, gateExecutable},
+	// Defers tool schemas less than the operator (here the defaults).
+	{"tool_search", `{"mode":"never"}`, gateExecutable},
+	{"tool_search", `{"threshold_tokens":20000}`, gateExecutable},
+	{"tool_search", `{"mode":null}`, gateExecutable},
+	{"tool_search", `null`, gateExecutable},
 	// Lifts a per-run cap: null or 0 is unlimited, the built-in value.
 	{"max_input_tokens", `null`, gateExecutable},
 	{"max_output_tokens", `0`, gateExecutable},
@@ -323,6 +329,9 @@ var projectSettingTrust = []struct {
 	{"workspace_listing_max_bytes", `4096`, gateNone},
 	// Loop-detection thresholds may be tightened down to 2.
 	{"loop_detection", `{"repeated_result":3,"repeated_poll":2,"repeated_text":2}`, gateNone},
+	// Tool schemas may be deferred more: always, or a lower threshold.
+	{"tool_search", `{"mode":"always","threshold_tokens":20000}`, gateNone},
+	{"tool_search", `{"mode":"auto","threshold_tokens":100}`, gateNone},
 }
 
 // Every settings key has an audited trust class, and each repository value

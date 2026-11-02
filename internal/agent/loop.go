@@ -546,6 +546,14 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 				releaseExtensions = releasePrepared
 			}
+			// The tools this request offers: with deferral, the eager tools,
+			// tool_search and the loaded deferred tools. The executor runs
+			// only what the provider was offered.
+			isSticky := config.toolSearchLatch != nil && config.toolSearchLatch.Load()
+			view, isDeferring := toolView(current.Tools, current.Messages, config.ToolSearch, isSticky)
+			if isDeferring && config.toolSearchLatch != nil {
+				config.toolSearchLatch.Store(true)
+			}
 			release, stop, err := run.accounting.admit(ctx, config.Model)
 			if stop != "" || err != nil {
 				release()
@@ -588,7 +596,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					admit = func() error { return run.accounting.attemptStop(run, types.Usage{}) }
 				}
 				request := newModelRequest(*config, run.config.bindings.snapshot().RunID, run.fallbackIndex)
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, admit: admit, switched: switched, request: request}, tail)
+				message, err := streamAssistantResponse(ctx, &current, view, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, admit: admit, switched: switched, request: request}, tail)
 				if stop := (*providerBudgetStop)(nil); errors.As(err, &stop) {
 					// The refused attempt was accounted as discarded.
 					return message, err
@@ -662,7 +670,9 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					run.result.StopReason = StopMaxToolCalls
 					return nil
 				}
-				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
+				offered := current
+				offered.Tools = view
+				executedToolBatch, err := executeToolCalls(ctx, offered, message, *config, run.emit)
 				if err != nil {
 					return err
 				}
@@ -942,6 +952,9 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // first when the request starts, each later one at its [types.EvAttempt],
 // when it is actually sent. Listeners get that as a model_attempt event.
 //
+// view is the request's tool view (see toolView): the request sends its
+// tools except the deferred ones the model has not loaded.
+//
 // tail holds the request-scope reminders due on this request. They go after
 // the transcript in this request only: cctx never holds them, so nothing
 // that records or compacts the transcript sees them. Their firings ride on
@@ -950,7 +963,7 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
 // provider's producer stops instead of running on unobserved.
-func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, observers responseObservers, tail requestTail) (types.AssistantMessage, error) {
+func streamAssistantResponse(ctx context.Context, cctx *AgentContext, view []AgentTool, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, observers responseObservers, tail requestTail) (types.AssistantMessage, error) {
 	messages := cctx.Messages
 	if config.TransformContext != nil {
 		messages = config.TransformContext(ctx, messages)
@@ -965,10 +978,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		llmMessages = append(llmMessages[:len(llmMessages):len(llmMessages)], scoped...)
 		requestScoped = len(scoped)
 	}
-	tools := make([]types.Tool, 0, len(cctx.Tools))
-	for _, tool := range cctx.Tools {
-		tools = append(tools, tool.Tool)
-	}
+	tools := offeredTools(view)
 	llmContext := types.Context{
 		SystemPrompt:  cctx.SystemPrompt,
 		Messages:      llmMessages,

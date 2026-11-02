@@ -264,7 +264,7 @@ func (r *Runtime) tool(req *request, d extension.Definition, t extension.Tool) a
 			return agent.AgentToolResult{}, err
 		}
 		return toAgent(result), nil
-	}}
+	}, Deferrable: true}
 }
 func (r *Runtime) callID(ctx context.Context, req *request, id string) string {
 	if logical, ok := ctx.Value(logicalKey{}).(string); ok && logical != "" {

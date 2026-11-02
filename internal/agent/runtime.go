@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
@@ -131,6 +132,9 @@ type AgentOptions struct {
 	// LoopThresholds configures the loop guard; nil means
 	// [DefaultLoopThresholds].
 	LoopThresholds *LoopThresholds
+	// ToolSearch configures deferred tool loading; nil means automatic
+	// deferral at [DefaultToolSearchThreshold].
+	ToolSearch *ToolSearch
 }
 
 // ErrRunActive is returned by Prompt and Continue while a run is in progress.
@@ -177,6 +181,9 @@ type Agent struct {
 	bindings      *runtimeBindings
 	ended         bool
 	outputSchema  *outputschema.Schema
+	// toolSearchLatch is set once a request of this conversation defers
+	// tools (see [ToolSearch]); Reset and an empty SetMessages clear it.
+	toolSearchLatch atomic.Bool
 
 	emitMu sync.Mutex
 	// seq is the last Seq handed out; guarded by emitMu.
@@ -203,6 +210,7 @@ type Agent struct {
 	ToolExecution              ToolExecutionMode
 	Reminders                  []Reminder
 	LoopThresholds             *LoopThresholds
+	ToolSearch                 *ToolSearch
 }
 
 var defaultModel = types.Model{
@@ -301,6 +309,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		ToolExecution:              toolExecution,
 		Reminders:                  append([]Reminder(nil), opts.Reminders...),
 		LoopThresholds:             opts.LoopThresholds,
+		ToolSearch:                 opts.ToolSearch,
 		budget:                     opts.Budget,
 	}
 }
@@ -450,6 +459,7 @@ func (a *Agent) Reset() {
 	a.state.ErrorMessage = ""
 	a.steeringQueue.Clear()
 	a.followUpQueue.Clear()
+	a.toolSearchLatch.Store(false)
 }
 
 // State returns a snapshot of the public agent state. Slices are copied so
@@ -484,11 +494,16 @@ func (a *Agent) SetTools(tools []AgentTool) {
 	a.state.Tools = copyAgentTools(tools)
 }
 
-// SetMessages replaces the conversation history.
+// SetMessages replaces the conversation history. An empty history (a
+// context reset or handoff) starts a new conversation, so it also clears the
+// tool-search latch as [Agent.Reset] does; queues and settings are kept.
 func (a *Agent) SetMessages(messages []types.Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.Messages = copyAgentMessages(messages)
+	if len(messages) == 0 {
+		a.toolSearchLatch.Store(false)
+	}
 }
 
 // SetSystemPrompt replaces the system prompt.
@@ -618,6 +633,11 @@ func (a *Agent) startableLocked() error {
 			return err
 		}
 	}
+	if a.ToolSearch != nil {
+		if err := a.ToolSearch.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -686,6 +706,8 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		OutputSchema:     a.outputSchema,
 		Reminders:        a.Reminders,
 		LoopThresholds:   a.LoopThresholds,
+		ToolSearch:       a.ToolSearch,
+		toolSearchLatch:  &a.toolSearchLatch,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

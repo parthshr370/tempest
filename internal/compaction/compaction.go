@@ -1356,6 +1356,11 @@ func Compact(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, p
 // copies are dropped; the newest copy of each one only the summarized part
 // holds follows the summary verbatim. A reminder so stays in front of the
 // model for the rest of the conversation and its copies collapse to one.
+//
+// The summary message carries the tools the messages it replaces show
+// loaded (agent.LoadedTools) in its LoadedTools, so the rebuilt
+// conversation shows the same loaded tools in the same order, and a request
+// offers the same tools after the checkpoint as before it.
 func ApplyCompaction(pathEntries []SessionEntry, prep *CompactionPreparation, summary string) []ptypes.Message {
 	if prep == nil {
 		return buildSessionContext(pathEntries)
@@ -1364,10 +1369,13 @@ func ApplyCompaction(pathEntries []SessionEntry, prep *CompactionPreparation, su
 	summaryText := compactionSummaryPrefix + summary + compactionSummarySuffix
 	if len(kept) > 0 {
 		if user, ok := asUser(kept[0]); ok && user.Reminder == "" {
-			return slices.Concat([]ptypes.Message{mergeSummaryIntoUser(summaryText, user)}, carried, kept[1:])
+			merged := mergeSummaryIntoUser(summaryText, user)
+			merged.LoadedTools = agent.LoadedTools(slices.Concat(prep.MessagesToSummarize, prep.TurnPrefixMessages, []ptypes.Message{user}))
+			return slices.Concat([]ptypes.Message{merged}, carried, kept[1:])
 		}
 	}
-	result := []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(summaryText), Timestamp: time.Now().UnixMilli()}}
+	loaded := agent.LoadedTools(slices.Concat(prep.MessagesToSummarize, prep.TurnPrefixMessages))
+	result := []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(summaryText), Timestamp: time.Now().UnixMilli(), LoadedTools: loaded}}
 	return slices.Concat(result, carried, kept)
 }
 
