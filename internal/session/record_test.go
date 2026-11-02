@@ -535,8 +535,10 @@ func TestAttachJournalRecordsAFullRunInOrder(t *testing.T) {
 			}
 		}
 	}
+	// The second usage line is the batch's tool-call receipt, committed
+	// before any of its tools start.
 	want := []string{
-		"run_started", "message", "message", "usage",
+		"run_started", "message", "message", "usage", "usage",
 		"tool_started", "tool_finished", "message",
 		"tool_started", "tool_finished", "message",
 		"tool_started", "tool_finished", "message",

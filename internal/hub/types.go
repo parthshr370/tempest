@@ -129,21 +129,26 @@ type Snapshot struct {
 }
 
 // WireBudget is the ACP form of [agent.Budget], matching the session/new and
-// tempest/set_budget parameters. Zero fields are unlimited.
+// tempest/set_budget parameters. Zero fields are unlimited; the token and
+// tool-call caps are omitted when zero.
 type WireBudget struct {
-	MaxTurns       int     `json:"maxTurns"`
-	MaxCostUSD     float64 `json:"maxCostUsd"`
-	MaxWallSeconds float64 `json:"maxWallSeconds"`
+	MaxTurns        int     `json:"maxTurns"`
+	MaxCostUSD      float64 `json:"maxCostUsd"`
+	MaxWallSeconds  float64 `json:"maxWallSeconds"`
+	MaxInputTokens  int     `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
+	MaxTotalTokens  int     `json:"maxTotalTokens,omitempty"`
+	MaxToolCalls    int     `json:"maxToolCalls,omitempty"`
 }
 
 // NewWireBudget converts a budget to its wire form.
 func NewWireBudget(b agent.Budget) WireBudget {
-	return WireBudget{MaxTurns: b.MaxTurns, MaxCostUSD: b.MaxCostUSD, MaxWallSeconds: b.MaxWallTime.Seconds()}
+	return WireBudget{MaxTurns: b.MaxTurns, MaxCostUSD: b.MaxCostUSD, MaxWallSeconds: b.MaxWallTime.Seconds(), MaxInputTokens: b.MaxInputTokens, MaxOutputTokens: b.MaxOutputTokens, MaxTotalTokens: b.MaxTotalTokens, MaxToolCalls: b.MaxToolCalls}
 }
 
 // Budget converts the wire form back to a budget.
 func (w WireBudget) Budget() agent.Budget {
-	return agent.Budget{MaxTurns: w.MaxTurns, MaxCostUSD: w.MaxCostUSD, MaxWallTime: time.Duration(w.MaxWallSeconds * float64(time.Second))}
+	return agent.Budget{MaxTurns: w.MaxTurns, MaxCostUSD: w.MaxCostUSD, MaxWallTime: time.Duration(w.MaxWallSeconds * float64(time.Second)), MaxInputTokens: w.MaxInputTokens, MaxOutputTokens: w.MaxOutputTokens, MaxTotalTokens: w.MaxTotalTokens, MaxToolCalls: w.MaxToolCalls}
 }
 
 // snapshotJSON shadows Budget so the snapshot carries the camelCase wire form.

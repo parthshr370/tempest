@@ -270,6 +270,10 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		MaxTurns             *int     `json:"maxTurns"`
 		MaxCostUSD           *float64 `json:"maxCostUsd"`
 		MaxWallSeconds       *float64 `json:"maxWallSeconds"`
+		MaxInputTokens       *int     `json:"maxInputTokens"`
+		MaxOutputTokens      *int     `json:"maxOutputTokens"`
+		MaxTotalTokens       *int     `json:"maxTotalTokens"`
+		MaxToolCalls         *int     `json:"maxToolCalls"`
 		Mode                 string   `json:"mode"`
 		Checkpoint           string   `json:"checkpoint"`
 		Goal                 string   `json:"goal"`
@@ -444,6 +448,18 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 			}
 			budget.MaxWallTime = time.Duration(seconds * float64(time.Second))
 		}
+		if p.MaxInputTokens != nil {
+			budget.MaxInputTokens = *p.MaxInputTokens
+		}
+		if p.MaxOutputTokens != nil {
+			budget.MaxOutputTokens = *p.MaxOutputTokens
+		}
+		if p.MaxTotalTokens != nil {
+			budget.MaxTotalTokens = *p.MaxTotalTokens
+		}
+		if p.MaxToolCalls != nil {
+			budget.MaxToolCalls = *p.MaxToolCalls
+		}
 		if err := s.SetBudget(budget); err != nil {
 			return nil, rpc.NewError(-32005, "budget_invalid", err.Error())
 		}
@@ -480,11 +496,7 @@ type openParams struct {
 			Model          string                `json:"model"`
 			PermissionMode string                `json:"permissionMode"`
 			Environment    environment.Reference `json:"environment"`
-			Budget         *struct {
-				MaxTurns       int     `json:"maxTurns"`
-				MaxCostUSD     float64 `json:"maxCostUsd"`
-				MaxWallSeconds float64 `json:"maxWallSeconds"`
-			} `json:"budget"`
+			Budget         *hub.WireBudget       `json:"budget"`
 		} `json:"tempest"`
 	} `json:"_meta"`
 }
@@ -535,10 +547,10 @@ func (c *Client) open(ctx context.Context, method string, raw json.RawMessage) (
 			n.PermissionMode = mode
 		}
 		if b := p.Meta.Tempest.Budget; b != nil {
-			if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallSeconds < 0 || b.MaxWallSeconds > float64(math.MaxInt64)/float64(time.Second) {
+			if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallSeconds < 0 || b.MaxWallSeconds > float64(math.MaxInt64)/float64(time.Second) || b.MaxInputTokens < 0 || b.MaxOutputTokens < 0 || b.MaxTotalTokens < 0 || b.MaxToolCalls < 0 {
 				return nil, rpc.NewError(-32005, "budget_invalid", "invalid budget")
 			}
-			n.Budget = tempest.Budget{MaxTurns: b.MaxTurns, MaxCostUSD: b.MaxCostUSD, MaxWallTime: time.Duration(b.MaxWallSeconds * float64(time.Second))}
+			n.Budget = b.Budget()
 		}
 		s, err = c.backend.New(ctx, p.Cwd, n)
 	} else {

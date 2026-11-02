@@ -45,9 +45,27 @@ type RunInput struct {
 
 // RunBudget may tighten, but can't remove, the host's limits.
 type RunBudget struct {
-	MaxTurns       *int     `json:"maxTurns,omitempty"`
-	MaxCostUSD     *float64 `json:"maxCostUsd,omitempty"`
-	MaxWallSeconds *float64 `json:"maxWallSeconds,omitempty"`
+	MaxTurns        *int     `json:"maxTurns,omitempty"`
+	MaxCostUSD      *float64 `json:"maxCostUsd,omitempty"`
+	MaxWallSeconds  *float64 `json:"maxWallSeconds,omitempty"`
+	MaxInputTokens  *int     `json:"maxInputTokens,omitempty"`
+	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
+	MaxTotalTokens  *int     `json:"maxTotalTokens,omitempty"`
+	MaxToolCalls    *int     `json:"maxToolCalls,omitempty"`
+}
+
+// tightenCap applies a caller's whole-number cap where zero is unlimited:
+// it may set one under an unlimited host or lower the host's, never remove
+// or raise it.
+func tightenCap(name string, requested *int, host *int) error {
+	if requested == nil {
+		return nil
+	}
+	if *requested < 0 || (*host > 0 && (*requested == 0 || *requested > *host)) {
+		return fmt.Errorf("%s must not relax the host cap", name)
+	}
+	*host = *requested
+	return nil
 }
 
 // RunOutput reports one admitted run, including its durable identity.
@@ -77,7 +95,7 @@ type toolResult struct {
 	IsError           bool          `json:"isError"`
 }
 
-var toolDefinition = json.RawMessage(`{"name":"tempest_run","description":"Run a bounded Tempest coding-agent session in the server host workspace. Reuse sessionId for conversation continuity and requestId for durable retries. Tools remain subject to host permissions.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"cwd":{"type":"string"},"sessionId":{"type":"string"},"requestId":{"type":"string","minLength":1},"model":{"type":"string"},"budget":{"type":"object","properties":{"maxTurns":{"type":"integer","minimum":0},"maxCostUsd":{"type":"number","minimum":0},"maxWallSeconds":{"type":"number","minimum":0}},"additionalProperties":false}},"required":["prompt"],"additionalProperties":false}}`)
+var toolDefinition = json.RawMessage(`{"name":"tempest_run","description":"Run a bounded Tempest coding-agent session in the server host workspace. Reuse sessionId for conversation continuity and requestId for durable retries. Tools remain subject to host permissions.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"cwd":{"type":"string"},"sessionId":{"type":"string"},"requestId":{"type":"string","minLength":1},"model":{"type":"string"},"budget":{"type":"object","properties":{"maxTurns":{"type":"integer","minimum":0},"maxCostUsd":{"type":"number","minimum":0},"maxWallSeconds":{"type":"number","minimum":0},"maxInputTokens":{"type":"integer","minimum":0},"maxOutputTokens":{"type":"integer","minimum":0},"maxTotalTokens":{"type":"integer","minimum":0},"maxToolCalls":{"type":"integer","minimum":0}},"additionalProperties":false}},"required":["prompt"],"additionalProperties":false}}`)
 
 var inputValidator = sync.OnceValues(func() (*jsonschema.Schema, error) {
 	var tool struct {
@@ -150,11 +168,20 @@ func (in RunInput) settings(host tempest.NewSession, providers map[string]adapte
 		host.Model = in.Model
 	}
 	if b := in.Budget; b != nil {
-		if b.MaxTurns != nil {
-			if *b.MaxTurns < 0 || (host.Budget.MaxTurns > 0 && (*b.MaxTurns == 0 || *b.MaxTurns > host.Budget.MaxTurns)) {
-				return host, fmt.Errorf("maxTurns must not relax the host cap")
+		for _, limit := range []struct {
+			name      string
+			requested *int
+			host      *int
+		}{
+			{"maxTurns", b.MaxTurns, &host.Budget.MaxTurns},
+			{"maxInputTokens", b.MaxInputTokens, &host.Budget.MaxInputTokens},
+			{"maxOutputTokens", b.MaxOutputTokens, &host.Budget.MaxOutputTokens},
+			{"maxTotalTokens", b.MaxTotalTokens, &host.Budget.MaxTotalTokens},
+			{"maxToolCalls", b.MaxToolCalls, &host.Budget.MaxToolCalls},
+		} {
+			if err := tightenCap(limit.name, limit.requested, limit.host); err != nil {
+				return host, err
 			}
-			host.Budget.MaxTurns = *b.MaxTurns
 		}
 		if b.MaxCostUSD != nil {
 			v := *b.MaxCostUSD
