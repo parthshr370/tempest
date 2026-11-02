@@ -236,6 +236,7 @@ type ResolvedConfig struct {
 	retry                  RetrySettings
 	contextFiles           ContextFileSettings
 	reminders              []agent.Reminder
+	loopDetection          agent.LoopThresholds
 	mcpServers             []mcpconfig.Server
 	mcpSamplingModel       string
 	mcpSamplingMaxTokens   int
@@ -382,6 +383,9 @@ func (c *ResolvedConfig) ContextFiles() ContextFileSettings {
 	return settings
 }
 
+// LoopDetection returns the loop guard's thresholds.
+func (c *ResolvedConfig) LoopDetection() agent.LoopThresholds { return c.loopDetection }
+
 // SkillPaths returns a defensive copy of explicit skill locations.
 func (c *ResolvedConfig) SkillPaths() []string {
 	return append([]string(nil), c.skillPaths...)
@@ -500,6 +504,7 @@ type fileSettings struct {
 	OTel                    *otelFileSettings                 `json:"otel"`
 	ContextFiles            *contextFilesSettings             `json:"context_files"`
 	Reminders               []agent.Reminder                  `json:"reminders"`
+	LoopDetection           *loopDetectionSettings            `json:"loop_detection"`
 }
 
 // contextFilesSettings is the context_files object; built-in defaults fill
@@ -509,6 +514,16 @@ type contextFilesSettings struct {
 	MaxBytes       *int     `json:"max_bytes"`
 	NestedMaxBytes *int     `json:"nested_max_bytes"`
 	Nested         *bool    `json:"nested"`
+}
+
+// loopDetectionSettings is the loop_detection object: the loop guard's
+// thresholds, 0 for off. Built-in defaults fill every member a layer leaves
+// unset.
+type loopDetectionSettings struct {
+	RepeatedCall     *int `json:"repeated_call"`
+	RepeatedResult   *int `json:"repeated_result"`
+	AlternatingCalls *int `json:"alternating_calls"`
+	RepeatedText     *int `json:"repeated_text"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -664,6 +679,10 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	if err := agent.ValidateReminders(settings.Reminders); err != nil {
 		return nil, &Error{Field: "reminders", Err: err}
 	}
+	loopDetection, err := resolveLoopDetection(settings.LoopDetection)
+	if err != nil {
+		return nil, err
+	}
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
@@ -724,6 +743,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		workspaceListing:       WorkspaceListing{Disabled: !settingValue(settings.WorkspaceListing), MaxFiles: listingMaxFiles, MaxBytes: listingMaxBytes},
 		contextFiles:           contextFiles,
 		reminders:              slices.Clone(settings.Reminders),
+		loopDetection:          loopDetection,
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,
@@ -771,6 +791,23 @@ func resolveContextFiles(raw *contextFilesSettings) (ContextFileSettings, error)
 	// bounds each nested file.
 	resolved.NestedMaxBytes = min(resolved.NestedMaxBytes, resolved.MaxBytes)
 	return resolved, nil
+}
+
+// resolveLoopDetection validates loop_detection after defaults filled it.
+func resolveLoopDetection(raw *loopDetectionSettings) (agent.LoopThresholds, error) {
+	if raw == nil {
+		raw = &loopDetectionSettings{}
+	}
+	thresholds := agent.LoopThresholds{
+		RepeatedCall:     settingValue(raw.RepeatedCall),
+		RepeatedResult:   settingValue(raw.RepeatedResult),
+		AlternatingCalls: settingValue(raw.AlternatingCalls),
+		RepeatedText:     settingValue(raw.RepeatedText),
+	}
+	if err := thresholds.Validate(); err != nil {
+		return agent.LoopThresholds{}, &Error{Field: "loop_detection", Err: err}
+	}
+	return thresholds, nil
 }
 
 // settingString trims a merged string setting; unset is empty.
