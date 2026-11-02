@@ -226,7 +226,7 @@ func TestDefaultStackHonorsConfiguredTaskOptIn(t *testing.T) {
 func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
-	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"}]`)
+	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout_seconds":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout_seconds":30}}]},{"text":"DONE"}]`)
 	owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, FauxScript: script})
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestNamedBashRunsInBackgroundWithoutAsync(t *testing.T) {
 func TestWaitWithdrawsNoticeWithItsResult(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	cwd := t.TempDir()
-	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout":30}}]},{"text":"DONE"}]`)
+	script := writeScript(t, `[{"toolCalls":[{"id":"bg","name":"bash","arguments":{"command":"sleep 0.3; printf ready > marker.txt","name":"make_marker","timeout_seconds":60}}]},{"toolCalls":[{"id":"w","name":"wait","arguments":{"names":["make_marker"],"timeout_seconds":30}}]},{"text":"DONE"}]`)
 	owner, err := Open(t.Context(), Options{SessionDir: t.TempDir(), Cwd: cwd, New: &NewSession{PermissionMode: permission.ModeBypass}, FauxScript: script})
 	if err != nil {
 		t.Fatal(err)

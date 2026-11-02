@@ -371,7 +371,7 @@ func TestGitHubWatchReleasesAdmissionBetweenPolls(t *testing.T) {
 		}
 		return func() { held-- }, nil
 	}})
-	_, err := executeTool(t, tool, map[string]any{"op": "run_watch", "run": "1", "timeout": 1})
+	_, err := executeTool(t, tool, map[string]any{"op": "run_watch", "run": "1", "timeout_seconds": 1})
 	if err == nil || held != 0 || commands < 2 {
 		t.Fatalf("watch admission: %v held=%d commands=%d", err, held, commands)
 	}

@@ -46,6 +46,12 @@ func encodedResult(encoded json.RawMessage) agent.AgentToolResult {
 	return agent.AgentToolResult{Content: []types.ContentBlock{types.NewText(string(encoded))}, Details: encoded}
 }
 
+// The wait tool's bounds, in seconds, match the job manager's.
+const (
+	defaultWaitSeconds = 30
+	maxWaitSeconds     = 300
+)
+
 // JobsAction validates the action before a permission gate classifies it.
 func JobsAction(params json.RawMessage) (string, error) {
 	var input struct {
@@ -76,8 +82,10 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 		parameters = schema.ObjectRequired(schema.JSON{"cursor": schema.String(), "limit": schema.Number(), "action": schema.JSON{"type": "string", "enum": []string{"list", "cleanup"}}, "job_id": schema.String()}, []string{})
 		description = "List durable session jobs, or explicitly clean up one terminal job's owned worktree. Cleanup never applies its patch."
 	case WaitTool:
-		parameters = schema.ObjectRequired(schema.JSON{"job_ids": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true}, "names": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "background bash job names, in place of or besides job_ids"}, "timeout": schema.Number()}, []string{})
-		description = "Wait for any requested job to settle. Pass job_ids, names (the name given to a background bash job) or both. Timeout stops waiting, not the jobs. A job this returns settled sends no separate completion notice later, unless that notice is already on its way; every other job keeps its notice, including one that reads finished while it is still wrapping up."
+		// The duration's unit is in its name, as in every tool: an unlabelled
+		// timeout drew milliseconds from models.
+		parameters = strictObjectSchema(schema.JSON{"job_ids": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true}, "names": schema.JSON{"type": "array", "items": schema.String(), "minItems": 1, "maxItems": 8, "uniqueItems": true, "description": "background bash job names, in place of or besides job_ids"}, "timeout_seconds": schema.JSON{"type": "number", "minimum": 0, "maximum": maxWaitSeconds, "default": defaultWaitSeconds, "description": fmt.Sprintf("seconds this call waits for a job to settle, at most %d; 0 or absent means %d", maxWaitSeconds, defaultWaitSeconds)}})
+		description = "Wait for any requested job to settle. Pass job_ids, names (the name given to a background bash job) or both. timeout_seconds stops waiting, not the jobs. A job this returns settled sends no separate completion notice later, unless that notice is already on its way; every other job keeps its notice, including one that reads finished while it is still wrapping up."
 	case CancelTool:
 		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "a background bash job's name, in place of job_id"}}, []string{})
 		description = "Durably request cancellation of one session-owned job, by job_id or by background bash job name. Use wait for its joined terminal state."
@@ -97,7 +105,7 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 			Name    string   `json:"name"`
 			JobIDs  []string `json:"job_ids"`
 			Names   []string `json:"names"`
-			Timeout *float64 `json:"timeout"`
+			Timeout *float64 `json:"timeout_seconds"`
 			Offset  int64    `json:"offset"`
 		}
 		if err := json.Unmarshal(params, &input); err != nil {
@@ -127,10 +135,10 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 				encoded, err = json.Marshal(page.ToolView())
 			}
 		case WaitTool:
-			timeout := 30 * time.Second
+			timeout := defaultWaitSeconds * time.Second
 			if input.Timeout != nil {
-				if *input.Timeout < 0 || *input.Timeout > 300 {
-					return agent.AgentToolResult{}, errors.New("wait timeout must be between 0 and 300 seconds")
+				if *input.Timeout < 0 || *input.Timeout > maxWaitSeconds {
+					return agent.AgentToolResult{}, fmt.Errorf("wait timeout_seconds must be between 0 and %d", maxWaitSeconds)
 				}
 				timeout = time.Duration(*input.Timeout * float64(time.Second))
 			}

@@ -20,22 +20,22 @@ func newDebugTool(cwd string, debugger *dap.Manager) agent.AgentTool {
 	var mu sync.Mutex
 	breakpoints := map[string]map[int]bool{}
 	actions := []string{"launch", "attach", "set_breakpoint", "remove_breakpoint", "set_breakpoints", "continue", "step_over", "step_in", "step_out", "pause", "threads", "stack_trace", "scopes", "variables", "evaluate", "output", "terminate"}
-	parameters := schema.Object(schema.JSON{
-		"action":       schema.JSON{"type": "string", "enum": actions},
-		"adapter":      schema.String(),
-		"program":      schema.String(),
-		"args":         schema.JSON{"type": "array", "items": schema.String()},
-		"cwd":          schema.String(),
-		"file":         schema.String(),
-		"line":         schema.JSON{"type": "integer"},
-		"lines":        schema.JSON{"type": "array", "items": schema.JSON{"type": "integer"}},
-		"thread_id":    schema.JSON{"type": "integer"},
-		"frame_id":     schema.JSON{"type": "integer"},
-		"variable_ref": schema.JSON{"type": "integer"},
-		"expression":   schema.String(),
-		"pid":          schema.JSON{"type": "integer"},
-		"arguments":    schema.JSON{"type": "object", "additionalProperties": true},
-		"timeout":      schema.JSON{"type": "number", "minimum": 1, "maximum": 300, "default": 30},
+	parameters := strictObjectSchema(schema.JSON{
+		"action":          schema.JSON{"type": "string", "enum": actions},
+		"adapter":         schema.String(),
+		"program":         schema.String(),
+		"args":            schema.JSON{"type": "array", "items": schema.String()},
+		"cwd":             schema.String(),
+		"file":            schema.String(),
+		"line":            schema.JSON{"type": "integer"},
+		"lines":           schema.JSON{"type": "array", "items": schema.JSON{"type": "integer"}},
+		"thread_id":       schema.JSON{"type": "integer"},
+		"frame_id":        schema.JSON{"type": "integer"},
+		"variable_ref":    schema.JSON{"type": "integer"},
+		"expression":      schema.String(),
+		"pid":             schema.JSON{"type": "integer"},
+		"arguments":       schema.JSON{"type": "object", "additionalProperties": true},
+		"timeout_seconds": schema.JSON{"type": "number", "minimum": 1, "maximum": 300, "default": 30},
 	}, "action")
 	return agent.AgentTool{
 		Tool: types.Tool{
@@ -61,7 +61,7 @@ func newDebugTool(cwd string, debugger *dap.Manager) agent.AgentTool {
 				Expression  string                     `json:"expression"`
 				PID         int                        `json:"pid"`
 				Arguments   map[string]json.RawMessage `json:"arguments"`
-				Timeout     *float64                   `json:"timeout"`
+				Timeout     *float64                   `json:"timeout_seconds"`
 			}
 			if err := decodeParams(raw, &input); err != nil {
 				return agent.AgentToolResult{}, err
@@ -69,7 +69,7 @@ func newDebugTool(cwd string, debugger *dap.Manager) agent.AgentTool {
 			timeout := dap.Timeout
 			if input.Timeout != nil {
 				if *input.Timeout < 1 || *input.Timeout > 300 {
-					return agent.AgentToolResult{}, errors.New("debug timeout must be between 1 and 300 seconds")
+					return agent.AgentToolResult{}, errors.New("debug timeout_seconds must be between 1 and 300")
 				}
 				timeout = time.Duration(*input.Timeout * float64(time.Second))
 			}

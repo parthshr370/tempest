@@ -105,6 +105,26 @@ func TestBuildParamsOAuthSystemToolsThinkingAndMetadata(t *testing.T) {
 	}
 }
 
+// TestConvertToolsKeepsClosedInputSchema checks that a tool whose schema
+// rejects undeclared arguments says so to Claude: the agent loop validates
+// arguments against the full schema, so an input_schema without
+// additionalProperties:false lets Claude send a field that is then refused.
+func TestConvertToolsKeepsClosedInputSchema(t *testing.T) {
+	tools := convertTools([]types.Tool{
+		{Name: "wait", Parameters: json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"timeout_seconds":{"type":"number"}},"required":[]}`)},
+		{Name: "open", Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}}}`)},
+	}, false, false, nil)
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `[{"description":"","input_schema":{"additionalProperties":false,"properties":{"timeout_seconds":{"type":"number"}},"required":[],"type":"object"},"name":"wait"},` +
+		`{"description":"","input_schema":{"properties":{"path":{"type":"string"}},"required":[],"type":"object"},"name":"open"}]`
+	if string(encoded) != want {
+		t.Fatalf("tools =\n%s\nwant\n%s", encoded, want)
+	}
+}
+
 func TestConvertMessagesGroupsToolResultsAndCachesLastUserBlock(t *testing.T) {
 	model := baseModel()
 	messages := []types.Message{

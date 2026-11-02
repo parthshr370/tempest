@@ -24,7 +24,7 @@ other tools.
 
 ## Timeouts and resets
 
-- `timeout` is seconds, default 30. `0` disables it.
+- `timeout_seconds` defaults to 30. `0` disables it.
 - A timeout interrupts the cell, keeping variables and effects that happened before
   the interruption.
 - SIGINT targets only the kernel, not subprocesses started by earlier cells.

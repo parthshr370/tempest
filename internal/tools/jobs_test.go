@@ -80,7 +80,7 @@ func TestManagementActionsAndObservationalWait(t *testing.T) {
 	for _, test := range []struct {
 		name         ToolName
 		args, action string
-	}{{JobsTool, `{}`, "list"}, {JobsTool, `{"action":"cleanup","job_id":"job_test"}`, "cleanup"}, {WaitTool, `{"job_ids":["job_test"],"timeout":0.001}`, "wait"}, {CancelTool, `{"job_id":"job_test"}`, "cancel"}, {LogsTool, `{"job_id":"job_test"}`, "logs"}} {
+	}{{JobsTool, `{}`, "list"}, {JobsTool, `{"action":"cleanup","job_id":"job_test"}`, "cleanup"}, {WaitTool, `{"job_ids":["job_test"],"timeout_seconds":0.001}`, "wait"}, {CancelTool, `{"job_id":"job_test"}`, "cancel"}, {LogsTool, `{"job_id":"job_test"}`, "logs"}} {
 		tool := newManagementTool(test.name, controller)
 		result, err := tool.Execute(context.Background(), "raw", json.RawMessage(test.args), nil)
 		if err != nil || controller.action != test.action || result.Terminate {

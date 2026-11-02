@@ -258,7 +258,7 @@ positive decimal strings. Search takes `query` and an optional `limit` (1 to 100
 Repository search is global. Other searches use the workspace repository when no
 explicit `repo` or query scope (`repo:`, `org:`, `user:`, `owner:`) is given.
 `file_read` takes a repository-relative `path` and optional `branch`.
-`run_watch` polls until completion, up to `timeout` seconds (1 to 300, default 30).
+`run_watch` polls until completion, up to `timeout_seconds` (1 to 300, default 30).
 `run_logs` returns failed-job logs.
 
 `gh_checkout` requires exec permission and is absent from all child, plan and scout sessions.
@@ -333,7 +333,7 @@ Start with `action:"launch"` and `program`, or `action:"attach"` and `pid`.
 `adapter` selects a trusted adapter definition. The default selection is `debugpy`
 for `.py` and `dlv` otherwise. `arguments` passes adapter-specific launch or attach
 fields. `cwd`, `program` and breakpoint `file` paths all resolve against the session
-workspace. Requests default to 30 seconds; `timeout` accepts 1 through 300 seconds.
+workspace. Requests default to 30 seconds; `timeout_seconds` accepts 1 through 300.
 Launch and attach always require per-call approval, even in bypass mode; approval
 is never remembered. Evaluation uses the same destructive, cloud and hook-settings
 checks as `eval`.
@@ -439,6 +439,14 @@ debug session is gone and requires an explicit new launch or attach.
 
 ## Tool reference
 
+Every argument that is a duration names its unit: `timeout_seconds` on `bash`,
+`wait`, `eval`, `debug` and `gh`; `ready_timeout_ms` on `bash`; `wait_ms` on
+`write_stdin` and `lsp_diagnostics`; `await_reply_ms` on `message`. `bash`,
+`wait`, `eval`, `debug` and `gh` reject arguments their schema does not declare,
+so a bare `timeout` fails with a validation error instead of being ignored. Every
+provider is sent that `additionalProperties: false`, so the model sees the rule
+before it calls.
+
 ### Files and search
 
 - `read`: files, directories, archives and their members, office documents, PDF text, SQLite, JSON queries, and internal URLs (`skill://`, `job://`, `history://`, `local://`, `issue://`, `pr://`). Numbered content when the file fits one read, a structural outline for a Go file that does not. `paths` reads up to 20 files in one call, each with its own selector.
@@ -455,11 +463,11 @@ debug session is gone and requires an explicit new launch or attach.
 
 ### Runtime
 
-- `bash`: workspace shell with a destructive-command guard and a default ten-minute timeout. `skill://` and `local://` words expand to paths. `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds. `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal. See [Subagents and jobs](subagents.md).
+- `bash`: workspace shell with a destructive-command guard and a default ten-minute timeout, which `timeout_seconds` overrides. `skill://` and `local://` words expand to paths. `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds. `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal. See [Subagents and jobs](subagents.md).
 - `eval`: persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset. Requires `python3`, or `node`/`bun` for JS, only when called. See [Eval](eval.md).
 - `debug`: launch or attach a session-owned debugger, control execution and inspect state. Requires an installed adapter. Plan mode denies all actions.
 - `jobs`: page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.
-- `wait`: wait for any requested job, by id or background bash job name, without cancelling it on wait timeout. A job `wait` returns settled (finished, its notice queued and its worktree cleaned up) gets no later completion notice, unless the loop had already taken that notice. Every other job it reports keeps its notice: one still running, and one whose state reads finished while it is still wrapping up, which a wait on several jobs can return beside the settled one.
+- `wait`: wait for any requested job, by id or background bash job name, for up to `timeout_seconds` (default 30, at most 300), without cancelling it on wait timeout. A job `wait` returns settled (finished, its notice queued and its worktree cleaned up) gets no later completion notice, unless the loop had already taken that notice. Every other job it reports keeps its notice: one still running, and one whose state reads finished while it is still wrapping up, which a wait on several jobs can return beside the settled one.
 - `cancel`: cancel one task or background bash job, by id or name.
 - `logs`: page a background command's bounded output (stdout and stderr in write order) by byte offset, by id or name.
 - `write_stdin`: type into a running background job (text, Ctrl-C, end of input) and get back the output it printed since the last call, by id or name.

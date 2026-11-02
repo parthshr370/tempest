@@ -146,10 +146,10 @@ func TestBashExpandsURLsBeforeThePermissionGate(t *testing.T) {
 	fixture := newRefsFixture(t)
 	bash, _ := NewTool(BashTool, t.TempDir(), ToolsOptions{Refs: fixture.root})
 
-	prepared := bash.PrepareArguments(mustJSON(t, map[string]any{"command": "cat skill://alpha/reference.md", "timeout": 5}))
+	prepared := bash.PrepareArguments(mustJSON(t, map[string]any{"command": "cat skill://alpha/reference.md", "timeout_seconds": 5}))
 	var args struct {
 		Command string `json:"command"`
-		Timeout int    `json:"timeout"`
+		Timeout int    `json:"timeout_seconds"`
 	}
 	if err := json.Unmarshal(prepared, &args); err != nil {
 		t.Fatal(err)

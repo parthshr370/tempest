@@ -56,7 +56,7 @@ func TestEvalToolRejectsInvalidTimeoutAndUnownedKernel(t *testing.T) {
 		t.Fatal("eval registered without a lifecycle owner")
 	}
 	tool := newEvalTool(nil)
-	for _, params := range []string{`{"language":"py","code":"1","timeout":-1}`, `{"language":"py","code":"1","timeout":2147484}`} {
+	for _, params := range []string{`{"language":"py","code":"1","timeout_seconds":-1}`, `{"language":"py","code":"1","timeout_seconds":2147484}`} {
 		if _, err := tool.Execute(context.Background(), "call", json.RawMessage(params), nil); err == nil {
 			t.Fatal("invalid timeout accepted")
 		}

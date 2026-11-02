@@ -824,8 +824,9 @@ func toolResultBlock(ctx context.Context, msg types.ToolResultMessage, blobReade
 }
 
 // convertTools maps our [types.Tool] list into Anthropic's tools[] array.
-// Each tool's Parameters JSON Schema becomes an input_schema; eager_input_streaming
-// is set when the compatibility layer supports it; the last tool gets cache_control
+// Each tool's Parameters JSON Schema becomes an input_schema of its type,
+// properties, required and additionalProperties; eager_input_streaming is set
+// when the compatibility layer supports it; the last tool gets cache_control
 // for prompt caching.
 func convertTools(tools []types.Tool, isOAuth bool, supportsEagerToolInputStreaming bool, cc *cacheControl) []map[string]any {
 	if tools == nil {
@@ -838,13 +839,9 @@ func convertTools(tools []types.Tool, isOAuth bool, supportsEagerToolInputStream
 			name = toClaudeCodeName(name)
 		}
 		converted := map[string]any{
-			"name":        name,
-			"description": tool.Description,
-			"input_schema": map[string]any{
-				"type":       "object",
-				"properties": schemaProperties(tool.Parameters),
-				"required":   schemaRequired(tool.Parameters),
-			},
+			"name":         name,
+			"description":  tool.Description,
+			"input_schema": inputSchema(tool.Parameters),
 		}
 		if supportsEagerToolInputStreaming {
 			converted["eager_input_streaming"] = true
@@ -903,20 +900,25 @@ func rawJSONToObject(raw json.RawMessage) map[string]any {
 	return map[string]any{}
 }
 
-// schemaProperties extracts the "properties" key from a JSON Schema.
-func schemaProperties(raw json.RawMessage) any {
-	if properties, ok := rawJSONToObject(raw)["properties"]; ok {
-		return properties
+// inputSchema builds a tool's input_schema from its JSON Schema. Top-level
+// additionalProperties is kept because the agent loop validates arguments
+// against the full schema: a closed object must look closed to Claude, which
+// accepts additionalProperties in input_schema (strict tool use requires it).
+func inputSchema(raw json.RawMessage) map[string]any {
+	document := rawJSONToObject(raw)
+	properties, ok := document["properties"]
+	if !ok {
+		properties = map[string]any{}
 	}
-	return map[string]any{}
-}
-
-// schemaRequired extracts the "required" key from a JSON Schema.
-func schemaRequired(raw json.RawMessage) any {
-	if required, ok := rawJSONToObject(raw)["required"]; ok {
-		return required
+	required, ok := document["required"]
+	if !ok {
+		required = []string{}
 	}
-	return []string{}
+	converted := map[string]any{"type": "object", "properties": properties, "required": required}
+	if additional, ok := document["additionalProperties"]; ok {
+		converted["additionalProperties"] = additional
+	}
+	return converted
 }
 
 // asUser type-asserts an [types.Message] to [types.UserMessage] (value or pointer).
