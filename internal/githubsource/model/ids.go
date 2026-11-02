@@ -35,9 +35,11 @@ const (
 )
 
 // Worker-session document namespace, declared by the github extension. The
-// controller writes it once before the worker's first provider request.
+// controller writes it once before the worker's first provider request. An
+// extension's document namespaces must be its bundle ID or start with
+// "<bundle ID>.", so it is ExtensionID + ".ticket".
 const (
-	WorkerNamespace = "github/ticket"
+	WorkerNamespace = "github.ticket"
 	WorkerDocument  = "ticket"
 )
 
