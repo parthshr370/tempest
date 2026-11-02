@@ -1,6 +1,7 @@
 package control
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -292,6 +293,185 @@ func TestPRStateFactsOrderedByGitHubTime(t *testing.T) {
 			t.Fatalf("older snapshot overrode newer reopen: %+v", got)
 		}
 	})
+	t.Run("snapshot in the same second as a reopen does not close", func(t *testing.T) {
+		h, id, dispatch := setup(t, 851)
+		at := epoch.Add(2 * time.Hour)
+		h.ingest("reopened", reopened(851, at))
+		h.ingestPRs("same-second-closed-snapshot", model.PullRequest{Number: 851, State: "closed", ClosedAt: at, UpdatedAt: at})
+		h.finish(dispatch, completed(1))
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("same-second closed snapshot overrode the reopen: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("snapshot in the same second as a merge does not unmerge", func(t *testing.T) {
+		h, id, dispatch := setup(t, 853)
+		at := epoch.Add(2 * time.Hour)
+		h.ingest("merged", prClosed(853, true, at))
+		h.ingestPRs("same-second-open-snapshot", model.PullRequest{Number: 853, State: "open", HeadSHA: "head853", UpdatedAt: at})
+		pr, _ := h.store.prs.get("853")
+		if !pr.Merged || pr.State != "closed" || pr.MergeSHA != "merge853" || !pr.ClosedAt.Equal(at) {
+			t.Fatalf("same-second open snapshot replaced the merge: %+v", *pr)
+		}
+		if pr.HeadSHA != "head853" {
+			t.Fatalf("outranked snapshot dropped its metadata: head %q", pr.HeadSHA)
+		}
+		h.finish(dispatch, completed(1))
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeMerged {
+			t.Fatalf("same-second open snapshot erased the merge: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("newer snapshot still replaces the state", func(t *testing.T) {
+		h, id, dispatch := setup(t, 855)
+		h.ingest("reopened", reopened(855, epoch.Add(time.Hour)))
+		h.ingestPRs("newer-closed-snapshot", model.PullRequest{Number: 855, State: "closed", ClosedAt: epoch.Add(2 * time.Hour), UpdatedAt: epoch.Add(2 * time.Hour)})
+		h.finish(dispatch, completed(1))
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeClosed {
+			t.Fatalf("newer closed snapshot ignored: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+}
+
+// Completion is decided once per intake batch, against the state after
+// every event and snapshot of the batch is staged. An intermediate state
+// must neither end a Ticket nor steer admission of later events.
+func TestCompletionOncePerIntakeBatch(t *testing.T) {
+	reopened := func(number int, at time.Time) model.Event {
+		return model.Event{ID: model.PRReopenedID(number, at), Kind: model.EventPRReopened, Thread: model.ThreadRef{Number: number, IsPR: true}, At: at}
+	}
+	// quiescent is a Ticket with an open own PR, its dispatch finished and
+	// every Input handled: only a PR fact can end it.
+	quiescent := func(t *testing.T, number int) (*harness, model.TicketID) {
+		h := newHarness(t)
+		id, dispatch := h.launched(number-1, int64(number)*10)
+		h.openPR(id, "pr", number)
+		h.finish(dispatch, completed(1))
+		h.at(3 * time.Hour)
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("setup ended the ticket: %+v", got)
+		}
+		return h, id
+	}
+	noise := func(n int) []model.Event {
+		events := make([]model.Event, n)
+		for i := range events {
+			events[i] = comment(999, false, int64(99000+i), mallory, "noise", epoch.Add(time.Hour))
+		}
+		return events
+	}
+	t.Run("close then reopen events", func(t *testing.T) {
+		h, id := quiescent(t, 961)
+		events := []model.Event{prClosed(961, false, epoch.Add(time.Hour)), reopened(961, epoch.Add(2*time.Hour))}
+		h.ingestBatch(model.IntakeBatch{Resource: "batch", Events: events, PRs: []model.PullRequest{{Number: 961, State: "open", UpdatedAt: epoch.Add(2 * time.Hour)}}})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("intermediate close ended the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("close then newer open snapshot", func(t *testing.T) {
+		h, id := quiescent(t, 963)
+		h.ingestBatch(model.IntakeBatch{Resource: "batch", Events: []model.Event{prClosed(963, false, epoch.Add(time.Hour))}, PRs: []model.PullRequest{{Number: 963, State: "open", UpdatedAt: epoch.Add(2 * time.Hour)}}})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("intermediate close ended the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("close at the end of the batch still ends", func(t *testing.T) {
+		h, id := quiescent(t, 965)
+		events := []model.Event{reopened(965, epoch.Add(time.Hour)), prClosed(965, true, epoch.Add(2*time.Hour))}
+		h.ingestBatch(model.IntakeBatch{Resource: "batch", Events: events})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeMerged {
+			t.Fatalf("final merge did not end the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("machine wake after a merge in the same batch is cancelled by the end", func(t *testing.T) {
+		h, id := quiescent(t, 975)
+		events := []model.Event{prClosed(975, true, epoch.Add(time.Hour)), prCI(975, "head975", nil, epoch.Add(2*time.Hour))}
+		h.ingestBatch(model.IntakeBatch{Resource: "batch", Events: events})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeMerged {
+			t.Fatalf("merge did not end the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+		if got := h.admit(); len(got) != 0 {
+			t.Fatalf("ended ticket kept a wake from the same batch: %+v", got)
+		}
+	})
+	t.Run("first snapshot of two own PRs does not end", func(t *testing.T) {
+		h := newHarness(t)
+		id, dispatch := h.launched(966, 9670)
+		h.openPR(id, "pr", 967)
+		h.openPR(id, "pr2", 968)
+		h.finish(dispatch, completed(1))
+		h.at(3 * time.Hour)
+		h.ingest("second-closed", prClosed(968, false, epoch.Add(time.Hour)))
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("one of two own PRs closed ended the ticket: %+v", got)
+		}
+		at := epoch.Add(2 * time.Hour)
+		h.ingestPRs("both", model.PullRequest{Number: 967, State: "closed", ClosedAt: at, UpdatedAt: at}, model.PullRequest{Number: 968, State: "open", UpdatedAt: at})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("first snapshot ended the ticket before the second reopened its PR: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("mention after a merge in the same batch is not lost", func(t *testing.T) {
+		h, id := quiescent(t, 969)
+		events := []model.Event{prClosed(969, true, epoch.Add(time.Hour)), mention(968, false, 9691, alice, "one more thing", epoch.Add(2*time.Hour))}
+		result := h.ingestBatch(model.IntakeBatch{Resource: "batch", Events: events})
+		if got := result.Decisions[1].Kind; got != model.DecisionInput {
+			t.Fatalf("mention after the merge was decided against an intermediate end: %s %s", got, result.Decisions[1].Reason)
+		}
+		got := h.ticket(id)
+		if got.Lifecycle != model.LifecycleOpen || got.HandledSeq == got.InputSeq {
+			t.Fatalf("mention not delivered to the open ticket: %+v", got)
+		}
+		wake := h.runAll()
+		if len(wake) != 1 {
+			t.Fatalf("mention did not wake the ticket: %+v", wake)
+		}
+		h.report(id, "ready", model.ReportReady)
+		h.finish(wake[0].Dispatch.ID, completed(1))
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeMerged {
+			t.Fatalf("handled mention did not let the merge end the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("close and reopen in different parts of a split batch", func(t *testing.T) {
+		h, id := quiescent(t, 971)
+		events := append([]model.Event{prClosed(971, false, epoch.Add(time.Hour))}, noise(model.MaxBatchEvents-1)...)
+		events = append(events, reopened(971, epoch.Add(2*time.Hour)))
+		h.ingestBatch(model.IntakeBatch{Resource: "split", Events: events})
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("close in the first part ended the ticket: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+	t.Run("crash between parts settles on the reread", func(t *testing.T) {
+		h, id := quiescent(t, 973)
+		batch := model.IntakeBatch{Resource: "split", Events: append([]model.Event{prClosed(973, false, epoch.Add(time.Hour))}, noise(model.MaxBatchEvents)...), ReadAt: h.clock.Now()}
+		h.store.store = &crashStore{Store: h.store.store, failAt: 2}
+		if _, err := h.store.Ingest(h.ctx, batch); !errors.Is(err, errCrash) {
+			t.Fatalf("expected crash at the second part: %v", err)
+		}
+		h.reopen()
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+			t.Fatalf("first part decided completion alone: %+v", got)
+		}
+		h.ingestBatch(batch)
+		if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeClosed {
+			t.Fatalf("reread did not settle the committed close: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
+		}
+	})
+}
+
+func (h *harness) ingestBatch(batch model.IntakeBatch) model.IngestResult {
+	h.t.Helper()
+	if batch.ReadAt.IsZero() {
+		batch.ReadAt = h.clock.Now()
+	}
+	result, err := h.store.Ingest(h.ctx, batch)
+	if err != nil {
+		h.t.Fatalf("ingest %s: %v", batch.Resource, err)
+	}
+	return result
+}
+
+func (h *harness) ingestPRs(resource string, prs ...model.PullRequest) model.IngestResult {
+	h.t.Helper()
+	return h.ingestBatch(model.IntakeBatch{Resource: resource, PRs: prs})
 }
 
 // Ledger arithmetic saturates instead of wrapping: no spend, grant or

@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -82,8 +83,9 @@ func sortThreads(threads []model.WatchedThread) {
 // Ingest decides and commits one batch. A batch above the event or body
 // bounds is split into consecutive commits; positions, cursor and PR facts
 // travel with the last part, so a crash between parts rereads the rest and
-// known EventIDs are skipped. A batch already committed (same resource and
-// content) commits nothing.
+// known EventIDs are skipped. Completion is decided once, in the last
+// part, after every event and snapshot is staged (settleCompletion). A
+// batch already committed (same resource and content) commits nothing.
 func (s *Store) Ingest(ctx context.Context, batch model.IntakeBatch) (model.IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -114,6 +116,7 @@ func (s *Store) Ingest(ctx context.Context, batch model.IntakeBatch) (model.Inge
 		}
 		if last {
 			s.stageReadState(batch)
+			s.settleCompletion(batch, s.clock.Now())
 		}
 		receipt, err := s.commit(ctx, commitID)
 		if err != nil {
@@ -203,11 +206,8 @@ func (s *Store) decide(event model.Event, now time.Time) (model.Decision, error)
 			s.deliverInput(id, event.ID, result.Class, result.Wakes && !result.NoWake[id], now)
 		}
 		decision.Tickets = result.Tickets
-		if event.Kind == model.EventPRClosed || event.Kind == model.EventPRMerged || event.Kind == model.EventPRReopened {
-			for _, id := range result.Tickets {
-				s.evaluateEnd(id, now)
-			}
-		}
+		// PR state facts end Tickets only through settleCompletion, once the
+		// whole batch is staged.
 	case actStop:
 		for _, id := range result.Tickets {
 			s.stopTicket(id, "human:"+event.Actor.Login, now)
@@ -262,13 +262,11 @@ func (s *Store) pushedSHA(id model.TicketID, sha string) bool {
 // Ticket follows and no batch described are not stored.
 //
 // State facts (pr_closed, pr_merged, pr_reopened) are ordered per PR by
-// GitHub's time, not arrival: PullRequest.UpdatedAt is the GitHub time of
-// the newest snapshot or state fact applied, and a state fact older than
-// it is stale and leaves the record alone; one with the same timestamp
-// breaks the tie by prStateRank. A pr_head older than UpdatedAt is stale
-// too, but does not move UpdatedAt: the source emits it with the
-// snapshot's updated_at, which a close in the same read shares. CI is
-// pinned to the head SHA and reviews accumulate, so neither needs order.
+// GitHub's time, not arrival, through orderPRState, the rule snapshots
+// use too. A pr_head older than UpdatedAt is stale too, but does not move
+// UpdatedAt: the source emits it with the snapshot's updated_at, which a
+// close in the same read shares. CI is pinned to the head SHA and reviews
+// accumulate, so neither needs order.
 func (s *Store) applyPRFact(event model.Event) {
 	if !event.Thread.IsPR || event.Thread.Number == 0 {
 		return
@@ -316,7 +314,7 @@ func (s *Store) applyPRFact(event model.Event) {
 		if event.Kind == model.EventPRReopened {
 			state = "open"
 		}
-		if event.At.Before(pr.UpdatedAt) || event.At.Equal(pr.UpdatedAt) && prStateRank(state, merged) < prStateRank(pr.State, pr.Merged) {
+		if orderPRState(*pr, event.At, state, merged) != prSupersedes {
 			return
 		}
 		pr.UpdatedAt = event.At
@@ -331,10 +329,41 @@ func (s *Store) applyPRFact(event model.Event) {
 	}
 }
 
-// prStateRank orders PR states whose facts share one GitHub timestamp
-// (GitHub reports whole seconds). Merged is final. A reopen in the same
-// second as a close must follow it, so open outranks closed: a tie never
-// ends a Ticket on a PR that may be open.
+// prOrder is how an observed PR state compares with the stored record.
+type prOrder int
+
+const (
+	// prStale: observed before the record's UpdatedAt.
+	prStale prOrder = iota
+	// prOutranked: observed in the same GitHub second as the record's
+	// UpdatedAt, but the stored state ranks higher.
+	prOutranked
+	// prSupersedes: observed later, or in the same second at an equal or
+	// higher rank.
+	prSupersedes
+)
+
+// orderPRState is the one ordering rule for a PR's state, shared by state
+// events and whole snapshots: state and merged observed at GitHub time at,
+// against current. UpdatedAt is the GitHub time of the newest state fact
+// or snapshot applied; a placeholder (zero UpdatedAt) knows no GitHub fact,
+// so the first one supersedes it.
+func orderPRState(current model.PullRequest, at time.Time, state string, merged bool) prOrder {
+	switch {
+	case current.UpdatedAt.IsZero() || at.After(current.UpdatedAt):
+		return prSupersedes
+	case at.Before(current.UpdatedAt):
+		return prStale
+	case prStateRank(state, merged) < prStateRank(current.State, current.Merged):
+		return prOutranked
+	}
+	return prSupersedes
+}
+
+// prStateRank orders PR states observed in one GitHub second (GitHub
+// reports whole seconds). Merged is final. A reopen in the same second as
+// a close must follow it, so open outranks closed: a tie never ends a
+// Ticket on a PR that may be open.
 func prStateRank(state string, merged bool) int {
 	switch {
 	case merged:
@@ -348,7 +377,6 @@ func prStateRank(state string, merged bool) int {
 // stageReadState moves the cursor and thread positions forward and adopts
 // the batch's PR facts.
 func (s *Store) stageReadState(batch model.IntakeBatch) {
-	now := s.clock.Now()
 	if batch.Cursor != nil && batch.Cursor.Key != "" {
 		s.applyCursor(*batch.Cursor)
 	}
@@ -356,7 +384,31 @@ func (s *Store) stageReadState(batch model.IntakeBatch) {
 		s.applyThread(update, batch.ReadAt)
 	}
 	for _, pr := range batch.PRs {
-		s.applyPR(pr, now)
+		s.applyPR(pr)
+	}
+}
+
+// settleCompletion runs the completion rule for every open Ticket
+// subscribed to a PR the batch carries a state fact or snapshot for, once
+// all of them are staged. Deciding per event or per snapshot would end a
+// Ticket on an intermediate state, a close that a later reopen or
+// snapshot of the same batch supersedes, and an ended Ticket is never
+// repaired by the newer fact. Events already known count too: after a
+// crash between the parts of a split batch, the reread settles the facts
+// the earlier part committed.
+func (s *Store) settleCompletion(batch model.IntakeBatch, now time.Time) {
+	var numbers []int
+	for _, event := range batch.Events {
+		if event.Thread.Number != 0 && (event.Kind == model.EventPRClosed || event.Kind == model.EventPRMerged || event.Kind == model.EventPRReopened) {
+			numbers = append(numbers, event.Thread.Number)
+		}
+	}
+	for _, pr := range batch.PRs {
+		numbers = append(numbers, pr.Number)
+	}
+	slices.Sort(numbers)
+	for _, number := range slices.Compact(numbers) {
+		s.refreshLinks(number, now)
 	}
 }
 
@@ -445,26 +497,29 @@ func (s *Store) titleTickets(thread *model.Thread) {
 	}
 }
 
-// applyPR adopts the source's view of a PR unless it is older than the
-// stored one. Owner is control's and is kept; an open PR on a Ticket's
-// branch, from this repository, authored by the account binds to it.
-func (s *Store) applyPR(next model.PullRequest, now time.Time) {
+// applyPR adopts the source's view of a PR through orderPRState: an older
+// snapshot is ignored; one from the same second whose state the stored one
+// outranks updates the metadata but keeps the stored state, merge and
+// close. Owner is control's and is kept; an open PR on a Ticket's branch,
+// from this repository, authored by the account binds to it.
+func (s *Store) applyPR(next model.PullRequest) {
 	key := strconv.Itoa(next.Number)
-	current, exists := s.prs.get(key)
-	if exists && next.UpdatedAt.Before(current.UpdatedAt) {
-		return
+	if current, exists := s.prs.get(key); exists {
+		switch orderPRState(*current, next.UpdatedAt, next.State, next.Merged) {
+		case prStale:
+			return
+		case prOutranked:
+			next.State, next.Merged, next.MergeSHA, next.ClosedAt = current.State, current.Merged, current.MergeSHA, current.ClosedAt
+		}
+		next.Owner = current.Owner
+	} else {
+		next.Owner = ""
 	}
-	owner := model.TicketID("")
-	if exists {
-		owner = current.Owner
-	}
-	next.Owner = owner
 	if next.CI != nil && next.CI.SHA != next.HeadSHA {
 		next.CI = nil
 	}
 	s.prs.put(key, next)
 	s.autoBind(next)
-	s.refreshLinks(next.Number, now)
 }
 
 // autoBind binds an open PR the account opened from a Ticket branch of this
