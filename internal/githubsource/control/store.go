@@ -94,6 +94,8 @@ type Store struct {
 	// work records what the current transaction created for the dispatch
 	// and outbox loops; Ingest reports it.
 	work workFlags
+	// feed notifies subscribers of every durable commit (Subscribe).
+	feed feed
 }
 
 // Store implements every slice interface except model.Control, whose
@@ -488,8 +490,13 @@ func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) 
 	if err != nil {
 		s.rollback()
 		if !errors.Is(err, durable.ErrInvalidCommit) {
+			before := s.seq
 			if reloadErr := s.load(context.WithoutCancel(ctx)); reloadErr != nil {
 				s.broken = reloadErr
+			} else if s.seq > before {
+				// The commit may have become durable: tell subscribers
+				// what it would have changed.
+				s.publish(s.seq, perTable)
 			}
 		}
 		return durable.Receipt{}, fmt.Errorf("control: commit %s: %w", id, err)
@@ -522,6 +529,7 @@ func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) 
 	}
 	clear(s.asOfUsed)
 	s.seq = receipt.Seq
+	s.publish(receipt.Seq, perTable)
 	return receipt, nil
 }
 
