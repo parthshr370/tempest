@@ -428,6 +428,9 @@ func toolEpisode(history []types.Message, batch []types.ToolResultMessage, tools
 	var batches []loopBatch
 	var calls []types.ContentBlock
 	var results []*types.ToolResultMessage
+	// Identical calls in one reply are one decision, made before any of
+	// their results were seen, so a batch holds each call once: a loop is
+	// the model repeating itself across replies.
 	flush := func() {
 		var built loopBatch
 		for index, call := range calls {
@@ -435,9 +438,13 @@ func toolEpisode(history []types.Message, batch []types.ToolResultMessage, tools
 			if result == nil {
 				continue
 			}
-			args := canonicalArguments(call.Arguments)
-			built.calls = append(built.calls, loopCall{tool: call.Name, args: args, key: call.Name + "\x00" + string(args), result: *result, polls: polling[call.Name]})
 			built.nudged = built.nudged || hostNotice(result.Content) == loopNudgePrefix
+			args := canonicalArguments(call.Arguments)
+			key := call.Name + "\x00" + string(args)
+			if slices.ContainsFunc(built.calls, func(seen loopCall) bool { return seen.key == key }) {
+				continue
+			}
+			built.calls = append(built.calls, loopCall{tool: call.Name, args: args, key: key, result: *result, polls: polling[call.Name]})
 		}
 		if len(built.calls) > 0 {
 			batches = append(batches, built)

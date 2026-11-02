@@ -210,10 +210,11 @@ guard watches for four patterns, with the thresholds of Pydantic AI's `DetectLoo
 | `repeated_text` | N replies in a row had no tool call and the same text, ignoring case and whitespace, with only Stop, SubagentStop or extension `on_yield` hook feedback between them. | 3 |
 
 The recent calls are the last 10, or more when a threshold needs it (the largest of
-10, `repeated_call`, `repeated_result` and twice `alternating_calls`). The checks
-run once per tool batch, after its last result, and once before each model call for
-repeated text, in the order above; a pattern is reported only when the newest batch
-or reply continues it.
+10, `repeated_call`, `repeated_result` and twice `alternating_calls`). Identical
+calls in one reply count once: the model made them before seeing any of their
+results. The checks run once per tool batch, after its last result, and once before
+each model call for repeated text, in the order above; a pattern is reported only
+when the newest batch or reply continues it.
 
 The first report of a loop is a notice at the tail of the transcript, starting with
 `[Loop notice from the host]`: appended to the batch's last tool result, or for

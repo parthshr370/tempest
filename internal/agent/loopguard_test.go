@@ -334,21 +334,26 @@ func TestLoopGuardCountsFailuresAcrossOtherCalls(t *testing.T) {
 	wantNotices(t, a.State().Messages, map[int]string{1: repeatedFailurePrefix, 2: repeatedFailurePrefix, 3: repeatedFailurePrefix, 5: loopNudgePrefix})
 }
 
-func TestLoopGuardNoticeGoesOnLastResultOfBatch(t *testing.T) {
+// TestLoopGuardCountsBatchesAndNoticesTheLastResult: identical calls in one
+// reply count once, since the model had seen none of their results, and the
+// notice goes on the last result of the batch that completes the loop.
+func TestLoopGuardCountsBatchesAndNoticesTheLastResult(t *testing.T) {
 	f := faux.New(faux.Options{})
 	same := json.RawMessage(`{"path":"a"}`)
 	f.SetResponses(
-		faux.Respond(faux.ToolCall("look", same, "a1"), faux.ToolCall("look", same, "a2"), faux.ToolCall("look", same, "a3"), faux.ToolCall("look", json.RawMessage(`{"path":"b"}`), "b1")),
+		faux.Respond(faux.ToolCall("look", same, "a1"), faux.ToolCall("look", same, "a2"), faux.ToolCall("look", same, "a3")),
+		faux.Respond(faux.ToolCall("look", same, "a4")),
+		faux.Respond(faux.ToolCall("look", same, "a5"), faux.ToolCall("look", json.RawMessage(`{"path":"b"}`), "b1")),
 		faux.Respond(faux.Text("done")),
 	)
-	a, detections := loopAgent(f, &LoopThresholds{RepeatedResult: 3}, lookTool("look"))
+	a, detections := loopAgent(f, &LoopThresholds{RepeatedResult: 3, RepeatedCall: 3}, lookTool("look"))
 
 	result, err := a.PromptText(context.Background(), "go")
 	if err != nil || result.StopReason != StopCompleted {
 		t.Fatalf("result = %+v %v, want completed", result, err)
 	}
-	wantNotices(t, a.State().Messages, map[int]string{3: loopNudgePrefix})
-	if got := *detections; len(got) != 1 || got[0].Tools[0] != "look" || got[0].Count != 3 {
+	wantNotices(t, a.State().Messages, map[int]string{5: loopNudgePrefix})
+	if got := *detections; len(got) != 1 || got[0].Pattern != LoopRepeatedResult || got[0].Tools[0] != "look" || got[0].Count != 3 {
 		t.Fatalf("loop_guard events = %+v, want one nudge about look x3", got)
 	}
 }
