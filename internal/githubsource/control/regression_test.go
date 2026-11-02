@@ -2,6 +2,7 @@ package control
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -281,11 +282,11 @@ func TestPRStateFactsOrderedByGitHubTime(t *testing.T) {
 			t.Fatalf("newest close ignored: %+v", got)
 		}
 	})
-	t.Run("snapshot older than a known fact is ignored", func(t *testing.T) {
+	t.Run("snapshot read before a known fact is ignored", func(t *testing.T) {
 		h, id, dispatch := setup(t, 849)
 		h.ingest("reopened", reopened(849, epoch.Add(2*time.Hour)))
 		old := model.PullRequest{Number: 849, Author: account, HeadRef: model.TicketBranch(id), HeadRepo: "acme/widgets", State: "closed", ClosedAt: epoch.Add(time.Hour), UpdatedAt: epoch.Add(time.Hour)}
-		if _, err := h.store.Ingest(h.ctx, model.IntakeBatch{Resource: "pr:849", PRs: []model.PullRequest{old}, ReadAt: h.clock.Now()}); err != nil {
+		if _, err := h.store.Ingest(h.ctx, model.IntakeBatch{Resource: "pr:849", PRs: []model.PullRequest{old}, ReadAt: epoch.Add(90 * time.Minute)}); err != nil {
 			t.Fatal(err)
 		}
 		h.finish(dispatch, completed(1))
@@ -293,11 +294,11 @@ func TestPRStateFactsOrderedByGitHubTime(t *testing.T) {
 			t.Fatalf("older snapshot overrode newer reopen: %+v", got)
 		}
 	})
-	t.Run("snapshot in the same second as a reopen does not close", func(t *testing.T) {
+	t.Run("snapshot read in the same second as a reopen does not close", func(t *testing.T) {
 		h, id, dispatch := setup(t, 851)
 		at := epoch.Add(2 * time.Hour)
 		h.ingest("reopened", reopened(851, at))
-		h.ingestPRs("same-second-closed-snapshot", model.PullRequest{Number: 851, State: "closed", ClosedAt: at, UpdatedAt: at})
+		h.ingestBatch(model.IntakeBatch{Resource: "same-second-closed-snapshot", PRs: []model.PullRequest{{Number: 851, State: "closed", ClosedAt: at, UpdatedAt: at}}, ReadAt: at.Add(500 * time.Millisecond)})
 		h.finish(dispatch, completed(1))
 		if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
 			t.Fatalf("same-second closed snapshot overrode the reopen: lifecycle=%s outcome=%s", got.Lifecycle, got.Outcome)
@@ -472,6 +473,74 @@ func (h *harness) ingestBatch(batch model.IntakeBatch) model.IngestResult {
 func (h *harness) ingestPRs(resource string, prs ...model.PullRequest) model.IngestResult {
 	h.t.Helper()
 	return h.ingestBatch(model.IntakeBatch{Resource: resource, PRs: prs})
+}
+
+// A snapshot is ordered by when it was read, not by the PR's updated_at:
+// a quiet PR closed in the same second as its last open read keeps that
+// updated_at forever, and every later read of it must still close it.
+func TestQuietCloseSettlesOnLaterRead(t *testing.T) {
+	for _, sameSecond := range []bool{false, true} {
+		for _, explicitReopen := range []bool{false, true} {
+			t.Run(fmt.Sprintf("same_second_%v/explicit_reopen_%v", sameSecond, explicitReopen), func(t *testing.T) {
+				h := newHarness(t)
+				id, dispatch := h.launched(980, 9801)
+				h.openPR(id, "pr", 981)
+				at := epoch.Add(time.Hour)
+				readAt := epoch.Add(2 * time.Hour)
+				if sameSecond {
+					readAt = at
+				}
+				h.ingestBatch(model.IntakeBatch{Resource: "last-open-read", PRs: []model.PullRequest{{Number: 981, State: "open", HeadSHA: "head", UpdatedAt: at}}, ReadAt: readAt})
+				if explicitReopen {
+					h.ingest("reopened", model.Event{ID: model.PRReopenedID(981, at), Kind: model.EventPRReopened, Thread: model.ThreadRef{Number: 981, IsPR: true}, At: at})
+				}
+				h.at(3 * time.Hour)
+				h.ingest("actual-close", prClosed(981, false, at))
+				h.finish(dispatch, completed(1))
+				if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+					t.Fatalf("close in the open read's second ended the ticket before a later read: %+v", got)
+				}
+				h.reopen()
+				closed := model.PullRequest{Number: 981, State: "closed", ClosedAt: at, UpdatedAt: at, HeadSHA: "head", HeadRef: "new-description"}
+				h.at(24 * time.Hour)
+				h.ingestPRs("current-pr-read", closed)
+				pr, _ := h.store.prs.get("981")
+				if got := h.ticket(id); got.Lifecycle != model.LifecycleEnded || got.Outcome != model.OutcomeClosed {
+					t.Fatalf("later read of the quiet closed PR did not end the ticket: PR=%s updated=%s ticket=%s/%s", pr.State, pr.UpdatedAt, got.Lifecycle, got.Outcome)
+				}
+			})
+		}
+	}
+}
+
+// PR state facts of a split batch's earlier parts are withheld until its
+// last part, so a Finished between a crash and the reread cannot end a
+// Ticket on a close that the unread later part reopens.
+func TestSplitBatchCrashThenFinish(t *testing.T) {
+	h := newHarness(t)
+	id, dispatch := h.launched(982, 9821)
+	h.openPR(id, "pr", 983)
+	h.at(3 * time.Hour)
+	events := []model.Event{prClosed(983, false, epoch.Add(time.Hour))}
+	for i := range model.MaxBatchEvents - 1 {
+		events = append(events, comment(999, false, int64(98300+i), mallory, "noise", epoch.Add(time.Hour)))
+	}
+	events = append(events, model.Event{ID: model.PRReopenedID(983, epoch.Add(2*time.Hour)), Kind: model.EventPRReopened, Thread: model.ThreadRef{Number: 983, IsPR: true}, At: epoch.Add(2 * time.Hour)})
+	batch := model.IntakeBatch{Resource: "oversized", Events: events, ReadAt: h.clock.Now()}
+	h.store.store = &crashStore{Store: h.store.store, failAt: 2}
+	if _, err := h.store.Ingest(h.ctx, batch); !errors.Is(err, errCrash) {
+		t.Fatalf("expected crash at the second part: %v", err)
+	}
+	h.reopen()
+	h.finish(dispatch, completed(1))
+	if got := h.ticket(id); got.Lifecycle != model.LifecycleOpen {
+		t.Fatalf("finish after a crash between parts ended the ticket on a half-applied batch: %+v", got)
+	}
+	h.ingestBatch(batch)
+	pr, _ := h.store.prs.get("983")
+	if got := h.ticket(id); pr.State != "open" || got.Lifecycle != model.LifecycleOpen {
+		t.Fatalf("reread lost the reopen: PR=%s ticket=%s/%s", pr.State, got.Lifecycle, got.Outcome)
+	}
 }
 
 // Ledger arithmetic saturates instead of wrapping: no spend, grant or

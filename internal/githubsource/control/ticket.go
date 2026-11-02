@@ -423,8 +423,8 @@ func (s *Store) evaluateEnd(id model.TicketID, now time.Time) {
 }
 
 // bindOwnPR links a PR this Ticket's branch produced as own. A PR binds to
-// at most one open Ticket. A PR not read yet gets a placeholder with a zero
-// UpdatedAt: no GitHub fact about it is known, so the first one applies.
+// at most one open Ticket. A PR not read yet gets a placeholder with no
+// as-of: no GitHub fact about it is known, so the first one applies.
 func (s *Store) bindOwnPR(id model.TicketID, number int) bool {
 	key := strconv.Itoa(number)
 	pr := s.prs.edit(key)

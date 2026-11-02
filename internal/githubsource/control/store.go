@@ -68,6 +68,9 @@ type Store struct {
 	// made, so completion applies only a report of the dispatch that
 	// finished.
 	reports *docTable[model.DispatchID]
+	// prAsOf maps a PR to the GitHub time as of which its record's state is
+	// known (orderPRState).
+	prAsOf *docTable[time.Time]
 
 	policies  *entryTable[model.Policy]
 	events    *entryTable[model.Event]
@@ -305,6 +308,9 @@ const (
 	// DispatchID during which Ticket.LastReport was made. It is control's
 	// own bookkeeping; the shared model does not read it.
 	namespaceReport = "gh/report"
+	// namespacePRAsOf holds one document per PR, id the number, value the
+	// as-of time of its state. Control's own bookkeeping too.
+	namespacePRAsOf = "gh/pr-asof"
 )
 
 func (s *Store) reset() {
@@ -328,11 +334,12 @@ func (s *Store) reset() {
 	s.reviewComments = make(map[int64]int)
 	s.ticketOutbox = make(map[model.TicketID][]model.OutboxID)
 	s.reports = newDocTable[model.DispatchID](namespaceReport)
+	s.prAsOf = newDocTable[time.Time](namespacePRAsOf)
 }
 
 // tables lists every table in the fixed order changes are written.
 func (s *Store) tables() []table {
-	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.outbox, s.ledgers, s.reports, s.ops}
+	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.prAsOf, s.outbox, s.ledgers, s.reports, s.ops}
 }
 
 // load rebuilds the projection from the journal's current records.
@@ -363,6 +370,7 @@ func (s *Store) load(ctx context.Context) error {
 		model.NamespaceInput:    s.inputs.load,
 		model.NamespaceOperator: s.ops.load,
 		namespaceReport:         s.reports.load,
+		namespacePRAsOf:         s.prAsOf.load,
 	}
 	var seq uint64
 	for _, kind := range []durable.Kind{durable.DocumentKind, durable.EntryKind} {

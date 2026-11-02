@@ -83,9 +83,12 @@ func sortThreads(threads []model.WatchedThread) {
 // Ingest decides and commits one batch. A batch above the event or body
 // bounds is split into consecutive commits; positions, cursor and PR facts
 // travel with the last part, so a crash between parts rereads the rest and
-// known EventIDs are skipped. Completion is decided once, in the last
-// part, after every event and snapshot is staged (settleCompletion). A
-// batch already committed (same resource and content) commits nothing.
+// known EventIDs are skipped. PR state facts of earlier parts are applied
+// in the last part too, so no completion check (a Finished or report
+// between a crash and the reread) sees a half-applied batch. Completion is
+// decided once, in the last part, after every event and snapshot is staged
+// (settleCompletion). A batch already committed (same resource and
+// content) commits nothing.
 func (s *Store) Ingest(ctx context.Context, batch model.IntakeBatch) (model.IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -109,7 +112,16 @@ func (s *Store) Ingest(ctx context.Context, batch model.IntakeBatch) (model.Inge
 			continue
 		}
 		s.work = workFlags{}
-		decisions, err := s.stageEvents(events)
+		if last {
+			for _, earlier := range parts[:index] {
+				for _, event := range earlier {
+					if event.ID != "" && prStateFact(event.Kind) {
+						s.applyPRState(event)
+					}
+				}
+			}
+		}
+		decisions, err := s.stageEvents(events, last)
 		if err != nil {
 			s.rollback()
 			return result, err
@@ -149,7 +161,9 @@ func splitEvents(events []model.Event) [][]model.Event {
 }
 
 // stageEvents stores each unknown event with its Decision and applies it.
-func (s *Store) stageEvents(events []model.Event) ([]model.Decision, error) {
+// PR state facts are applied only when applyState is set (the batch's last
+// part); Ingest applies those of earlier parts there.
+func (s *Store) stageEvents(events []model.Event, applyState bool) ([]model.Decision, error) {
 	now := s.clock.Now()
 	var decisions []model.Decision
 	for _, event := range events {
@@ -158,7 +172,12 @@ func (s *Store) stageEvents(events []model.Event) ([]model.Decision, error) {
 		}
 		event = s.boundBody(event)
 		s.events.add(string(event.ID), event)
-		s.applyPRFact(event)
+		switch {
+		case !prStateFact(event.Kind):
+			s.applyPRFact(event)
+		case applyState:
+			s.applyPRState(event)
+		}
 		decision, err := s.decide(event, now)
 		if err != nil {
 			return nil, err
@@ -258,27 +277,38 @@ func (s *Store) pushedSHA(id model.TicketID, sha string) bool {
 	return false
 }
 
-// applyPRFact updates the PR record an event describes. Facts for a PR no
-// Ticket follows and no batch described are not stored.
-//
-// State facts (pr_closed, pr_merged, pr_reopened) are ordered per PR by
-// GitHub's time, not arrival, through orderPRState, the rule snapshots
-// use too. A pr_head older than UpdatedAt is stale too, but does not move
-// UpdatedAt: the source emits it with the snapshot's updated_at, which a
-// close in the same read shares. CI is pinned to the head SHA and reviews
-// accumulate, so neither needs order.
-func (s *Store) applyPRFact(event model.Event) {
-	if !event.Thread.IsPR || event.Thread.Number == 0 {
-		return
+// prRecord returns the record of the PR an event describes, creating a
+// placeholder for a PR a Ticket follows. Facts for a PR no Ticket follows
+// and no batch described are not stored: nil.
+func (s *Store) prRecord(ref model.ThreadRef) *model.PullRequest {
+	if !ref.IsPR || ref.Number == 0 {
+		return nil
 	}
-	key := strconv.Itoa(event.Thread.Number)
-	pr := s.prs.edit(key)
+	key := strconv.Itoa(ref.Number)
+	if pr := s.prs.edit(key); pr != nil {
+		return pr
+	}
+	thread, ok := s.threads.get(key)
+	if !ok || len(thread.Tickets) == 0 {
+		return nil
+	}
+	return s.prs.put(key, model.PullRequest{Number: ref.Number, State: "open"})
+}
+
+// prStateFact reports the event kinds that change a PR's state.
+func prStateFact(kind model.EventKind) bool {
+	return kind == model.EventPRClosed || kind == model.EventPRMerged || kind == model.EventPRReopened
+}
+
+// applyPRFact updates the PR record with a fact that is not a state fact.
+// A pr_head older than UpdatedAt is stale, but does not move UpdatedAt:
+// the source emits it with the snapshot's updated_at, which a close in the
+// same read shares. CI is pinned to the head SHA and reviews accumulate,
+// so neither needs order.
+func (s *Store) applyPRFact(event model.Event) {
+	pr := s.prRecord(event.Thread)
 	if pr == nil {
-		thread, ok := s.threads.get(key)
-		if !ok || len(thread.Tickets) == 0 {
-			return
-		}
-		pr = s.prs.put(key, model.PullRequest{Number: event.Thread.Number, State: "open"})
+		return
 	}
 	switch event.Kind {
 	case model.EventPRHead:
@@ -309,23 +339,53 @@ func (s *Store) applyPRFact(event model.Event) {
 				pr.Reviews[i].State = "DISMISSED"
 			}
 		}
-	case model.EventPRClosed, model.EventPRMerged, model.EventPRReopened:
-		state, merged := "closed", event.Kind == model.EventPRMerged
-		if event.Kind == model.EventPRReopened {
-			state = "open"
-		}
-		if orderPRState(*pr, event.At, state, merged) != prSupersedes {
-			return
-		}
+	}
+}
+
+// applyPRState applies a state fact (pr_closed, pr_merged, pr_reopened)
+// as of its At, through orderPRState. Applying one again is harmless: the
+// record's as-of only moves forward, so a repeat is stale or a tie that
+// changes nothing.
+func (s *Store) applyPRState(event model.Event) {
+	pr := s.prRecord(event.Thread)
+	if pr == nil {
+		return
+	}
+	state, merged := "closed", event.Kind == model.EventPRMerged
+	if event.Kind == model.EventPRReopened {
+		state = "open"
+	}
+	key := strconv.Itoa(pr.Number)
+	if orderPRState(*pr, s.asOf(key), event.At, state, merged) != prSupersedes {
+		return
+	}
+	s.advanceAsOf(key, event.At)
+	if event.At.After(pr.UpdatedAt) {
 		pr.UpdatedAt = event.At
-		switch event.Kind {
-		case model.EventPRClosed:
-			pr.State, pr.Merged, pr.ClosedAt = state, false, event.At
-		case model.EventPRMerged:
-			pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, true, event.CommitSHA, event.At
-		case model.EventPRReopened:
-			pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, false, "", time.Time{}
-		}
+	}
+	switch event.Kind {
+	case model.EventPRClosed:
+		pr.State, pr.Merged, pr.ClosedAt = state, false, event.At
+	case model.EventPRMerged:
+		pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, true, event.CommitSHA, event.At
+	case model.EventPRReopened:
+		pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, false, "", time.Time{}
+	}
+}
+
+// asOf is the GitHub time as of which a PR record's state is known; zero
+// for a placeholder, which knows no GitHub fact.
+func (s *Store) asOf(key string) time.Time {
+	if at, ok := s.prAsOf.get(key); ok {
+		return *at
+	}
+	return time.Time{}
+}
+
+// advanceAsOf moves a PR's as-of forward to at, in whole seconds.
+func (s *Store) advanceAsOf(key string, at time.Time) {
+	if at = at.Truncate(time.Second); at.After(s.asOf(key)) {
+		s.prAsOf.put(key, at)
 	}
 }
 
@@ -333,10 +393,11 @@ func (s *Store) applyPRFact(event model.Event) {
 type prOrder int
 
 const (
-	// prStale: observed before the record's UpdatedAt.
+	// prStale: observed before the record's as-of.
 	prStale prOrder = iota
 	// prOutranked: observed in the same GitHub second as the record's
-	// UpdatedAt, but the stored state ranks higher.
+	// as-of, but the stored state ranks higher; or an unmerged
+	// observation of a merged PR.
 	prOutranked
 	// prSupersedes: observed later, or in the same second at an equal or
 	// higher rank.
@@ -344,17 +405,25 @@ const (
 )
 
 // orderPRState is the one ordering rule for a PR's state, shared by state
-// events and whole snapshots: state and merged observed at GitHub time at,
-// against current. UpdatedAt is the GitHub time of the newest state fact
-// or snapshot applied; a placeholder (zero UpdatedAt) knows no GitHub fact,
-// so the first one supersedes it.
-func orderPRState(current model.PullRequest, at time.Time, state string, merged bool) prOrder {
+// facts and whole snapshots. Every fact is ordered by the GitHub time as
+// of which it describes the PR, in whole seconds: a state fact by its At,
+// a snapshot by when it was read (applyPR). asOf is that time of the
+// newest fact applied; zero (a placeholder) is superseded by any fact.
+//
+// A fact observed before asOf is stale, so a delayed old close cannot
+// undo a later reopen. One observed later supersedes in full: each new
+// poll reads GitHub's current state, which wins over everything known
+// before it. A tie in one GitHub second is ambiguous and the rank decides
+// (prStateRank); the next read, a later second, settles it. Merged is
+// final: GitHub cannot reopen a merged PR, so nothing unmerges one.
+func orderPRState(current model.PullRequest, asOf, at time.Time, state string, merged bool) prOrder {
+	at = at.Truncate(time.Second)
 	switch {
-	case current.UpdatedAt.IsZero() || at.After(current.UpdatedAt):
-		return prSupersedes
-	case at.Before(current.UpdatedAt):
+	case !asOf.IsZero() && at.Before(asOf):
 		return prStale
-	case prStateRank(state, merged) < prStateRank(current.State, current.Merged):
+	case current.Merged && !merged:
+		return prOutranked
+	case !asOf.IsZero() && at.Equal(asOf) && prStateRank(state, merged) < prStateRank(current.State, current.Merged):
 		return prOutranked
 	}
 	return prSupersedes
@@ -375,7 +444,7 @@ func prStateRank(state string, merged bool) int {
 }
 
 // stageReadState moves the cursor and thread positions forward and adopts
-// the batch's PR facts.
+// the batch's PR snapshots as of its read time.
 func (s *Store) stageReadState(batch model.IntakeBatch) {
 	if batch.Cursor != nil && batch.Cursor.Key != "" {
 		s.applyCursor(*batch.Cursor)
@@ -384,7 +453,7 @@ func (s *Store) stageReadState(batch model.IntakeBatch) {
 		s.applyThread(update, batch.ReadAt)
 	}
 	for _, pr := range batch.PRs {
-		s.applyPR(pr)
+		s.applyPR(pr, batch.ReadAt)
 	}
 }
 
@@ -399,7 +468,7 @@ func (s *Store) stageReadState(batch model.IntakeBatch) {
 func (s *Store) settleCompletion(batch model.IntakeBatch, now time.Time) {
 	var numbers []int
 	for _, event := range batch.Events {
-		if event.Thread.Number != 0 && (event.Kind == model.EventPRClosed || event.Kind == model.EventPRMerged || event.Kind == model.EventPRReopened) {
+		if event.Thread.Number != 0 && prStateFact(event.Kind) {
 			numbers = append(numbers, event.Thread.Number)
 		}
 	}
@@ -497,15 +566,24 @@ func (s *Store) titleTickets(thread *model.Thread) {
 	}
 }
 
-// applyPR adopts the source's view of a PR through orderPRState: an older
-// snapshot is ignored; one from the same second whose state the stored one
-// outranks updates the metadata but keeps the stored state, merge and
-// close. Owner is control's and is kept; an open PR on a Ticket's branch,
-// from this repository, authored by the account binds to it.
-func (s *Store) applyPR(next model.PullRequest) {
+// applyPR adopts the source's view of a PR through orderPRState. A
+// snapshot is GitHub's state when it was read, so it is ordered by readAt
+// (the batch's ReadAt, GitHub's clock), not by the PR's updated_at, which
+// a quiet PR never moves: a close in the same second as the last open read
+// would otherwise lose every later read forever. It is never older than
+// its own updated_at, which also orders it when the batch has no read
+// time. An older snapshot is ignored; an outranked one updates the
+// metadata but keeps the stored state, merge and close. Owner is
+// control's and is kept; an open PR on a Ticket's branch, from this
+// repository, authored by the account binds to it.
+func (s *Store) applyPR(next model.PullRequest, readAt time.Time) {
 	key := strconv.Itoa(next.Number)
+	asOf := readAt
+	if next.UpdatedAt.After(asOf) {
+		asOf = next.UpdatedAt
+	}
 	if current, exists := s.prs.get(key); exists {
-		switch orderPRState(*current, next.UpdatedAt, next.State, next.Merged) {
+		switch orderPRState(*current, s.asOf(key), asOf, next.State, next.Merged) {
 		case prStale:
 			return
 		case prOutranked:
@@ -519,6 +597,7 @@ func (s *Store) applyPR(next model.PullRequest) {
 		next.CI = nil
 	}
 	s.prs.put(key, next)
+	s.advanceAsOf(key, asOf)
 	s.autoBind(next)
 }
 
