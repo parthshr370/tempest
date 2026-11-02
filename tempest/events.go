@@ -88,6 +88,11 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 		}
 		fallback := ev.Fallback
 		return []Update{update("tempest/model_fallback", map[string]any{"runId": m.runID, "from": fallback.From.Provider + ":" + fallback.From.ID, "to": fallback.To.Provider + ":" + fallback.To.ID, "reason": fallback.Reason, "attempts": fallback.Attempts, "fallbackIndex": fallback.Index}, at)}
+	case agent.EventLoopGuard:
+		if ev.Loop == nil {
+			return nil
+		}
+		return []Update{update("tempest/loop_guard", map[string]any{"runId": m.runID, "pattern": ev.Loop.Pattern, "tools": ev.Loop.Tools, "count": ev.Loop.Count, "action": ev.Loop.Action}, at)}
 	case agent.EventAgentStart:
 		m.started = at
 		m.turn = 0

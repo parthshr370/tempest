@@ -84,6 +84,11 @@ type AgentTool struct {
 	PrepareArguments func(args json.RawMessage) json.RawMessage
 	ExecutionMode    ToolExecutionMode
 	Execute          func(ctx context.Context, toolCallID string, params json.RawMessage, onUpdate AgentToolUpdateCallback) (AgentToolResult, error)
+	// Polls marks a tool whose job is to observe changing state, such as
+	// waiting for a job or reading its new output: the same call returning
+	// the same result is what polling looks like, so the loop guard never
+	// reports it (see loopguard.go). The repeated-failure guard still does.
+	Polls bool
 }
 
 // AgentContext is the context snapshot passed into the low-level agent loop.
@@ -216,6 +221,9 @@ type AgentLoopConfig struct {
 	// Reminders are added at the tail of model requests on their cadence
 	// and conditions; see [Reminder].
 	Reminders []Reminder
+	// LoopThresholds configures the loop guard; nil means
+	// [DefaultLoopThresholds].
+	LoopThresholds *LoopThresholds
 }
 
 // Budget caps one run. Zero fields are unlimited. The loop checks the budget
@@ -275,6 +283,10 @@ const (
 	// arguments, until it had failed with the same error RepeatedFailureLimit
 	// times in a row. [RunResult.Err] names the call and its error.
 	StopRepeatedFailure StopReason = "repeated_failure"
+	// StopLoopDetected: the loop guard found the same loop again after it
+	// had told the model about it (see loopguard.go). [RunResult.Err] is a
+	// *[LoopError] naming the loop.
+	StopLoopDetected StopReason = "loop_detected"
 )
 
 // RunResult is how one run ended. Prompt and Continue return it, and the run's
@@ -284,8 +296,8 @@ type RunResult struct {
 	RunID      string
 	ElapsedMS  int64
 	StopReason StopReason
-	// Err is set when StopReason is StopError, StopOutputInvalid or
-	// StopRepeatedFailure.
+	// Err is set when StopReason is StopError, StopOutputInvalid,
+	// StopRepeatedFailure or StopLoopDetected.
 	Err error
 	// Turns counts model calls made in this run.
 	Turns int
@@ -339,6 +351,10 @@ const (
 	// SentAt when it was sent. A backoff or switch cancelled first reports
 	// none.
 	EventModelAttempt AgentEventType = "model_attempt"
+	// EventLoopGuard reports that the loop guard found a loop: Loop says
+	// which and whether the model was nudged or the run stops. It precedes
+	// the message that carries the notice.
+	EventLoopGuard AgentEventType = "loop_guard"
 )
 
 // ModelRequest describes one logical model request: the model, the request
@@ -378,6 +394,7 @@ type AgentEvent struct {
 	Hook                  *hooks.Report
 	Fallback              *types.ModelFallback
 	Request               *ModelRequest
+	Loop                  *LoopDetection
 	Attempt               int
 	RetryDelay            time.Duration
 	FailedAt              time.Time

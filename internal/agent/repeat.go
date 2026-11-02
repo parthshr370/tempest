@@ -147,12 +147,27 @@ func (key failureKey) matches(result types.ToolResultMessage, caller types.Assis
 	return false
 }
 
-// resultContent is a result's content without the repeated-failure notice.
+// resultContent is a result's content without a host notice: the
+// repeated-failure notice or a loop notice.
 func resultContent(content []types.ContentBlock) []types.ContentBlock {
-	if last := len(content) - 1; last >= 0 && content[last].Type == types.BlockText && strings.HasPrefix(content[last].Text, repeatedFailurePrefix) {
-		return content[:last]
+	if hostNotice(content) != "" {
+		return content[:len(content)-1]
 	}
 	return content
+}
+
+// hostNotice is the prefix of the host notice that ends content, or "".
+func hostNotice(content []types.ContentBlock) string {
+	last := len(content) - 1
+	if last < 0 || content[last].Type != types.BlockText {
+		return ""
+	}
+	for _, prefix := range []string{repeatedFailurePrefix, loopNudgePrefix, loopStopPrefix} {
+		if strings.HasPrefix(content[last].Text, prefix) {
+			return prefix
+		}
+	}
+	return ""
 }
 
 func sameContent(a, b []types.ContentBlock) bool {

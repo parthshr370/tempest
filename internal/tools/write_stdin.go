@@ -43,7 +43,9 @@ func newWriteStdinTool(controller work.Controller) agent.AgentTool {
 		"close_stdin": schema.JSON{"type": "boolean", "description": "end the job's input after text"},
 		"wait_ms":     schema.JSON{"type": "integer", "minimum": 0, "maximum": work.MaxStdinWaitMS, "description": fmt.Sprintf("longest wait for output, default %d", work.DefaultStdinWaitMS)},
 	}, []string{})
-	return agent.AgentTool{Tool: types.Tool{Name: string(WriteStdinTool), Description: writeStdinDescription, Parameters: parameters}, Label: string(WriteStdinTool), Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+	// Empty text polls a job's output, so the loop guard treats the tool as
+	// polling; its failures still count toward the repeated-failure stop.
+	return agent.AgentTool{Tool: types.Tool{Name: string(WriteStdinTool), Description: writeStdinDescription, Parameters: parameters}, Label: string(WriteStdinTool), Polls: true, Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 		var input struct {
 			JobID      string `json:"job_id"`
 			Name       string `json:"name"`

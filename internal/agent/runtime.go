@@ -128,6 +128,9 @@ type AgentOptions struct {
 	// Reminders are added at the tail of model requests; see [Reminder].
 	// A run with an invalid list ends with StopError before its first request.
 	Reminders []Reminder
+	// LoopThresholds configures the loop guard; nil means
+	// [DefaultLoopThresholds].
+	LoopThresholds *LoopThresholds
 }
 
 // ErrRunActive is returned by Prompt and Continue while a run is in progress.
@@ -199,6 +202,7 @@ type Agent struct {
 	SessionID                  string
 	ToolExecution              ToolExecutionMode
 	Reminders                  []Reminder
+	LoopThresholds             *LoopThresholds
 }
 
 var defaultModel = types.Model{
@@ -296,6 +300,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		SessionID:                  opts.SessionID,
 		ToolExecution:              toolExecution,
 		Reminders:                  append([]Reminder(nil), opts.Reminders...),
+		LoopThresholds:             opts.LoopThresholds,
 		budget:                     opts.Budget,
 	}
 }
@@ -608,6 +613,11 @@ func (a *Agent) startableLocked() error {
 			return err
 		}
 	}
+	if a.LoopThresholds != nil {
+		if err := a.LoopThresholds.Validate(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -675,6 +685,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		bindings:         a.bindings,
 		OutputSchema:     a.outputSchema,
 		Reminders:        a.Reminders,
+		LoopThresholds:   a.LoopThresholds,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

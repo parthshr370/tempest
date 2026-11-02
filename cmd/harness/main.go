@@ -385,7 +385,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "session: %s (resume with -resume %s)\n", sess.ID(), sess.ID())
 	}
 	switch outcome.StopReason {
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure:
+	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
 		return 1
 	case agent.StopAborted:
 		return exitAborted
@@ -421,6 +421,8 @@ type runReport struct {
 	Message ptypes.Message `json:"message,omitempty"`
 	// Output is the final answer parsed against -output-schema.
 	Output json.RawMessage `json:"output,omitempty"`
+	// Loop names the loop that stopped a loop_detected run.
+	Loop *agent.LoopDetection `json:"loop,omitempty"`
 }
 
 // writeRunOutput prints the run result: a runReport in json mode; otherwise
@@ -446,7 +448,7 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 	}
 	switch outcome.StopReason {
 	case agent.StopCompleted:
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure:
+	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
 		fmt.Fprintf(stderr, "run failed after %d turns: %v\n", outcome.Turns, outcome.Err)
 	default:
 		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)
@@ -458,6 +460,9 @@ func makeRunReport(outcome runOutcome, last ptypes.Message) runReport {
 	report.SubmissionID, report.RequestID = outcome.SubmissionID, outcome.RequestID
 	if outcome.Err != nil {
 		report.Error = outcome.Err.Error()
+	}
+	if loop, ok := errors.AsType[*agent.LoopError](outcome.Err); ok {
+		report.Loop = &loop.LoopDetection
 	}
 	if !outcome.Usage.Cost.Unknown {
 		cost := outcome.Usage.Cost.Total

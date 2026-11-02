@@ -16,7 +16,21 @@ var errHookPromptBlocked = errors.New("prompt blocked by hook")
 var errHookPromptConsumed = errors.New("interrupted queued prompt consumed")
 
 func hookMessage(event, text string) types.Message {
-	return types.UserMessage{Content: types.StringContent(event + " hook context: " + text), Timestamp: time.Now().UnixMilli()}
+	return types.UserMessage{Content: types.StringContent(event + hookContextInfix + text), Timestamp: time.Now().UnixMilli()}
+}
+
+const hookContextInfix = " hook context: "
+
+// isHookContinuation reports whether a user message's text is feedback from
+// a hook that sends a finished model back to work (Stop, SubagentStop or an
+// extension's on_yield), as opposed to new input.
+func isHookContinuation(text string) bool {
+	for _, event := range []string{"Stop", "SubagentStop", "on_yield"} {
+		if strings.HasPrefix(text, event+hookContextInfix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (run *loopRun) startHooks(ctx context.Context, current *AgentContext) error {

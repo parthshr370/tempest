@@ -15,8 +15,10 @@
 // fails it after one correction turn ends with [StopOutputInvalid]. A run
 // whose model sends one tool call unchanged until it has failed the same way
 // [RepeatedFailureLimit] times in a row ends with [StopRepeatedFailure] after
-// that turn (see repeat.go). A run that starts emits agent_start first and
-// exactly one agent_end last; agent_end carries the [RunResult].
+// that turn (see repeat.go), and one whose model repeats a loop it was
+// already told about ends with [StopLoopDetected] (see loopguard.go). A run
+// that starts emits agent_start first and exactly one agent_end last;
+// agent_end carries the [RunResult].
 //
 // # Goroutine ownership
 //
@@ -505,6 +507,15 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				return err
 			}
 			pendingMessages = nil
+			// The run ends here, before the model call, when the model keeps
+			// giving the same final answer to the hook feedback just appended.
+			if loop, err := run.noteRepeatedText(ctx, &current); err != nil || loop != nil {
+				if loop != nil {
+					run.result.StopReason = StopLoopDetected
+					run.result.Err = loop
+				}
+				return err
+			}
 			if prepareResume {
 				update, err := config.PrepareNextTurnE(ctx, ShouldStopAfterTurnContext{Context: current, NewMessages: run.messages, Model: config.Model})
 				if err != nil {
@@ -610,6 +621,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			toolResults := []types.ToolResultMessage{}
 			hasMoreToolCalls = false
 			var repeatedFailure error
+			var loop *LoopError
 			var handoff *string
 			if hasToolCalls(message) {
 				run.stopHookContinuations = 0
@@ -619,6 +631,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 				}
 				toolResults = executedToolBatch.Messages
 				repeatedFailure = executedToolBatch.RepeatedFailure
+				loop = executedToolBatch.Loop
 				handoff = executedToolBatch.Handoff
 				// A batch terminates the turn only when EVERY result sets
 				// Terminate — a single non-terminating result means the model
@@ -643,6 +656,11 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			if handoff == nil && repeatedFailure != nil && ctx.Err() == nil {
 				run.result.StopReason = StopRepeatedFailure
 				run.result.Err = repeatedFailure
+				return nil
+			}
+			if handoff == nil && loop != nil && ctx.Err() == nil {
+				run.result.StopReason = StopLoopDetected
+				run.result.Err = loop
 				return nil
 			}
 
