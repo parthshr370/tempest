@@ -94,7 +94,6 @@ func mustJSON(value model.PullRequest) []byte {
 func (s *Source) readThread(ctx context.Context, rd *round, watched model.WatchedThread) error {
 	thread := watched.Thread
 	number := thread.Ref.Number
-	readAt := s.clock.Now()
 	resource := threadResource(number, "")
 	response, err := s.get(ctx, rd, model.GHRequest{Path: s.repoPath("issues/%d", number)})
 	var ghErr *model.GHError
@@ -107,6 +106,14 @@ func (s *Source) readThread(ctx context.Context, rd *round, watched model.Watche
 	if err != nil {
 		return err
 	}
+	// The read begins at GitHub's clock. Date has whole seconds, so a
+	// notification in the same second may be newer than the read: count
+	// the read from the second before.
+	began, err := serverDate(response)
+	if err != nil {
+		return err
+	}
+	readAt := began.Add(-time.Second)
 	issue, err := decode[ghIssue](response, "issue")
 	if err != nil {
 		return err
@@ -244,121 +251,58 @@ func pullFacts(pull ghPull, known *model.PullRequest, ref model.ThreadRef, obser
 	return events
 }
 
-// positionedRead is one paginated thread stream committed page by page.
-type positionedRead struct {
-	resource string
-	request  model.GHRequest
-	old      model.Position
-	entries  func(raw []byte, observedAt time.Time) ([]entry, error)
-	position func(batch *model.IntakeBatch, position model.Position)
-	// pr, when set, rides along in every batch that changes it.
-	pr *prTracker
-}
-
-// readPositioned walks a stream and commits each page in bounded runs.
-// Before the last page the position moves to the last run's mark, which
-// every unread item is at or after; the last run of a complete walk moves
-// it to the newest updated_at read, never backward.
-func (s *Source) readPositioned(ctx context.Context, rd *round, read positionedRead) (bool, error) {
-	committed := read.old
-	newest := read.old.Since
-	return s.walk(ctx, rd, read.request, func(response model.GHResponse, final bool) (bool, error) {
-		entries, err := read.entries(response.Body, s.clock.Now())
-		if err != nil {
-			return false, err
-		}
-		fresh := false
-		for _, item := range entries {
-			newest = later(newest, item.updated)
-			fresh = fresh || item.updated.After(read.old.Since) || item.id > read.old.LastID
-		}
-		runs := split(entries)
-		if final && len(runs) == 0 {
-			runs = [][]entry{nil}
-		}
-		for i, run := range runs {
-			position := committed
-			if len(run) > 0 {
-				last := run[len(run)-1]
-				position.Since = later(position.Since, last.mark)
-				position.LastID = max(position.LastID, last.id)
-			}
-			if final && i == len(runs)-1 {
-				position.Since = later(position.Since, newest)
-			}
-			events := eventsOf(run)
-			prs := read.pr.pending()
-			moved := !position.Since.Equal(committed.Since) || position.LastID != committed.LastID
-			if len(events) == 0 && len(prs) == 0 && !moved {
-				continue
-			}
-			batch := model.IntakeBatch{Resource: read.resource, Events: events, PRs: prs}
-			read.position(&batch, position)
-			if err := s.ingest(ctx, rd, batch); err != nil {
-				return false, err
-			}
-			committed = position
-			read.pr.markCommitted()
-		}
-		return fresh, nil
-	})
-}
-
+// readComments scans the conversation, which GitHub lists in ID order.
 func (s *Source) readComments(ctx context.Context, rd *round, ref model.ThreadRef, old model.Position) (bool, error) {
-	return s.readPositioned(ctx, rd, positionedRead{
+	return s.scan(ctx, rd, scanSpec{
 		resource: threadResource(ref.Number, "comments"),
-		// The per-issue listing is in ID order and filters by updated_at.
-		request: model.GHRequest{Path: s.repoPath("issues/%d/comments", ref.Number), Query: listQuery(s.rereadFrom(old.Since), false)},
-		old:     old,
-		entries: func(raw []byte, observedAt time.Time) ([]entry, error) {
-			rows, err := decodeBytes[[]ghComment](raw, "comments")
-			if err != nil {
-				return nil, err
-			}
-			entries := make([]entry, 0, len(rows))
-			for _, row := range rows {
-				// Unread items have higher IDs, so they were created no
-				// earlier than this one and updated no earlier still.
-				entries = append(entries, entry{events: s.commentEvents(row, ref, false, observedAt), mark: row.CreatedAt, updated: row.UpdatedAt})
-			}
-			return entries, nil
-		},
+		path:     s.repoPath("issues/%d/comments", ref.Number),
+		windowed: true,
+		old:      old,
+		entries:  s.commentEntries(ref, false),
 		position: func(batch *model.IntakeBatch, position model.Position) {
 			batch.Threads = []model.ThreadUpdate{{Ref: ref, Comments: &position}}
 		},
 	})
 }
 
+// readReviewComments scans the inline comments. Without a sort parameter
+// GitHub lists them in ID order.
 func (s *Source) readReviewComments(ctx context.Context, rd *round, ref model.ThreadRef, old model.Position) (bool, error) {
-	return s.readPositioned(ctx, rd, positionedRead{
+	return s.scan(ctx, rd, scanSpec{
 		resource: threadResource(ref.Number, "review_comments"),
-		request:  model.GHRequest{Path: s.repoPath("pulls/%d/comments", ref.Number), Query: listQuery(s.rereadFrom(old.Since), true)},
+		path:     s.repoPath("pulls/%d/comments", ref.Number),
+		windowed: true,
 		old:      old,
-		entries: func(raw []byte, observedAt time.Time) ([]entry, error) {
-			rows, err := decodeBytes[[]ghComment](raw, "review comments")
-			if err != nil {
-				return nil, err
-			}
-			entries := make([]entry, 0, len(rows))
-			for _, row := range rows {
-				entries = append(entries, entry{events: s.commentEvents(row, ref, true, observedAt), mark: row.UpdatedAt, updated: row.UpdatedAt})
-			}
-			return entries, nil
-		},
+		entries:  s.commentEntries(ref, true),
 		position: func(batch *model.IntakeBatch, position model.Position) {
 			batch.Threads = []model.ThreadUpdate{{Ref: ref, ReviewComments: &position}}
 		},
 	})
 }
 
-// readReviews reads every review page (the listing has no since). Reviews
-// after LastID become events; a dismissal of an earlier one becomes a
-// dismissed event. Each review is kept on the PR record pinned to the
-// commit it reviewed.
+func (s *Source) commentEntries(ref model.ThreadRef, inline bool) func([]byte, time.Time) ([]entry, error) {
+	return func(raw []byte, observedAt time.Time) ([]entry, error) {
+		rows, err := decodeBytes[[]ghComment](raw, "comments")
+		if err != nil {
+			return nil, err
+		}
+		entries := make([]entry, 0, len(rows))
+		for _, row := range rows {
+			entries = append(entries, entry{events: s.commentEvents(row, ref, inline, observedAt), updated: row.UpdatedAt, id: row.ID})
+		}
+		return entries, nil
+	}
+}
+
+// readReviews scans every review (the chronological listing has no
+// since), so a scan also sees dismissals of reviews it read before. A
+// review not yet on the PR record becomes an event, a dismissal not yet
+// recorded a dismissed event; each review is kept on the record pinned to
+// the commit it reviewed.
 func (s *Source) readReviews(ctx context.Context, rd *round, ref model.ThreadRef, old model.Position, pr *prTracker) (bool, error) {
-	return s.readPositioned(ctx, rd, positionedRead{
+	return s.scan(ctx, rd, scanSpec{
 		resource: threadResource(ref.Number, "reviews"),
-		request:  model.GHRequest{Path: s.repoPath("pulls/%d/reviews", ref.Number), Query: listQuery(time.Time{}, false)},
+		path:     s.repoPath("pulls/%d/reviews", ref.Number),
 		old:      old,
 		pr:       pr,
 		entries: func(raw []byte, observedAt time.Time) ([]entry, error) {
@@ -368,28 +312,29 @@ func (s *Source) readReviews(ctx context.Context, rd *round, ref model.ThreadRef
 			}
 			entries := make([]entry, 0, len(rows))
 			for _, row := range rows {
+				item := entry{id: row.ID}
 				if row.State == reviewPending || s.isAccount(row.User) {
+					// Listed, so it orders the scan, but never recorded.
+					entries = append(entries, item)
 					continue
 				}
-				item := entry{id: row.ID}
 				if row.SubmittedAt != nil {
-					item.mark, item.updated = *row.SubmittedAt, *row.SubmittedAt
+					item.updated = *row.SubmittedAt
 				}
 				index := slices.IndexFunc(pr.record.Reviews, func(fact model.ReviewFact) bool { return fact.ID == row.ID })
-				switch {
-				case row.ID > old.LastID:
+				if index < 0 {
 					item.events = append(item.events, s.reviewEvent(row, ref, false, observedAt))
-					if row.State == reviewDismissed {
-						item.events = append(item.events, s.reviewEvent(row, ref, true, observedAt))
-					}
-				case row.State == reviewDismissed && (index < 0 || pr.record.Reviews[index].State != reviewDismissed):
+				}
+				if row.State == reviewDismissed && (index < 0 || pr.record.Reviews[index].State != reviewDismissed) {
 					item.events = append(item.events, s.reviewEvent(row, ref, true, observedAt))
 				}
-				fact := model.ReviewFact{ID: row.ID, Actor: actor(row.User), State: row.State, CommitSHA: row.CommitID, SubmittedAt: item.mark}
-				if index < 0 {
+				fact := model.ReviewFact{ID: row.ID, Actor: actor(row.User), State: row.State, CommitSHA: row.CommitID, SubmittedAt: item.updated}
+				item.apply = func() {
+					if index := slices.IndexFunc(pr.record.Reviews, func(known model.ReviewFact) bool { return known.ID == fact.ID }); index >= 0 {
+						pr.record.Reviews[index] = fact
+						return
+					}
 					pr.record.Reviews = append(pr.record.Reviews, fact)
-				} else {
-					pr.record.Reviews[index] = fact
 				}
 				entries = append(entries, item)
 			}

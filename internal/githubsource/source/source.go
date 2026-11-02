@@ -7,7 +7,9 @@
 // read up to it, so a crash or a failed page rereads instead of skipping.
 // Notifications never supply a lower bound for reading a thread: they only
 // flag the thread, which is then read from its own committed positions
-// (from its creation when it was never read).
+// (from its creation when it was never read). Every position is on
+// GitHub's clock, from reply Date headers and item timestamps; the local
+// clock only schedules rounds, so local skew cannot exclude activity.
 package source
 
 import (
@@ -38,9 +40,9 @@ const (
 	// lowBudgetDivisor: below Limit/lowBudgetDivisor remaining requests a
 	// round reads only flagged threads.
 	lowBudgetDivisor = 10
-	// rereadPageFactor bounds pages that only reread already-committed
-	// items (the lookback overlap) to this multiple of MaxPages, so the
-	// overlap cannot starve progress yet a round stays bounded.
+	// rereadPageFactor bounds observe-stream pages that only reread the
+	// lookback to this multiple of MaxPages; past it the round skips to the
+	// cursor, so the lookback cannot starve progress.
 	rereadPageFactor = 4
 	// rateLimitRetry is the wait after a 429 that names no Retry-After.
 	rateLimitRetry = time.Minute
@@ -263,38 +265,25 @@ func (s *Source) get(ctx context.Context, rd *round, request model.GHRequest) (m
 	return response, nil
 }
 
-// pageVisitor handles one page of a walk. final is true on the last page.
-// fresh reports whether the page held an item past the committed position;
-// pages that only reread committed items do not use up MaxPages.
-type pageVisitor func(response model.GHResponse, final bool) (fresh bool, err error)
-
-// walk reads pages from first by Link rel="next" until the listing ends
-// (complete) or MaxPages fresh pages were read.
-func (s *Source) walk(ctx context.Context, rd *round, first model.GHRequest, visit pageVisitor) (bool, error) {
+// walk reads a snapshot listing (check runs, commit statuses) from first
+// by Link rel="next" until it ends (complete) or MaxPages pages were read.
+// Nothing positions on it: an incomplete walk is read again next round.
+func (s *Source) walk(ctx context.Context, rd *round, first model.GHRequest, visit func(model.GHResponse) error) (bool, error) {
 	request := first
-	fresh, total := 0, 0
-	for {
+	for range s.maxPages {
 		response, err := s.get(ctx, rd, request)
 		if err != nil {
 			return false, err
 		}
-		final := response.NextPath == ""
-		pageFresh, err := visit(response, final)
-		if err != nil {
+		if err := visit(response); err != nil {
 			return false, err
 		}
-		if final {
+		if response.NextPath == "" {
 			return true, nil
-		}
-		total++
-		if pageFresh {
-			fresh++
-		}
-		if fresh >= s.maxPages || total >= s.maxPages*rereadPageFactor {
-			return false, nil
 		}
 		request = model.GHRequest{Path: response.NextPath}
 	}
+	return false, nil
 }
 
 // ingest commits one batch.

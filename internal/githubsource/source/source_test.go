@@ -142,7 +142,8 @@ func TestRereadCommitsNothingNewAndEditsAreNewVersions(t *testing.T) {
 		t.Fatalf("comments = %+v (the account's own comment must not be stored)", comments)
 	}
 	thread := e.intake.thread(number)
-	if !thread.Comments.Since.Equal(start.Add(time.Minute)) || thread.Title != "Crash on save" || thread.State != "open" {
+	// The position is one second past GitHub's clock when the scan began.
+	if !thread.Comments.Since.Equal(start.Add(time.Minute+time.Second)) || thread.Comments.LastID != 0 || thread.Title != "Crash on save" || thread.State != "open" {
 		t.Fatalf("thread after first read = %+v", thread)
 	}
 
@@ -169,25 +170,6 @@ func TestRereadCommitsNothingNewAndEditsAreNewVersions(t *testing.T) {
 	}
 }
 
-func TestCommentFirstSeenEditedKeepsItsCreationVersion(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, nil)
-	number := e.repo.OpenIssue(alice, "t", "")
-	id := e.repo.Comment(number, alice, "@acme-bot fxi this")
-	e.repo.Advance(20 * time.Second)
-	e.repo.EditComment(id, "@acme-bot fix this")
-	e.intake.subscribe(number)
-	e.pollClean()
-	created := e.intake.eventsOfKind(model.EventComment)
-	current := e.intake.eventsOfKind(model.EventCommentEdited)
-	if len(created) != 1 || created[0].ID != model.CommentID(id, start) || !created[0].Mention || created[0].Body != "@acme-bot fix this" {
-		t.Fatalf("creation version = %+v", created)
-	}
-	if len(current) != 1 || current[0].ID != model.CommentID(id, start.Add(20*time.Second)) {
-		t.Fatalf("edited version = %+v", current)
-	}
-}
-
 func TestLateIndexedCommentWithinLookbackIsRead(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
@@ -204,7 +186,7 @@ func TestLateIndexedCommentWithinLookbackIsRead(t *testing.T) {
 	if e.intake.hasEvent(model.CommentID(late, start.Add(time.Minute))) {
 		t.Fatal("hidden comment was read before it was indexed")
 	}
-	if since := e.intake.thread(number).Comments.Since; !since.Equal(start.Add(2 * time.Minute)) {
+	if since := e.intake.thread(number).Comments.Since; !since.Equal(start.Add(2*time.Minute + time.Second)) {
 		t.Fatalf("position = %s", since)
 	}
 	e.repo.Advance(5 * time.Minute)
@@ -239,8 +221,11 @@ func TestNotificationsPaginateAndOnlyFlagThreads(t *testing.T) {
 			t.Fatalf("notification step read a thread: %s", request.Path)
 		}
 	}
-	if pages != 3 {
-		t.Fatalf("notification pages = %d, want 3", pages)
+	// The head page (the newest 50), then the rows below it oldest first:
+	// a window that does not fit lowers the top, an empty one moves the
+	// bottom, and the rest fits one page.
+	if pages != 4 {
+		t.Fatalf("notification requests = %d, want 4", pages)
 	}
 	for number := 1; number <= threads+1; number++ {
 		thread := e.intake.thread(number)
@@ -251,16 +236,27 @@ func TestNotificationsPaginateAndOnlyFlagThreads(t *testing.T) {
 	if ref := e.intake.thread(pull).Ref; !ref.IsPR {
 		t.Fatalf("pull request flag ref = %+v", ref)
 	}
+	// GitHub's clock at the read was start+3m: coverage settles one
+	// lookback behind it, and a first listing has no validator to keep.
 	cursor, _, _ := e.intake.Cursor(context.Background(), model.CursorNotifications)
-	if !cursor.Since.Equal(start.Add(threads*time.Second)) || cursor.LastModified != "" {
-		t.Fatalf("cursor = %+v: a moved cursor changes the URL, so no validator is kept", cursor)
+	if !cursor.Since.Equal(start.Add(3*time.Minute-time.Hour)) || cursor.LastModified != "" {
+		t.Fatalf("cursor = %+v", cursor)
 	}
+}
 
-	// The next round repeats the same URL and keeps its validator; the one
-	// after sends it and gets 304, committing nothing.
+// TestUnchangedInboxIsNotModified keeps a one-page inbox: the second round
+// repeats the first round's URL and keeps its validator, the third sends
+// it, gets 304 and commits nothing.
+func TestUnchangedInboxIsNotModified(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	e.intake.hideFlagged = true
+	e.repo.Notify(e.repo.OpenIssue(alice, "issue", ""))
 	e.repo.Advance(time.Minute)
 	e.pollClean()
-	cursor, _, _ = e.intake.Cursor(context.Background(), model.CursorNotifications)
+	e.repo.Advance(time.Minute)
+	e.pollClean()
+	cursor, _, _ := e.intake.Cursor(context.Background(), model.CursorNotifications)
 	if cursor.LastModified == "" {
 		t.Fatalf("stable listing kept no validator: %+v", cursor)
 	}
@@ -288,21 +284,24 @@ func TestNotifiedOldThreadIsReadFromItsOwnPosition(t *testing.T) {
 	e.repo.Advance(48 * time.Hour)
 	e.repo.Comment(old, alice, "@acme-bot can you look")
 	e.repo.Notify(old)
+	// The read must begin after the notification's second to clear it.
+	e.repo.Advance(time.Second)
 
 	e.pollClean()
 	if got := len(e.intake.eventsOfKind(model.EventComment)); got != oldComments+1 {
 		t.Fatalf("comments read = %d, want %d", got, oldComments+1)
 	}
 	thread := e.intake.thread(old)
-	if thread.NeedsReconcile || !thread.Comments.Since.Equal(start.Add(48*time.Hour)) {
+	if thread.NeedsReconcile || !thread.Comments.Since.Equal(start.Add(48*time.Hour+2*time.Second)) {
 		t.Fatalf("thread after complete read = %+v", thread)
 	}
 
-	// A known thread whose comment and notification are indexed late, after
-	// the notification cursor moved past them on another thread.
+	// A known thread whose comment and notification are indexed late,
+	// while another thread's notification is listed at once.
 	e.repo.Advance(time.Minute)
 	e.repo.SetIndexDelay(10 * time.Minute)
 	late := e.repo.Comment(old, carol, "@acme-bot one more thing")
+	lateAt := e.repo.Now()
 	e.repo.Notify(old)
 	e.repo.SetIndexDelay(0)
 	e.repo.Advance(time.Minute)
@@ -310,13 +309,12 @@ func TestNotifiedOldThreadIsReadFromItsOwnPosition(t *testing.T) {
 	e.repo.Notify(other)
 	e.repo.Advance(time.Minute)
 	e.pollClean()
-	cursor, _, _ := e.intake.Cursor(context.Background(), model.CursorNotifications)
-	if cursor.Since.Before(start.Add(48*time.Hour + 2*time.Minute)) {
-		t.Fatalf("cursor did not move past the late comment: %s", cursor.Since)
+	if e.intake.hasEvent(model.CommentID(late, lateAt)) {
+		t.Fatal("the late comment was read before it was indexed")
 	}
 	e.repo.Advance(10 * time.Minute)
 	e.pollClean()
-	if !e.intake.hasEvent(model.CommentID(late, start.Add(48*time.Hour+time.Minute))) {
+	if !e.intake.hasEvent(model.CommentID(late, lateAt)) {
 		t.Fatal("late-indexed mention older than the notification cursor was lost")
 	}
 }
@@ -334,16 +332,17 @@ func TestPartialFailureKeepsPositionAndOtherThreadsAdvance(t *testing.T) {
 	e.repo.Comment(short, carol, "hello")
 	e.intake.subscribe(long, short)
 	e.client.failOnce(func(request model.GHRequest) bool {
-		return strings.Contains(request.Path, fmt.Sprintf("issues/%d/comments", long)) && strings.Contains(request.Path, "page=2")
+		return strings.HasPrefix(request.Path, fmt.Sprintf("repos/o/r/issues/%d/comments", long)) && request.Query.Get("page") != ""
 	}, &model.GHError{Status: http.StatusBadGateway, Message: "Bad Gateway"})
 
 	report := e.poll()
 	if len(report.Errors) != 1 || report.Errors[0].Resource != fmt.Sprintf("thread:%d", long) || report.Errors[0].Status != http.StatusBadGateway {
 		t.Fatalf("errors = %+v", report.Errors)
 	}
-	// Page 1 ends at comment 100, created at second 99.
-	if since := e.intake.thread(long).Comments.Since; !since.Equal(start.Add(99 * time.Second)) {
-		t.Fatalf("failed thread position = %s, want page 1's end", since)
+	// The scan began at GitHub's clock and read page 1: comments 1 to 100.
+	pageEnd := e.repo.Comments(long)[99].ID
+	if position := e.intake.thread(long).Comments; !position.Since.Equal(start.Add(longThread*time.Second)) || position.LastID != pageEnd {
+		t.Fatalf("failed thread position = %+v, want the scan's start and page 1's end", position)
 	}
 	if got := len(e.intake.eventsOfKind(model.EventComment)); got != 101 {
 		t.Fatalf("comments after partial round = %d, want page 1 plus the short thread", got)
@@ -357,8 +356,8 @@ func TestPartialFailureKeepsPositionAndOtherThreadsAdvance(t *testing.T) {
 	if got := len(e.intake.eventsOfKind(model.EventComment)); got != longThread+1 {
 		t.Fatalf("comments after recovery = %d", got)
 	}
-	if since := e.intake.thread(long).Comments.Since; !since.Equal(start.Add((longThread - 1) * time.Second)) {
-		t.Fatalf("recovered position = %s", since)
+	if position := e.intake.thread(long).Comments; !position.Since.Equal(start.Add((longThread+1)*time.Second)) || position.LastID != 0 {
+		t.Fatalf("recovered position = %+v, want the finished scan one second past its start", position)
 	}
 }
 
@@ -526,6 +525,7 @@ func TestLowRateBudgetReadsOnlyFlaggedThreads(t *testing.T) {
 	e.intake.subscribe(quiet)
 	e.repo.Advance(time.Minute)
 	e.repo.Notify(flagged)
+	e.repo.Advance(time.Second)
 	e.repo.SetRateLimit(5000, 100, start.Add(time.Hour))
 	e.pollClean()
 	for _, request := range e.client.requests() {
@@ -658,36 +658,34 @@ func TestBranchCIBaselineThenChange(t *testing.T) {
 
 func TestBatchesSplitAtEventAndByteLimits(t *testing.T) {
 	t.Parallel()
-	const editedComments = 60
+	const manyComments = 150
 	const bigComments = 12
 	const bigBody = 60000
 	e := newEnv(t, nil)
-	edited := e.repo.OpenIssue(alice, "edited", "")
-	for range editedComments {
-		id := e.repo.Comment(edited, alice, "x")
-		e.repo.Advance(time.Second)
-		e.repo.EditComment(id, "y")
+	many := e.repo.OpenIssue(alice, "many", "")
+	for range manyComments {
+		e.repo.Comment(many, alice, "x")
 	}
 	big := e.repo.OpenIssue(alice, "big", "")
 	for range bigComments {
 		e.repo.Comment(big, alice, strings.Repeat("b", bigBody))
 	}
-	e.intake.subscribe(edited, big)
+	e.intake.subscribe(many, big)
 	e.pollClean()
-	if got := len(e.intake.eventsOfKind(model.EventComment)) + len(e.intake.eventsOfKind(model.EventCommentEdited)); got != 2*editedComments+bigComments {
+	if got := len(e.intake.eventsOfKind(model.EventComment)); got != manyComments+bigComments {
 		t.Fatalf("events = %d", got)
 	}
-	var editedBatches, bigBatches int
+	var manyBatches, bigBatches int
 	for _, batch := range e.intake.recorded() {
 		switch batch.Resource {
-		case fmt.Sprintf("thread:%d:comments", edited):
-			editedBatches++
+		case fmt.Sprintf("thread:%d:comments", many):
+			manyBatches++
 		case fmt.Sprintf("thread:%d:comments", big):
 			bigBatches++
 		}
 	}
-	if editedBatches != 2 || bigBatches != 2 {
-		t.Fatalf("batches: edited %d (120 events), big %d (720000 bytes)", editedBatches, bigBatches)
+	if manyBatches != 2 || bigBatches != 2 {
+		t.Fatalf("batches: many %d (150 events), big %d (720000 bytes)", manyBatches, bigBatches)
 	}
 }
 

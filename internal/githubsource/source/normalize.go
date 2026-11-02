@@ -228,10 +228,13 @@ func edited(created, updated time.Time) bool {
 	return updated.Truncate(time.Second).After(created.Truncate(time.Second))
 }
 
-// commentEvents normalizes one conversation or inline comment. A comment
-// first seen already edited also yields its creation version with the plain
-// kind, so a mention fixed by a quick edit before the poll still counts as
-// written; known IDs make the extra event free on rereads.
+// commentEvents normalizes one conversation or inline comment as the
+// version GitHub returned. An unedited comment is its creation event. An
+// edited one is only its edited version: REST returns the current body and
+// no history, so the creation body is unknown, and edited text is context
+// that never requests, stops or wakes (design §5 rule 6). A creation event
+// read before the edit stays committed under its own EventID. Edits within
+// the creation second are not visible at GitHub's one-second resolution.
 func (s *Source) commentEvents(row ghComment, ref model.ThreadRef, inline bool, observedAt time.Time) []model.Event {
 	if s.isAccount(row.User) {
 		return nil
@@ -251,14 +254,12 @@ func (s *Source) commentEvents(row ghComment, ref model.ThreadRef, inline bool, 
 		}
 	}
 	base = s.text.withBody(base, row.Body, !inline)
-	created := base
-	created.ID, created.Kind, created.At = id(row.ID, row.CreatedAt), kind, row.CreatedAt
 	if !edited(row.CreatedAt, row.UpdatedAt) {
-		return []model.Event{created}
+		base.ID, base.Kind, base.At = id(row.ID, row.CreatedAt), kind, row.CreatedAt
+		return []model.Event{base}
 	}
-	current := base
-	current.ID, current.Kind, current.At = id(row.ID, row.UpdatedAt), editedKind, row.UpdatedAt
-	return []model.Event{created, current}
+	base.ID, base.Kind, base.At = id(row.ID, row.UpdatedAt), editedKind, row.UpdatedAt
+	return []model.Event{base}
 }
 
 // reviewEvent normalizes a submitted review, including a bodyless approval.

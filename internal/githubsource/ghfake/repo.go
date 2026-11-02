@@ -45,6 +45,7 @@ const (
 const (
 	maxPerPage                = 100
 	defaultNotificationsPage  = 50
+	maxNotificationsPage      = 50
 	defaultPollIntervalSecond = 60
 	etagDigestBytes           = 8
 )
@@ -519,6 +520,13 @@ func (r *Repo) EditReviewComment(id int64, body string) {
 	panic(fmt.Sprintf("ghfake: no review comment %d", id))
 }
 
+// DeleteReviewComment removes an inline comment.
+func (r *Repo) DeleteReviewComment(id int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reviewComment = slices.DeleteFunc(r.reviewComment, func(comment *ReviewComment) bool { return comment.ID == id })
+}
+
 // Review submits a review of the pull request head and returns its ID.
 func (r *Repo) Review(number int, author User, state, body string) int64 {
 	r.mu.Lock()
@@ -626,11 +634,14 @@ func (r *Repo) routes(server *Server) {
 	}
 }
 
-// rated adds rate-limit headers and charges the budget for replies that
-// are not 304, which GitHub does not count.
+// rated adds the Date header from the repository clock, which is GitHub's
+// clock (the source takes its cursors from it), adds rate-limit headers
+// and charges the budget for replies that are not 304, which GitHub does
+// not count.
 func (r *Repo) rated(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		r.mu.Lock()
+		w.Header().Set("Date", r.now.UTC().Format(http.TimeFormat))
 		if r.rateLimit > 0 {
 			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(r.rateLimit))
 			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(max(r.rateRemaining-1, 0)))
@@ -687,9 +698,10 @@ func invalid(w http.ResponseWriter, message string) {
 	WriteJSON(w, http.StatusUnprocessableEntity, map[string]string{"message": message})
 }
 
-// window selects the requested page of rows and sets the Link header.
-// ok is false after an invalid page parameter was answered.
-func window[T any](w http.ResponseWriter, request *http.Request, rows []T, defaultPerPage int) ([]T, bool) {
+// window selects the requested page of rows, at most limit per page, and
+// sets the Link header. ok is false after an invalid page parameter was
+// answered.
+func window[T any](w http.ResponseWriter, request *http.Request, rows []T, defaultPerPage, limit int) ([]T, bool) {
 	query := request.URL.Query()
 	perPage, page := defaultPerPage, 1
 	for _, param := range []struct {
@@ -707,7 +719,7 @@ func window[T any](w http.ResponseWriter, request *http.Request, rows []T, defau
 		}
 		*param.target = parsed
 	}
-	perPage = min(perPage, maxPerPage)
+	perPage = min(perPage, limit)
 	start := min((page-1)*perPage, len(rows))
 	end := min(start+perPage, len(rows))
 	if end < len(rows) {
@@ -723,13 +735,18 @@ func window[T any](w http.ResponseWriter, request *http.Request, rows []T, defau
 
 // since parses the since parameter; zero when absent.
 func since(w http.ResponseWriter, request *http.Request) (time.Time, bool) {
-	text := request.URL.Query().Get("since")
+	return timeParam(w, request, "since")
+}
+
+// timeParam parses an RFC 3339 query parameter; zero when absent.
+func timeParam(w http.ResponseWriter, request *http.Request, name string) (time.Time, bool) {
+	text := request.URL.Query().Get(name)
 	if text == "" {
 		return time.Time{}, true
 	}
 	parsed, err := time.Parse(time.RFC3339, text)
 	if err != nil {
-		invalid(w, "invalid since")
+		invalid(w, "invalid "+name)
 		return time.Time{}, false
 	}
 	return parsed, true
@@ -845,7 +862,7 @@ func (r *Repo) listIssues(w http.ResponseWriter, request *http.Request) {
 		}
 	}
 	ordered(request, rows, "created", "desc")
-	if page, ok := window(w, request, rows, DefaultPerPage); ok {
+	if page, ok := window(w, request, rows, DefaultPerPage, maxPerPage); ok {
 		reply(w, request, page)
 	}
 }
@@ -874,7 +891,7 @@ func (r *Repo) listIssueComments(w http.ResponseWriter, request *http.Request) {
 	// The per-issue listing has no sort parameter: always ID ascending.
 	rows := r.visibleComments(found.issue.Number, after)
 	slices.SortFunc(rows, func(a, b Comment) int { return cmp.Compare(a.ID, b.ID) })
-	if page, ok := window(w, request, rows, DefaultPerPage); ok {
+	if page, ok := window(w, request, rows, DefaultPerPage, maxPerPage); ok {
 		reply(w, request, page)
 	}
 }
@@ -888,7 +905,7 @@ func (r *Repo) listAllComments(w http.ResponseWriter, request *http.Request) {
 	}
 	rows := r.visibleComments(0, after)
 	ordered(request, rows, "", "asc")
-	if page, ok := window(w, request, rows, DefaultPerPage); ok {
+	if page, ok := window(w, request, rows, DefaultPerPage, maxPerPage); ok {
 		reply(w, request, page)
 	}
 }
@@ -934,7 +951,7 @@ func (r *Repo) listReviews(w http.ResponseWriter, request *http.Request) {
 			rows = append(rows, *review)
 		}
 	}
-	if page, ok := window(w, request, rows, DefaultPerPage); ok {
+	if page, ok := window(w, request, rows, DefaultPerPage, maxPerPage); ok {
 		reply(w, request, page)
 	}
 }
@@ -956,7 +973,7 @@ func (r *Repo) listReviewComments(w http.ResponseWriter, request *http.Request, 
 	}
 	rows := r.visibleReviewComments(number, after)
 	ordered(request, rows, "", "asc")
-	if page, ok := window(w, request, rows, DefaultPerPage); ok {
+	if page, ok := window(w, request, rows, DefaultPerPage, maxPerPage); ok {
 		reply(w, request, page)
 	}
 }
@@ -1049,7 +1066,7 @@ func (r *Repo) listCheckRuns(w http.ResponseWriter, request *http.Request) {
 		rows = append(rows, *run)
 	}
 	slices.SortFunc(rows, func(a, b CheckRun) int { return cmp.Compare(a.ID, b.ID) })
-	page, ok := window(w, request, rows, DefaultPerPage)
+	page, ok := window(w, request, rows, DefaultPerPage, maxPerPage)
 	if ok {
 		reply(w, request, checkRunsReply{TotalCount: len(rows), CheckRuns: page})
 	}
@@ -1091,20 +1108,26 @@ func (r *Repo) getCombinedStatus(w http.ResponseWriter, request *http.Request) {
 			}
 		}
 	}
-	page, ok := window(w, request, rows, maxPerPage)
+	page, ok := window(w, request, rows, maxPerPage, maxPerPage)
 	if ok {
 		reply(w, request, combinedStatusReply{State: state, SHA: sha, TotalCount: len(rows), Statuses: page})
 	}
 }
 
-// listNotifications serves the inbox newest first, with Last-Modified,
-// If-Modified-Since and X-Poll-Interval like GitHub. Last-Modified is when
-// the listing last changed: a late-indexed notification changes it when it
-// appears, although its updated_at is older.
+// listNotifications serves the inbox newest first, with since (updated at
+// or after), before (updated strictly before), Last-Modified,
+// If-Modified-Since and X-Poll-Interval like GitHub, at most 50 rows a
+// page. Last-Modified is when the listing last changed: a late-indexed
+// notification changes it when it appears, although its updated_at is
+// older.
 func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	after, ok := since(w, request)
+	if !ok {
+		return
+	}
+	before, ok := timeParam(w, request, "before")
 	if !ok {
 		return
 	}
@@ -1122,7 +1145,7 @@ func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 		if changedAt.After(lastModified) {
 			lastModified = changedAt
 		}
-		if (all || notification.Unread) && !notification.UpdatedAt.Before(after) {
+		if (all || notification.Unread) && !notification.UpdatedAt.Before(after) && (before.IsZero() || notification.UpdatedAt.Before(before)) {
 			rows = append(rows, *notification)
 		}
 	}
@@ -1142,7 +1165,7 @@ func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 		}
 		return strings.Compare(b.ID, a.ID)
 	})
-	if page, ok := window(w, request, rows, defaultNotificationsPage); ok {
+	if page, ok := window(w, request, rows, defaultNotificationsPage, maxNotificationsPage); ok {
 		reply(w, request, page)
 	}
 }

@@ -166,7 +166,8 @@ func (m *memIntake) applyThread(update model.ThreadUpdate, readAt time.Time) boo
 		if position.update == nil {
 			continue
 		}
-		if position.update.Since.Before(position.stored.Since) || position.update.LastID < position.stored.LastID {
+		// Positions order as (Since, LastID), as control's intake does.
+		if position.update.Since.Before(position.stored.Since) || position.update.Since.Equal(position.stored.Since) && position.update.LastID < position.stored.LastID {
 			m.t.Errorf("thread %d %s moved backward: %+v -> %+v", update.Ref.Number, position.name, *position.stored, *position.update)
 		}
 		*position.stored = *position.update

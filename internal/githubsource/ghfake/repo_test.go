@@ -141,9 +141,24 @@ func TestRepoNotificationsConditionalAndNewestFirst(t *testing.T) {
 	}
 	f.repo.Advance(time.Minute)
 	f.repo.Notify(issue)
-	f.get("notifications", url.Values{"all": {"true"}, "since": {repoStart.Add(90 * time.Second).Format(time.RFC3339)}}, &rows)
+	response = f.get("notifications", url.Values{"all": {"true"}, "since": {repoStart.Add(90 * time.Second).Format(time.RFC3339)}}, &rows)
 	if len(rows) != 1 || rows[0].Subject.Type != "Issue" {
 		t.Fatalf("since filter = %+v", rows)
+	}
+	if date, err := http.ParseTime(response.Header.Get("Date")); err != nil || !date.Equal(f.repo.Now()) {
+		t.Fatalf("Date = %q, want the repository clock %s", response.Header.Get("Date"), f.repo.Now())
+	}
+	// before is exclusive: the pull's notification at one minute is out.
+	f.get("notifications", url.Values{"all": {"true"}, "before": {repoStart.Add(time.Minute).Format(time.RFC3339)}}, &rows)
+	if len(rows) != 1 || rows[0].Repository.FullName != "x/y" {
+		t.Fatalf("before filter = %+v", rows)
+	}
+	for range 60 {
+		f.repo.Notify(f.repo.OpenIssue(alice, "more", ""))
+	}
+	response = f.get("notifications", url.Values{"all": {"true"}, "per_page": {"100"}}, &rows)
+	if len(rows) != 50 || response.NextPath == "" {
+		t.Fatalf("notification pages hold at most 50 rows: %d, next %q", len(rows), response.NextPath)
 	}
 }
 

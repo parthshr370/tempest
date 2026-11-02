@@ -7,16 +7,15 @@ import (
 )
 
 // entry is one listed GitHub item: the events it yields (none for the
-// account's own items, two for a comment first seen edited) and the read
-// position that is safe once it and everything before it is committed.
+// account's own items) and what orders and positions it.
 type entry struct {
 	events []model.Event
-	// mark is the stream's safe Since through this item.
-	mark time.Time
-	// updated is the item's updated_at, for the end-of-walk position.
+	// updated is the item's updated_at (submitted_at for a review).
 	updated time.Time
-	// id is the item's GitHub ID, for streams positioned by ID.
+	// id is the item's GitHub ID, the order of thread listings.
 	id int64
+	// apply records the item on the PR when a scan takes it as new.
+	apply func()
 }
 
 func bodyBytes(events []model.Event) int {
@@ -61,6 +60,14 @@ func eventsOf(entries []entry) []model.Event {
 // later returns the later of two times; positions only move forward.
 func later(a, b time.Time) time.Time {
 	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// earlier returns the earlier of two times.
+func earlier(a, b time.Time) time.Time {
+	if b.Before(a) {
 		return b
 	}
 	return a
