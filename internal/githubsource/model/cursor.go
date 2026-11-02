@@ -6,10 +6,18 @@ import "time"
 // commit that stores everything read up to it.
 type Cursor struct {
 	Key CursorKey `json:"key"`
-	// Since is the newest updated_at fully read. For notifications it is a
-	// listing position only: it schedules thread reconciliation and is never
-	// used as a lower bound for reading a thread's comments.
+	// Since is settled coverage on GitHub's clock: every row updated before
+	// it was read by a request at least the poll lookback after that update,
+	// so no late-indexed row can still appear below it. For notifications it
+	// is a listing position only: it schedules thread reconciliation and is
+	// never used as a lower bound for reading a thread's comments.
 	Since time.Time `json:"since,omitzero"`
+	// LastID, when set, records progress through the second Since itself,
+	// which then holds more rows than a page: of the rows updated in that
+	// second, those GitHub lists up to and including the row with this ID
+	// were read (an observe stream lists one second in ascending ID order,
+	// notifications in descending). Zero means none of that second.
+	LastID int64 `json:"lastId,omitempty"`
 	// LastModified and ETag are conditional-request validators.
 	LastModified string `json:"lastModified,omitempty"`
 	ETag         string `json:"etag,omitempty"`
