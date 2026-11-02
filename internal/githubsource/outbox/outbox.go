@@ -17,10 +17,13 @@
 // Found settles confirmed. Not finding a comment or pull request proves
 // nothing: GitHub's listings are mutable and eventually consistent, and a
 // human may have edited the marker away. Such a write is never sent again
-// automatically; it settles unknown and only an operator resolves it. Only
-// a write proven not sent (GitHub refused it before writing, or nothing
-// was sent yet) goes back to pending. A push is the exception: it carries
-// an exact lease and is repeatable, so a branch still at the lease retries.
+// automatically. Because a listing can lag the write, it is read again on
+// later passes (absentReads reads, the last at least absentWindow after
+// the attempt) and settles unknown only if it is still not found; then
+// only an operator resolves it. Only a write proven not sent (GitHub
+// refused it before writing, or nothing was sent yet) goes back to
+// pending. A push is the exception: it carries an exact lease and is
+// repeatable, so a branch still at the lease retries.
 package outbox
 
 import (
@@ -68,6 +71,13 @@ const (
 	// attempting write's outcome before settling it unknown.
 	maxReconcileReads = 3
 	reconcileBackoff  = 30 * time.Second
+	// A comment or pull request that may have been written and is not
+	// found is read again absentBackoff later, since GitHub's listings
+	// can lag a write. It settles unknown after absentReads such reads in
+	// one process, the last at least absentWindow after the attempt.
+	absentReads   = 3
+	absentWindow  = 2 * time.Minute
+	absentBackoff = time.Minute
 	// maxScanPages bounds one listing search; past it the search fails.
 	maxScanPages = 100
 	scanPageSize = 100
@@ -92,8 +102,9 @@ type Outbox struct {
 	flights sync.WaitGroup
 
 	mu sync.Mutex
-	// reads counts failed outcome reads of attempting intents in this
-	// process; next delays the following read.
+	// reads counts outcome reads of attempting intents in this process
+	// that failed or did not find the write; next delays the following
+	// read.
 	reads map[model.OutboxID]readState
 	// busy holds the Tickets with an operation in flight; released holds
 	// the ones whose operation ended since the current pass listed due
@@ -112,10 +123,12 @@ type Outbox struct {
 
 type readState struct {
 	failures int
+	absent   int
 	next     time.Time
+	// cause is the ambiguous failure of this process's own attempt, kept
+	// for the error of a later read that still does not find the write.
+	cause error
 }
-
-var _ model.Outbox = (*Outbox)(nil)
 
 // New validates options.
 func New(options Options) (*Outbox, error) {
@@ -333,7 +346,7 @@ func (o *Outbox) process(ctx context.Context, due model.OutboxIntent) (bool, err
 		if !o.readDue(due.ID) {
 			return false, nil
 		}
-		return o.settle(ctx, due, o.reconcile(ctx, due))
+		return o.settle(ctx, due, o.reconcile(ctx, due, o.cause(due.ID)))
 	}
 	intent, err := o.store.Attempt(ctx, due.ID, o.clock.Now())
 	if err != nil {
@@ -361,6 +374,12 @@ type step struct {
 	// keep leaves the intent attempting: its outcome could not be read
 	// yet. Nothing is sent again until a later read decides it.
 	keep bool
+	// absent is a write that may have been sent and was not found. It
+	// settles as state (unknown) only after the listing had time to show
+	// it (absentRead); until then it stays attempting.
+	absent bool
+	// cause is an absent write's ambiguous failure.
+	cause error
 }
 
 func confirmed(result *model.EffectReply) step {
@@ -371,10 +390,11 @@ func failed(err error) step { return step{state: model.EffectFailed, err: err} }
 
 func unknown(err error) step { return step{state: model.EffectUnknown, err: err} }
 
-// unsure settles a comment or pull request whose request may have reached
-// GitHub but which no listing shows: unknown, for an operator.
-func unsure(what string, err error) step {
-	return unknown(fmt.Errorf("%s may have been sent and is not found; it is not sent again until an operator resolves it: %w", what, err))
+// unsure decides a comment or pull request whose request may have reached
+// GitHub but which no listing shows: read again later, then unknown, for an
+// operator.
+func unsure(what string, cause error) step {
+	return step{state: model.EffectUnknown, absent: true, cause: cause, err: fmt.Errorf("%s may have been sent and is not found; it is not sent again until an operator resolves it: %w", what, cause)}
 }
 
 // retry sends a write proven not sent back to pending.
@@ -390,7 +410,9 @@ func (o *Outbox) retry(intent model.OutboxIntent, reason error, retryAfter time.
 func unread(err error) step { return step{keep: true, err: err} }
 
 // settle commits a step. A kept intent stays attempting: after
-// maxReconcileReads failed reads in this process it settles unknown.
+// maxReconcileReads failed reads in this process it settles unknown. An
+// absent one stays attempting until absentRead says the listing had time
+// to show it.
 func (o *Outbox) settle(ctx context.Context, intent model.OutboxIntent, decided step) (bool, error) {
 	if ctx.Err() != nil {
 		// Shutdown: whatever was sent is reconciled by the next process.
@@ -402,6 +424,14 @@ func (o *Outbox) settle(ctx context.Context, intent model.OutboxIntent, decided 
 			return false, nil
 		}
 		decided = unknown(fmt.Errorf("outcome could not be read after %d tries: %w", maxReconcileReads, decided.err))
+	}
+	if decided.absent {
+		reads, done := o.absentRead(intent, decided.cause)
+		if !done {
+			o.log.Info("github outbox: write not found yet; reading again later", "intent", intent.ID, "kind", intent.Kind, "reads", reads)
+			return false, nil
+		}
+		decided.err = fmt.Errorf("%w (not found in %d reads over %s)", decided.err, reads, o.clock.Now().Sub(intent.AttemptedAt).Round(time.Second))
 	}
 	if err := o.point("decided", intent); err != nil {
 		return false, err
@@ -447,6 +477,41 @@ func (o *Outbox) readFailed(id model.OutboxID, wait time.Duration) bool {
 	return state.failures >= maxReconcileReads
 }
 
+// absentRead records a read that did not find a write that may have been
+// sent, and reports the count and whether to settle it unknown now:
+// after absentReads reads, the last at least absentWindow after the
+// attempt. Otherwise the next read waits absentBackoff, and the last one
+// until the window has passed. The first cause seen is kept for the reads
+// of reconciliation, which no longer know it.
+func (o *Outbox) absentRead(intent model.OutboxIntent, cause error) (int, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	now := o.clock.Now()
+	state := o.reads[intent.ID]
+	state.absent++
+	if state.cause == nil {
+		state.cause = cause
+	}
+	windowEnd := intent.AttemptedAt.Add(absentWindow)
+	if state.absent >= absentReads && !now.Before(windowEnd) {
+		return state.absent, true
+	}
+	state.next = now.Add(absentBackoff)
+	if state.absent+1 >= absentReads && state.next.Before(windowEnd) {
+		state.next = windowEnd
+	}
+	o.reads[intent.ID] = state
+	return state.absent, false
+}
+
+// cause is the ambiguous failure this process saw when it sent the
+// intent, or nil after a restart.
+func (o *Outbox) cause(id model.OutboxID) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.reads[id].cause
+}
+
 func (o *Outbox) forget(id model.OutboxID) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -469,15 +534,19 @@ func (o *Outbox) attempt(ctx context.Context, intent model.OutboxIntent) step {
 }
 
 // reconcile decides an intent found attempting: its request may or may not
-// have reached GitHub.
-func (o *Outbox) reconcile(ctx context.Context, intent model.OutboxIntent) step {
+// have reached GitHub. cause is the ambiguous failure this process saw
+// when it sent the request, nil when an earlier process sent it.
+func (o *Outbox) reconcile(ctx context.Context, intent model.OutboxIntent, cause error) step {
+	if cause == nil {
+		cause = errors.New("the process stopped after the attempt was recorded")
+	}
 	switch intent.Kind {
 	case model.EffectComment, model.EffectReviewReply:
-		return o.reconcileComment(ctx, intent)
+		return o.reconcileComment(ctx, intent, cause)
 	case model.EffectPush:
 		return o.reconcilePush(ctx, intent)
 	case model.EffectOpenPR:
-		return o.reconcileOpenPR(ctx, intent)
+		return o.searchPR(ctx, intent, cause)
 	case model.EffectUpdatePR:
 		return o.reconcileUpdatePR(ctx, intent)
 	}

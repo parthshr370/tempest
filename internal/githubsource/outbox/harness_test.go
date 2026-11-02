@@ -239,6 +239,28 @@ func (w *world) drain() {
 	w.t.Fatal("outbox did not drain")
 }
 
+// reread runs passes like drain, but lets time run on by absentBackoff,
+// on the controller's and GitHub's clocks, while intents stay due: a write
+// that is not found is read again later before it settles unknown.
+func (w *world) reread() {
+	w.t.Helper()
+	for range 4 * absentReads {
+		if err := w.publish(); err != nil {
+			w.t.Fatalf("publish: %v", err)
+		}
+		due, err := w.store.Due(w.ctx, w.clock.Now())
+		if err != nil {
+			w.t.Fatal(err)
+		}
+		if len(due) == 0 {
+			return
+		}
+		w.clock.Advance(absentBackoff)
+		w.repo.Advance(absentBackoff)
+	}
+	w.t.Fatal("outbox did not settle")
+}
+
 func session(id model.TicketID) string { return "worker-" + string(id) }
 
 // launch ingests an authorized request on thread and walks its dispatch to

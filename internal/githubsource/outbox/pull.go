@@ -124,15 +124,10 @@ func (o *Outbox) existingPR(ctx context.Context, intent model.OutboxIntent, refu
 	return failed(refusal)
 }
 
-// reconcileOpenPR decides a PR open found attempting after a restart.
-func (o *Outbox) reconcileOpenPR(ctx context.Context, intent model.OutboxIntent) step {
-	return o.searchPR(ctx, intent, errors.New("the process stopped after the attempt was recorded"))
-}
-
 // searchPR looks for the PR whose open may have reached GitHub by its
-// marker. Not found settles unknown, never pending: a human may have
-// rewritten the body of the very PR the attempt opened. The account's other
-// PRs from the branch are named for the operator.
+// marker. Not found is read again later, then unknown, never pending: a
+// human may have rewritten the body of the very PR the attempt opened. The
+// account's other PRs from the branch are named for the operator.
 func (o *Outbox) searchPR(ctx context.Context, intent model.OutboxIntent, cause error) step {
 	var found *pull
 	var others []string

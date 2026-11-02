@@ -3,7 +3,6 @@ package outbox
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -89,8 +88,9 @@ func (o *Outbox) postComment(ctx context.Context, path, body string) (comment, e
 	return posted, nil
 }
 
-// reconcileComment decides a comment found attempting after a restart.
-func (o *Outbox) reconcileComment(ctx context.Context, intent model.OutboxIntent) step {
+// reconcileComment decides a comment found attempting: after a restart, or
+// on a later read of a write not found yet.
+func (o *Outbox) reconcileComment(ctx context.Context, intent model.OutboxIntent, cause error) step {
 	var root int64
 	if intent.Kind == model.EffectReviewReply {
 		var err error
@@ -98,11 +98,12 @@ func (o *Outbox) reconcileComment(ctx context.Context, intent model.OutboxIntent
 			return unread(err)
 		}
 	}
-	return o.searchComment(ctx, intent, root, errors.New("the process stopped after the attempt was recorded"))
+	return o.searchComment(ctx, intent, root, cause)
 }
 
 // searchComment looks for a comment whose request may have reached GitHub.
-// Found is confirmed; not found settles unknown, never pending.
+// Found is confirmed; not found is read again later, then unknown, never
+// pending.
 func (o *Outbox) searchComment(ctx context.Context, intent model.OutboxIntent, root int64, cause error) step {
 	found, err := o.findComment(ctx, intent, root)
 	switch {

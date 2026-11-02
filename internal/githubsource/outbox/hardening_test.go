@@ -201,13 +201,15 @@ func TestPushCredentialIsTheAccountHelperOnly(t *testing.T) {
 
 // P1-2: a comment whose request may have reached GitHub is found by its
 // marker in the whole thread, or settles unknown. It is never posted twice,
-// whatever the controller's clock, GitHub's indexing or a human's edit.
+// whatever the controller's clock, GitHub's indexing or a human's edit. A
+// listing that lags less than the reread window still confirms it.
 func TestAmbiguousCommentIsFoundOrUnknown(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		want model.EffectState
 	}{
 		{"controller clock ahead", model.EffectConfirmed},
+		{"listing delayed a minute", model.EffectConfirmed},
 		{"delayed listing", model.EffectUnknown},
 		{"marker edited away", model.EffectUnknown},
 		{"marker kept by an edit", model.EffectConfirmed},
@@ -219,7 +221,10 @@ func TestAmbiguousCommentIsFoundOrUnknown(t *testing.T) {
 				w.clock.Advance(3 * time.Hour)
 			}
 			ticket := w.launch(thread)
-			if tc.name == "delayed listing" {
+			switch tc.name {
+			case "listing delayed a minute":
+				w.repo.SetIndexDelay(time.Minute)
+			case "delayed listing":
 				w.repo.SetIndexDelay(time.Hour)
 			}
 			intent := w.enqueue(ticket, "call-1", model.EffectComment, model.EffectPayload{Body: "original"})
@@ -232,7 +237,7 @@ func TestAmbiguousCommentIsFoundOrUnknown(t *testing.T) {
 				w.repo.EditComment(posted.ID, "human corrected text\n\n"+model.OutboxMarker(intent.ID))
 			}
 			w.restart()
-			w.drain()
+			w.reread()
 			got := w.intent(ticket, intent.ID)
 			if got.State != tc.want {
 				t.Fatalf("intent = %+v, want %s", got, tc.want)
@@ -261,7 +266,7 @@ func TestAmbiguousPROpenIsFoundOrUnknown(t *testing.T) {
 	w.repo.EditIssue(first.Number, "Human rewritten PR body")
 	w.repo.Close(first.Number)
 	w.restart()
-	w.drain()
+	w.reread()
 	got := w.intent(ticket, intent.ID)
 	if got.State != model.EffectUnknown || !strings.Contains(got.LastError, fmt.Sprintf("#%d (closed)", first.Number)) {
 		t.Fatalf("intent = %+v, want unknown naming #%d", got, first.Number)
@@ -285,7 +290,7 @@ func TestMarkerScope(t *testing.T) {
 		w.repo.Comment(thread.Number, botUser, "Quoted diagnostic:\n```\n"+model.OutboxMarker(intent.ID)+"\n```")
 		crashAt(w, "attempted")
 		w.restart()
-		w.drain()
+		w.reread()
 		if got := w.intent(ticket, intent.ID); got.State != model.EffectUnknown {
 			t.Fatalf("intent = %+v, want unknown", got)
 		}
@@ -302,7 +307,7 @@ func TestMarkerScope(t *testing.T) {
 		w.repo.ReviewComment(number, botUser, ghfake.ReviewCommentSpec{Body: marked("elsewhere", intent.ID), Path: "b.go", Line: 1, InReplyTo: other})
 		crashAt(w, "attempted")
 		w.restart()
-		w.drain()
+		w.reread()
 		if got := w.intent(ticket, intent.ID); got.State != model.EffectUnknown {
 			t.Fatalf("intent = %+v, want unknown", got)
 		}
