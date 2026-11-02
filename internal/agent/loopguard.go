@@ -28,6 +28,21 @@ import (
 // call is never progress (a failure seldom changes anything), nor is a repeat
 // (doing the same thing again with the same answer changes nothing new).
 //
+// A repeated successful call to a tool that may change things is still
+// progress for workspace reads, though not for anything else: its unchanged
+// answer does not show an unchanged workspace (a command that appends to a
+// file and prints nothing answers the same every time), so what a read sees
+// may have changed. Every read's count starts over and a nudge about a read
+// is forgiven. The call's own repeats count toward repeated poll, the outer
+// bound for a command whose answer does not change. An undo/redo loop of two
+// edits is caught there too: an edit's result is its diff and the content
+// hash of the file it wrote, the same each time it is redone.
+//
+// Calls with the same key in one reply are one decision, made before any of
+// their results were seen, so their repeats count once. Every result is
+// still observed in source order: a changed result among them is new, and
+// the last one is what the call's next run is compared with.
+//
 // A call's count is its repeats since the last progress, each within
 // maxLoopGap calls of the one before. Two patterns read it:
 //
@@ -168,7 +183,8 @@ const (
 	loopStopPrefix  = "[Loop stop from the host]"
 )
 
-const changeApproach = "Change your approach, or explain what is blocking you."
+// stopWarning is the default advice of a nudge.
+const stopWarning = "Change your approach, or explain what is blocking you. If it goes on, the run stops."
 
 // detectedLoop is one report of a detector.
 type detectedLoop struct {
@@ -178,9 +194,10 @@ type detectedLoop struct {
 	// key identifies the loop for escalation: its pattern and its call's
 	// fingerprint, or its text.
 	key string
-	// message describes the loop to the model; detail names it in the run
-	// error.
+	// message describes the loop to the model; advice, when set, replaces
+	// stopWarning in the nudge; detail names the loop in the run error.
 	message string
+	advice  string
 	detail  string
 }
 
@@ -192,7 +209,11 @@ func (loop *detectedLoop) notice(action LoopAction) string {
 	if action == LoopStop {
 		return fmt.Sprintf("%s %s You were already told about this loop, so the run has stopped.", loopStopPrefix, loop.message)
 	}
-	return fmt.Sprintf("%s %s %s If it goes on, the run stops.", loopNudgePrefix, loop.message, changeApproach)
+	advice := loop.advice
+	if advice == "" {
+		advice = stopWarning
+	}
+	return fmt.Sprintf("%s %s %s", loopNudgePrefix, loop.message, advice)
 }
 
 // loopCall is one tool call of the episode with its result.
@@ -213,6 +234,9 @@ type loopCall struct {
 	// noted marks a result the failure guard already put its notice on: that
 	// repetition is the failure guard's to report.
 	noted bool
+	// again marks a call an earlier call of the same reply already made with
+	// the same arguments.
+	again bool
 }
 
 func (call loopCall) describe() string {
@@ -324,10 +348,13 @@ func (c *loopCounts) observe(batch loopBatch) {
 		seen, known := c.last[call.key]
 		c.last[call.key] = loopSeen{call: call, at: c.calls}
 		repeat := known && seen.call.digest == call.digest
+		mayChange := !call.failed && !call.readsWorkspace
 		switch {
+		case repeat && call.again:
+			// The reply's earlier identical call counted this decision.
 		case repeat && c.calls-seen.at <= maxLoopGap:
 			c.streak[call.key]++
-		case !repeat && !call.failed && !call.readsWorkspace:
+		case !repeat && mayChange:
 			// Progress: everything counted so far is behind it.
 			clear(c.streak)
 			clear(c.nudged)
@@ -335,7 +362,26 @@ func (c *loopCounts) observe(batch loopBatch) {
 		default:
 			c.streak[call.key] = 1
 		}
+		if repeat && mayChange {
+			c.forgetReads()
+		}
 		c.calls++
+	}
+}
+
+// forgetReads starts every workspace read's count over and forgives the
+// nudges about reads: a call that may have changed the workspace ran, so a
+// read's unchanged answer before it says nothing about its answer after.
+func (c *loopCounts) forgetReads() {
+	for key := range c.streak {
+		if c.last[key].call.readsWorkspace {
+			delete(c.streak, key)
+		}
+	}
+	for key := range c.nudged {
+		if _, call, _ := strings.Cut(key, "\x00"); c.last[call].call.readsWorkspace {
+			delete(c.nudged, key)
+		}
 	}
 }
 
@@ -394,11 +440,12 @@ func (t LoopThresholds) detectCalls(batch loopBatch, counts *loopCounts) *detect
 		}
 		loop := &detectedLoop{
 			pattern: pattern, tools: []string{call.tool}, count: count, key: string(pattern) + "\x00" + call.key,
-			message: fmt.Sprintf("Your last %d calls to `%s` used the same arguments and returned the same result, and nothing changed in between, so calling it again will not change the outcome.", count, call.tool),
+			message: fmt.Sprintf("Your last %d calls to `%s` used the same arguments and returned the same result with no progress in between, so calling it again will not change the outcome.", count, call.tool),
 			detail:  fmt.Sprintf("%s returned the same result %d times with no progress in between", call.describe(), count),
 		}
 		if pattern == LoopRepeatedPoll {
-			loop.message = fmt.Sprintf("Your last %d calls to `%s` used the same arguments and returned the same result, and nothing changed in between. If you are waiting for something, wait in one call instead: a command that loops until it is ready under a timeout, such as `timeout 120 sh -c 'until CHECK; do sleep 2; done'`, or a background job and the wait tool.", count, call.tool)
+			loop.message = fmt.Sprintf("Your last %d calls to `%s` used the same arguments and returned the same result with no progress in between.", count, call.tool)
+			loop.advice = fmt.Sprintf("If each call does make progress that its result does not show, such as a command that changes files and prints nothing, you may go on, but have the command print what it changed: %d more unchanged results stop the run. If you are waiting for something, wait in one call instead: a command that loops until it is ready under a timeout, such as `timeout 120 sh -c 'until CHECK; do sleep 2; done'`, or a background job and the wait tool. Otherwise change your approach, or explain what is blocking you.", threshold)
 		}
 		return loop
 	}
@@ -427,8 +474,8 @@ func toolEpisode(history []types.Message, batch []types.ToolResultMessage, tools
 	var calls []types.ContentBlock
 	var results []*types.ToolResultMessage
 	// Identical calls in one reply are one decision, made before any of
-	// their results were seen, so a batch holds each call once: a loop is
-	// the model repeating itself across replies.
+	// their results were seen: a later one is marked again, so its repeat
+	// is not counted a second time, but its result is still observed.
 	flush := func() {
 		var built loopBatch
 		for index, call := range calls {
@@ -439,14 +486,12 @@ func toolEpisode(history []types.Message, batch []types.ToolResultMessage, tools
 			built.nudged = built.nudged || hasHostNotice(result.Content, loopNudgePrefix)
 			args := canonicalArguments(call.Arguments)
 			key := call.Name + "\x00" + string(args)
-			if slices.ContainsFunc(built.calls, func(seen loopCall) bool { return seen.key == key }) {
-				continue
-			}
 			tool := byName[call.Name]
 			built.calls = append(built.calls, loopCall{
 				tool: call.Name, args: args, key: key, digest: resultDigest(*result), failed: result.IsError,
 				polls: tool.Polls, readsWorkspace: tool.ReadsWorkspace != nil && tool.ReadsWorkspace(call.Arguments),
 				noted: hasHostNotice(result.Content, repeatedFailurePrefix),
+				again: slices.ContainsFunc(built.calls, func(seen loopCall) bool { return seen.key == key }),
 			})
 		}
 		if len(built.calls) > 0 {

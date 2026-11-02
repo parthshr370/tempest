@@ -3,6 +3,7 @@ package tempest
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"strings"
 	"sync"
 	"time"
@@ -276,6 +277,36 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 	}
 	return nil
 }
+
+// replayEvents is how a transcript replays through the mapper, on load and
+// when the history is rebuilt after a rewind or compaction alike: each
+// message's end, with its tool calls' starts after an assistant message, and
+// a tool result as its call's end. The end carries the result's full
+// content, a guard's notice included, so the result's message end, whose
+// only update is that notice for a live call that already ended, is left out.
+func replayEvents(messages []Message) iter.Seq[agent.AgentEvent] {
+	return func(yield func(agent.AgentEvent) bool) {
+		for _, msg := range messages {
+			m := normalizeMessage(msg)
+			if result, ok := m.(types.ToolResultMessage); ok {
+				if !yield(agent.ToolExecutionEnd(result.ToolCallID, result.ToolName, result, result.IsError)) {
+					return
+				}
+				continue
+			}
+			if !yield(agent.MessageEnd(msg)) {
+				return
+			}
+			assistant, _ := m.(types.AssistantMessage)
+			for _, b := range assistant.Content {
+				if b.Type == types.BlockToolCall && !yield(agent.ToolExecutionStart(b.ID, b.Name, b.Arguments)) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func normalizeMessage(msg Message) Message {
 	switch v := msg.(type) {
 	case *types.UserMessage:

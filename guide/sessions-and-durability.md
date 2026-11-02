@@ -215,6 +215,12 @@ anything but a workspace read. Progress starts every count over. Workspace reads
 changes only when something else changed the workspace. A failed call is never
 progress either.
 
+An unchanged answer does not prove an unchanged workspace: a command that appends to
+a file and prints nothing answers the same every time it runs. So any successful call
+that may change things, even one that repeated its answer, starts every workspace
+read's count over and forgives a notice about a read. Its own unchanged answers count
+only toward `repeated_poll`, the outer bound for commands whose answer does not change.
+
 | Pattern | Reported when | Default |
 |---|---|---|
 | `repeated_result` | A failed call, or a workspace read, returned the same result N times with no progress in between. | 3 |
@@ -223,23 +229,32 @@ progress either.
 
 So an edit followed by the same test run, whether the test output changes or not, is
 never a loop: each new edit is progress. Re-reading an unchanged file between edits
-is not either. Two stateful tools whose answers keep changing are not. Re-reading the
-same unchanged file three times with nothing changed in between is, and so is A, B, A,
-B where both keep giving the same answers.
+or between runs of a silent command is not either. Two stateful tools whose answers
+keep changing are not. Re-reading the same unchanged file three times with nothing
+in between is, and so is A, B, A, B where both keep giving the same answers. An
+undo/redo of two edits is the latter: an edit's result is its diff and the content
+hash of the file it wrote, the same each time it is redone, so each leg counts toward
+`repeated_poll`.
 
 Each repeat must come within 10 calls of the one before; a call made again after 10
-or more other calls starts a new count. Identical calls in one reply
-count once: the model made them before seeing any of their results. The checks run
-once per tool batch, after its last result, and once before each model call for
-repeated text; a pattern is reported only when the newest batch or reply continues it.
+or more other calls starts a new count. Identical calls in one reply count once: the
+model made them before seeing any of their results. Each of their results is still
+looked at in order, so a changed result among them is new (progress when it succeeded
+and its tool may change things), and the last is what the call's next run is compared
+with. The checks run once per tool batch, after its last result, and once before each
+model call for repeated text; a pattern is reported only when the newest batch or
+reply continues it.
 
 The first report of a loop is a notice at the tail of the transcript, starting with
 `[Loop notice from the host]`: appended to the batch's last tool result, or for
 repeated text sent as a user message after the hook feedback. It names the call and
-tells the model to change its approach or say what is blocking it; for
-`repeated_poll` it also says how to wait in one call. Counting starts over after a
-notice, so the loop has to build up anew. If the same pattern is reported again, for
-the same call or one that was repeating with it (the other leg of A, B, A, B), with no
+tells the model to change its approach or say what is blocking it. For
+`repeated_poll` it says instead that a model whose calls make progress the result
+does not show may go on, better with a command that prints what it changed, how
+many more unchanged results stop the run, and how to wait in one call. Counting
+starts over after a notice, so the loop has to build up anew. If the same pattern
+is reported again, for the same call or one that was repeating with it (the other
+leg of A, B, A, B), with no
 progress since the notice, the host appends a `[Loop stop from the host]` notice and
 the run ends with `loop_detected` after that turn. A different pattern gets its own
 notice first, and after progress the next report is a notice again. The system prompt
@@ -250,7 +265,10 @@ and earlier messages never change, so the cached prompt prefix is kept.
 `session/prompt` fails with `-32026 loop_detected`. Every notice and stop is also
 published as a `tempest/loop_guard` update, and a tool result that got a notice (from
 this guard or the repeated-failure guard) is sent again as a `tool_call_update` with
-its full content, notice included, after the call's completed update.
+its full content, notice included, after the call's completed update. History
+replayed from the journal (`session/load`) or rebuilt after a rewind or compaction
+announces every call with its `tool_call`, and the call's completed update already
+carries the notice.
 
 Waiting is not a loop. `wait`, `jobs`, `logs` and `write_stdin` are polling tools:
 their successful calls are never reported. A command polling for a server, such as

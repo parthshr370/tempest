@@ -530,18 +530,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 	if loaded != nil {
 		// Replay reconciled messages through the same mapping before any watcher exists.
 		listener := c.hub.Listener()
-		for _, msg := range loaded.Messages {
-			_ = listener(ctx, agent.MessageEnd(msg))
-			switch m := normalizeMessage(msg).(type) {
-			case types.AssistantMessage:
-				for _, b := range m.Content {
-					if b.Type == types.BlockToolCall {
-						_ = listener(ctx, agent.ToolExecutionStart(b.ID, b.Name, b.Arguments))
-					}
-				}
-			case types.ToolResultMessage:
-				_ = listener(ctx, agent.ToolExecutionEnd(m.ToolCallID, m.ToolName, m, m.IsError))
-			}
+		for ev := range replayEvents(loaded.Messages) {
+			_ = listener(ctx, ev)
 		}
 		mapper.usage.Total = loaded.UsageTotal
 		mapper.usage.CostUnknown = loaded.UsageTotal.Cost.Unknown
@@ -552,8 +542,8 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		c.hub.ReplaceHistory(func() []Update {
 			savedUsage := mapper.usage
 			var updates []Update
-			for _, msg := range messages {
-				updates = append(updates, mapper.mapEvent(agent.MessageEnd(msg))...)
+			for ev := range replayEvents(messages) {
+				updates = append(updates, mapper.mapEvent(ev)...)
 			}
 			mapper.usage = savedUsage
 			updates = append(updates, update("tempest/usage", map[string]any{"usageState": savedUsage}, time.Time{}))

@@ -669,6 +669,113 @@ func TestLoopGuardProgressForgivesANudge(t *testing.T) {
 	wantNotices(t, a.State().Messages, map[int]string{2: loopNudgePrefix, 6: loopNudgePrefix})
 }
 
+// TestLoopGuardUnchangedCommandStartsReadsOver: the review's productive
+// trace. A command that appends to a file and prints nothing answers the
+// same every time, yet each run changed the workspace, so the reference file
+// read after it is not a repeated read. The command's own unchanged answers
+// count toward the polling bound only: twelve cycles get one notice, on the
+// tenth run, and complete.
+func TestLoopGuardUnchangedCommandStartsReadsOver(t *testing.T) {
+	appendItem := call{"bash", `{"command":"append next item"}`}
+	reference := call{"read", `{"path":"reference.txt"}`}
+	t.Run("productive cycles", func(t *testing.T) {
+		calls := cycle(12, func(int) []call { return []call{appendItem, reference} })
+		a, result, detections := runCalls(t, nil, calls, lookTool("bash"), readTool("read"))
+		if result.StopReason != StopCompleted || len(detections) != 1 || detections[0].Pattern != LoopRepeatedPoll || detections[0].Tools[0] != "bash" {
+			t.Fatalf("result = %s, loop_guard events = %+v; want completed after one repeated_poll notice on bash", result.StopReason, detections)
+		}
+		wantNotices(t, a.State().Messages, map[int]string{18: loopNudgePrefix})
+		nudge := toolResults(a.State().Messages)[18].Content
+		if text := nudge[len(nudge)-1].Text; !strings.Contains(text, "you may go on") || !strings.Contains(text, "10 more unchanged results stop the run") {
+			t.Fatalf("poll nudge %q does not let the model go on when it is making progress", text)
+		}
+	})
+	t.Run("bounded by polling", func(t *testing.T) {
+		calls := cycle(25, func(int) []call { return []call{appendItem, reference} })
+		a, result, _ := runCalls(t, nil, calls, lookTool("bash"), readTool("read"))
+		wantLoopStop(t, result, LoopRepeatedPoll, 10, "bash")
+		wantNotices(t, a.State().Messages, map[int]string{18: loopNudgePrefix, 38: loopStopPrefix})
+	})
+	t.Run("forgives a read notice", func(t *testing.T) {
+		// The second stretch of three reads follows a run of the command
+		// that may have changed the file, so it is nudged again, not stopped.
+		calls := append([]call{appendItem}, repeatCall(reference, 3)...)
+		calls = append(append(calls, appendItem), repeatCall(reference, 3)...)
+		a, result, detections := runCalls(t, nil, calls, lookTool("bash"), readTool("read"))
+		if result.StopReason != StopCompleted || len(detections) != 2 || detections[1].Action != LoopNudge {
+			t.Fatalf("result = %s, loop_guard events = %+v; want completed after two nudges", result.StopReason, detections)
+		}
+		wantNotices(t, a.State().Messages, map[int]string{3: loopNudgePrefix, 7: loopNudgePrefix})
+	})
+	t.Run("reads with nothing between", func(t *testing.T) {
+		calls := append([]call{appendItem}, repeatCall(reference, 6)...)
+		a, result, _ := runCalls(t, nil, calls, lookTool("bash"), readTool("read"))
+		wantLoopStop(t, result, LoopRepeatedResult, 3, "read")
+		wantNotices(t, a.State().Messages, map[int]string{3: loopNudgePrefix, 6: loopStopPrefix})
+	})
+}
+
+// TestLoopGuardStopsUndoRedo: two edits undoing each other answer the same
+// each time they are redone (an edit's result is its diff and the written
+// file's content hash), so each leg repeats and the polling bound nudges,
+// then stops.
+func TestLoopGuardStopsUndoRedo(t *testing.T) {
+	calls := cycle(22, func(int) []call { return []call{{"edit", `{"path":"on"}`}, {"edit", `{"path":"off"}`}} })
+	a, result, detections := runCalls(t, nil, calls, lookTool("edit"))
+	wantLoopStop(t, result, LoopRepeatedPoll, 10, "edit")
+	if len(detections) != 2 || detections[0].Action != LoopNudge {
+		t.Fatalf("loop_guard events = %+v, want a nudge then a stop", detections)
+	}
+	if got := notices(a.State().Messages); got[len(got)-1] != loopStopPrefix {
+		t.Fatalf("notices = %q, want the stop on the last result", got)
+	}
+}
+
+// TestLoopGuardObservesEverySiblingResult: identical calls in one reply
+// count once, but each result is observed. A changed later result is new, so
+// a stateful tool whose second answer in each reply is fresh makes progress;
+// identical results still count once per reply.
+func TestLoopGuardObservesEverySiblingResult(t *testing.T) {
+	pairs := func(t *testing.T, replies int, second func(index int64) string) (RunResult, []LoopDetection) {
+		t.Helper()
+		var runs atomic.Int64
+		tool := executorTool("stateful", `{"type":"object"}`, ExecSequential, func(context.Context, string, json.RawMessage, AgentToolUpdateCallback) (AgentToolResult, error) {
+			text := "stable"
+			if n := runs.Add(1); n%2 == 0 {
+				text = second(n)
+			}
+			return AgentToolResult{Content: []types.ContentBlock{types.NewText(text)}}, nil
+		})
+		f := faux.New(faux.Options{})
+		for index := range replies {
+			f.AppendResponses(faux.Respond(
+				faux.ToolCall("stateful", json.RawMessage(`{}`), fmt.Sprintf("a%d", index)),
+				faux.ToolCall("stateful", json.RawMessage(`{}`), fmt.Sprintf("b%d", index)),
+			))
+		}
+		f.AppendResponses(faux.Respond(faux.Text("done")))
+		a, detections := loopAgent(f, nil, tool)
+		result, err := a.PromptText(context.Background(), "consume the next two results each time")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result, *detections
+	}
+	t.Run("changed later result", func(t *testing.T) {
+		result, detections := pairs(t, 24, func(n int64) string { return fmt.Sprintf("fresh result %d", n) })
+		if result.StopReason != StopCompleted || len(detections) != 0 {
+			t.Fatalf("result = %s after %d turns, loop_guard events = %+v; want completed with none", result.StopReason, result.Turns, detections)
+		}
+	})
+	t.Run("identical results", func(t *testing.T) {
+		result, detections := pairs(t, 24, func(int64) string { return "stable" })
+		wantLoopStop(t, result, LoopRepeatedPoll, 10, "stateful")
+		if result.Turns != 20 || len(detections) != 2 {
+			t.Fatalf("turns = %d, loop_guard events = %+v; want a nudge on reply 10 and a stop on reply 20", result.Turns, detections)
+		}
+	})
+}
+
 func TestLoopGuardNewPromptStartsOver(t *testing.T) {
 	thresholds := &LoopThresholds{RepeatedResult: 3}
 	same := call{"look", `{"path":"a"}`}

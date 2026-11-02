@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/engine/types"
+	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/provider/faux"
 	"go.harness.dev/harness/internal/session/journal"
 )
@@ -180,4 +182,182 @@ func TestHostNoticesReachToolCallUpdates(t *testing.T) {
 	if completed["completed"] != 4 || completed["failed"] != 3 {
 		t.Fatalf("completed/failed tool_call_updates = %v", completed)
 	}
+}
+
+// toolCallStep scripts one reply making one call with a unique id.
+func toolCallStep(t *testing.T, tool string, args any, id int) faux.ResponseStep {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return faux.Respond(faux.ToolCall(tool, raw, fmt.Sprintf("call-%d", id)))
+}
+
+// approvingSession opens a session whose prompter allows every call, with
+// room for long loops.
+func approvingSession(t *testing.T, provider *faux.Faux) *Session {
+	t.Helper()
+	owner := openFaux(t, provider, promptFunc(func(context.Context, Ask) (Choice, error) { return permission.AllowOnce, nil }))
+	if err := owner.SetBudget(Budget{MaxTurns: 60}); err != nil {
+		t.Fatal(err)
+	}
+	return owner
+}
+
+// TestLoopGuardLetsSilentShellEditsFinish: the review's trace through the
+// real bash and read tools. Each identical command appends the next number
+// and prints nothing, then the unchanged reference file is read. The reads
+// are not repeats, since the command may have changed the workspace; the
+// command's own unchanged output gets the polling notice on its tenth run,
+// and all twelve items are written.
+func TestLoopGuardLetsSilentShellEditsFinish(t *testing.T) {
+	provider := faux.New(faux.Options{})
+	owner := approvingSession(t, provider)
+	cwd := owner.Snapshot().Cwd
+	for name, content := range map[string]string{"reference.txt": "reference: keep every input line\n", "data.txt": ""} {
+		if err := os.WriteFile(filepath.Join(cwd, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command := `n=$(wc -l < data.txt); printf '%s\n' "$((n+1))" >> data.txt`
+	for index := range 12 {
+		provider.AppendResponses(toolCallStep(t, "bash", map[string]any{"command": command}, 2*index), toolCallStep(t, "read", map[string]any{"path": "reference.txt"}, 2*index+1))
+	}
+	provider.AppendResponses(faux.Respond(faux.Text("done")))
+	result, err := owner.Prompt(t.Context(), Prompt{Text: "Append the next numbered item, consulting reference.txt after each, for twelve items."})
+	if err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run=%+v %v, want completed", result, err)
+	}
+	data, err := os.ReadFile(filepath.Join(cwd, "data.txt"))
+	if err != nil || string(data) != "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n" {
+		t.Fatalf("data.txt = %q %v, want twelve items", data, err)
+	}
+	runs := 0
+	for _, message := range owner.Messages() {
+		if result, ok := message.(types.ToolResultMessage); ok && result.ToolName == "bash" {
+			runs++
+			if got := agent.HostNoticed(result.Content); got != (runs == 10) {
+				t.Fatalf("bash run %d noticed=%v, want the polling notice on run 10 only", runs, got)
+			}
+		}
+	}
+	if nudges, stops := loopNotices(owner.Messages()); nudges != 1 || stops != 0 {
+		t.Fatalf("notices: %d nudges, %d stops; want one polling nudge", nudges, stops)
+	}
+}
+
+// TestLoopGuardStopsRealUndoRedo: undo/redo through the real bash and write
+// tools. Each leg answers the same every time it is redone (write's answer
+// includes the content hash of what it wrote), so the polling bound nudges
+// and then stops.
+func TestLoopGuardStopsRealUndoRedo(t *testing.T) {
+	legs := map[string]func(value string) map[string]any{
+		"bash": func(value string) map[string]any {
+			return map[string]any{"command": fmt.Sprintf("printf '%s' > toggle.txt", value)}
+		},
+		"write": func(value string) map[string]any { return map[string]any{"path": "toggle.txt", "content": value} },
+	}
+	for tool, args := range legs {
+		t.Run(tool, func(t *testing.T) {
+			provider := faux.New(faux.Options{})
+			owner := approvingSession(t, provider)
+			for index := range 44 {
+				value := "on"
+				if index%2 != 0 {
+					value = "off"
+				}
+				provider.AppendResponses(toolCallStep(t, tool, args(value), index))
+			}
+			provider.AppendResponses(faux.Respond(faux.Text("never")))
+			result, err := owner.Prompt(t.Context(), Prompt{Text: "toggle the setting"})
+			var loop *agent.LoopError
+			if err != nil || result.StopReason != agent.StopLoopDetected || !errors.As(result.Err, &loop) || loop.Pattern != agent.LoopRepeatedPoll {
+				t.Fatalf("run=%+v %v, want loop_detected (repeated_poll)", result, err)
+			}
+			if nudges, stops := loopNotices(owner.Messages()); nudges != 1 || stops != 1 {
+				t.Fatalf("notices: %d nudges, %d stops; want a nudge then a stop", nudges, stops)
+			}
+		})
+	}
+}
+
+// TestRewindReplaysToolCallsWithTheirNotices: a guard's notice reaches
+// clients in a tool_call_update; the history replayed from the journal and
+// the history rebuilt by a rewind announce every call with its tool_call
+// before any update for it, and carry the notice once.
+func TestRewindReplaysToolCallsWithTheirNotices(t *testing.T) {
+	ctx := t.Context()
+	provider := faux.New(faux.Options{})
+	owner := openFaux(t, provider, nil)
+	cwd := owner.Snapshot().Cwd
+	if err := os.WriteFile(filepath.Join(cwd, "reference.txt"), []byte("UNIQUE_REFERENCE\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 3 {
+		provider.AppendResponses(toolCallStep(t, "read", map[string]any{"path": "reference.txt"}, index))
+	}
+	provider.AppendResponses(faux.Respond(faux.Text("done")))
+	if result, err := owner.Prompt(ctx, Prompt{Text: "read the reference"}); err != nil || result.StopReason != agent.StopCompleted {
+		t.Fatalf("run=%+v %v", result, err)
+	}
+	wellFormed := func(t *testing.T, s *Session) {
+		t.Helper()
+		snap := s.Snapshot()
+		history, err := s.History(snap.HistoryEpoch, 0, snap.HistoryLen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		announced := map[string]bool{}
+		noticed := 0
+		for _, u := range history {
+			var payload struct {
+				ToolCallID string `json:"toolCallId"`
+			}
+			if err := json.Unmarshal(u.Update, &payload); err != nil {
+				t.Fatal(err)
+			}
+			switch u.Kind {
+			case "tool_call":
+				announced[payload.ToolCallID] = true
+			case "tool_call_update":
+				if !announced[payload.ToolCallID] {
+					t.Fatalf("tool_call_update for %s before its tool_call: %s", payload.ToolCallID, u.Update)
+				}
+				if strings.Contains(string(u.Update), "[Loop notice from the host]") {
+					noticed++
+				}
+			}
+		}
+		if len(announced) != 3 || noticed != 1 {
+			t.Fatalf("history announces %d calls and carries the notice in %d updates; want 3 and 1", len(announced), noticed)
+		}
+	}
+	t.Run("live", func(t *testing.T) { wellFormed(t, owner) })
+	path := owner.core.store.Path()
+	if err := owner.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := Open(ctx, Options{SessionDir: filepath.Dir(path), Cwd: cwd, Resume: &ResumeSession{Path: path}, Stack: &StackConfig{Model: provider.Model(), StreamFn: provider.StreamSimple}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := resumed.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	}()
+	t.Run("journal replay", func(t *testing.T) { wellFormed(t, resumed) })
+	checkpoint, err := resumed.CreateCheckpoint(ctx, "keep the noticed read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.SetResponses(faux.Respond(faux.Text("later work")))
+	if _, err := resumed.Prompt(ctx, Prompt{Text: "later prompt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := resumed.Rewind(ctx, RewindOptions{Checkpoint: checkpoint.ID}); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("rewind", func(t *testing.T) { wellFormed(t, resumed) })
 }
