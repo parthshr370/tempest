@@ -11,8 +11,12 @@ type Tool struct {
 }
 
 // Context is the provider request input (02-map-ai-agent.md A13).
+// RequestScoped counts the trailing Messages sent with this request only
+// (request-scope reminders): the next request no longer carries them, so a
+// provider that places explicit cache breakpoints places them before these.
 type Context struct {
-	SystemPrompt string    `json:"systemPrompt,omitempty"`
-	Messages     []Message `json:"messages"`
-	Tools        []Tool    `json:"tools,omitempty"`
+	SystemPrompt  string    `json:"systemPrompt,omitempty"`
+	Messages      []Message `json:"messages"`
+	Tools         []Tool    `json:"tools,omitempty"`
+	RequestScoped int       `json:"requestScoped,omitempty"`
 }

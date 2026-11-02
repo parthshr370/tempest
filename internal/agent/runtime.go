@@ -125,6 +125,9 @@ type AgentOptions struct {
 	ToolExecution ToolExecutionMode
 	// Budget caps each run; see [Agent.SetBudget].
 	Budget Budget
+	// Reminders are added at the tail of model requests; see [Reminder].
+	// A run with an invalid list ends with StopError before its first request.
+	Reminders []Reminder
 }
 
 // ErrRunActive is returned by Prompt and Continue while a run is in progress.
@@ -195,6 +198,7 @@ type Agent struct {
 	Work                       work.RunHooks
 	SessionID                  string
 	ToolExecution              ToolExecutionMode
+	Reminders                  []Reminder
 }
 
 var defaultModel = types.Model{
@@ -291,6 +295,7 @@ func NewAgent(opts AgentOptions) *Agent {
 		followUpQueue:              PendingMessageQueue{Mode: followUpMode},
 		SessionID:                  opts.SessionID,
 		ToolExecution:              toolExecution,
+		Reminders:                  append([]Reminder(nil), opts.Reminders...),
 		budget:                     opts.Budget,
 	}
 }
@@ -669,6 +674,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		PrepareNextTurnE: a.PrepareNextTurnE,
 		bindings:         a.bindings,
 		OutputSchema:     a.outputSchema,
+		Reminders:        a.Reminders,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

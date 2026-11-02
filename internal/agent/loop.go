@@ -194,6 +194,8 @@ type loopRun struct {
 	// fallbackIndex is the fallback chain position of config.Model: 0 for the
 	// primary, set when the run switches to a backup and kept until it ends.
 	fallbackIndex int
+	// reminders is nil when the run has none.
+	reminders *reminderRun
 }
 
 // execute emits agent_start, runs body, then emits the run's single agent_end.
@@ -218,6 +220,9 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 		}
 		run.initialTurns = state.Turns
 		run.restoreFallback(state.Fallback)
+		if len(run.config.Reminders) > 0 {
+			run.reminders = newReminderRun(run.config.Reminders, state.Reminders)
+		}
 		if !run.root {
 			run.result.Usage = state.Usage
 		}
@@ -250,6 +255,9 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 				if err := run.config.Work.Start(ctx, work.RunInfo{SessionID: run.config.SessionID, RunID: state.RunID, LogicalRunID: state.LogicalRunID, Resume: run.config.Resume}); err != nil {
 					return err
 				}
+			}
+			if err := ValidateReminders(run.config.Reminders); err != nil {
+				return err
 			}
 			return body(ctx)
 		})
@@ -534,6 +542,10 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 
 			message, err := func() (types.AssistantMessage, error) {
 				defer release()
+				tail, err := run.fireReminders(ctx, &current)
+				if err != nil {
+					return types.AssistantMessage{}, err
+				}
 				// A discarded attempt is already in the transcript as an errored
 				// message; it is accounted like any finished call.
 				discarded := func(attempt types.AssistantMessage) error {
@@ -553,7 +565,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					return run.emit(ctx, AgentEvent{Type: EventModelFallback, Fallback: &fallback})
 				}
 				request := newModelRequest(*config, run.config.bindings.snapshot().RunID, run.fallbackIndex)
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, switched: switched, request: request})
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, switched: switched, request: request}, tail)
 				return message, errors.Join(err, run.accountUsage(ctx, message))
 			}()
 			if err != nil {
@@ -616,6 +628,7 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					current.Messages = append(current.Messages, result)
 					run.messages = append(run.messages, result)
 				}
+				run.reminders.countToolCalls(message)
 			}
 
 			if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
@@ -869,24 +882,38 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // first when the request starts, each later one at its [types.EvAttempt],
 // when it is actually sent. Listeners get that as a model_attempt event.
 //
+// tail holds the request-scope reminders due on this request. They go after
+// the transcript in this request only: cctx never holds them, so nothing
+// that records or compacts the transcript sees them. Their firings ride on
+// the request's final message_end.
+//
 // The provider stream is always drained to its end before this returns. When
 // a listener failure cuts the turn short, the stream is cancelled first so the
 // provider's producer stops instead of running on unobserved.
-func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, observers responseObservers) (types.AssistantMessage, error) {
+func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config AgentLoopConfig, emit AgentEventSink, streamFn StreamFn, observers responseObservers, tail requestTail) (types.AssistantMessage, error) {
 	messages := cctx.Messages
 	if config.TransformContext != nil {
 		messages = config.TransformContext(ctx, messages)
 	}
 
 	llmMessages := config.ConvertToLlm(messages)
+	requestScoped := 0
+	if len(tail.messages) > 0 {
+		scoped := config.ConvertToLlm(tail.messages)
+		// The full slice expression copies: the converted list may share
+		// the transcript's backing array.
+		llmMessages = append(llmMessages[:len(llmMessages):len(llmMessages)], scoped...)
+		requestScoped = len(scoped)
+	}
 	tools := make([]types.Tool, 0, len(cctx.Tools))
 	for _, tool := range cctx.Tools {
 		tools = append(tools, tool.Tool)
 	}
 	llmContext := types.Context{
-		SystemPrompt: cctx.SystemPrompt,
-		Messages:     llmMessages,
-		Tools:        tools,
+		SystemPrompt:  cctx.SystemPrompt,
+		Messages:      llmMessages,
+		Tools:         tools,
+		RequestScoped: requestScoped,
 	}
 
 	// The options' credentials were given for CredentialRoute: the run's
@@ -1040,7 +1067,9 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 				}
 			}
 			logEnd(finalMessage)
-			if err := emit(ctx, MessageEnd(finalMessage)); err != nil {
+			end := MessageEnd(finalMessage)
+			end.Reminders = tail.fires
+			if err := emit(ctx, end); err != nil {
 				return finalMessage, err
 			}
 			return finalMessage, nil
@@ -1060,7 +1089,9 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 		}
 	}
 	logEnd(finalMessage)
-	if err := emit(ctx, MessageEnd(finalMessage)); err != nil {
+	end := MessageEnd(finalMessage)
+	end.Reminders = tail.fires
+	if err := emit(ctx, end); err != nil {
 		return finalMessage, err
 	}
 	return finalMessage, nil

@@ -302,9 +302,20 @@ func buildParams(ctx context.Context, model types.Model, c types.Context, isOAut
 	if opts != nil {
 		blobReader = opts.BlobReader
 	}
-	messages, err := convertMessages(ctx, c.Messages, model, isOAuth, ccResult.CacheControl, compat.AllowEmptySignature, blobReader)
+	// The request-scope tail goes after the message cache breakpoint: the
+	// next request no longer carries it, and a breakpoint on it would cache
+	// a prefix that request cannot read.
+	split := len(c.Messages) - min(max(c.RequestScoped, 0), len(c.Messages))
+	messages, err := convertMessages(ctx, c.Messages[:split], model, isOAuth, ccResult.CacheControl, compat.AllowEmptySignature, blobReader)
 	if err != nil {
 		return nil, err
+	}
+	if split < len(c.Messages) {
+		tail, err := convertMessages(ctx, c.Messages[split:], model, isOAuth, nil, compat.AllowEmptySignature, blobReader)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, tail...)
 	}
 	params := map[string]any{
 		"model":      model.ID,

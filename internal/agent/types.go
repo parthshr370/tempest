@@ -213,6 +213,9 @@ type AgentLoopConfig struct {
 	// validates the final text, granting one correction turn before the run
 	// ends with [StopOutputInvalid].
 	OutputSchema *outputschema.Schema
+	// Reminders are added at the tail of model requests on their cadence
+	// and conditions; see [Reminder].
+	Reminders []Reminder
 }
 
 // Budget caps one run. Zero fields are unlimited. The loop checks the budget
@@ -384,6 +387,10 @@ type AgentEvent struct {
 	ChildSessionID        string
 	UsageRunID            string
 	Resume                bool
+	// Reminders are the request-scope reminders sent with the request
+	// whose final message_end this is, or the conversation-scope reminder
+	// whose message this is.
+	Reminders []ReminderFire
 	// Model and Usage are set on usage events for delegated model calls.
 	Model string
 	// RunResult is set on agent_end; Usage is also set on usage events.
