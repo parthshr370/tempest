@@ -117,6 +117,17 @@ type MessageEntry struct {
 	// ContextFiles are the nested context files a tool result delivers,
 	// committed in the same line as the text that carries them.
 	ContextFiles []ContextFileRecord
+	// Reminders are the reminder firings this message commits: the
+	// conversation-scope reminder a user message is, or the request-scope
+	// reminders sent with the request a final assistant message answers.
+	Reminders []ReminderFire
+}
+
+// ReminderFire is one reminder firing: its name and scope ("request" or
+// "conversation"). A request-scope reminder's text is never journaled.
+type ReminderFire struct {
+	Name  string `json:"name"`
+	Scope string `json:"scope"`
 }
 
 func (MessageEntry) kind() EntryType            { return KindMessage }
@@ -275,6 +286,7 @@ type wireEntry struct {
 	Metered         bool                `json:"metered,omitempty"`
 	CallOccurrences []string            `json:"call_occurrences,omitempty"`
 	ContextFiles    []ContextFileRecord `json:"context_files,omitempty"`
+	Reminders       []ReminderFire      `json:"reminders,omitempty"`
 	SourceHash      string              `json:"source_hash,omitempty"`
 	CompactionID    string              `json:"compaction_id,omitempty"`
 	Snapshot        *work.Artifact      `json:"snapshot,omitempty"`
@@ -320,6 +332,7 @@ func MarshalEntry(entry Entry) ([]byte, error) {
 		}
 		wire.Message = message
 		wire.QueueID, wire.Withdraws, wire.Metered, wire.CallOccurrences, wire.ContextFiles = e.QueueID, e.Withdraws, e.Metered, e.CallOccurrences, e.ContextFiles
+		wire.Reminders = e.Reminders
 	case ModelChangeEntry:
 		wire.Model, wire.Role = e.Model, e.Role
 	case CompactionEntry:
@@ -424,7 +437,12 @@ func decodeEntry(raw []byte) (Entry, error) {
 				return nil, fmt.Errorf("decode journal message: invalid context file %+v", file)
 			}
 		}
-		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Withdraws: wire.Withdraws, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences, ContextFiles: wire.ContextFiles}, nil
+		for _, fire := range wire.Reminders {
+			if fire.Name == "" || (fire.Scope != "request" && fire.Scope != "conversation") {
+				return nil, fmt.Errorf("decode journal message: invalid reminder %+v", fire)
+			}
+		}
+		return MessageEntry{Meta: meta, Message: message, QueueID: wire.QueueID, Withdraws: wire.Withdraws, Metered: wire.Metered, CallOccurrences: wire.CallOccurrences, ContextFiles: wire.ContextFiles, Reminders: wire.Reminders}, nil
 	case KindModelChange:
 		return ModelChangeEntry{Meta: meta, Model: wire.Model, Role: wire.Role}, nil
 	case KindCompaction:

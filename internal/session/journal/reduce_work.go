@@ -45,6 +45,8 @@ type RunDetail struct {
 	// Fallback is the run's last switch to a backup model, nil when it stayed
 	// on its primary model.
 	Fallback *ModelFallbackRecord
+	// Reminders are the reminder firings the run's messages committed.
+	Reminders []ReminderFire
 }
 
 func assistantBlocks(m types.Message) []types.ContentBlock {
@@ -194,13 +196,15 @@ func (l *Loaded) reduceWork(ctx context.Context, entries []Entry, path string, w
 					}
 					_ = a
 				}
-				if e.Message != nil && e.Message.Role() == "user" && text != "" {
+				// A conversation reminder is the harness's text, not the user's.
+				if e.Message != nil && e.Message.Role() == "user" && text != "" && len(e.Reminders) == 0 {
 					text = boundedText(text, (1<<20)-historyBytes[e.RunID])
 					if text != "" {
 						r.History = append(r.History, RunMessage{Role: "user", Text: text})
 						historyBytes[e.RunID] += len(text)
 					}
 				}
+				r.Reminders = append(r.Reminders, e.Reminders...)
 			}
 			if e.Metered {
 				if a, ok := asAssistantMessage(e.Message); ok {
@@ -481,6 +485,24 @@ func (l *Loaded) LogicalUsage(logicalID string) (types.Usage, int, time.Time) {
 		}
 	}
 	return usage, turns, started
+}
+
+// LogicalReminders counts each reminder's committed firings, by name, across
+// every run of one logical run.
+func (l *Loaded) LogicalReminders(logicalID string) map[string]int {
+	var fires map[string]int
+	for _, r := range l.Runs {
+		if r.LogicalRunID != logicalID {
+			continue
+		}
+		for _, fire := range r.Reminders {
+			if fires == nil {
+				fires = map[string]int{}
+			}
+			fires[fire.Name]++
+		}
+	}
+	return fires
 }
 
 // SortedUsageSources returns stable source ordering for recovery imports.
