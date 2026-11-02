@@ -81,6 +81,10 @@ type runTrace struct {
 	sampled bool
 	request *requestTrace
 	tools   map[string]*toolTrace
+	// loop is the loop guard's last report in the run; loopNudges counts
+	// its nudges.
+	loop       *agent.LoopDetection
+	loopNudges int
 }
 
 type requestTrace struct {
@@ -148,6 +152,13 @@ func (l *agentListener) handle(ctx context.Context, event agent.AgentEvent) erro
 	case agent.EventHook:
 		if event.Hook != nil {
 			l.telemetry.recordHook(event.Hook)
+		}
+	case agent.EventLoopGuard:
+		if l.run != nil && event.Loop != nil {
+			l.run.loop = event.Loop
+			if event.Loop.Action == agent.LoopNudge {
+				l.run.loopNudges++
+			}
 		}
 	case agent.EventAgentEnd:
 		l.endRun(event)
@@ -562,8 +573,15 @@ func (l *agentListener) endRun(event agent.AgentEvent) {
 	)
 	runSpan.attributes = append(runSpan.attributes, usageAttributes("gen_ai.aggregated_usage.", result.Usage)...)
 	runSpan.attributes = append(runSpan.attributes, costAttributes(result.Usage.Cost)...)
+	if run.loop != nil {
+		runSpan.attributes = append(runSpan.attributes,
+			stringAttribute("tempest.loop.pattern", string(run.loop.Pattern)),
+			stringAttribute("tempest.loop.action", string(run.loop.Action)),
+			intAttribute("tempest.loop.nudges", int64(run.loopNudges)),
+		)
+	}
 	switch result.StopReason {
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure:
+	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
 		runSpan.status = statusError
 		runSpan.attributes = append(runSpan.attributes, stringAttribute("error.type", string(result.StopReason)))
 		if result.Err != nil {

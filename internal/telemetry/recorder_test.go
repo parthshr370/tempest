@@ -330,3 +330,38 @@ func TestSpansCarryTheRemoteTracestate(t *testing.T) {
 		}
 	}
 }
+
+// TestLoopGuardReachesTheRunSpan: a run the loop guard nudged and then
+// stopped carries the loop's pattern, the action and the nudge count, and
+// fails with error.type loop_detected.
+func TestLoopGuardReachesTheRunSpan(t *testing.T) {
+	c := newCollector(t)
+	tel := newTestTelemetry(t, c, false)
+	attempts := make([]func(*stream.AssistantStream), 6)
+	for index := range attempts {
+		attempts[index] = toolCallAttempt("echo", `{"text":"same"}`)
+	}
+	agt := agent.NewAgent(agent.AgentOptions{
+		InitialState:   &agent.AgentState{Model: testModel, Tools: []agent.AgentTool{echoTool(nil)}},
+		StreamFn:       (&scriptedProvider{attempts: attempts}).Stream,
+		Trace:          tel.Tracing(),
+		LoopThresholds: &agent.LoopThresholds{RepeatedResult: 3},
+	})
+	detach := tel.Attach(agt, AgentInfo{SessionID: "session-1"})
+	defer detach()
+	result, err := agt.Prompt(context.Background(), types.UserMessage{Content: types.StringContent("echo")})
+	if err != nil || result.StopReason != agent.StopLoopDetected {
+		t.Fatalf("run = %+v, %v", result, err)
+	}
+	if err := tel.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	run := spansByName(collectedSpans(t, c))["invoke_agent tempest"]
+	if len(run) != 1 {
+		t.Fatalf("span names = %v", c.spanNames(t))
+	}
+	span := run[0]
+	if span.Status.Code != int(statusError) || span.attr("error.type") != "loop_detected" || span.attr("tempest.loop.pattern") != "repeated_result" || span.attr("tempest.loop.action") != "stop" || span.attr("tempest.loop.nudges") != "1" {
+		t.Fatalf("run span = %+v", span)
+	}
+}
