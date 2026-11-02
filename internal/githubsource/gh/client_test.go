@@ -299,8 +299,8 @@ func TestEndpointAndNextPath(t *testing.T) {
 	}
 	links := map[string]string{
 		`<https://api.github.com/repositories/1/issues?page=3>; rel="next", <https://api.github.com/repositories/1/issues?page=9>; rel="last"`: "repositories/1/issues?page=3",
-		`<https://ghe.example.com/api/v3/repos/o/r/pulls?page=2>; rel="next"`:                                                              "repos/o/r/pulls?page=2",
-		`<https://api.github.com/x?page=1>; rel="prev"`:                                                                                    "",
+		`<https://ghe.example.com/api/v3/repos/o/r/pulls?page=2>; rel="next"`:                                                                  "repos/o/r/pulls?page=2",
+		`<https://api.github.com/x?page=1>; rel="prev"`:                                                                                        "",
 		"": "",
 	}
 	for link, want := range links {
