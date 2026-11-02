@@ -69,8 +69,13 @@ type Store struct {
 	// finished.
 	reports *docTable[model.DispatchID]
 	// prAsOf maps a PR to the GitHub time as of which its record's state is
-	// known (orderPRState).
-	prAsOf *docTable[time.Time]
+	// known (orderPRState), as committed. heldAsOf holds a later as-of that
+	// only confirmed the committed state, in memory: it is written with the
+	// next commit that orders a fact of the same PR (asOfUsed lists those of
+	// the current transaction) and lost on restart (holdAsOf).
+	prAsOf   *docTable[time.Time]
+	heldAsOf map[string]time.Time
+	asOfUsed map[string]bool
 
 	policies  *entryTable[model.Policy]
 	events    *entryTable[model.Event]
@@ -335,6 +340,8 @@ func (s *Store) reset() {
 	s.ticketOutbox = make(map[model.TicketID][]model.OutboxID)
 	s.reports = newDocTable[model.DispatchID](namespaceReport)
 	s.prAsOf = newDocTable[time.Time](namespacePRAsOf)
+	s.heldAsOf = make(map[string]time.Time)
+	s.asOfUsed = make(map[string]bool)
 }
 
 // tables lists every table in the fixed order changes are written.
@@ -441,18 +448,22 @@ func (s *Store) rollback() {
 	for _, t := range s.tables() {
 		t.rollback()
 	}
+	clear(s.asOfUsed)
 }
 
 // commit writes everything staged as one durable commit. With nothing
-// staged it commits nothing. On success the projection adopts the committed
-// bytes; on failure staged changes are dropped and, unless the store
-// rejected the batch before writing, the projection is rebuilt from the
-// journal because the commit may have become durable.
+// staged but as-of advances it commits nothing and holds them
+// (holdAsOf). On success the projection adopts the committed bytes; on
+// failure staged changes are dropped and, unless the store rejected the
+// batch before writing, the projection is rebuilt from the journal because
+// the commit may have become durable.
 func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) {
+	s.stageHeldAsOf()
 	tables := s.tables()
 	perTable := make([][]staged, len(tables))
 	var commit durable.Commit
 	commit.ID = id
+	changed := false
 	for i, t := range tables {
 		changes, err := t.stage()
 		if err != nil {
@@ -465,9 +476,11 @@ func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) 
 			if c.kind == durable.DocumentKind {
 				commit.Expected = append(commit.Expected, durable.RevisionCheck{SessionID: model.ControlSession, Kind: c.kind, Namespace: c.namespace, ID: c.id, Revision: c.revision})
 			}
+			changed = changed || c.namespace != namespacePRAsOf
 		}
 	}
-	if len(commit.Changes) == 0 {
+	if !changed {
+		s.holdAsOf()
 		s.rollback()
 		return durable.Receipt{Seq: s.seq}, nil
 	}
@@ -501,9 +514,13 @@ func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) 
 						s.sortOutbox(intent.Ticket)
 					}
 				}
+			case namespacePRAsOf:
+				// stageHeldAsOf staged at least the held value.
+				delete(s.heldAsOf, c.id)
 			}
 		}
 	}
+	clear(s.asOfUsed)
 	s.seq = receipt.Seq
 	return receipt, nil
 }

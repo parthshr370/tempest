@@ -1,6 +1,7 @@
 package control
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -573,4 +574,144 @@ func TestLedgerArithmeticCannotMintAllowance(t *testing.T) {
 			t.Errorf("micro(%g) = %d, want saturation", usd, got)
 		}
 	}
+}
+
+// An unchanged successful read commits nothing (g2-check.md Check 4 P2): a
+// later read time alone is held in memory and written only with the next
+// commit that orders a fact of the same PR. A restart loses it, which
+// leaves exactly the store of a run without those reads, and the next read
+// holds a later as-of again (design §5).
+func TestUnchangedReadsCommitNothing(t *testing.T) {
+	const number = 991
+	updated := epoch.Add(time.Hour)
+	setup := func(t *testing.T) (*harness, model.DispatchID, func() model.IntakeBatch) {
+		h := newHarness(t)
+		id, dispatch := h.launched(990, 9901)
+		h.openPR(id, "pr", number)
+		note := comment(number, true, 99101, mallory, "looks fine", updated)
+		read := func() model.IntakeBatch {
+			return model.IntakeBatch{
+				Resource: "thread:991",
+				Events:   []model.Event{note},
+				Cursor:   &model.Cursor{Key: model.CursorBranchCI, BranchSHA: "main1", Fingerprint: "fp1"},
+				Threads: []model.ThreadUpdate{{
+					Ref: model.ThreadRef{Number: number, IsPR: true}, Title: "Fix", State: "open", Author: &account,
+					Comments: &model.Position{Since: updated.Add(time.Second), LastID: 99101}, Reconcile: new(false), LastActivityAt: updated,
+				}},
+				PRs: []model.PullRequest{{
+					Number: number, Author: account, HeadRef: model.TicketBranch(id), HeadRepo: "acme/widgets", HeadSHA: "head991", BaseRef: "main",
+					State: "open", CI: &model.CISnapshot{SHA: "head991", Fingerprint: "fp", Passing: 3}, UpdatedAt: updated,
+				}},
+				ReadAt: h.clock.Now(),
+			}
+		}
+		h.at(2 * time.Hour)
+		h.ingestBatch(read())
+		return h, dispatch, read
+	}
+	// count wraps the current journal and counts its commits.
+	count := func(h *harness) *crashStore {
+		counter := &crashStore{Store: h.store.store}
+		h.store.store = counter
+		return counter
+	}
+	asOf := func(h *harness) string {
+		return journal(h.t, h.store.store)[namespacePRAsOf+"/991"]
+	}
+	stamp := func(at time.Time) string {
+		raw, _ := json.Marshal(at)
+		return string(raw)
+	}
+	poll := func(h *harness, read func() model.IntakeBatch) {
+		for i := 1; i <= 20; i++ {
+			h.at(2*time.Hour + time.Duration(i)*time.Minute + 300*time.Millisecond)
+			h.ingestBatch(read())
+		}
+	}
+	requireOpen := func(h *harness, dispatch model.DispatchID) {
+		h.t.Helper()
+		if pr, _ := h.store.prs.get("991"); pr.State != "open" {
+			h.t.Fatalf("delayed close applied: PR %+v", *pr)
+		}
+		h.finish(dispatch, completed(1))
+		if got := h.ticket(h.dispatch(dispatch).Ticket); got.Lifecycle != model.LifecycleOpen {
+			h.t.Fatalf("delayed close ended the ticket: %+v", got)
+		}
+	}
+
+	t.Run("identical reads commit nothing", func(t *testing.T) {
+		h, _, read := setup(t)
+		before := journal(t, h.store.store)
+		counter := count(h)
+		poll(h, read)
+		if counter.commits != 0 {
+			t.Fatalf("20 unchanged reads made %d commits", counter.commits)
+		}
+		if diff := diffJournals(before, journal(t, h.store.store)); diff != "" {
+			t.Fatalf("unchanged reads changed the journal: %s", diff)
+		}
+	})
+	t.Run("held as-of rejects a delayed close and commits with it", func(t *testing.T) {
+		h, dispatch, read := setup(t)
+		poll(h, read)
+		counter := count(h)
+		h.ingest("issue:999", comment(999, false, 99901, mallory, "noise", h.clock.Now()))
+		if counter.commits != 1 || asOf(h) != stamp(epoch.Add(2*time.Hour)) {
+			t.Fatalf("an unrelated commit carried the held as-of: commits=%d as-of=%s", counter.commits, asOf(h))
+		}
+		h.at(3 * time.Hour)
+		h.ingest("late-close", prClosed(number, false, epoch.Add(2*time.Hour+10*time.Minute)))
+		if want := stamp(epoch.Add(2*time.Hour + 20*time.Minute)); asOf(h) != want {
+			t.Fatalf("commit that relied on the held as-of did not write it: got %s want %s", asOf(h), want)
+		}
+		requireOpen(h, dispatch)
+		h.reopen()
+		if pr, _ := h.store.prs.get("991"); pr.State != "open" {
+			t.Fatalf("restart lost the rejection: PR %+v", *pr)
+		}
+	})
+	t.Run("restart then the next read rejects a delayed close", func(t *testing.T) {
+		h, dispatch, read := setup(t)
+		poll(h, read)
+		h.reopen()
+		if want := stamp(epoch.Add(2 * time.Hour)); asOf(h) != want {
+			t.Fatalf("held as-of reached the journal: got %s want %s", asOf(h), want)
+		}
+		counter := count(h)
+		h.at(3 * time.Hour)
+		h.ingestBatch(read())
+		if counter.commits != 0 {
+			t.Fatalf("unchanged read after restart made %d commits", counter.commits)
+		}
+		h.ingest("late-close", prClosed(number, false, epoch.Add(2*time.Hour+30*time.Minute)))
+		if want := stamp(epoch.Add(3 * time.Hour)); asOf(h) != want {
+			t.Fatalf("as-of after the rejection: got %s want %s", asOf(h), want)
+		}
+		requireOpen(h, dispatch)
+	})
+	t.Run("restart equals a run without the reads", func(t *testing.T) {
+		polled, dispatch, read := setup(t)
+		poll(polled, read)
+		polled.reopen()
+		baseline, _, _ := setup(t)
+		baseline.reopen()
+		if diff := diffJournals(journal(t, baseline.store.store), journal(t, polled.store.store)); diff != "" {
+			t.Fatalf("restart after unchanged reads differs from a run without them: %s", diff)
+		}
+		// Any read after the restart is later than every lost read, so a
+		// stream that lists the old close lists the reopen that the
+		// unchanged reads summarized too, in the same batch.
+		late := []model.Event{
+			prClosed(number, false, epoch.Add(2*time.Hour+10*time.Minute)),
+			{ID: model.PRReopenedID(number, epoch.Add(2*time.Hour+15*time.Minute)), Kind: model.EventPRReopened, Thread: model.ThreadRef{Number: number, IsPR: true}, At: epoch.Add(2*time.Hour + 15*time.Minute)},
+		}
+		for _, h := range []*harness{baseline, polled} {
+			h.at(3 * time.Hour)
+			h.ingest("pr-events", late...)
+		}
+		if diff := diffJournals(journal(t, baseline.store.store), journal(t, polled.store.store)); diff != "" {
+			t.Fatalf("same input after restart diverged: %s", diff)
+		}
+		requireOpen(polled, dispatch)
+	})
 }

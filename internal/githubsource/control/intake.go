@@ -88,7 +88,8 @@ func sortThreads(threads []model.WatchedThread) {
 // between a crash and the reread) sees a half-applied batch. Completion is
 // decided once, in the last part, after every event and snapshot is staged
 // (settleCompletion). A batch already committed (same resource and
-// content) commits nothing.
+// content) commits nothing, and so does one that changes no record: a
+// later read time alone is held in memory (holdAsOf).
 func (s *Store) Ingest(ctx context.Context, batch model.IntakeBatch) (model.IngestResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -373,19 +374,55 @@ func (s *Store) applyPRState(event model.Event) {
 	}
 }
 
-// asOf is the GitHub time as of which a PR record's state is known; zero
-// for a placeholder, which knows no GitHub fact.
+// asOf is the GitHub time as of which a PR record's state is known: the
+// committed or staged as-of, or a later held one; zero for a placeholder,
+// which knows no GitHub fact. It marks the PR as ordered by the current
+// transaction (stageHeldAsOf).
 func (s *Store) asOf(key string) time.Time {
-	if at, ok := s.prAsOf.get(key); ok {
-		return *at
+	s.asOfUsed[key] = true
+	at := s.heldAsOf[key]
+	if stored, ok := s.prAsOf.get(key); ok && stored.After(at) {
+		at = *stored
 	}
-	return time.Time{}
+	return at
 }
 
 // advanceAsOf moves a PR's as-of forward to at, in whole seconds.
 func (s *Store) advanceAsOf(key string, at time.Time) {
 	if at = at.Truncate(time.Second); at.After(s.asOf(key)) {
 		s.prAsOf.put(key, at)
+	}
+}
+
+// holdAsOf keeps in memory the as-of advances of a transaction that
+// changed nothing else, typically an unchanged read of a PR, instead of
+// committing them: a commit per poll would grow the journal with poll
+// count, not repository activity. stageHeldAsOf writes a held as-of with
+// the next commit that orders a fact of the same PR, so every committed
+// decision is committed with the as-of it was made against. A restart
+// loses only as-ofs that no commit relied on: the reopened store is the
+// one a run without those reads would have (as if they had failed), and
+// the next read of the PR, later on GitHub's clock, holds a later as-of
+// again. See design §5.
+func (s *Store) holdAsOf() {
+	for key, at := range s.prAsOf.dirty {
+		if at.After(s.heldAsOf[key]) {
+			s.heldAsOf[key] = *at
+		}
+	}
+}
+
+// stageHeldAsOf stages the held as-of of every PR the transaction ordered
+// a fact of, before commit decides whether anything changed.
+func (s *Store) stageHeldAsOf() {
+	for key := range s.asOfUsed {
+		held, ok := s.heldAsOf[key]
+		if !ok {
+			continue
+		}
+		if stored, ok := s.prAsOf.get(key); !ok || held.After(*stored) {
+			s.prAsOf.put(key, held)
+		}
 	}
 }
 
