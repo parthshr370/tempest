@@ -57,7 +57,7 @@ choose where credentials go apply only after the operator trusts the workspace:
 
 | Keys | Applied when |
 |---|---|
-| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `context_files`, `reminders`, `session_dir`, `log_file`, `faux_script`, and `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`, `max_tokens`, `mcp_sampling_max_tokens`, `retry_enabled`, `retry_max_attempts`, `retry_max_delay_ms`, `bash_timeout` or `log_file_max_bytes` above the operator's value | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
+| `hooks`, `mcp_config`, `mcp_servers`, `mcp_sampling_allow_headless` other than `false`, `lsp_config`, `enable_lsp`, `debug_adapters`, `cloud_policy`, `permission_allow_tools`, `permission_mode_default` other than `"plan"`, `plan` other than `true`, `permission_deny_tools` set to `null`, `enable_web` other than `false`, `attach`, `skill_paths`, `agent_dir`, `context_files`, `reminders`, `session_dir`, `log_file`, `faux_script`, `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`, `max_tokens`, `mcp_sampling_max_tokens`, `retry_enabled`, `retry_max_attempts`, `retry_max_delay_ms`, `bash_timeout` or `log_file_max_bytes` above the operator's value, and `loop_detection` looser than the operator's | `-trust-project-hooks`, `HARNESS_TRUST_PROJECT_HOOKS=true`, or the workspace's absolute canonical path in user `trusted_hook_projects`. |
 | `providers`, `anthropic_base_url`, `openai_base_url`, `web_search_url`, `otel`, and a `model`, `plan_model`, `smol_model`, `mcp_sampling_model` or `fallback_models` entry with an `@http(s)://` endpoint | `-trust-project-providers`, `HARNESS_TRUST_PROJECT_PROVIDERS=true`, or the path in user `trusted_provider_projects`. |
 | `no_hooks`, `disableAllHooks`, `trusted_hook_projects`, `trusted_provider_projects`, `environment`, `environments`, and `hooks` inside a project profile | Never. Only the operator sets them. |
 
@@ -96,6 +96,14 @@ lifts the ceiling. The caps bound prompt size, output tokens, retries, waiting,
 command run time and log disk use, which are the operator's budget to set. A
 repository `max_tokens` still counts as an explicit output cap, which ChatGPT plan
 models refuse.
+
+The [loop guard](sessions-and-durability.md#loops) works the same way in the other
+direction: a lower threshold reports sooner. An untrusted repository's
+`loop_detection` applies when every threshold it sets is a whole number from 2 up to
+the operator's threshold (the built-in default when none sets it); where the
+operator turned a pattern off with `0`, any threshold from 2 applies. A larger
+threshold, `0`, a `null` or an invalid value drops the whole `loop_detection` object
+with the trust warning.
 
 Trusted project `hooks` add to the hooks below them instead of replacing them: each
 event's array from `settings.json`, then from `settings.local.json`, is appended to the
@@ -357,6 +365,7 @@ each flag and variable above, names the same setting. The main keys:
 | `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
 | `context_files` | Object: `fallback` file names tried after `AGENTS.md` (default `["CLAUDE.md"]`), `max_bytes`, the total context file cap (default 65536), `nested_max_bytes` per nested file (default 16384, at most `max_bytes`), and `nested` on-read discovery below the working directory (default `true`). See [Skills and context](skills-and-context.md#context-discovery). |
 | `reminders` | Array of reminders added at the tail of model requests: `name`, `text`, `scope` (`request` or `conversation`), `every`, `first`, `max_fires` (default 1) and `when` (`final_turn`, `context_percent`, `tool_calls`, `without_tool`). Default none; a repository needs trust to add any. See [Skills and context](skills-and-context.md#reminders). |
+| `loop_detection` | Object: the loop guard's thresholds `repeated_call` (default 5), `repeated_result` (3), `alternating_calls` (3) and `repeated_text` (3); each is `0` (that pattern off) or at least 2. See [Loops](sessions-and-durability.md#loops). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 

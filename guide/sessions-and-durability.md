@@ -159,6 +159,7 @@ Every run ends with one of these:
 | `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
 | `error` | The provider failed, or the session journal could not be written. | 1 |
 | `repeated_failure` | The model sent the same tool call, with the same arguments, until it had failed with the same error five times in a row. | 1 |
+| `loop_detected` | The model kept repeating a loop (see [Loops](#loops)) after a host notice told it about that loop. | 1 |
 
 ### Budgets
 
@@ -193,6 +194,59 @@ turn. `error` in the report names the call and its error, and over ACP
 user message (a new prompt included) resets the count, and a successful result is
 never changed. The count is read from the transcript, so continuing a resumed
 session (`Session.Continue`, `tempest/continue`) carries it on.
+
+### Loops
+
+A model can also be stuck while its calls succeed: re-reading a file that has not
+changed, re-running a command with the same output, flipping between two calls, or
+giving the same final answer to a Stop hook that keeps sending it back. The loop
+guard watches for four patterns, with the thresholds of Pydantic AI's `DetectLoops`:
+
+| Pattern | Reported when | Default |
+|---|---|---|
+| `repeated_result` | The same call (same tool, same arguments after JSON canonicalization) returned the same result, error or not, each of its last N times within the recent calls. Other calls in between don't matter. | 3 |
+| `alternating_calls` | The last 2N calls alternate between the same two calls (A, B, A, B, ...). | 3 cycles |
+| `repeated_call` | The same call was made N times within the recent calls, whatever it returned. | 5 |
+| `repeated_text` | N replies in a row had no tool call and the same text, ignoring case and whitespace, with only Stop, SubagentStop or extension `on_yield` hook feedback between them. | 3 |
+
+The recent calls are the last 10, or more when a threshold needs it (the largest of
+10, `repeated_call`, `repeated_result` and twice `alternating_calls`). The checks
+run once per tool batch, after its last result, and once before each model call for
+repeated text, in the order above; a pattern is reported only when the newest batch
+or reply continues it.
+
+The first report of a loop is a notice at the tail of the transcript, starting with
+`[Loop notice from the host]`: appended to the batch's last tool result, or for
+repeated text sent as a user message after the hook feedback. It names the pattern
+and tells the model to change its approach or say what is blocking it. The calls
+before a notice are not counted again, so the loop has to build up anew; if the same
+loop (the same calls, or the same text) is reported again, the host appends a
+`[Loop stop from the host]` notice and the run ends with `loop_detected` after that
+turn. A different loop gets its own notice first. The system prompt and earlier
+messages never change, so the cached prompt prefix is kept.
+
+`error` in the report says which loop it was, `loop` in the
+[run report](#the-run-report) gives its `pattern`, `tools` and `count`, and over ACP
+`session/prompt` fails with `-32026 loop_detected`. Every notice and stop is also
+published as a `tempest/loop_guard` update.
+
+Polling is not a loop. `wait`, `jobs`, `logs` and `write_stdin` are polling tools:
+their calls are never reported, though they still count as calls in between (a
+`wait` between A and B breaks an A-B alternation). The repeated-failure stop still
+applies to them. MCP and extension tools carry no polling metadata and are checked
+like any other tool. When the repeated-failure guard noted a result in a batch, the
+loop guard leaves that batch alone, so consecutive identical failures keep their
+own notice and stop.
+
+Like the failure count, the guard reads everything from the transcript, so a resumed
+or replayed session reaches the same decisions and never repeats a notice. Any user
+message (a new prompt, a steer, a job notice, a compaction summary) starts the count
+over; `Continue` adds none, so it carries the count on. After a `loop_detected` stop,
+the next repetition of the same loop stops a continued run again at once, while a
+model that moved on is not stopped by the loop still among the recent calls.
+
+The thresholds are the `loop_detection` setting, and `0` turns a pattern off; see
+[Configuration](configuration.md#settings-file).
 
 ### Background work and shutdown
 
@@ -253,8 +307,9 @@ In text mode the last assistant text goes to stdout, and a stop reason other tha
 ```
 
 `cost_usd` is `null` when any call's price was unknown. `error` appears on `error`,
-`output_invalid` and `repeated_failure` stops. `message` is the transcript's last
-message.
+`output_invalid`, `repeated_failure` and `loop_detected` stops, and `loop`
+(`pattern`, `tools`, `count`, `action`) on `loop_detected`. `message` is the
+transcript's last message.
 
 ### Structured final answers
 
@@ -296,9 +351,11 @@ contains the actual `tempest/gap` marker and the final report, stderr explains t
 incomplete stream, and the command exits 1. A broken pipe cancels and joins the run.
 
 Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output`,
-`tempest/message`, `tempest/compaction` and `tempest/model_fallback` updates as ACP
-and Go watchers. `tempest/model_fallback` carries `runId`, `from`, `to`, `reason`,
-`attempts` and `fallbackIndex`. Output events only announce byte availability; read
+`tempest/message`, `tempest/compaction`, `tempest/model_fallback` and
+`tempest/loop_guard` updates as ACP and Go watchers. `tempest/model_fallback` carries
+`runId`, `from`, `to`, `reason`, `attempts` and `fallbackIndex`; `tempest/loop_guard`
+carries `runId`, `pattern`, `tools`, `count` and `action` (`nudge` or `stop`). Output
+events only announce byte availability; read
 command logs separately. Child transcripts and thinking are not forwarded into the
 parent stream, but every agent-to-agent message is, as `tempest/message`. The final
 run-report shape is unchanged.
