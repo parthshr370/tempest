@@ -231,6 +231,21 @@ func TestSnapshotBudgetUsesWireCasing(t *testing.T) {
 	}
 }
 
+func TestSnapshotBudgetCarriesTokenAndToolCallCaps(t *testing.T) {
+	snap := Snapshot{SessionID: "s", Budget: agent.Budget{MaxTurns: 3, MaxInputTokens: 1000, MaxOutputTokens: 200, MaxTotalTokens: 1100, MaxToolCalls: 7}}
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"budget":{"maxTurns":3,"maxCostUsd":0,"maxWallSeconds":0,"maxInputTokens":1000,"maxOutputTokens":200,"maxTotalTokens":1100,"maxToolCalls":7}`) {
+		t.Fatalf("snapshot = %s", raw)
+	}
+	var decoded Snapshot
+	if err := json.Unmarshal(raw, &decoded); err != nil || decoded.Budget != snap.Budget {
+		t.Fatalf("round trip = %+v err = %v", decoded.Budget, err)
+	}
+}
+
 func TestSubscriberQueueBoundsBytesAndReclaimsConsumedBytes(t *testing.T) {
 	h := New(Snapshot{SessionID: "s"}, nil)
 	defer h.Close()

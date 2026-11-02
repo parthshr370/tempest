@@ -97,6 +97,13 @@ command run time and log disk use, which are the operator's budget to set. A
 repository `max_tokens` still counts as an explicit output cap, which ChatGPT plan
 models refuse.
 
+The per-run caps `max_input_tokens`, `max_output_tokens`, `max_total_tokens` and
+`max_tool_calls` work the same way, except that their default, 0, means unlimited.
+An untrusted repository may set any of them to a whole number from 1 when the
+operator set none, or up to the operator's value when it did. Its own 0 or `null`
+would lift the operator's cap, so like a larger value it is dropped with the trust
+warning.
+
 The [loop guard](sessions-and-durability.md#loops) works the same way in the other
 direction: a lower threshold reports sooner. An untrusted repository's
 `loop_detection` applies when every threshold it sets is a whole number from 2 up to
@@ -281,6 +288,7 @@ sessions run every role on one session model behind the default role's list. See
 |---|---|
 | `-fallback-model <route>` | Backup model for the default role, tried in order when the model is unavailable; repeatable. Also on `serve` and `mcp`. See [Backup models](providers.md#backup-models). |
 | `-max-turns <n>`, `-max-cost <usd>`, `-max-wall-time <duration>` | Per-run budgets; see [Runs](sessions-and-durability.md#runs). Zero means unlimited. |
+| `-max-input-tokens <n>`, `-max-output-tokens <n>`, `-max-total-tokens <n>`, `-max-tool-calls <n>` | Per-run token and tool-call caps, counted over the whole run including subagents (not per request, unlike `-max-tokens`); see [Budgets](sessions-and-durability.md#budgets). Zero means unlimited. Settings `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_tool_calls` and `HARNESS_MAX_INPUT_TOKENS`, `HARNESS_MAX_OUTPUT_TOKENS`, `HARNESS_MAX_TOTAL_TOKENS`, `HARNESS_MAX_TOOL_CALLS` set them too. Also on `serve` and `mcp`. |
 | `-bash-timeout <duration>` | Default shell-command timeout (10m); `HARNESS_BASH_TIMEOUT` or settings `bash_timeout` can set it too. A positive model-supplied `timeout` in seconds overrides it, up to 2147483 seconds. Timeouts kill the whole process group. |
 | `-enable-task` | Register the `task` tool with the built-in `explore` (read-only, `smol` role) and `general` (full coding, default role) subagents. |
 | `-plan` | Run the read-only plan stack on the `plan` role model. Only read/search/list tools (including `ast_grep` when installed and authenticated `gh`), `manifest_diff`, enabled `lsp_*` tools (rename computes a plan only) and enabled read-only web/attachment tools are available; `-faux-script` still overrides the model provider. |
@@ -324,6 +332,7 @@ problem.
 | `HARNESS_PERMISSION_ALLOW_TOOLS`, `HARNESS_PERMISSION_DENY_TOOLS` | Per-tool allow and deny lists. |
 | `HARNESS_SESSION_DIR`, `HARNESS_AGENT_DIR` | Session and agent data directories. |
 | `HARNESS_BASH_TIMEOUT` | Default bash timeout as a Go duration, for example `1s` or `10m`. |
+| `HARNESS_MAX_INPUT_TOKENS`, `HARNESS_MAX_OUTPUT_TOKENS`, `HARNESS_MAX_TOTAL_TOKENS`, `HARNESS_MAX_TOOL_CALLS` | Per-run token and tool-call caps (settings `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_tool_calls`). |
 | `HARNESS_RETRY_*` | Retry policy: `ENABLED`, `MAX_ATTEMPTS`, `BASE_DELAY_MS`, `BACKOFF_CAP_MS`, `MAX_DELAY_MS`, `JITTER_MIN`, `JITTER_MAX`. |
 | `HARNESS_WORKSPACE_LISTING`, `HARNESS_WORKSPACE_LISTING_MAX_FILES`, `HARNESS_WORKSPACE_LISTING_MAX_BYTES` | Session-start file listing and its caps (settings `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes`). |
 | `HARNESS_STREAM_IDLE_SECONDS`, `HARNESS_STREAM_FIRST_OUTPUT_SECONDS` | Stream stall bounds: seconds without an SSE event once output has started (default 90), and before the first output (default 300, never below the idle bound). |
@@ -348,6 +357,7 @@ each flag and variable above, names the same setting. The main keys:
 | Key | Purpose |
 |---|---|
 | `model`, `plan_model`, `smol_model`, `max_tokens` | Role models and the output-token cap. |
+| `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_tool_calls` | Per-run caps on prompt tokens, output tokens, both together, and tool calls (default 0, unlimited). A repository may only lower them. See [Budgets](sessions-and-durability.md#budgets). |
 | `anthropic_base_url`, `openai_base_url` | Provider endpoints, overridden by flags and `HARNESS_*` variables. |
 | `fallback_models` | Backup models per role: `default`, `plan`, `smol`. A role without an entry uses `default`'s list; `[]` turns backups off for it. |
 | `reasoning`, `plan_reasoning`, `smol_reasoning` | Reasoning effort per role. |

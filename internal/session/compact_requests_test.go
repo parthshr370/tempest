@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -102,6 +103,122 @@ func TestCompactionRequestsAreEachAdmittedAgainstTheCostCap(t *testing.T) {
 		if part.Finished == nil || part.Finished.Status != "error" || !strings.Contains(part.Finished.Error, string(agent.StopMaxCost)) {
 			t.Fatalf("stopped phase recorded as %+v, want an error naming the cost cap", part.Finished)
 		}
+	}
+}
+
+// runCappedCompaction runs a prompt whose history must be summarized in
+// several requests, under budget, with send answering every request.
+func runCappedCompaction(t *testing.T, send agent.StreamFn, budget agent.Budget) agent.RunResult {
+	t.Helper()
+	s := queueStore(t)
+	model := types.Model{API: "priced-api", Provider: "priced", ID: "m", ContextWindow: 4000, MaxTokens: 1600}
+	a := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: model}, StreamFn: send, SessionID: s.ID(), Budget: budget})
+	r := newCompactionRunner(model, send)
+	r.configureJournal(s, nil, a)
+	a.PrepareNextTurnE = r.hookE(a.SetMessages)
+	AttachJournal(a, s)
+	a.SetMessages([]types.Message{cUser(strings.Repeat("u", 800_000)), cAssistant("ok"), cUser(strings.Repeat("r", 16_000)), cAssistant("ok")})
+	result, err := a.PromptText(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+// summaryUsage answers like pricedSummaries but gives each summary the usage
+// usage(n) for the n-th summary request.
+func summaryUsage(p *pricedSummaries, usage func(n int) types.Usage) agent.StreamFn {
+	return func(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
+		answer := p.Stream(ctx, model, c, opts)
+		if c.SystemPrompt != compaction.SummarizationSystemPrompt {
+			return answer
+		}
+		message, err := answer.Result(ctx)
+		if err != nil {
+			panic(err)
+		}
+		message.Usage = usage(p.count())
+		out := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+		out.Push(types.StreamEvent{Type: types.EvDone, Reason: message.StopReason, Message: message})
+		out.End()
+		return out
+	}
+}
+
+// Summary requests count against token caps like turns: each is admitted
+// against the tokens the earlier ones used, and one that reports no tokens
+// fails a token-capped run before another request is sent. Under a cost cap,
+// a summary of unknown price fails the run the same way.
+func TestCompactionRequestsAreHeldToTokenCapsAndMeasured(t *testing.T) {
+	t.Run("measured", func(t *testing.T) {
+		p := &pricedSummaries{}
+		result := runCappedCompaction(t, p.Stream, agent.Budget{MaxInputTokens: 2})
+		if result.StopReason != agent.StopMaxInputTokens || p.count() != 2 || result.Usage.Input != 2 {
+			t.Fatalf("%d summary requests, result %+v; want max_input_tokens after 2", p.count(), result)
+		}
+	})
+	t.Run("no usage under a token cap", func(t *testing.T) {
+		p := &pricedSummaries{}
+		result := runCappedCompaction(t, summaryUsage(p, func(int) types.Usage { return types.Usage{} }), agent.Budget{MaxInputTokens: 100})
+		if !errors.Is(result.Err, agent.ErrUnknownUsage) || p.count() != 1 {
+			t.Fatalf("%d summary requests, result %+v; want ErrUnknownUsage after 1", p.count(), result)
+		}
+	})
+	t.Run("unknown price under a cost cap", func(t *testing.T) {
+		p := &pricedSummaries{}
+		unpriced := func(int) types.Usage { return types.Usage{Input: 1, TotalTokens: 1, Cost: types.Cost{Unknown: true}} }
+		result := runCappedCompaction(t, summaryUsage(p, unpriced), agent.Budget{MaxCostUSD: 1})
+		if !errors.Is(result.Err, agent.ErrUnknownPrice) || p.count() != 1 {
+			t.Fatalf("%d summary requests, result %+v; want ErrUnknownPrice after 1", p.count(), result)
+		}
+	})
+}
+
+// failingSummaries fails the first summary attempt after it reported 100
+// prompt tokens, the way a dropped stream is billed, and answers the rest.
+type failingSummaries struct{ pricedSummaries }
+
+func (f *failingSummaries) Stream(ctx context.Context, model types.Model, c types.Context, opts *types.SimpleStreamOptions) *stream.AssistantStream {
+	answer := f.pricedSummaries.Stream(ctx, model, c, opts)
+	if c.SystemPrompt != compaction.SummarizationSystemPrompt || f.count() > 1 {
+		return answer
+	}
+	out := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+	out.Push(types.StreamEvent{Type: types.EvStart})
+	out.Push(types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, StopReason: types.StopError, ErrorCode: string(retry.CodeStreamInterrupted), ErrorMessage: "stream dropped", Usage: types.Usage{Input: 100, TotalTokens: 100}}})
+	out.End()
+	return out
+}
+
+// A summary request is retried only while the run is under its caps: when
+// the failed attempt's usage reached a cap, the run stops there and the
+// attempt's usage is journaled.
+func TestCompactionRetryIsReadmittedAfterAFailedAttempt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		cap      int
+		wantStop agent.StopReason
+		wantSent int
+	}{
+		{"cap reached", 100, agent.StopMaxInputTokens, 1},
+		{"under the cap", 102, agent.StopMaxInputTokens, 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := &failingSummaries{}
+			policy := retry.DefaultConfig()
+			policy.Sleeper = noRetryDelay{}
+			retrier, err := retry.New(retry.StreamFunc(f.Stream), policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := runCappedCompaction(t, retrier.Stream, agent.Budget{MaxInputTokens: test.cap})
+			if result.StopReason != test.wantStop || f.count() != test.wantSent {
+				t.Fatalf("%d summary attempts, result %+v; want %q after %d", f.count(), result, test.wantStop, test.wantSent)
+			}
+			if want := 100 + test.wantSent - 1; result.Usage.Input != want {
+				t.Fatalf("input = %d, want %d", result.Usage.Input, want)
+			}
+		})
 	}
 }
 

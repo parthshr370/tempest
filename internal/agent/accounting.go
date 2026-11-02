@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync"
 	"time"
 
@@ -12,14 +12,17 @@ import (
 type accountingKey struct{}
 type localRunKey struct{}
 
-// runAccounting follows the run context into child agents. Cost-capped calls
-// are serialized through admission so parallel children cannot each spend the
-// same remaining budget. A single admitted call may still overrun the soft cap.
+// runAccounting follows the run context into child agents. Cost- and
+// token-capped calls are serialized through admission so parallel children
+// cannot each spend the same remaining budget. A single admitted call may
+// still overrun the soft cap.
 type runAccounting struct {
-	mu         sync.Mutex
-	usage      types.Usage
-	err        error
-	maxCost    float64
+	mu    sync.Mutex
+	usage types.Usage
+	err   error
+	// limits are the root run's caps shared with its children: cost, tokens
+	// and tool calls. Turn and wall-time caps stay per run.
+	limits     Budget
 	admission  chan struct{}
 	emit       AgentEventSink
 	sources    map[string]types.Usage
@@ -36,8 +39,8 @@ func newLoopRun(ctx context.Context, config AgentLoopConfig, emit AgentEventSink
 	accounting, _ := ctx.Value(accountingKey{}).(*runAccounting)
 	root := accounting == nil
 	if root {
-		accounting = &runAccounting{maxCost: config.MaxCostUSD, emit: emit, sources: map[string]types.Usage{}}
-		if config.MaxCostUSD > 0 {
+		accounting = &runAccounting{limits: config.Budget, emit: emit, sources: map[string]types.Usage{}}
+		if config.MaxCostUSD > 0 || tokenCapped(config.Budget) {
 			accounting.admission = make(chan struct{}, 1)
 		}
 		ctx = context.WithValue(ctx, accountingKey{}, accounting)
@@ -108,24 +111,25 @@ func (a *runAccounting) fail(err error) error {
 	return err
 }
 
-func (a *runAccounting) costStop() (StopReason, error) {
+// withFailure joins the shared accounting's failure to err unless err
+// already carries it, as when the failing call returned it too.
+func withFailure(err, failure error) error {
+	if failure == nil || errors.Is(err, failure) {
+		return err
+	}
+	return errors.Join(err, failure)
+}
+
+// capStop names the shared cost or token cap the run's usage has reached.
+func (a *runAccounting) capStop() (StopReason, error) {
 	if err := a.failure(); err != nil {
 		return "", err
 	}
-	if a.maxCost == 0 {
-		return "", nil
-	}
-	usage := a.total()
-	if usage.Cost.Unknown {
-		return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", a.maxCost, ErrUnknownPrice)
-	}
-	if usage.Cost.Total >= a.maxCost {
-		return StopMaxCost, nil
-	}
-	return "", nil
+	return spendStop(a.limits, a.total())
 }
 
-// admit holds the cost gate until the caller has accounted for the response.
+// admit holds the cost and token gate until the caller has accounted for
+// the response.
 func (a *runAccounting) admit(ctx context.Context, model types.Model) (release func(), stop StopReason, err error) {
 	release = func() {}
 	if ctx.Err() != nil {
@@ -140,16 +144,23 @@ func (a *runAccounting) admit(ctx context.Context, model types.Model) (release f
 	case <-ctx.Done():
 		return release, StopAborted, nil
 	}
-	if stop, err = a.costStop(); stop != "" || err != nil {
+	if stop, err = a.capStop(); stop != "" || err != nil {
 		return release, stop, err
 	}
-	return release, "", a.fail((Budget{MaxCostUSD: a.maxCost}).Validate(model))
+	return release, "", a.fail((Budget{MaxCostUSD: a.limits.MaxCostUSD}).Validate(model))
 }
 
 func (run *loopRun) accountUsage(ctx context.Context, message types.AssistantMessage) error {
-	run.result.Usage.Add(message.Usage)
+	if err := run.chargeUsage(ctx, message); err != nil {
+		return err
+	}
+	return run.checkMeasured(message)
+}
+
+func (run *loopRun) chargeUsage(ctx context.Context, message types.AssistantMessage) error {
 	source := run.config.bindings.lastReceipt()
 	if !run.root {
+		run.addUsage(message.Usage)
 		return run.accounting.record(ctx, source, message.Model, message.Usage, run.config.SessionID)
 	}
 	a := run.accounting
@@ -163,4 +174,18 @@ func (run *loopRun) accountUsage(ctx context.Context, message types.AssistantMes
 	}
 	a.usage.Add(message.Usage)
 	return nil
+}
+
+// addUsage charges usage to a child run's own spend.
+func (run *loopRun) addUsage(usage types.Usage) {
+	run.accounting.mu.Lock()
+	defer run.accounting.mu.Unlock()
+	run.usage.Add(usage)
+}
+
+// ownUsage returns a child run's own spend.
+func (run *loopRun) ownUsage() types.Usage {
+	run.accounting.mu.Lock()
+	defer run.accounting.mu.Unlock()
+	return run.usage
 }

@@ -155,7 +155,7 @@ Every run ends with one of these:
 | Stop reason | Meaning | Exit code |
 |---|---|---|
 | `completed` | The model replied without calling a tool. | 0 |
-| `max_turns`, `max_cost`, `max_wall_time` | A budget tripped. | 0 |
+| `max_turns`, `max_cost`, `max_wall_time`, `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_tool_calls` | A budget tripped. | 0 |
 | `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
 | `error` | The provider failed, or the session journal could not be written. | 1 |
 | `repeated_failure` | The model sent the same tool call, with the same arguments, until it had failed with the same error five times in a row. | 1 |
@@ -175,6 +175,42 @@ summary, so a summary written in many requests stops at the cap too (see
 | `-max-turns N` | Model calls. Finishing naturally on call N still reports `completed`; the cap stops a run only when another turn or outstanding work remains. |
 | `-max-cost USD` | The summed cost of the run's model calls. When the price of a model the run can bill (its model, the plan and smol role models, the MCP sampling model, or a backup of any) is unknown and its route does not report billed cost, the run is refused at startup: an unknown price is not a zero price. On a billed-cost route, a call that comes back without a cost stops the run with that error. |
 | `-max-wall-time D` | Elapsed time, as a Go duration such as `10m`. |
+| `-max-input-tokens N` | Prompt tokens sent by the run's model calls: uncached input plus cache reads and cache writes. |
+| `-max-output-tokens N` | Output tokens of the run's model calls, reasoning included. Per run; `-max-tokens` caps one response. |
+| `-max-total-tokens N` | Prompt plus output tokens as counted above. |
+| `-max-tool-calls N` | Tool calls the run runs. See below for how a response's calls are admitted. |
+
+The cost and token caps count every model call the run pays for: its turns,
+retried and backup attempts, compaction summaries, MCP sampling, and the calls of
+subagents started with `task`. Before each request the run stops if a cap is
+already reached, and so before each retry and each switch to a backup, counting
+what the failed attempts reported; after it, the response's exact usage is added.
+So these caps are soft by one request: the last request admitted can go past the
+cap by its own size, and the run then stops at the next boundary. Under a token
+cap, a completed model response that reports no token usage (a turn, a compaction
+summary, MCP sampling, or a subagent's response under the run's cap) ends the run
+with an error, as an unknown price does under `-max-cost`; the run stops even when
+the `task` that ran the subagent reports its failure as an ordinary result.
+
+Changing the budget with `tempest/set_budget` or `Session.SetBudget` applies to
+runs started after the call. A run already in progress keeps the budget it started
+with; to stop it now, cancel it.
+
+The tool-call cap is checked before a response's tool calls run, for all of them
+at once. When the calls fit in what is left, they all run and count, including
+ones that then fail or are denied. When they do not all fit, none of them runs:
+each gets an error result saying the limit stopped it, so every call is answered
+and the transcript stays valid, and the run ends with `max_tool_calls`. Reaching
+the cap exactly does not stop the run, so the model can still answer without
+tools. A subagent's calls count against the run that started it, and a
+subagent whose calls do not fit stops the same way.
+
+Each response's tokens are journaled with it, and an admitted response's tool
+calls are journaled as a usage receipt before they run. A run resumed after a
+crash continues the same logical run and counts what was already spent once, as
+it does for cost. The JSON report's `usage` carries
+`toolCalls`. The caps also come from settings and `HARNESS_MAX_*` variables, where
+a repository may only lower them; see [Configuration](configuration.md#project-settings-and-trust).
 
 At the turn cap, the run checks for pending foreground tasks and job deliveries
 without resuming more task phases. An empty task graph doesn't turn a clean final
@@ -338,7 +374,9 @@ naming the attempt count and the last cause, unless the role has
 [backup models](providers.md#backup-models): then the next backup gets the same
 request, and the run stays on it until it ends. The switch is journaled as
 `model_fallback` before the backup is called, so a crash at any later point resumes
-on the backup, and a switch the journal cannot record stops the run instead.
+on the backup, and a switch the journal cannot record stops the run instead. A
+retry or backup is not sent once the run's spend has reached a cost or token cap;
+the run stops at that cap instead.
 
 ## Output formats
 

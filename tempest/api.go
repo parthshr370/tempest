@@ -442,7 +442,9 @@ func (s *Session) History(epoch, offset, limit int) ([]Update, error) {
 // Answer resolves a pending approval; the first answer wins.
 func (s *Session) Answer(id string, c Choice) error { return s.answer(id, c) }
 
-// SetBudget validates and installs the budget for future run boundaries.
+// SetBudget validates and installs the budget for runs started after the
+// call. A run in progress keeps the budget it started with; cancel it to
+// stop it now.
 func (s *Session) SetBudget(b Budget) error { return s.setBudget(b) }
 
 // SetPermissionMode changes the mode used by subsequent permission checks.

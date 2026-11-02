@@ -147,8 +147,10 @@ func promptCompletion(result tempest.RunResult, err error) (any, *rpc.Error) {
 	switch result.StopReason {
 	case "aborted":
 		reason = "cancelled"
-	case "max_turns", "max_cost", "max_wall_time":
+	case "max_turns", "max_cost", "max_wall_time", "max_tool_calls":
 		reason = "max_turn_requests"
+	case "max_input_tokens", "max_output_tokens", "max_total_tokens":
+		reason = "max_tokens"
 	}
 	var cost any
 	if !result.Usage.Cost.Unknown {

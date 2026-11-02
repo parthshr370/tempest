@@ -82,19 +82,25 @@ type BoolInput struct {
 
 // FlagValues is the typed collection of configuration-bearing command flags.
 type FlagValues struct {
-	Model                 StringInput
-	PlanModel             StringInput
-	SmolModel             StringInput
-	FallbackModels        StringsInput
-	Reasoning             StringInput
-	PlanReasoning         StringInput
-	SmolReasoning         StringInput
-	MaxTokens             IntInput
-	PermissionMode        StringInput
-	BashTimeout           StringInput
-	LogLevel              StringInput
-	LogFile               StringInput
-	LogFileMaxBytes       IntInput
+	Model           StringInput
+	PlanModel       StringInput
+	SmolModel       StringInput
+	FallbackModels  StringsInput
+	Reasoning       StringInput
+	PlanReasoning   StringInput
+	SmolReasoning   StringInput
+	MaxTokens       IntInput
+	PermissionMode  StringInput
+	BashTimeout     StringInput
+	LogLevel        StringInput
+	LogFile         StringInput
+	LogFileMaxBytes IntInput
+	// MaxInputTokens, MaxOutputTokens, MaxTotalTokens and MaxToolCalls are
+	// the cumulative per-run caps; see [ResolvedConfig.RunLimits].
+	MaxInputTokens        IntInput
+	MaxOutputTokens       IntInput
+	MaxTotalTokens        IntInput
+	MaxToolCalls          IntInput
 	EnableTask            BoolInput
 	Plan                  BoolInput
 	Attach                StringsInput
@@ -214,6 +220,7 @@ type ResolvedConfig struct {
 	smolReasoning          string
 	maxTokens              int
 	maxTokensConfigured    bool
+	runLimits              agent.Budget
 	permissionModeDefault  string
 	bashTimeout            time.Duration
 	logLevel               string
@@ -303,6 +310,10 @@ func (c *ResolvedConfig) MaxTokens() int { return c.maxTokens }
 
 // MaxTokensConfigured reports whether the user set an output-token cap.
 func (c *ResolvedConfig) MaxTokensConfigured() bool { return c.maxTokensConfigured }
+
+// RunLimits returns the cumulative per-run token and tool-call caps (only
+// those four [agent.Budget] fields are set). Zero is unlimited.
+func (c *ResolvedConfig) RunLimits() agent.Budget { return c.runLimits }
 
 // PermissionModeDefault returns the configured default tool permission mode.
 func (c *ResolvedConfig) PermissionModeDefault() string { return c.permissionModeDefault }
@@ -461,6 +472,10 @@ type fileSettings struct {
 	LogLevel                *string                           `json:"log_level"`
 	LogFile                 *string                           `json:"log_file"`
 	LogFileMaxBytes         *int64                            `json:"log_file_max_bytes"`
+	MaxInputTokens          *int                              `json:"max_input_tokens"`
+	MaxOutputTokens         *int                              `json:"max_output_tokens"`
+	MaxTotalTokens          *int                              `json:"max_total_tokens"`
+	MaxToolCalls            *int                              `json:"max_tool_calls"`
 	EnableWeb               *bool                             `json:"enable_web"`
 	WebSearchURL            *string                           `json:"web_search_url"`
 	AgentDir                *string                           `json:"agent_dir"`
@@ -635,6 +650,20 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	if logFileMax <= 0 {
 		return nil, &Error{Field: "log_file_max_bytes", Err: errors.New("must be positive")}
 	}
+	runLimits := agent.Budget{
+		MaxInputTokens:  settingValue(settings.MaxInputTokens),
+		MaxOutputTokens: settingValue(settings.MaxOutputTokens),
+		MaxTotalTokens:  settingValue(settings.MaxTotalTokens),
+		MaxToolCalls:    settingValue(settings.MaxToolCalls),
+	}
+	for _, limit := range []struct {
+		field string
+		value int
+	}{{"max_input_tokens", runLimits.MaxInputTokens}, {"max_output_tokens", runLimits.MaxOutputTokens}, {"max_total_tokens", runLimits.MaxTotalTokens}, {"max_tool_calls", runLimits.MaxToolCalls}} {
+		if limit.value < 0 {
+			return nil, &Error{Field: limit.field, Err: errors.New("must not be negative")}
+		}
+	}
 	hookSettings, err := layered.hooks()
 	if err != nil {
 		return nil, err
@@ -711,6 +740,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		logLevel:               settingString(settings.LogLevel),
 		logFile:                settingString(settings.LogFile),
 		logFileMaxBytes:        logFileMax,
+		runLimits:              runLimits,
 		enableWeb:              settingValue(settings.EnableWeb),
 		enableTask:             settingValue(settings.EnableTask),
 		plan:                   settingValue(settings.Plan),

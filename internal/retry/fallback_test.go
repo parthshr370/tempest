@@ -220,7 +220,7 @@ func TestFallbackCallsTheBackupOnlyAfterAdmission(t *testing.T) {
 			}
 			return nil
 		}, true, ""},
-		{"refused", func(context.Context, context.CancelFunc, *chainProvider) error { return errRefused }, false, CodeProviderFailure},
+		{"refused", func(context.Context, context.CancelFunc, *chainProvider) error { return errRefused }, false, CodeNotAdmitted},
 		{"cancelled while admitting", func(ctx context.Context, cancel context.CancelFunc, _ *chainProvider) error {
 			cancel()
 			<-ctx.Done()

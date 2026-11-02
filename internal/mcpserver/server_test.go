@@ -362,6 +362,29 @@ func TestRunInputBudgetValidation(t *testing.T) {
 	}
 }
 
+// A caller may set a token or tool-call cap under an unlimited host and
+// lower a host cap, but not raise it or lift it with 0.
+func TestRunInputRunLimitsOnlyTighten(t *testing.T) {
+	host := tempest.NewSession{Budget: tempest.Budget{MaxInputTokens: 1000, MaxToolCalls: 10}}
+	for _, raw := range []string{`{"maxInputTokens":1001}`, `{"maxInputTokens":0}`, `{"maxToolCalls":11}`, `{"maxToolCalls":0}`, `{"maxOutputTokens":-1}`} {
+		var in RunInput
+		if err := json.Unmarshal([]byte(`{"prompt":"go","budget":`+raw+`}`), &in); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := in.settings(host, nil); err == nil {
+			t.Fatalf("relaxed host cap: %s", raw)
+		}
+	}
+	var in RunInput
+	if err := json.Unmarshal([]byte(`{"prompt":"go","budget":{"maxInputTokens":1000,"maxOutputTokens":50,"maxTotalTokens":900,"maxToolCalls":3}}`), &in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := in.settings(host, nil)
+	if want := (tempest.Budget{MaxInputTokens: 1000, MaxOutputTokens: 50, MaxTotalTokens: 900, MaxToolCalls: 3}); err != nil || got.Budget != want {
+		t.Fatalf("tighten = %+v err = %v, want %+v", got.Budget, err, want)
+	}
+}
+
 func TestRunInputAcceptsHostRegisteredProvider(t *testing.T) {
 	providers := map[string]tempest.ProviderDefinition{"gateway": {Protocol: "openai-chat", BaseURL: "https://gateway.example/v1"}}
 	settings, err := (RunInput{Prompt: "hi", Model: "gateway:model"}).settings(tempest.NewSession{}, providers)

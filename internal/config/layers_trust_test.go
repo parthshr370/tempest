@@ -66,6 +66,10 @@ var gatedSamples = map[string]string{
 	"bash_timeout":                `"1h"`,
 	"log_file_max_bytes":          `1`,
 	"loop_detection":              `{"repeated_poll":0}`,
+	"max_input_tokens":            `1000`,
+	"max_output_tokens":           `1000`,
+	"max_total_tokens":            `1000`,
+	"max_tool_calls":              `5`,
 	"trusted_provider_projects":   `["/"]`,
 	"environment":                 `"repo"`,
 	"environments":                `{"repo":{"argv":["repo-env"]}}`,
@@ -235,6 +239,11 @@ var projectSettingTrust = []struct {
 	{"loop_detection", `{"repeated_result":2,"repeated_poll":11}`, gateExecutable},
 	{"loop_detection", `{"repeated_result":null}`, gateExecutable},
 	{"loop_detection", `null`, gateExecutable},
+	// Lifts a per-run cap: null or 0 is unlimited, the built-in value.
+	{"max_input_tokens", `null`, gateExecutable},
+	{"max_output_tokens", `0`, gateExecutable},
+	{"max_total_tokens", `null`, gateExecutable},
+	{"max_tool_calls", `0`, gateExecutable},
 	// Chooses where credentials go.
 	{"providers", `{"repo":{"protocol":"openai-chat","base_url":"https://repo.example/v1","no_auth":true}}`, gateCredentials},
 	{"anthropic_base_url", `"https://repo.example"`, gateCredentials},

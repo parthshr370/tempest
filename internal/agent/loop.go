@@ -10,15 +10,16 @@
 // The run completes ([StopCompleted]) when the model replies with no tool
 // calls and no steering or follow-up message is queued. It also ends on
 // Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
-// turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime]), or a
-// failure ([StopError]). A run with an output schema whose final answer still
-// fails it after one correction turn ends with [StopOutputInvalid]. A run
-// whose model sends one tool call unchanged until it has failed the same way
-// [RepeatedFailureLimit] times in a row ends with [StopRepeatedFailure] after
-// that turn (see repeat.go), and one whose model repeats a loop it was
-// already told about ends with [StopLoopDetected] (see loopguard.go). A run
-// that starts emits agent_start first and exactly one agent_end last;
-// agent_end carries the [RunResult].
+// turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime] and the
+// token caps), a response whose tool calls would pass the tool-call cap
+// ([StopMaxToolCalls]), or a failure ([StopError]). A run with an output
+// schema whose final answer still fails it after one correction turn ends
+// with [StopOutputInvalid]. A run whose model sends one tool call unchanged
+// until it has failed the same way [RepeatedFailureLimit] times in a row ends
+// with [StopRepeatedFailure] after that turn (see repeat.go), and one whose
+// model repeats a loop it was already told about ends with [StopLoopDetected]
+// (see loopguard.go). A run that starts emits agent_start first and exactly
+// one agent_end last; agent_end carries the [RunResult].
 //
 // # Goroutine ownership
 //
@@ -182,9 +183,13 @@ type loopRun struct {
 	streamFn StreamFn
 	started  time.Time
 	// messages are the messages this run added to the transcript.
-	messages     []types.Message
-	result       RunResult
-	accounting   *runAccounting
+	messages   []types.Message
+	result     RunResult
+	accounting *runAccounting
+	// usage is a child run's own spend, guarded by accounting.mu: provider
+	// work joined to the run reads it from other goroutines (see
+	// runAccounting.attemptStop). The root's spend is the accounting's.
+	usage        types.Usage
 	root         bool
 	initialTurns int
 	enforceFirst bool
@@ -226,7 +231,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 			run.reminders = newReminderRun(run.config.Reminders, state.Reminders)
 		}
 		if !run.root {
-			run.result.Usage = state.Usage
+			run.addUsage(state.Usage)
 		}
 		run.enforceFirst = !state.StartedAt.IsZero() || state.Turns > 0 || state.Usage != (types.Usage{}) || run.config.Work != nil
 		if run.root {
@@ -268,7 +273,7 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 		// Joined outside work must account before the run's total is final.
 		run.accounting.settle()
 	}
-	err = errors.Join(err, run.accounting.failure())
+	err = withFailure(err, run.accounting.failure())
 	var budgetStop *providerBudgetStop
 	switch {
 	case err == nil:
@@ -302,11 +307,13 @@ func (run *loopRun) execute(ctx context.Context, prompts []types.Message, body f
 	}
 	if failure := run.accounting.failure(); failure != nil {
 		run.result.StopReason = StopError
-		run.result.Err = errors.Join(run.result.Err, failure)
+		run.result.Err = withFailure(run.result.Err, failure)
 	}
 	run.result.ElapsedMS = time.Since(run.started).Milliseconds()
 	if run.root {
 		run.result.Usage = run.accounting.total()
+	} else {
+		run.result.Usage = run.ownUsage()
 	}
 	// agent_end must reach listeners after an abort too, so it is delivered
 	// under a context that is not canceled.
@@ -417,17 +424,14 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 	if budget.MaxTurns > 0 && run.initialTurns+run.result.Turns >= budget.MaxTurns {
 		return StopMaxTurns, nil
 	}
-	if stop, err := run.accounting.costStop(); stop != "" || err != nil {
+	if stop, err := run.accounting.capStop(); stop != "" || err != nil {
 		return stop, err
 	}
-	if budget.MaxCostUSD > 0 {
-		// PrepareNextTurn can switch to a model whose price is unknown; the
-		// budget can no longer be enforced, which is a failure, not free.
-		if run.result.Usage.Cost.Unknown {
-			return "", fmt.Errorf("cost budget $%g cannot be enforced: %w", budget.MaxCostUSD, ErrUnknownPrice)
-		}
-		if run.result.Usage.Cost.Total >= budget.MaxCostUSD {
-			return StopMaxCost, nil
+	// A child's own caps. The root's are the shared ones above, which also
+	// fail a model whose price is unknown, as PrepareNextTurn may switch to.
+	if !run.root {
+		if stop, err := spendStop(budget, run.ownUsage()); stop != "" || err != nil {
+			return stop, err
 		}
 	}
 	if budget.MaxWallTime > 0 && time.Since(run.started) >= budget.MaxWallTime {
@@ -575,8 +579,20 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 					run.fallbackIndex = fallback.Index
 					return run.emit(ctx, AgentEvent{Type: EventModelFallback, Fallback: &fallback})
 				}
+				// The request is sent again, as a retry or to a backup, only
+				// while the spend, the discarded attempts' included, leaves
+				// the run under its cost and token caps. Without such caps
+				// nothing is asked.
+				var admit func() error
+				if run.accounting.capsAttempts(run) {
+					admit = func() error { return run.accounting.attemptStop(run, types.Usage{}) }
+				}
 				request := newModelRequest(*config, run.config.bindings.snapshot().RunID, run.fallbackIndex)
-				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, switched: switched, request: request}, tail)
+				message, err := streamAssistantResponse(ctx, &current, *config, run.emit, run.streamFn, responseObservers{discarded: discarded, admit: admit, switched: switched, request: request}, tail)
+				if stop := (*providerBudgetStop)(nil); errors.As(err, &stop) {
+					// The refused attempt was accounted as discarded.
+					return message, err
+				}
 				return message, errors.Join(err, run.accountUsage(ctx, message))
 			}()
 			if err != nil {
@@ -625,6 +641,27 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			var handoff *string
 			if hasToolCalls(message) {
 				run.stopHookContinuations = 0
+				refusal, err := run.admitToolCalls(ctx, message)
+				if err != nil {
+					return err
+				}
+				if refusal != "" {
+					// The batch would pass the tool-call cap: none of it runs,
+					// every call is answered, and the turn ends the run.
+					toolResults, err = refuseToolCalls(ctx, message, refusal, *config, run.emit)
+					if err != nil {
+						return err
+					}
+					for _, result := range toolResults {
+						current.Messages = append(current.Messages, result)
+						run.messages = append(run.messages, result)
+					}
+					if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
+						return err
+					}
+					run.result.StopReason = StopMaxToolCalls
+					return nil
+				}
 				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
 				if err != nil {
 					return err
@@ -889,12 +926,17 @@ func snapshotAssistant(m types.AssistantMessage) types.AssistantMessage {
 // streamed so far ends as an errored message: listeners get its message_end,
 // it stays in the transcript (conversion to the provider request skips
 // errored assistant messages, so the re-sent request is unchanged), and
-// discarded accounts for it. The next attempt starts a new message. Tool calls
-// in a discarded attempt never run: they run only after the final message.
+// discarded accounts for it. An attempt that reported usage without
+// streaming a start gets its message_start then, so it is accounted too.
+// The next attempt starts a new message. Tool calls in a discarded attempt
+// never run: they run only after the final message.
 // A switch to a backup model ([types.EvFallback]) discards the attempt the
 // same way and reports the switch; the backup is called only after that
 // report returned (it journals the switch), through the stream's
 // AdmitFallback, so the switch is durable before the backup can spend.
+// When admit is set, neither a retry (through AdmitRetry) nor a backup is
+// sent when admit, asked once the failed attempt is accounted, refuses: the
+// request then ends with admit's error.
 //
 // Every attempt is reported to the model-request hooks without waiting: the
 // first when the request starts, each later one at its [types.EvAttempt],
@@ -944,17 +986,10 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 	if config.GetAPIKey != nil {
 		options.APIKeyFor = config.GetAPIKey
 	}
-	// admitted carries the outcome of reporting each switch to the fallback
-	// chain, which waits for it before calling the backup.
-	admitted := make(chan error, 1)
-	options.AdmitFallback = func(admitCtx context.Context, _ types.ModelFallback) error {
-		select {
-		case err := <-admitted:
-			return err
-		case <-admitCtx.Done():
-			return admitCtx.Err()
-		}
-	}
+	// The fallback layer waits for each switch to be reported, and with
+	// admit, both layers wait for each failed attempt to be admitted, before
+	// they send the request again.
+	gate := gateAttempts(&options, observers.admit != nil)
 	// The request's span is a sibling of the run's tool spans; providers send
 	// it as the traceparent of their HTTP requests.
 	requestCtx := tracecontext.StartChild(ctx)
@@ -1035,6 +1070,16 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			}
 			// An attempt that failed before streaming (an HTTP error) opened
 			// no message and reported no usage; the retry event is its record.
+			// One that reported usage without a message_start (some
+			// providers skip it) is opened now, as a final message would be,
+			// so it is recorded and charged like any discarded attempt.
+			if !addedPartial && attempt.Usage != (types.Usage{}) {
+				cctx.Messages = append(cctx.Messages, attempt)
+				addedPartial = true
+				if err := emit(ctx, MessageStart(attempt)); err != nil {
+					return attempt, err
+				}
+			}
 			if addedPartial {
 				addedPartial = false
 				cctx.Messages[len(cctx.Messages)-1] = attempt
@@ -1045,8 +1090,16 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 					return attempt, err
 				}
 			}
+			if observers.admit != nil {
+				if err := observers.admit(); err != nil {
+					request.end(requestFailed, &attempt)
+					gate.answer(event, err)
+					return attempt, err
+				}
+			}
 			if event.Type == types.EvRetry || event.Fallback == nil {
 				request.end(requestFailed, &attempt)
+				gate.answer(event, nil)
 				continue
 			}
 			fallback := *event.Fallback
@@ -1054,7 +1107,7 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 			request.switchModel(fallback, &attempt)
 			config.Model = fallback.To
 			err := observers.switched(fallback)
-			admitted <- err
+			gate.answer(event, err)
 			if err != nil {
 				return attempt, err
 			}
@@ -1116,11 +1169,13 @@ func streamAssistantResponse(ctx context.Context, cctx *AgentContext, config Age
 }
 
 // responseObservers receive what happens to one logical model request:
-// discarded accounts an attempt that is sent again, switched applies a
-// switch to a backup model, and request reports each attempt to the
-// model-request hooks.
+// discarded accounts an attempt that is sent again, admit (nil when no cap
+// can refuse one) decides whether it may be, switched applies a switch to a
+// backup model, and request reports each attempt to the model-request
+// hooks.
 type responseObservers struct {
 	discarded func(types.AssistantMessage) error
+	admit     func() error
 	switched  func(types.ModelFallback) error
 	request   *modelRequest
 }

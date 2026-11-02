@@ -146,6 +146,36 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Loop: loop, Handoff: toolBatchHandoff(finalizedCalls)}, nil
 }
 
+// refuseToolCalls answers every tool call of assistantMessage with the same
+// error result without preparing or running any of them: no hook, permission
+// prompt or execution happens. Each call gets the start, end and result
+// message events an unknown tool's call gets, under its own invocation, so
+// listeners and the journal see every call answered.
+func refuseToolCalls(ctx context.Context, assistantMessage types.AssistantMessage, reason string, config AgentLoopConfig, emit AgentEventSink) ([]types.ToolResultMessage, error) {
+	var messages []types.ToolResultMessage
+	index := 0
+	for _, call := range assistantMessage.Content {
+		if call.Type != types.BlockToolCall {
+			continue
+		}
+		ctx := toolCallContext(ctx, config, index)
+		index++
+		if err := emit(ctx, ToolExecutionStart(call.ID, call.Name, call.Arguments)); err != nil {
+			return nil, err
+		}
+		finalized := finalizedOutcome{toolCall: call, result: createErrorToolResult(reason), isError: true}
+		if err := emitToolExecutionEnd(ctx, finalized, emit); err != nil {
+			return nil, err
+		}
+		message := createToolResultMessage(finalized)
+		if err := emitToolResultMessage(ctx, message, emit); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
+}
+
 // executeToolCallsParallel runs tool calls concurrently. Results are written
 // into slots[i] (source-order indexing) so the emitted ToolResultMessages keep
 // source order even though end-events fire in completion order.

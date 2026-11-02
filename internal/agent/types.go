@@ -238,6 +238,12 @@ type AgentLoopConfig struct {
 // at turn boundaries (after a turn's tools finish, before the next model
 // call), so a single long turn can overrun MaxWallTime; Abort or a context
 // deadline is the hard stop.
+//
+// Cost and token caps are checked before each model request against the
+// exact usage already reported, so the last admitted request can overrun its
+// cap by its own size. They count delegated child runs and compaction
+// requests. The tool-call cap is checked before a response's tool calls run
+// and never overrun; see [StopMaxToolCalls].
 type Budget struct {
 	// MaxTurns caps model calls in the run.
 	MaxTurns int
@@ -245,12 +251,26 @@ type Budget struct {
 	MaxCostUSD float64
 	// MaxWallTime caps elapsed time since the run started.
 	MaxWallTime time.Duration
+	// MaxInputTokens caps the prompt tokens of the run's model calls:
+	// uncached input plus cache reads and cache writes.
+	MaxInputTokens int
+	// MaxOutputTokens caps the output tokens of the run's model calls,
+	// reasoning included.
+	MaxOutputTokens int
+	// MaxTotalTokens caps input plus output tokens as counted above.
+	MaxTotalTokens int
+	// MaxToolCalls caps the tool calls the run admits for execution.
+	MaxToolCalls int
 }
 
 // ErrUnknownPrice is returned when a cost budget is set for a model whose
 // price is unknown and whose route does not report billed cost: the budget
 // could never trip, so the run must not start.
 var ErrUnknownPrice = errors.New("model price is unknown")
+
+// ErrUnknownUsage ends a run with a token budget when a completed model
+// response reports no tokens: an unmeasured call is not a free one.
+var ErrUnknownUsage = errors.New("model response reported no token usage")
 
 // Validate rejects negative or non-finite limits and a cost budget that cannot
 // be enforced for model. A route that reports billed cost is enforceable
@@ -261,6 +281,9 @@ func (b Budget) Validate(model types.Model) error {
 	}
 	if b.MaxTurns < 0 || b.MaxCostUSD < 0 || b.MaxWallTime < 0 {
 		return fmt.Errorf("budget limits must not be negative (max turns %d, max cost %g, max wall time %s)", b.MaxTurns, b.MaxCostUSD, b.MaxWallTime)
+	}
+	if b.MaxInputTokens < 0 || b.MaxOutputTokens < 0 || b.MaxTotalTokens < 0 || b.MaxToolCalls < 0 {
+		return fmt.Errorf("budget limits must not be negative (max input tokens %d, max output tokens %d, max total tokens %d, max tool calls %d)", b.MaxInputTokens, b.MaxOutputTokens, b.MaxTotalTokens, b.MaxToolCalls)
 	}
 	if b.MaxCostUSD > 0 && model.Cost.Unknown && !model.ReportsBilledCost() {
 		return fmt.Errorf("cost budget $%g cannot be enforced for %s/%s: %w", b.MaxCostUSD, model.Provider, model.ID, ErrUnknownPrice)
@@ -277,10 +300,18 @@ const (
 	StopCompleted StopReason = "completed"
 	// StopAborted: Abort was called or the caller's context was canceled.
 	StopAborted StopReason = "aborted"
-	// StopMaxTurns, StopMaxCost, StopMaxWallTime: a [Budget] limit tripped.
-	StopMaxTurns    StopReason = "max_turns"
-	StopMaxCost     StopReason = "max_cost"
-	StopMaxWallTime StopReason = "max_wall_time"
+	// StopMaxTurns, StopMaxCost, StopMaxWallTime, StopMaxInputTokens,
+	// StopMaxOutputTokens, StopMaxTotalTokens: a [Budget] limit tripped.
+	StopMaxTurns        StopReason = "max_turns"
+	StopMaxCost         StopReason = "max_cost"
+	StopMaxWallTime     StopReason = "max_wall_time"
+	StopMaxInputTokens  StopReason = "max_input_tokens"
+	StopMaxOutputTokens StopReason = "max_output_tokens"
+	StopMaxTotalTokens  StopReason = "max_total_tokens"
+	// StopMaxToolCalls: a response asked for more tool calls than
+	// [Budget.MaxToolCalls] had left. None of them ran; each got an error
+	// result, so the transcript stays valid for Continue.
+	StopMaxToolCalls StopReason = "max_tool_calls"
 	// StopError: the provider failed, a listener failed, or the loop
 	// panicked. [RunResult.Err] carries the cause.
 	StopError StopReason = "error"
@@ -333,7 +364,8 @@ const (
 	EventToolPermission      AgentEventType = "tool_permission"
 	EventToolExecutionUpdate AgentEventType = "tool_execution_update"
 	EventToolExecutionEnd    AgentEventType = "tool_execution_end"
-	// EventUsage reports a delegated model call without adding its transcript.
+	// EventUsage reports a usage receipt without adding its transcript: a
+	// delegated or compaction model call, or a response's admitted tool calls.
 	EventUsage AgentEventType = "usage"
 	EventWork  AgentEventType = "work"
 	EventHook  AgentEventType = "hook"

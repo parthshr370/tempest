@@ -101,7 +101,7 @@ See [providers](guide/providers.md) for model routes and credentials.
 - **Backup models per role**: when a model is unavailable after its retries, the next one answers, sticks for the run, and is journaled, so a crash resumes on it.
 - **Billed cost first**, catalog prices as fallback, and unknown prices kept unknown.
 - **Catalog-aware limits**, shared across vendor protocols, with context-aware output clamping and configured overrides for unlisted models.
-- **Run budgets** for model calls, USD cost, and elapsed time.
+- **Run budgets** for model calls, USD cost, elapsed time, input/output/total tokens, and tool calls, with whole tool-call batches admitted or refused.
 - **Prompt caching** and typed transient-error retries where the route supports them.
 
 [Provider reference](guide/providers.md) · [Run behavior](guide/sessions-and-durability.md#runs)

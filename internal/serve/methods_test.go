@@ -195,6 +195,43 @@ func TestRunErrorAndBudgetStopReasons(t *testing.T) {
 	}
 }
 
+// A token cap ends an ACP prompt with max_tokens and the tool-call cap with
+// max_turn_requests, like max_cost; _meta keeps the exact reason.
+func TestTokenAndToolCallBudgetStopReasons(t *testing.T) {
+	for _, test := range []struct {
+		budget     map[string]any
+		acp, exact string
+	}{
+		{map[string]any{"maxOutputTokens": 1}, "max_tokens", "max_output_tokens"},
+		{map[string]any{"maxToolCalls": 1}, "max_turn_requests", "max_tool_calls"},
+	} {
+		t.Run(test.exact, func(t *testing.T) {
+			f := faux.New(faux.Options{})
+			f.SetResponses(faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"a"}`), "read-a"), faux.ToolCall("read", json.RawMessage(`{"path":"b"}`), "read-b")))
+			s := newServer(t, f, nil, permission.ModeBypass, nil)
+			c := connect(t, s)
+			var created struct {
+				SessionID string `json:"sessionId"`
+			}
+			call(t, c, "session/new", map[string]any{"cwd": t.TempDir(), "_meta": map[string]any{"tempest": map[string]any{"budget": test.budget}}}, &created)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var reply struct {
+				StopReason string `json:"stopReason"`
+				Meta       struct {
+					Tempest struct {
+						StopReason string `json:"stopReason"`
+					} `json:"tempest"`
+				} `json:"_meta"`
+			}
+			err := c.conn.Call(ctx, "session/prompt", map[string]any{"sessionId": created.SessionID, "prompt": []any{map[string]string{"type": "text", "text": "go"}}}, &reply)
+			if err != nil || reply.StopReason != test.acp || reply.Meta.Tempest.StopReason != test.exact || f.CallCount() != 1 {
+				t.Fatalf("result = %+v err = %v calls = %d", reply, err, f.CallCount())
+			}
+		})
+	}
+}
+
 // TestRepeatedFailureIsARunError: a prompt whose model repeats one failing
 // call fails with repeated_failure, like an output that never validates.
 func TestRepeatedFailureIsARunError(t *testing.T) {
