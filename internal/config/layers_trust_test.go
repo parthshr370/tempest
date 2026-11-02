@@ -65,7 +65,7 @@ var gatedSamples = map[string]string{
 	"retry_max_delay_ms":          `0`,
 	"bash_timeout":                `"1h"`,
 	"log_file_max_bytes":          `1`,
-	"loop_detection":              `{"repeated_call":0}`,
+	"loop_detection":              `{"repeated_poll":0}`,
 	"trusted_provider_projects":   `["/"]`,
 	"environment":                 `"repo"`,
 	"environments":                `{"repo":{"argv":["repo-env"]}}`,
@@ -230,9 +230,9 @@ var projectSettingTrust = []struct {
 	{"log_file_max_bytes", `104857601`, gateExecutable},
 	// Loosens the loop guard: turns a detector off, raises a threshold
 	// above the operator's (here the default), or resets it with null.
-	{"loop_detection", `{"repeated_call":0}`, gateExecutable},
+	{"loop_detection", `{"repeated_poll":0}`, gateExecutable},
 	{"loop_detection", `{"repeated_text":4}`, gateExecutable},
-	{"loop_detection", `{"repeated_result":2,"alternating_calls":4}`, gateExecutable},
+	{"loop_detection", `{"repeated_result":2,"repeated_poll":11}`, gateExecutable},
 	{"loop_detection", `{"repeated_result":null}`, gateExecutable},
 	{"loop_detection", `null`, gateExecutable},
 	// Chooses where credentials go.
@@ -313,7 +313,7 @@ var projectSettingTrust = []struct {
 	{"workspace_listing_max_bytes", `1`, gateNone},
 	{"workspace_listing_max_bytes", `4096`, gateNone},
 	// Loop-detection thresholds may be tightened down to 2.
-	{"loop_detection", `{"repeated_call":2,"repeated_result":3,"alternating_calls":2,"repeated_text":2}`, gateNone},
+	{"loop_detection", `{"repeated_result":3,"repeated_poll":2,"repeated_text":2}`, gateNone},
 }
 
 // Every settings key has an audited trust class, and each repository value

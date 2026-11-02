@@ -14,7 +14,9 @@ import (
 )
 
 // lookTool succeeds with a result that depends only on its path argument,
-// like reading a file that does not change.
+// like a command that prints the same thing each time. It is not marked as
+// a workspace read, so the guard treats it as a command, MCP or extension
+// tool would be treated.
 func lookTool(name string) AgentTool {
 	return executorTool(name, `{"type":"object","properties":{"path":{"type":"string"}}}`, ExecParallel, func(_ context.Context, _ string, params json.RawMessage, _ AgentToolUpdateCallback) (AgentToolResult, error) {
 		var input struct {
@@ -25,6 +27,14 @@ func lookTool(name string) AgentTool {
 		}
 		return AgentToolResult{Content: []types.ContentBlock{types.NewText("contents of " + input.Path)}}, nil
 	})
+}
+
+// readTool is lookTool marked as a workspace read, like reading a file that
+// does not change.
+func readTool(name string) AgentTool {
+	tool := lookTool(name)
+	tool.ReadsWorkspace = func(json.RawMessage) bool { return true }
+	return tool
 }
 
 // counterTool succeeds with a different result on every call, so the same
@@ -56,13 +66,28 @@ func repeatCall(c call, count int) []call {
 	return calls
 }
 
+// cycle repeats the calls of one round count times, in order.
+func cycle(count int, round func(index int) []call) []call {
+	var calls []call
+	for index := range count {
+		calls = append(calls, round(index)...)
+	}
+	return calls
+}
+
 // loopAgent runs tools under thresholds with a generous turn cap and records
 // the loop_guard events.
 func loopAgent(f *faux.Faux, thresholds *LoopThresholds, tools ...AgentTool) (*Agent, *[]LoopDetection) {
-	a := newRuntimeAgent(f, func(opts *AgentOptions) {
+	return loopAgentWith(f, func(opts *AgentOptions) {
 		opts.InitialState.Tools = tools
-		opts.Budget = Budget{MaxTurns: 60}
 		opts.LoopThresholds = thresholds
+	})
+}
+
+func loopAgentWith(f *faux.Faux, mutate func(*AgentOptions)) (*Agent, *[]LoopDetection) {
+	a := newRuntimeAgent(f, func(opts *AgentOptions) {
+		opts.Budget = Budget{MaxTurns: 60}
+		mutate(opts)
 	})
 	var detections []LoopDetection
 	a.Subscribe(func(_ context.Context, event AgentEvent) error {
@@ -72,6 +97,29 @@ func loopAgent(f *faux.Faux, thresholds *LoopThresholds, tools ...AgentTool) (*A
 		return nil
 	})
 	return a, &detections
+}
+
+// runCalls runs one prompt whose model makes calls, one per reply, then
+// answers "done".
+func runCalls(t *testing.T, thresholds *LoopThresholds, calls []call, tools ...AgentTool) (*Agent, RunResult, []LoopDetection) {
+	t.Helper()
+	f := faux.New(faux.Options{})
+	f.SetResponses(append(callSteps(calls...), faux.Respond(faux.Text("done")))...)
+	a, detections := loopAgent(f, thresholds, tools...)
+	result, err := a.PromptText(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a, result, *detections
+}
+
+// wantNoLoop fails unless the run completed with no loop notice.
+func wantNoLoop(t *testing.T, a *Agent, result RunResult, detections []LoopDetection) {
+	t.Helper()
+	if result.StopReason != StopCompleted || len(detections) != 0 {
+		t.Fatalf("result = %s after %d turns, loop_guard events = %+v; want completed with none", result.StopReason, result.Turns, detections)
+	}
+	wantNotices(t, a.State().Messages, nil)
 }
 
 // notices returns, per tool result, the host notice prefix it ends with ("" for none).
@@ -106,94 +154,183 @@ func wantLoopStop(t *testing.T, result RunResult, pattern LoopPattern, count int
 }
 
 func TestLoopGuardRepeatedResultNudgesThenStops(t *testing.T) {
-	f := faux.New(faux.Options{})
 	// Key order and whitespace differ; the call is the same.
 	same := []call{{"look", `{"path":"a"}`}, {"look", `{ "path" : "a" }`}, {"look", `{"path":"a"}`}, {"look", `{"path":"a"}`}, {"look", `{"path": "a"}`}, {"look", `{"path":"a"}`}}
-	f.SetResponses(append(callSteps(same...), faux.Respond(faux.Text("never")))...)
-	a, detections := loopAgent(f, &LoopThresholds{RepeatedResult: 3}, lookTool("look"))
-
-	result, err := a.PromptText(context.Background(), "go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The third identical result is nudged; the calls before the nudge are
-	// not counted again, so the stop comes when three more repeat it.
+	a, result, detections := runCalls(t, &LoopThresholds{RepeatedResult: 3}, same, readTool("look"))
+	// The third identical read is nudged; the calls before the nudge are not
+	// counted again, so the stop comes when three more repeat it.
 	wantLoopStop(t, result, LoopRepeatedResult, 3, "look")
-	if result.Turns != 6 || f.CallCount() != 6 {
-		t.Fatalf("turns = %d calls = %d, want 6", result.Turns, f.CallCount())
+	if result.Turns != 6 {
+		t.Fatalf("turns = %d, want 6", result.Turns)
 	}
 	wantNotices(t, a.State().Messages, map[int]string{2: loopNudgePrefix, 5: loopStopPrefix})
 	if lastRole(t, a) != "toolResult" {
 		t.Fatalf("last role %s, want the stopping turn's result last", lastRole(t, a))
 	}
-	if got := *detections; len(got) != 2 || got[0].Action != LoopNudge || got[1].Action != LoopStop || got[0].Pattern != LoopRepeatedResult {
-		t.Fatalf("loop_guard events = %+v, want a nudge then a stop", got)
+	if len(detections) != 2 || detections[0].Action != LoopNudge || detections[1].Action != LoopStop || detections[0].Pattern != LoopRepeatedResult {
+		t.Fatalf("loop_guard events = %+v, want a nudge then a stop", detections)
 	}
 	if !strings.Contains(result.Err.Error(), `look {"path":"a"}`) {
 		t.Fatalf("run error %q does not name the call", result.Err)
 	}
 }
 
-func TestLoopGuardRepeatedCallNudgesThenStops(t *testing.T) {
-	f := faux.New(faux.Options{})
-	tick := call{"tick", `{}`}
-	other := call{"look", `{"path":"x"}`}
-	// Four ticks, then a fifth after another call: five within ten calls.
-	calls := append(repeatCall(tick, 4), other, tick)
-	// After the nudge, five more ticks within the window stop the run.
-	calls = append(calls, repeatCall(tick, 5)...)
-	f.SetResponses(append(callSteps(calls...), faux.Respond(faux.Text("never")))...)
-	a, _ := loopAgent(f, &LoopThresholds{RepeatedCall: 5}, counterTool("tick"), lookTool("look"))
-
-	result, err := a.PromptText(context.Background(), "go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantLoopStop(t, result, LoopRepeatedCall, 5, "tick")
-	wantNotices(t, a.State().Messages, map[int]string{5: loopNudgePrefix, 10: loopStopPrefix})
+// TestLoopGuardRereadAfterAnEditIsProgress: reading the same unchanged file
+// three times is nudged only when nothing changed in between; an edit in
+// between is progress.
+func TestLoopGuardRereadAfterAnEditIsProgress(t *testing.T) {
+	read := call{"read", `{"path":"config.yaml"}`}
+	calls := cycle(8, func(index int) []call {
+		return []call{read, {"edit", fmt.Sprintf(`{"revision":%d}`, index)}}
+	})
+	a, result, detections := runCalls(t, nil, calls, readTool("read"), counterTool("edit"))
+	wantNoLoop(t, a, result, detections)
 }
 
-func TestLoopGuardRepeatedCallCountsOnlyWithinWindow(t *testing.T) {
-	tick := call{"tick", `{}`}
-	// Four ticks, some other calls, one more tick. With five other calls
-	// the ten-call window still holds all five ticks; with six, the first
-	// tick has left it.
-	for others, want := range map[int]map[int]string{5: {9: loopNudgePrefix}, 6: {}} {
-		calls := repeatCall(tick, 4)
-		for index := range others {
-			calls = append(calls, call{"look", fmt.Sprintf(`{"path":"f%d"}`, index)})
-		}
-		calls = append(calls, tick)
-		f := faux.New(faux.Options{})
-		f.SetResponses(append(callSteps(calls...), faux.Respond(faux.Text("done")))...)
-		a, _ := loopAgent(f, &LoopThresholds{RepeatedCall: 5}, counterTool("tick"), lookTool("look"))
+// TestLoopGuardProductiveEditTestCycles: the review's productive traces.
+// An edit followed by the same test command, whose output changes or stays
+// the same, and two stateful tools whose answers keep changing, are work,
+// not loops, under the default thresholds.
+func TestLoopGuardProductiveEditTestCycles(t *testing.T) {
+	test := call{"bash", `{"command":"go test ./pkg"}`}
+	editThenTest := func(cycles int) []call {
+		return cycle(cycles, func(index int) []call {
+			return []call{{"edit", fmt.Sprintf(`{"revision":%d}`, index)}, test}
+		})
+	}
+	t.Run("changing test output", func(t *testing.T) {
+		a, result, detections := runCalls(t, nil, editThenTest(11), counterTool("edit"), counterTool("bash"))
+		wantNoLoop(t, a, result, detections)
+	})
+	t.Run("same test output", func(t *testing.T) {
+		a, result, detections := runCalls(t, nil, editThenTest(12), counterTool("edit"), lookTool("bash"))
+		wantNoLoop(t, a, result, detections)
+	})
+	t.Run("alternating stateful tools", func(t *testing.T) {
+		calls := cycle(7, func(int) []call { return []call{{"next_page", `{}`}, {"process_page", `{}`}} })
+		a, result, detections := runCalls(t, nil, calls, counterTool("next_page"), counterTool("process_page"))
+		wantNoLoop(t, a, result, detections)
+	})
+}
 
-		result, err := a.PromptText(context.Background(), "go")
-		if err != nil || result.StopReason != StopCompleted {
-			t.Fatalf("%d others: result = %+v %v, want completed", others, result, err)
+// TestLoopGuardLetsCommandsPoll: a command whose answer has not changed yet
+// may be polling for a change, so the default guard allows nine unchanged
+// answers, nudges on the tenth and stops after ten more.
+func TestLoopGuardLetsCommandsPoll(t *testing.T) {
+	health := call{"bash", `{"command":"curl -s localhost:8080/health"}`}
+	t.Run("seven probes", func(t *testing.T) {
+		a, result, detections := runCalls(t, nil, repeatCall(health, 7), lookTool("bash"))
+		wantNoLoop(t, a, result, detections)
+	})
+	t.Run("probes and sleeps", func(t *testing.T) {
+		calls := cycle(9, func(int) []call { return []call{health, {"bash", `{"command":"sleep 2"}`}} })
+		a, result, detections := runCalls(t, nil, calls, lookTool("bash"))
+		wantNoLoop(t, a, result, detections)
+	})
+	t.Run("bound", func(t *testing.T) {
+		a, result, detections := runCalls(t, nil, repeatCall(health, 25), lookTool("bash"))
+		wantLoopStop(t, result, LoopRepeatedPoll, 10, "bash")
+		wantNotices(t, a.State().Messages, map[int]string{9: loopNudgePrefix, 19: loopStopPrefix})
+		if detections[0].Pattern != LoopRepeatedPoll {
+			t.Fatalf("loop_guard events = %+v", detections)
+		}
+		nudge := toolResults(a.State().Messages)[9].Content
+		if text := nudge[len(nudge)-1].Text; !strings.Contains(text, "until") || !strings.Contains(text, "wait tool") {
+			t.Fatalf("poll nudge %q does not say how to wait", text)
+		}
+	})
+	t.Run("an answer that changes", func(t *testing.T) {
+		var probes atomic.Int64
+		// Starting, starting, ..., then ready: each change is progress.
+		probe := executorTool("bash", `{"type":"object"}`, ExecParallel, func(context.Context, string, json.RawMessage, AgentToolUpdateCallback) (AgentToolResult, error) {
+			return AgentToolResult{Content: []types.ContentBlock{types.NewText(fmt.Sprintf("starting, %d of 3 services up", probes.Add(1)/8))}}, nil
+		})
+		a, result, detections := runCalls(t, nil, repeatCall(health, 24), probe)
+		wantNoLoop(t, a, result, detections)
+	})
+}
+
+// TestLoopGuardAlternatingRepeats: A-B-A-B with both legs answering the same
+// each time is a loop. The nudge about one leg covers the other leg, which
+// was repeating with it, so the stop comes on whichever leg repeats next.
+func TestLoopGuardAlternatingRepeats(t *testing.T) {
+	calls := cycle(6, func(int) []call { return []call{{"look", `{"path":"a"}`}, {"look", `{"path":"b"}`}} })
+	a, result, detections := runCalls(t, nil, calls, readTool("look"))
+	wantLoopStop(t, result, LoopRepeatedResult, 3, "look")
+	wantNotices(t, a.State().Messages, map[int]string{4: loopNudgePrefix, 9: loopStopPrefix})
+	if len(detections) != 2 {
+		t.Fatalf("loop_guard events = %+v, want a nudge then a stop", detections)
+	}
+}
+
+// TestLoopGuardStopsOnlyAfterThatPatternsNotice: a nudge about a polling
+// command does not make a later repeated read a stop; the read gets its own
+// notice first.
+func TestLoopGuardStopsOnlyAfterThatPatternsNotice(t *testing.T) {
+	probe, read := call{"bash", `{"command":"status"}`}, call{"read", `{"path":"a"}`}
+	calls := append(repeatCall(probe, 3), repeatCall(read, 6)...)
+	a, result, detections := runCalls(t, &LoopThresholds{RepeatedResult: 3, RepeatedPoll: 3}, calls, lookTool("bash"), readTool("read"))
+	wantLoopStop(t, result, LoopRepeatedResult, 3, "read")
+	wantNotices(t, a.State().Messages, map[int]string{2: loopNudgePrefix, 5: loopNudgePrefix, 8: loopStopPrefix})
+	if len(detections) != 3 || detections[0].Pattern != LoopRepeatedPoll || detections[1].Pattern != LoopRepeatedResult || detections[1].Action != LoopNudge {
+		t.Fatalf("loop_guard events = %+v", detections)
+	}
+
+	// The review's trace: a file read three times unchanged, then read
+	// again while it changes. The changing reads are not repeats, so the
+	// nudge is never followed by a stop.
+	var reads atomic.Int64
+	changing := executorTool("read", `{"type":"object"}`, ExecParallel, func(context.Context, string, json.RawMessage, AgentToolUpdateCallback) (AgentToolResult, error) {
+		text := "unchanged initial contents"
+		if n := reads.Add(1); n > 3 {
+			text = fmt.Sprintf("new file revision %d", n)
+		}
+		return AgentToolResult{Content: []types.ContentBlock{types.NewText(text)}}, nil
+	})
+	changing.ReadsWorkspace = func(json.RawMessage) bool { return true }
+	a, result, detections = runCalls(t, nil, repeatCall(call{"read", `{}`}, 9), changing)
+	if result.StopReason != StopCompleted || len(detections) != 1 || detections[0].Pattern != LoopRepeatedResult {
+		t.Fatalf("result = %s, loop_guard events = %+v; want completed after one nudge", result.StopReason, detections)
+	}
+}
+
+// TestLoopGuardRepeatedFailureBetweenOtherCalls: the same command failing
+// the same way, with only reads of other files between, is a loop even
+// though the failure streak resets on each read.
+func TestLoopGuardRepeatedFailureBetweenOtherCalls(t *testing.T) {
+	calls := cycle(6, func(index int) []call {
+		return []call{{"probe", `{"id":"x"}`}, {"read", fmt.Sprintf(`{"path":"file-%d"}`, index)}}
+	})
+	a, result, _ := runCalls(t, nil, calls, probeTool(), readTool("read"))
+	wantLoopStop(t, result, LoopRepeatedResult, 3, "probe")
+	wantNotices(t, a.State().Messages, map[int]string{4: loopNudgePrefix, 10: loopStopPrefix})
+}
+
+// TestLoopGuardCountsRepeatsCloseTogether: a call made again within ten
+// calls of its last run continues its count; one made after more than ten
+// other calls starts over.
+func TestLoopGuardCountsRepeatsCloseTogether(t *testing.T) {
+	same := call{"read", `{"path":"a"}`}
+	for _, others := range []int{9, 10} {
+		var calls []call
+		next := 0
+		for round := range 3 {
+			calls = append(calls, same)
+			for range others * min(1, 2-round) {
+				calls = append(calls, call{"read", fmt.Sprintf(`{"path":"f%d"}`, next)})
+				next++
+			}
+		}
+		a, result, _ := runCalls(t, nil, calls, readTool("read"))
+		if result.StopReason != StopCompleted {
+			t.Fatalf("%d others: result = %+v, want completed", others, result)
+		}
+		want := map[int]string{}
+		if others == 9 {
+			want[2*others+2] = loopNudgePrefix
 		}
 		wantNotices(t, a.State().Messages, want)
 	}
-}
-
-func TestLoopGuardAlternatingCalls(t *testing.T) {
-	f := faux.New(faux.Options{})
-	first, second := call{"look", `{"path":"a"}`}, call{"look", `{"path":"b"}`}
-	var calls []call
-	for range 6 {
-		calls = append(calls, first, second)
-	}
-	f.SetResponses(append(callSteps(calls...), faux.Respond(faux.Text("never")))...)
-	a, _ := loopAgent(f, &LoopThresholds{AlternatingCalls: 3}, lookTool("look"))
-
-	result, err := a.PromptText(context.Background(), "go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Two and a half cycles say nothing; the third cycle is nudged and three
-	// more cycles after it stop the run.
-	wantLoopStop(t, result, LoopAlternatingCalls, 3, "look", "look")
-	wantNotices(t, a.State().Messages, map[int]string{5: loopNudgePrefix, 11: loopStopPrefix})
 }
 
 // yieldExtension sends a finished model back to work with the same feedback
@@ -210,8 +347,34 @@ func (yieldExtension) AfterTool(_ context.Context, _ types.ContentBlock, result 
 	return result, nil
 }
 func (yieldExtension) AfterResponse(context.Context, types.AssistantMessage) error { return nil }
-func (yieldExtension) Yield(context.Context) (string, error)                   { return "the tests still fail", nil }
-func (yieldExtension) BeforeCompaction(context.Context) error                  { return nil }
+func (yieldExtension) Yield(context.Context) (string, error)                       { return "the tests still fail", nil }
+func (yieldExtension) BeforeCompaction(context.Context) error                      { return nil }
+
+// textRoles names each transcript message, telling the guard's notices,
+// hook feedback and reminders apart from other user messages.
+func textRoles(messages []types.Message) string {
+	var roles []string
+	for _, message := range messages {
+		text := ""
+		user, isUser := message.(types.UserMessage)
+		if isUser {
+			text = user.Content.Text
+		}
+		switch {
+		case isUser && user.Reminder != "":
+			roles = append(roles, "reminder")
+		case strings.HasPrefix(text, loopNudgePrefix):
+			roles = append(roles, "nudge")
+		case strings.HasPrefix(text, loopStopPrefix):
+			roles = append(roles, "stop")
+		case isHookContinuation(text):
+			roles = append(roles, "feedback")
+		default:
+			roles = append(roles, message.Role())
+		}
+	}
+	return strings.Join(roles, " ")
+}
 
 func TestLoopGuardRepeatedTextNudgesThenStops(t *testing.T) {
 	f := faux.New(faux.Options{})
@@ -233,25 +396,8 @@ func TestLoopGuardRepeatedTextNudgesThenStops(t *testing.T) {
 	if result.Turns != 6 || f.CallCount() != 6 {
 		t.Fatalf("turns = %d calls = %d, want the run to end before a seventh call", result.Turns, f.CallCount())
 	}
-	var roles []string
-	for _, message := range a.State().Messages {
-		text := ""
-		if user, ok := message.(types.UserMessage); ok {
-			text = user.Content.Text
-		}
-		switch {
-		case strings.HasPrefix(text, loopNudgePrefix):
-			roles = append(roles, "nudge")
-		case strings.HasPrefix(text, loopStopPrefix):
-			roles = append(roles, "stop")
-		case isHookContinuation(text):
-			roles = append(roles, "feedback")
-		default:
-			roles = append(roles, message.Role())
-		}
-	}
 	want := "user assistant feedback assistant feedback assistant feedback nudge assistant feedback assistant feedback assistant feedback stop"
-	if got := strings.Join(roles, " "); got != want {
+	if got := textRoles(a.State().Messages); got != want {
 		t.Fatalf("transcript = %s\nwant %s", got, want)
 	}
 }
@@ -278,27 +424,67 @@ func TestLoopGuardRepeatedTextResetsOnUserMessage(t *testing.T) {
 	}
 }
 
+// TestLoopGuardSeesThroughReminders: reminders restate instructions; they
+// are not new input. A request-scope reminder never reaches the transcript,
+// and a conversation reminder in it neither ends a loop episode nor counts
+// as a reply, so both loops are nudged and stopped exactly as without them.
+func TestLoopGuardSeesThroughReminders(t *testing.T) {
+	for _, scope := range []ReminderScope{ReminderRequest, ReminderConversation} {
+		t.Run(string(scope), func(t *testing.T) {
+			reminders := []Reminder{{Name: "rule", Text: "Keep the tests green.", Scope: scope, MaxFires: 100}}
+			read := call{"look", `{"path":"a"}`}
+			f := faux.New(faux.Options{})
+			f.SetResponses(append(callSteps(repeatCall(read, 6)...), faux.Respond(faux.Text("never")))...)
+			a, _ := loopAgentWith(f, func(opts *AgentOptions) {
+				opts.InitialState.Tools = []AgentTool{readTool("look")}
+				opts.Reminders = reminders
+			})
+			result, err := a.PromptText(context.Background(), "go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantLoopStop(t, result, LoopRepeatedResult, 3, "look")
+			wantNotices(t, a.State().Messages, map[int]string{2: loopNudgePrefix, 5: loopStopPrefix})
+
+			f = faux.New(faux.Options{})
+			for range 7 {
+				f.AppendResponses(faux.Respond(faux.Text("I am done.")))
+			}
+			a = newRuntimeAgent(f, func(opts *AgentOptions) {
+				opts.Extensions = yieldExtension{}
+				opts.Reminders = reminders
+			})
+			if result, err = a.PromptText(context.Background(), "go"); err != nil {
+				t.Fatal(err)
+			}
+			wantLoopStop(t, result, LoopRepeatedText, 3)
+			if result.Turns != 6 {
+				t.Fatalf("turns = %d, want 6", result.Turns)
+			}
+			if scope == ReminderConversation && !strings.Contains(textRoles(a.State().Messages), "reminder assistant") {
+				t.Fatalf("transcript = %s, want conversation reminders in it", textRoles(a.State().Messages))
+			}
+
+			// The failure streak runs on through reminders too.
+			f = faux.New(faux.Options{})
+			f.SetResponses(append(probeSteps(repeatArgs(`{"id":"x"}`, RepeatedFailureLimit)...), faux.Respond(faux.Text("never")))...)
+			a, _ = loopAgentWith(f, func(opts *AgentOptions) {
+				opts.InitialState.Tools = []AgentTool{probeTool()}
+				opts.Reminders = reminders
+			})
+			if result, err = a.PromptText(context.Background(), "go"); err != nil || result.StopReason != StopRepeatedFailure || result.Turns != RepeatedFailureLimit {
+				t.Fatalf("failing run = %+v %v, want repeated_failure after %d calls", result, err, RepeatedFailureLimit)
+			}
+		})
+	}
+}
+
 func TestLoopGuardExemptsPollingTools(t *testing.T) {
-	f := faux.New(faux.Options{})
 	poll := lookTool("wait")
 	poll.Polls = true
-	calls := repeatCall(call{"wait", `{"path":"job-1"}`}, 8)
-	// Polls stay in the sequence: between A and B they break the A-B
-	// alternation that A, B, A, B, A, B alone would be.
-	for range 3 {
-		calls = append(calls, call{"look", `{"path":"a"}`}, call{"wait", `{"path":"job-1"}`}, call{"look", `{"path":"b"}`}, call{"wait", `{"path":"job-1"}`})
-	}
-	f.SetResponses(append(callSteps(calls...), faux.Respond(faux.Text("done")))...)
-	a, detections := loopAgent(f, &LoopThresholds{RepeatedCall: 5, AlternatingCalls: 3}, poll, lookTool("look"))
-
-	result, err := a.PromptText(context.Background(), "go")
-	if err != nil || result.StopReason != StopCompleted {
-		t.Fatalf("result = %+v %v, want completed: polling is not a loop", result, err)
-	}
-	if len(*detections) != 0 {
-		t.Fatalf("loop_guard events = %+v, want none", *detections)
-	}
-	wantNotices(t, a.State().Messages, nil)
+	calls := repeatCall(call{"wait", `{"path":"job-1"}`}, 25)
+	a, result, detections := runCalls(t, nil, calls, poll)
+	wantNoLoop(t, a, result, detections)
 }
 
 func TestLoopGuardRepeatedFailureStillStopsPollingTool(t *testing.T) {
@@ -319,7 +505,7 @@ func TestLoopGuardRepeatedFailureStillStopsPollingTool(t *testing.T) {
 
 // TestLoopGuardCountsFailuresAcrossOtherCalls: the failure streak resets on
 // another call, but the identical failure coming back after it is a repeated
-// result, and the batches the failure guard already noted get no second
+// result, and the results the failure guard already noted get no second
 // notice.
 func TestLoopGuardCountsFailuresAcrossOtherCalls(t *testing.T) {
 	f := faux.New(faux.Options{})
@@ -334,6 +520,41 @@ func TestLoopGuardCountsFailuresAcrossOtherCalls(t *testing.T) {
 	wantNotices(t, a.State().Messages, map[int]string{1: repeatedFailurePrefix, 2: repeatedFailurePrefix, 3: repeatedFailurePrefix, 5: loopNudgePrefix})
 }
 
+// TestLoopGuardStopsMixedBatches: the review's batch of one unchanged
+// successful call and two identical failures, sent again and again. The
+// success resets the failure streak and the failure notice on one result no
+// longer hides the batch from the loop guard, so the repeated failure is
+// nudged on the third batch and stopped on the sixth, with both notices on
+// the last result.
+func TestLoopGuardStopsMixedBatches(t *testing.T) {
+	f := faux.New(faux.Options{})
+	for index := range 12 {
+		f.AppendResponses(faux.Respond(
+			faux.ToolCall("look", json.RawMessage(`{"path":"same"}`), fmt.Sprintf("look-%d", index)),
+			faux.ToolCall("probe", json.RawMessage(`{"id":"missing"}`), fmt.Sprintf("probe-%d-a", index)),
+			faux.ToolCall("probe", json.RawMessage(`{"id":"missing"}`), fmt.Sprintf("probe-%d-b", index)),
+		))
+	}
+	f.AppendResponses(faux.Respond(faux.Text("done")))
+	a, detections := loopAgent(f, nil, lookTool("look"), probeTool())
+	result, err := a.PromptText(context.Background(), "go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLoopStop(t, result, LoopRepeatedResult, 3, "probe")
+	if result.Turns != 6 || len(*detections) != 2 {
+		t.Fatalf("turns = %d, loop_guard events = %+v; want a nudge on turn 3 and a stop on turn 6", result.Turns, *detections)
+	}
+	results := toolResults(a.State().Messages)
+	nudged := results[8].Content
+	if !hasHostNotice(nudged, repeatedFailurePrefix) || hostNotice(nudged) != loopNudgePrefix {
+		t.Fatalf("third batch's last result = %+v, want the failure notice then the loop notice", nudged)
+	}
+	if got := resultContent(nudged); len(got) != 1 || !strings.Contains(got[0].Text, "no job") {
+		t.Fatalf("content without notices = %+v", got)
+	}
+}
+
 // TestLoopGuardCountsBatchesAndNoticesTheLastResult: identical calls in one
 // reply count once, since the model had seen none of their results, and the
 // notice goes on the last result of the batch that completes the loop.
@@ -346,7 +567,7 @@ func TestLoopGuardCountsBatchesAndNoticesTheLastResult(t *testing.T) {
 		faux.Respond(faux.ToolCall("look", same, "a5"), faux.ToolCall("look", json.RawMessage(`{"path":"b"}`), "b1")),
 		faux.Respond(faux.Text("done")),
 	)
-	a, detections := loopAgent(f, &LoopThresholds{RepeatedResult: 3, RepeatedCall: 3}, lookTool("look"))
+	a, detections := loopAgent(f, &LoopThresholds{RepeatedResult: 3}, readTool("look"))
 
 	result, err := a.PromptText(context.Background(), "go")
 	if err != nil || result.StopReason != StopCompleted {
@@ -386,7 +607,7 @@ func TestLoopGuardResumeKeepsNudgeAndStopDecisions(t *testing.T) {
 	first := faux.New(faux.Options{})
 	first.SetResponses(callSteps(repeatCall(same, 4)...)...)
 	a := newRuntimeAgent(first, func(opts *AgentOptions) {
-		opts.InitialState.Tools = []AgentTool{lookTool("look")}
+		opts.InitialState.Tools = []AgentTool{readTool("look")}
 		opts.Budget = Budget{MaxTurns: 4}
 		opts.LoopThresholds = thresholds
 	})
@@ -400,7 +621,7 @@ func TestLoopGuardResumeKeepsNudgeAndStopDecisions(t *testing.T) {
 	// two more repeats stop the run and no second nudge is given.
 	second := faux.New(faux.Options{})
 	second.SetResponses(append(callSteps(repeatCall(same, 3)...), faux.Respond(faux.Text("never")))...)
-	b := resumed(t, a, second, thresholds, lookTool("look"))
+	b := resumed(t, a, second, thresholds, readTool("look"))
 	result, err = b.Continue(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -415,7 +636,7 @@ func TestLoopGuardResumeKeepsNudgeAndStopDecisions(t *testing.T) {
 	// the loop stops again at once, without a nudge.
 	third := faux.New(faux.Options{})
 	third.SetResponses(callSteps(same)...)
-	c := resumed(t, b, third, thresholds, lookTool("look"))
+	c := resumed(t, b, third, thresholds, readTool("look"))
 	result, err = c.Continue(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -425,13 +646,27 @@ func TestLoopGuardResumeKeepsNudgeAndStopDecisions(t *testing.T) {
 		t.Fatalf("restarted turns = %d, want 1", result.Turns)
 	}
 
-	// A model that moved on is not stopped by the loop still in the window.
+	// A model that moved on is not stopped by the loop it left.
 	fourth := faux.New(faux.Options{})
 	fourth.SetResponses(append(callSteps(call{"look", `{"path":"b"}`}), faux.Respond(faux.Text("done")))...)
-	d := resumed(t, c, fourth, thresholds, lookTool("look"))
+	d := resumed(t, c, fourth, thresholds, readTool("look"))
 	if result, err = d.Continue(context.Background()); err != nil || result.StopReason != StopCompleted {
 		t.Fatalf("moved-on run = %+v %v, want completed", result, err)
 	}
+}
+
+// TestLoopGuardProgressForgivesANudge: after a nudge, progress (an edit)
+// means the next report of the same loop is a nudge again, not a stop.
+func TestLoopGuardProgressForgivesANudge(t *testing.T) {
+	read := call{"read", `{"path":"a"}`}
+	calls := append(repeatCall(read, 3), call{"edit", `{"revision":1}`})
+	calls = append(calls, repeatCall(read, 3)...)
+	a, result, detections := runCalls(t, nil, calls, readTool("read"), counterTool("edit"))
+	if result.StopReason != StopCompleted || len(detections) != 2 || detections[1].Action != LoopNudge {
+		t.Fatalf("result = %s, loop_guard events = %+v; want completed after two nudges", result.StopReason, detections)
+	}
+	// The read just after the edit is the first of the new count.
+	wantNotices(t, a.State().Messages, map[int]string{2: loopNudgePrefix, 6: loopNudgePrefix})
 }
 
 func TestLoopGuardNewPromptStartsOver(t *testing.T) {
@@ -439,7 +674,7 @@ func TestLoopGuardNewPromptStartsOver(t *testing.T) {
 	same := call{"look", `{"path":"a"}`}
 	f := faux.New(faux.Options{})
 	f.SetResponses(append(callSteps(repeatCall(same, 3)...), faux.Respond(faux.Text("ok")))...)
-	a, _ := loopAgent(f, thresholds, lookTool("look"))
+	a, _ := loopAgent(f, thresholds, readTool("look"))
 	if result, err := a.PromptText(context.Background(), "go"); err != nil || result.StopReason != StopCompleted {
 		t.Fatalf("first prompt = %+v %v", result, err)
 	}
@@ -459,10 +694,10 @@ func TestLoopThresholdsValidate(t *testing.T) {
 	if err := (LoopThresholds{}).Validate(); err != nil {
 		t.Fatalf("all off: %v", err)
 	}
-	if err := (LoopThresholds{RepeatedText: 1}).Validate(); err == nil || !strings.Contains(err.Error(), "repeated_text") {
-		t.Fatalf("threshold 1 = %v, want an error naming repeated_text", err)
+	if err := (LoopThresholds{RepeatedPoll: 1}).Validate(); err == nil || !strings.Contains(err.Error(), "repeated_poll") {
+		t.Fatalf("threshold 1 = %v, want an error naming repeated_poll", err)
 	}
-	a := newRuntimeAgent(faux.New(faux.Options{}), func(opts *AgentOptions) { opts.LoopThresholds = &LoopThresholds{RepeatedCall: -1} })
+	a := newRuntimeAgent(faux.New(faux.Options{}), func(opts *AgentOptions) { opts.LoopThresholds = &LoopThresholds{RepeatedResult: -1} })
 	if _, err := a.PromptText(context.Background(), "go"); err == nil {
 		t.Fatal("run started with an invalid threshold")
 	}

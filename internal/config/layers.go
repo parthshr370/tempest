@@ -769,12 +769,10 @@ func tightensLoopDetection(value *settingsNode, operator *loopDetectionSettings)
 		var configured *int
 		var builtin int
 		switch name {
-		case "repeated_call":
-			configured, builtin = operator.RepeatedCall, defaults.RepeatedCall
 		case "repeated_result":
 			configured, builtin = operator.RepeatedResult, defaults.RepeatedResult
-		case "alternating_calls":
-			configured, builtin = operator.AlternatingCalls, defaults.AlternatingCalls
+		case "repeated_poll":
+			configured, builtin = operator.RepeatedPoll, defaults.RepeatedPoll
 		case "repeated_text":
 			configured, builtin = operator.RepeatedText, defaults.RepeatedText
 		default:
@@ -1110,10 +1108,9 @@ func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[
 			"nested":           boolNode(true),
 		}},
 		"loop_detection": {object: map[string]*settingsNode{
-			"repeated_call":     numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedCall)),
-			"repeated_result":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedResult)),
-			"alternating_calls": numberNode(strconv.Itoa(agent.DefaultLoopThresholds.AlternatingCalls)),
-			"repeated_text":     numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedText)),
+			"repeated_result": numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedResult)),
+			"repeated_poll":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedPoll)),
+			"repeated_text":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedText)),
 		}},
 	}
 	fallback, err := stringsNode(DefaultContextFallback)

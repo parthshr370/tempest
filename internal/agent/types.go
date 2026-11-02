@@ -87,8 +87,16 @@ type AgentTool struct {
 	// Polls marks a tool whose job is to observe changing state, such as
 	// waiting for a job or reading its new output: the same call returning
 	// the same result is what polling looks like, so the loop guard never
-	// reports it (see loopguard.go). The repeated-failure guard still does.
+	// reports it while it succeeds (see loopguard.go). A failure is not
+	// polling: both guards still count it.
 	Polls bool
+	// ReadsWorkspace reports whether a call with these arguments only reads
+	// the workspace: it changes nothing, and its result changes only when the
+	// workspace does. The loop guard never takes such a call as progress, and
+	// reports one returning the same result sooner than a call that may see
+	// state outside the workspace. Nil, the default for commands, MCP and
+	// extension tools, means every call may change things and see such state.
+	ReadsWorkspace func(arguments json.RawMessage) bool
 }
 
 // AgentContext is the context snapshot passed into the low-level agent loop.

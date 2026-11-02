@@ -22,9 +22,11 @@ import (
 // before a failed result, in transcript order, that are the same failure,
 // meaning the same tool, the same arguments after JSON canonicalization and
 // the same result content. Any other tool result (a success, another call or
-// another error) or any user message ends the streak. The count is derived
-// from the transcript every time, never kept in memory, so it is the same
-// after a resume or a replay of the journal.
+// another error) or any user message other than a conversation reminder ends
+// the streak. The same failure coming back after other calls is the loop
+// guard's (loopguard.go). The count is derived from the transcript every
+// time, never kept in memory, so it is the same after a resume or a replay of
+// the journal.
 const (
 	// repeatedFailureNoticeAt is the streak at which a failed result starts
 	// carrying the notice: the first unchanged retry already shows the model
@@ -128,7 +130,9 @@ func (key failureKey) streak(history []types.Message, assistant types.AssistantM
 			}
 			held = held[:0]
 		default:
-			return count
+			if !isReminder(message) {
+				return count
+			}
 		}
 	}
 	return count
@@ -147,11 +151,11 @@ func (key failureKey) matches(result types.ToolResultMessage, caller types.Assis
 	return false
 }
 
-// resultContent is a result's content without a host notice: the
-// repeated-failure notice or a loop notice.
+// resultContent is a result's content without the host notices that end it:
+// the repeated-failure notice, a loop notice, or both.
 func resultContent(content []types.ContentBlock) []types.ContentBlock {
-	if hostNotice(content) != "" {
-		return content[:len(content)-1]
+	for hostNotice(content) != "" {
+		content = content[:len(content)-1]
 	}
 	return content
 }
@@ -168,6 +172,24 @@ func hostNotice(content []types.ContentBlock) string {
 		}
 	}
 	return ""
+}
+
+// hasHostNotice reports whether one of the host notices that end content
+// starts with prefix.
+func hasHostNotice(content []types.ContentBlock, prefix string) bool {
+	for notice := hostNotice(content); notice != ""; notice = hostNotice(content) {
+		if notice == prefix {
+			return true
+		}
+		content = content[:len(content)-1]
+	}
+	return false
+}
+
+// HostNoticed reports whether content ends with a host notice: a guard
+// added text to the tool's result after the tool returned it.
+func HostNoticed(content []types.ContentBlock) bool {
+	return hostNotice(content) != ""
 }
 
 func sameContent(a, b []types.ContentBlock) bool {

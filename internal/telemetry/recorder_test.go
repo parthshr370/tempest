@@ -345,7 +345,7 @@ func TestLoopGuardReachesTheRunSpan(t *testing.T) {
 		InitialState:   &agent.AgentState{Model: testModel, Tools: []agent.AgentTool{echoTool(nil)}},
 		StreamFn:       (&scriptedProvider{attempts: attempts}).Stream,
 		Trace:          tel.Tracing(),
-		LoopThresholds: &agent.LoopThresholds{RepeatedResult: 3},
+		LoopThresholds: &agent.LoopThresholds{RepeatedPoll: 3},
 	})
 	detach := tel.Attach(agt, AgentInfo{SessionID: "session-1"})
 	defer detach()
@@ -361,7 +361,7 @@ func TestLoopGuardReachesTheRunSpan(t *testing.T) {
 		t.Fatalf("span names = %v", c.spanNames(t))
 	}
 	span := run[0]
-	if span.Status.Code != int(statusError) || span.attr("error.type") != "loop_detected" || span.attr("tempest.loop.pattern") != "repeated_result" || span.attr("tempest.loop.action") != "stop" || span.attr("tempest.loop.nudges") != "1" {
+	if span.Status.Code != int(statusError) || span.attr("error.type") != "loop_detected" || span.attr("tempest.loop.pattern") != "repeated_poll" || span.attr("tempest.loop.action") != "stop" || span.attr("tempest.loop.nudges") != "1" {
 		t.Fatalf("run span = %+v", span)
 	}
 }

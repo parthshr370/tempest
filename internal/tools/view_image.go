@@ -33,6 +33,7 @@ type viewImageDetails struct {
 func newViewImageTool(cwd string, options ToolsOptions) agent.AgentTool {
 	getRoot := rootOnce(cwd)
 	return agent.AgentTool{
+		ReadsWorkspace: workspaceRead,
 		Tool: types.Tool{
 			Name:        string(ViewImageTool),
 			Description: fmt.Sprintf("Look at an image file in the workspace (PNG, JPEG, GIF or WebP, up to %d bytes and %d px per side). The image is returned to you as an image you can see. Use it for screenshots, diagrams and rendered output; use read for text files.", document.MaxInlineImageBytes, document.MaxInlineImageSidePx),

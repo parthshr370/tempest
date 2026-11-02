@@ -520,10 +520,9 @@ type contextFilesSettings struct {
 // thresholds, 0 for off. Built-in defaults fill every member a layer leaves
 // unset.
 type loopDetectionSettings struct {
-	RepeatedCall     *int `json:"repeated_call"`
-	RepeatedResult   *int `json:"repeated_result"`
-	AlternatingCalls *int `json:"alternating_calls"`
-	RepeatedText     *int `json:"repeated_text"`
+	RepeatedResult *int `json:"repeated_result"`
+	RepeatedPoll   *int `json:"repeated_poll"`
+	RepeatedText   *int `json:"repeated_text"`
 }
 
 // maxRetryDurationMS is the largest millisecond value convertible to a
@@ -799,10 +798,9 @@ func resolveLoopDetection(raw *loopDetectionSettings) (agent.LoopThresholds, err
 		raw = &loopDetectionSettings{}
 	}
 	thresholds := agent.LoopThresholds{
-		RepeatedCall:     settingValue(raw.RepeatedCall),
-		RepeatedResult:   settingValue(raw.RepeatedResult),
-		AlternatingCalls: settingValue(raw.AlternatingCalls),
-		RepeatedText:     settingValue(raw.RepeatedText),
+		RepeatedResult: settingValue(raw.RepeatedResult),
+		RepeatedPoll:   settingValue(raw.RepeatedPoll),
+		RepeatedText:   settingValue(raw.RepeatedText),
 	}
 	if err := thresholds.Validate(); err != nil {
 		return agent.LoopThresholds{}, &Error{Field: "loop_detection", Err: err}

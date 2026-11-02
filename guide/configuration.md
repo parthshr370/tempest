@@ -365,7 +365,7 @@ each flag and variable above, names the same setting. The main keys:
 | `workspace_listing`, `workspace_listing_max_files`, `workspace_listing_max_bytes` | Session-start file listing in the first user message (default on, 10000 paths, 4096 bytes). See [Skills and context](skills-and-context.md#workspace-listing). |
 | `context_files` | Object: `fallback` file names tried after `AGENTS.md` (default `["CLAUDE.md"]`), `max_bytes`, the total context file cap (default 65536), `nested_max_bytes` per nested file (default 16384, at most `max_bytes`), and `nested` on-read discovery below the working directory (default `true`). See [Skills and context](skills-and-context.md#context-discovery). |
 | `reminders` | Array of reminders added at the tail of model requests: `name`, `text`, `scope` (`request` or `conversation`), `every`, `first`, `max_fires` (default 1) and `when` (`final_turn`, `context_percent`, `tool_calls`, `without_tool`). Default none; a repository needs trust to add any. See [Skills and context](skills-and-context.md#reminders). |
-| `loop_detection` | Object: the loop guard's thresholds `repeated_call` (default 5), `repeated_result` (3), `alternating_calls` (3) and `repeated_text` (3); each is `0` (that pattern off) or at least 2. See [Loops](sessions-and-durability.md#loops). |
+| `loop_detection` | Object: the loop guard's thresholds `repeated_result` (default 3), `repeated_poll` (10) and `repeated_text` (3); each is `0` (that pattern off) or at least 2. See [Loops](sessions-and-durability.md#loops). |
 | `faux_script` | Scripted model, as `-faux-script`. |
 | `profiles` | Named partial settings objects; see [Profiles](#profiles). |
 
