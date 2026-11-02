@@ -1098,7 +1098,9 @@ func (r *Repo) getCombinedStatus(w http.ResponseWriter, request *http.Request) {
 }
 
 // listNotifications serves the inbox newest first, with Last-Modified,
-// If-Modified-Since and X-Poll-Interval like GitHub.
+// If-Modified-Since and X-Poll-Interval like GitHub. Last-Modified is when
+// the listing last changed: a late-indexed notification changes it when it
+// appears, although its updated_at is older.
 func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1113,8 +1115,12 @@ func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 		if notification.visibleAt.After(r.now) {
 			continue
 		}
-		if notification.UpdatedAt.After(lastModified) {
-			lastModified = notification.UpdatedAt
+		changedAt := notification.UpdatedAt
+		if notification.visibleAt.After(changedAt) {
+			changedAt = notification.visibleAt
+		}
+		if changedAt.After(lastModified) {
+			lastModified = changedAt
 		}
 		if (all || notification.Unread) && !notification.UpdatedAt.Before(after) {
 			rows = append(rows, *notification)
