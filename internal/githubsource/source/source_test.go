@@ -517,6 +517,9 @@ func TestRateLimitStopsRoundAndBacksOff(t *testing.T) {
 	}
 }
 
+// TestLowRateBudgetReadsOnlyFlaggedThreads: other clients used more than
+// polling's share, above the outbox reserve: the flagged thread is read,
+// a quiet one not yet overdue and the observe stream are not.
 func TestLowRateBudgetReadsOnlyFlaggedThreads(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, func(config *model.Config) { config.Observe.Comments = true })
@@ -526,7 +529,7 @@ func TestLowRateBudgetReadsOnlyFlaggedThreads(t *testing.T) {
 	e.repo.Advance(time.Minute)
 	e.repo.Notify(flagged)
 	e.repo.Advance(time.Second)
-	e.repo.SetRateLimit(5000, 100, start.Add(time.Hour))
+	e.repo.SetRateLimit(5000, 2500, start.Add(time.Hour))
 	e.pollClean()
 	for _, request := range e.client.requests() {
 		if strings.Contains(request.Path, fmt.Sprintf("issues/%d", quiet)) || strings.Contains(request.Path, "issues/comments") {

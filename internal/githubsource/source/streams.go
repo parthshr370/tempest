@@ -118,7 +118,7 @@ func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 		return backlogErr
 	case read.unverified != nil:
 		return read.unverified
-	case !complete && !covered.After(base) && !read.advanced:
+	case !complete && !covered.After(base) && !read.advanced && !read.deferred:
 		return fmt.Errorf("notifications: a round's requests ended at %s without progress; the cursor stays", covered.Format(time.RFC3339))
 	}
 	return nil
@@ -134,6 +134,9 @@ type notificationRead struct {
 	// requests counts the round's listing requests, the head included;
 	// the backlog stops at limit.
 	requests, limit int
+	// deferred reports that the backlog stopped because polling's share
+	// of the rate window was spent.
+	deferred bool
 	// partialAt is the second where the backlog stopped when it walked
 	// that second in ID order, and partial the lowest ID it read there.
 	partialAt time.Time
@@ -146,6 +149,28 @@ type notificationRead struct {
 
 // errRoundBound ends a listing at the round's request bound.
 var errRoundBound = errors.New("round request bound reached")
+
+// bounded reports that the backlog may send no more requests this round:
+// it reached its request bound, or polling's share of the rate window is
+// spent. The rows below the head are required but not urgent, so past the
+// share they wait for budget instead of spending what the outbox and the
+// tools are left; the head still flags the newest rows every round, and
+// the round reports the deferral.
+func (n *notificationRead) bounded() bool {
+	if n.requests >= n.limit {
+		return true
+	}
+	if n.rd.windowLeft() <= 0 {
+		n.deferBacklog()
+		return true
+	}
+	return false
+}
+
+func (n *notificationRead) deferBacklog() {
+	n.deferred = true
+	n.rd.deferWork("notification backlog deferred: polling's share of the rate window is spent; the cursor stays and the newest page is still read")
+}
 
 // flag marks the repository's Issue or PR thread of row, keeping the
 // newest notification per thread.
@@ -197,7 +222,7 @@ func (n *notificationRead) backlog(ctx context.Context, from, to time.Time, resu
 	for {
 		width := to.Sub(from)
 		for from.Before(to) {
-			if n.requests >= n.limit {
+			if n.bounded() {
 				return from, false, nil
 			}
 			until := from.Add(width)
@@ -280,7 +305,7 @@ func (n *notificationRead) second(ctx context.Context, at time.Time, after int64
 	}
 	query := notificationQuery(at, at.Add(time.Second))
 	fetch := func(ctx context.Context, page, perPage int) (listing, error) {
-		if n.requests >= n.limit {
+		if n.bounded() {
 			return listing{}, errRoundBound
 		}
 		query := maps.Clone(query)
@@ -340,7 +365,12 @@ func (n *notificationRead) second(ctx context.Context, at time.Time, after int64
 // secondWhole reads the second at whole, with every request polling has
 // left in the rate window if that is more than the round's bound. A second
 // larger than that stalls: retrying it at once would spend as much again.
+// With the window's share already spent it is deferred instead.
 func (n *notificationRead) secondWhole(ctx context.Context, at time.Time, fetch fetcher) (bool, error) {
+	if n.rd.windowLeft() <= 0 {
+		n.deferBacklog()
+		return false, nil
+	}
 	n.limit = max(n.limit, n.requests+n.rd.windowLeft())
 	done, err := readWhole(ctx, fetch, notificationsPage, n.limit, func([]entry) {})
 	switch {
@@ -542,8 +572,9 @@ func (p position) compare(o position) int {
 // a page is paged by number, as a ranked walk in ascending ID order, and
 // the cursor's LastID keeps the progress through it; a second the walk
 // cannot prove is read whole. The ETag is kept only while the cursor, and
-// so the first request's URL, is unchanged and its reply was the whole
-// listing.
+// so the first request's URL, is unchanged and its reply proved itself the
+// whole listing: no next page and shorter than a page, since a full page
+// keeps its ETag while a next page appears.
 func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) error {
 	stored, found, err := s.intake.Cursor(ctx, spec.key)
 	if err != nil {
@@ -567,12 +598,19 @@ func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) err
 	if read.front.compare(read.cover) < 0 {
 		read.front = read.cover
 	}
-	first, err := s.get(ctx, rd, model.GHRequest{Path: spec.path, Query: read.query(read.cover.at), ETag: stored.ETag})
+	query := read.query(read.cover.at)
+	first, err := s.get(ctx, rd, model.GHRequest{Path: spec.path, Query: query, ETag: stored.ETag})
 	if err != nil {
 		return err
 	}
 	if first.Status == http.StatusNotModified {
-		return nil
+		if first.NextPath == "" {
+			return nil
+		}
+		// The page is unchanged but no longer the whole listing.
+		if first, err = s.get(ctx, rd, model.GHRequest{Path: spec.path, Query: query}); err != nil {
+			return err
+		}
 	}
 	if read.front.compare(read.cover) > 0 {
 		err = read.walk(ctx, &streamWalk{r: read, pos: read.front}, false)
@@ -584,7 +622,7 @@ func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) err
 	if err != nil {
 		return err
 	}
-	if first.NextPath == "" && sameCursor(read.cursor, stored) && first.ETag != stored.ETag {
+	if first.NextPath == "" && !fullPage(first.Body, query) && sameCursor(read.cursor, stored) && first.ETag != stored.ETag {
 		// The first reply was the whole listing and its URL is unchanged.
 		cursor := read.cursor
 		cursor.ETag = first.ETag

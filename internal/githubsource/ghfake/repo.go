@@ -692,7 +692,9 @@ func (s *statusRecorder) Write(body []byte) (int, error) {
 }
 
 // reply writes value with a content ETag and answers a matching
-// If-None-Match with 304.
+// If-None-Match with 304. The ETag covers the page's rows only, so a full
+// last page that gains a next page still answers 304, with the headers
+// already set, its new Link included.
 func reply(w http.ResponseWriter, request *http.Request, value any) {
 	raw, err := json.Marshal(value)
 	if err != nil {

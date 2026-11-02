@@ -95,11 +95,15 @@ func TestDoParsesHeadersPaginationAndRateLimit(t *testing.T) {
 	}
 }
 
+// TestDoConditionalRequestReturnsNotModified: a 304 comes back with an
+// empty body and its own headers, its Link pagination included: the page
+// is unchanged, the listing past it may not be.
 func TestDoConditionalRequestReturnsNotModified(t *testing.T) {
 	server := ghfake.NewServer(t)
 	server.HandleFunc("GET /notifications", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("If-None-Match") == `"v1"` && r.Header.Get("If-Modified-Since") == "Mon, 02 Nov 2026 11:00:00 GMT" {
 			w.Header().Set("ETag", `"v1"`)
+			w.Header().Set("Link", `<https://api.github.com/notifications?page=2>; rel="next"`)
 			w.WriteHeader(http.StatusNotModified)
 			return
 		}
@@ -110,7 +114,8 @@ func TestDoConditionalRequestReturnsNotModified(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Status != http.StatusNotModified || response.Body != nil || response.ETag != `"v1"` {
+	if response.Status != http.StatusNotModified || response.Body != nil || response.ETag != `"v1"` ||
+		response.NextPath != "notifications?page=2" || len(response.Header.Values("Link")) != 1 {
 		t.Fatalf("response = %+v", response)
 	}
 	if _, err := client.Do(context.Background(), model.GHRequest{Path: "notifications", ETag: "bad\r\nX-Injected: 1"}); err == nil || !strings.Contains(err.Error(), "line break") {

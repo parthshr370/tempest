@@ -19,8 +19,12 @@ const stateGone = "gone"
 
 // pollWatched reads watched threads, flagged ones first and within each
 // group the one read longest ago first, while the round's allowance
-// lasts. The first flagged thread is read even when it is spent, so flags
-// always progress; the rest wait for a later round, which reads them
+// lasts. Two reads go on when it is spent: the first flagged thread, so
+// flags always progress, and the overdue thread, the one read longest ago
+// of those unread for watchFloorRounds rounds, so every watched thread is
+// read within watchFloorRounds + N - 1 rounds of its last read, for N
+// threads watched meanwhile, however much else the account spends (up to
+// the outbox reserve). The rest wait for a later round, which reads them
 // before the threads read this one.
 func (s *Source) pollWatched(ctx context.Context, rd *round) error {
 	watched, err := s.intake.Watched(ctx, rd.started)
@@ -42,19 +46,32 @@ func (s *Source) pollWatched(ctx context.Context, rd *round) error {
 		}
 		return cmp.Or(lastRead[a.Thread.Ref.Number]-lastRead[b.Thread.Ref.Number], a.Thread.Ref.Number-b.Thread.Ref.Number)
 	})
+	// overdue is the floor's thread: of those unread for watchFloorRounds,
+	// the one read longest ago.
+	overdue := 0
+	for _, item := range watched {
+		number := item.Thread.Ref.Number
+		if item.Thread.State == stateGone || s.rounds-lastRead[number] < watchFloorRounds {
+			continue
+		}
+		if overdue == 0 || cmp.Or(lastRead[number]-lastRead[overdue], number-overdue) < 0 {
+			overdue = number
+		}
+	}
 	read := 0
 	for _, item := range watched {
 		if rd.stopped() {
 			return nil
 		}
+		number := item.Thread.Ref.Number
 		if item.Thread.State == stateGone {
 			continue
 		}
-		if rd.spare() <= 0 && (read > 0 || !item.Thread.NeedsReconcile) {
-			return nil
+		if rd.spare() <= 0 && (read > 0 || !item.Thread.NeedsReconcile) && number != overdue {
+			continue
 		}
 		read++
-		s.readRound[item.Thread.Ref.Number] = s.rounds
+		s.readRound[number] = s.rounds
 		if err := s.readThread(ctx, rd, item); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

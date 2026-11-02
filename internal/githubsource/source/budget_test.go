@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -188,7 +189,11 @@ func TestNotificationResumeChecksTheJoinAfterItsLastRow(t *testing.T) {
 // holds more rows than polling may read whole fails closed, then waits
 // instead of spending the same requests every round: rounds inside the
 // wait read only up to that second and report it, the wait doubles, and
-// the retry after budget returns reads it whole.
+// the retry after budget returns reads it whole. A retry spends no more
+// than polling's share left in the window, and none of it once another
+// client used the whole share: the backlog is then deferred, which the
+// round reports, and only the head is read (Check 4: such retries spent
+// 66 requests of what the outbox was left).
 func TestUnprovenNotificationSecondBacksOff(t *testing.T) {
 	t.Parallel()
 	const threads = 3301
@@ -204,38 +209,52 @@ func TestUnprovenNotificationSecondBacksOff(t *testing.T) {
 		requests++
 		return inbox(request, rows, now)
 	})
-	// Another client of the account used polling's whole share.
+	// Other clients of the account left polling 40 requests of its share,
+	// or none.
+	short := model.RateLimit{Limit: 5000, Remaining: 3040, Reset: start.Add(time.Hour)}
 	spent := model.RateLimit{Limit: 5000, Remaining: 3000, Reset: start.Add(time.Hour)}
+	const (
+		stalled = iota
+		deferred
+		complete
+	)
 	steps := []struct {
-		advance  time.Duration
-		rate     model.RateLimit
-		retry    bool
-		complete bool
+		advance time.Duration
+		rate    model.RateLimit
+		outcome int
+		most    int
 	}{
-		{0, spent, true, false},
-		{0, spent, false, false},
-		{61 * time.Second, spent, true, false},
-		{61 * time.Second, spent, false, false},
-		{61 * time.Second, model.RateLimit{Limit: 5000, Remaining: 5000, Reset: start.Add(time.Hour)}, true, true},
+		{0, short, stalled, 40},
+		{0, short, stalled, 2},
+		{61 * time.Second, spent, deferred, 1},
+		{61 * time.Second, short, stalled, 40},
+		{61 * time.Second, short, stalled, 2},
+		{61 * time.Second, model.RateLimit{Limit: 5000, Remaining: 5000, Reset: start.Add(time.Hour)}, complete, 200},
 	}
 	for index, step := range steps {
 		e.repo.Advance(step.advance)
 		e.source.health.RateLimit = step.rate
 		before := requests
-		err := e.source.pollNotifications(context.Background(), e.source.newRound())
+		rd := e.source.newRound()
+		err := e.source.pollNotifications(context.Background(), rd)
 		sent, cursor := requests-before, e.intake.cursors[model.CursorNotifications]
-		t.Logf("round %d: %d requests, %d flagged, cursor %+v, err %v", index, sent, len(e.intake.threads), cursor, err)
-		switch {
-		case step.complete:
+		t.Logf("round %d: %d requests, %d flagged, cursor %+v, deferred %q, err %v", index, sent, len(e.intake.threads), cursor, rd.deferred, err)
+		if sent > step.most {
+			t.Fatalf("round %d sent %d requests, at most %d", index, sent, step.most)
+		}
+		switch step.outcome {
+		case complete:
 			if err != nil || !cursor.Since.After(at) || len(e.intake.threads) != threads {
 				t.Fatalf("round %d: the retry with budget did not read the second whole", index)
 			}
-		case err == nil || !strings.Contains(err.Error(), "retried after") || cursor.Since.After(at) || cursor.LastID != 0:
-			t.Fatalf("round %d: the unproven second did not fail closed", index)
-		case step.retry && sent < threads/notificationsPage:
-			t.Fatalf("round %d: the retry sent %d requests, too few to have read the second", index, sent)
-		case !step.retry && sent > 2:
-			t.Fatalf("round %d: inside the wait the round sent %d requests", index, sent)
+		case deferred:
+			if err != nil || len(rd.deferred) != 1 || cursor.Since.After(at) || cursor.LastID != 0 {
+				t.Fatalf("round %d: the backlog past the share was not deferred", index)
+			}
+		default:
+			if err == nil || !strings.Contains(err.Error(), "retried after") || cursor.Since.After(at) || cursor.LastID != 0 {
+				t.Fatalf("round %d: the unproven second did not fail closed", index)
+			}
 		}
 	}
 }
@@ -301,6 +320,104 @@ func TestRoundBudgetFollowsRateHeaders(t *testing.T) {
 		if rd.window != test.window || rd.allowance != test.allowance {
 			t.Errorf("%s: window %d allowance %d, want %d and %d", test.name, rd.window, rd.allowance, test.window, test.allowance)
 		}
+	}
+}
+
+// TestWatchedThreadsReadWithinTheFloor: other clients of the account use
+// more than polling's share in every window, so the allowance is always
+// spent, and no notification flags the watched threads. Each mention on
+// one of them must still be read within watchFloorRounds + N - 1 rounds
+// of being posted, for N watched threads, and the floor's reads of
+// unchanged threads must cost next to nothing (Check 4: the mention was
+// never read).
+func TestWatchedThreadsReadWithinTheFloor(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	e.source.client = directClient{base: e.server.URL()}
+	var numbers []int
+	for index := range 3 {
+		numbers = append(numbers, e.repo.OpenIssue(alice, fmt.Sprintf("t%d", index), ""))
+	}
+	e.intake.subscribe(numbers...)
+	bound := watchFloorRounds + len(numbers) - 1
+	type mention struct {
+		id     int64
+		at     time.Time
+		posted int
+	}
+	var pending []mention
+	worst, charged := 0, 0
+	for round := range 125 {
+		if round%11 == 0 {
+			number := numbers[(round/11)%len(numbers)]
+			pending = append(pending, mention{e.repo.Comment(number, alice, "@acme-bot please act"), e.repo.Now(), round})
+		}
+		// The window resets every hour; other clients have always used
+		// half of it, from the first round on.
+		reset := start.Add(time.Duration(round/60+1) * time.Hour)
+		e.repo.SetRateLimit(5000, 2500, reset)
+		if round == 0 {
+			e.source.health.RateLimit = model.RateLimit{Limit: 5000, Remaining: 2500, Reset: reset}
+		}
+		e.pollClean()
+		spent := 2500 - e.source.Health().RateLimit.Remaining
+		charged += spent
+		worst = max(worst, spent)
+		pending = slices.DeleteFunc(pending, func(m mention) bool {
+			if !e.intake.hasEvent(model.CommentID(m.id, m.at)) {
+				if round-m.posted+1 >= bound {
+					t.Fatalf("round %d: the mention posted in round %d is unread after %d rounds", round, m.posted, round-m.posted+1)
+				}
+				return false
+			}
+			return true
+		})
+		e.repo.Advance(time.Minute)
+	}
+	// Each round lists the empty inbox (charged); the floor's reads of an
+	// unchanged thread are 304s, and a thread with a new mention costs its
+	// issue and its comments.
+	mentions := (125 + 10) / 11
+	t.Logf("125 rounds over the share charged %d requests, at most %d in a round, for %d mentions", charged, worst, mentions)
+	if worst > 3 || charged > 125+2*mentions {
+		t.Fatalf("the floor charged %d requests, %d in one round", charged, worst)
+	}
+}
+
+// TestOutboxReserveStopsPolling: once the account is down to the outbox
+// reserve, polling sends nothing more in that window, not even for a
+// flagged thread, and reports the round degraded without failing it; a
+// new window reads again (Check 4: urgent reads spent past any share).
+func TestOutboxReserveStopsPolling(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	flagged := e.repo.OpenIssue(alice, "flagged", "@acme-bot please act")
+	e.repo.Notify(flagged)
+	e.repo.Advance(time.Second)
+	reserve := 5000 * outboxReservePercent / 100
+	e.repo.SetRateLimit(5000, reserve+1, start.Add(time.Hour))
+	degraded := func(round string, sent int) {
+		t.Helper()
+		report, health := e.poll(), e.source.Health()
+		if got := len(e.client.requests()); got != sent {
+			t.Fatalf("%s: %d requests sent, want %d", round, got, sent)
+		}
+		if len(report.Errors) != 1 || report.Errors[0].Resource != budgetResource || !health.Healthy || health.ConsecutiveFailures != 0 {
+			t.Fatalf("%s: report %+v, health %+v", round, report.Errors, health)
+		}
+	}
+	// The notifications head finds the account at the reserve.
+	degraded("first round", 1)
+	e.repo.Advance(time.Minute)
+	degraded("second round", 1)
+	if !e.intake.thread(flagged).NeedsReconcile {
+		t.Fatal("the flagged thread was read inside the reserve")
+	}
+	e.repo.Advance(time.Hour)
+	e.repo.SetRateLimit(5000, 5000, start.Add(2*time.Hour))
+	e.pollClean()
+	if e.intake.thread(flagged).NeedsReconcile {
+		t.Fatal("the flagged thread was not read in the new window")
 	}
 }
 
