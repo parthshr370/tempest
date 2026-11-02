@@ -425,3 +425,72 @@ func TestToolSearchKeepsPermissionGate(t *testing.T) {
 		t.Fatalf("gate saw %v, calls %d, result %+v", gated, catalog.count("mcp__gh__create_issue"), results[1])
 	}
 }
+
+// Auto deferral is sticky: once a conversation defers, a catalog change
+// that takes the deferrable schemas back under the threshold (an MCP
+// tools/list_changed, an extension generation) does not flip the request
+// back to the eager layout. Reset starts a new conversation, which decides
+// by the threshold again.
+func TestToolSearchAutoStaysDeferred(t *testing.T) {
+	var catalog deferredCatalog
+	full := catalog.tools()
+	chars := 0
+	for _, tool := range full[1:] {
+		chars += len(tool.Name) + len(tool.Description) + len(tool.Parameters)
+	}
+	policy := &ToolSearch{Mode: ToolSearchAuto, ThresholdTokens: (chars + 3) / 4}
+	small := full[:2]
+	script := &sentRequests{}
+	a := newSearchAgent(full, script, policy, nil)
+	for _, tools := range [][]AgentTool{full, small, full, small} {
+		a.SetTools(tools)
+		if _, err := a.PromptText(context.Background(), "hi"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, request := range script.sent() {
+		if got := request.names(); !slices.Equal(got, []string{"read", ToolSearchName}) {
+			t.Fatalf("request %d tools = %v, want the deferred layout", i, got)
+		}
+	}
+	a.Reset()
+	if _, err := a.PromptText(context.Background(), "new conversation"); err != nil {
+		t.Fatal(err)
+	}
+	sent := script.sent()
+	if got, want := sent[len(sent)-1].names(), []string{"read", "mcp__gh__create_issue"}; !slices.Equal(got, want) {
+		t.Fatalf("after Reset tools = %v, want %v", got, want)
+	}
+}
+
+// A conversation reopened in a new Agent (resume, fork) under the
+// threshold keeps deferring when its transcript shows a tool_search call,
+// so its loaded tools keep their places.
+func TestToolSearchAutoReopenedAfterSearchStaysDeferred(t *testing.T) {
+	var catalog deferredCatalog
+	small := catalog.tools()[:3]
+	searched := []types.Message{
+		types.UserMessage{Content: types.StringContent("load")},
+		callMessage("s1", ToolSearchName, `{"query":"mcp__gh__list_pulls"}`),
+		types.ToolResultMessage{ToolCallID: "s1", ToolName: ToolSearchName, Content: []types.ContentBlock{types.NewText("loaded")}, Details: json.RawMessage(`{"loaded":["mcp__gh__list_pulls"]}`)},
+		doneMessage(),
+	}
+	for _, tc := range []struct {
+		name     string
+		messages []types.Message
+		want     []string
+	}{
+		{"searched", searched, []string{"read", ToolSearchName, "mcp__gh__list_pulls"}},
+		{"never searched", nil, []string{"read", "mcp__gh__create_issue", "mcp__gh__list_pulls"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			script := &sentRequests{}
+			if _, err := newSearchAgent(small, script, nil, tc.messages).PromptText(context.Background(), "next"); err != nil {
+				t.Fatal(err)
+			}
+			if got := script.sent()[0].names(); !slices.Equal(got, tc.want) {
+				t.Fatalf("tools = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

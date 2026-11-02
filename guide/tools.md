@@ -462,7 +462,10 @@ first loaded. A load only appends, so the request changes once per load and is
 byte-identical on every request after it, and a loaded tool stays loaded for the rest
 of the conversation. Which tools are loaded is read from the conversation itself (the
 `tool_search` results and successful calls of deferred tools), so a resumed or forked session
-offers the same list without any extra record. Providers cache the tool list ahead of
+offers the same list without any extra record. A compaction checkpoint that summarizes
+those results keeps the loaded tools, in their order, on its summary message, so the
+tool list after a checkpoint is the one before it, and a resume from the checkpoint
+offers it too. Rewinding to a point before a load drops that load. Providers cache the tool list ahead of
 the conversation (Anthropic places it before the system prompt), so one load costs one
 cache write of the conversation so far; deferral saves the deferred schemas on every
 request.
@@ -478,7 +481,11 @@ the server removed leaves the tool list and a call to it fails as an unknown too
 
 The `tool_search` setting controls deferral: `{"mode": "auto", "threshold_tokens":
 10000}` is the default, `"always"` defers every MCP and extension tool, and `"never"`
-sends every schema with every request. A repository may only defer more than the
+sends every schema with every request. In `"auto"` mode deferral, once on, stays on
+for the rest of the conversation even when a tool list change takes the schemas back under
+the threshold, so the tool list does not flip between the two layouts. A resumed or
+forked session keeps deferring when it has called `tool_search`; otherwise its first
+request decides by the threshold again. A repository may only defer more than the
 operator; see [Project settings and trust](configuration.md#project-settings-and-trust).
 
 ## Tool reference

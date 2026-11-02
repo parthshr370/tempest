@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/types"
@@ -180,6 +181,9 @@ type Agent struct {
 	bindings      *runtimeBindings
 	ended         bool
 	outputSchema  *outputschema.Schema
+	// toolSearchLatch is set once a request of this conversation defers
+	// tools (see [ToolSearch]); Reset clears it.
+	toolSearchLatch atomic.Bool
 
 	emitMu sync.Mutex
 	// seq is the last Seq handed out; guarded by emitMu.
@@ -455,6 +459,7 @@ func (a *Agent) Reset() {
 	a.state.ErrorMessage = ""
 	a.steeringQueue.Clear()
 	a.followUpQueue.Clear()
+	a.toolSearchLatch.Store(false)
 }
 
 // State returns a snapshot of the public agent state. Slices are copied so
@@ -697,6 +702,7 @@ func (a *Agent) loopConfigLocked(skipInitialSteeringPoll bool) AgentLoopConfig {
 		Reminders:        a.Reminders,
 		LoopThresholds:   a.LoopThresholds,
 		ToolSearch:       a.ToolSearch,
+		toolSearchLatch:  &a.toolSearchLatch,
 	}
 	if thinkingLevel := a.state.ThinkingLevel; thinkingLevel != "" && thinkingLevel != ThinkingOff {
 		config.Reasoning = string(thinkingLevel)

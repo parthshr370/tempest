@@ -53,9 +53,17 @@ const (
 // load only ever appends to the list, and a loaded tool stays for the rest
 // of the conversation, so the provider's cached prefix changes once per
 // load and never otherwise. Which tools are loaded is read from the
-// transcript (successful tool_search results and successful calls of
-// deferred tools), which the journal already holds: a resumed conversation
-// offers the same list.
+// transcript (see [LoadedTools]), which the journal already holds: a
+// resumed, compacted, rewound or forked conversation offers the list its
+// transcript shows.
+//
+// Auto mode is sticky: once a conversation defers, it keeps deferring while
+// it has deferrable tools, even when a catalog change takes their schemas
+// back under the threshold, so the request layout does not flip with the
+// catalog. The latch lives in the [Agent] until [Agent.Reset]; a
+// conversation reopened in a new Agent (resume, fork) also defers from its
+// first request when its transcript shows a tool_search call, and otherwise
+// decides by the threshold again.
 type ToolSearch struct {
 	// Mode is when to defer; empty means [ToolSearchAuto].
 	Mode ToolSearchMode
@@ -83,25 +91,27 @@ type toolSearchDetails struct {
 	Loaded []string `json:"loaded"`
 }
 
-// toolView returns the tools one request offers: tools unchanged when
-// nothing is deferred, otherwise the eager tools, tool_search and the
-// loaded deferred tools, followed by the deferred tools not loaded yet,
-// marked unloaded so they are neither sent nor run. It reads only its
-// arguments, so the same catalog and transcript give the same view.
-func toolView(tools []AgentTool, messages []types.Message, policy *ToolSearch) []AgentTool {
+// toolView returns the tools one request offers, and whether it defers:
+// tools unchanged when nothing is deferred, otherwise the eager tools,
+// tool_search and the loaded deferred tools, followed by the deferred tools
+// not loaded yet, marked unloaded so they are neither sent nor run.
+// isSticky reports that this conversation deferred before (see
+// [ToolSearch]). It reads only its arguments, so the same catalog,
+// transcript and latch give the same view.
+func toolView(tools []AgentTool, messages []types.Message, policy *ToolSearch, isSticky bool) ([]AgentTool, bool) {
 	var settings ToolSearch
 	if policy != nil {
 		settings = *policy
 	}
 	if settings.Mode == ToolSearchNever {
-		return tools
+		return tools, false
 	}
 	deferred, chars := 0, 0
 	for _, tool := range tools {
 		if tool.Name == ToolSearchName {
 			// A tool already has the name: offering a second one would
 			// make calls ambiguous, so nothing is deferred.
-			return tools
+			return tools, false
 		}
 		if tool.Deferrable {
 			deferred++
@@ -109,11 +119,13 @@ func toolView(tools []AgentTool, messages []types.Message, policy *ToolSearch) [
 		}
 	}
 	if deferred == 0 {
-		return tools
+		return tools, false
 	}
+	names := LoadedTools(messages)
 	threshold := cmp.Or(settings.ThresholdTokens, DefaultToolSearchThreshold)
-	if settings.Mode != ToolSearchAlways && (chars+estimate.CharsPerToken-1)/estimate.CharsPerToken < threshold {
-		return tools
+	isOverThreshold := (chars+estimate.CharsPerToken-1)/estimate.CharsPerToken >= threshold
+	if settings.Mode != ToolSearchAlways && !isOverThreshold && !isSticky && !slices.Contains(names, ToolSearchName) {
+		return tools, false
 	}
 
 	view := make([]AgentTool, 0, len(tools)+1)
@@ -129,7 +141,7 @@ func toolView(tools []AgentTool, messages []types.Message, policy *ToolSearch) [
 	}
 	loaded := make(map[string]bool)
 	var order []int
-	for _, name := range loadedNames(messages) {
+	for _, name := range names {
 		if i, ok := index[name]; ok && !loaded[name] {
 			loaded[name] = true
 			order = append(order, i)
@@ -145,7 +157,7 @@ func toolView(tools []AgentTool, messages []types.Message, policy *ToolSearch) [
 			view = append(view, tool)
 		}
 	}
-	return view
+	return view, true
 }
 
 // offeredTools is the schemas a request sends: every tool in the view
@@ -160,12 +172,16 @@ func offeredTools(view []AgentTool) []types.Tool {
 	return tools
 }
 
-// loadedNames lists, in first-appearance order, the tools the transcript
-// shows loaded: those a successful tool_search result names, and every tool
-// with a successful result. The caller keeps the deferred ones; a call
-// result keeps a tool loaded after compaction dropped the search that
-// loaded it.
-func loadedNames(messages []types.Message) []string {
+// LoadedTools lists, in first-appearance order, the tools messages show
+// loaded: the names a compaction carried on its summary message
+// ([types.UserMessage.LoadedTools]), the names a successful tool_search
+// result loaded, and every tool with a successful result, tool_search
+// itself included, which records that the conversation searched. A request
+// offers the deferred ones. A compaction puts this list for the messages it
+// replaces on its summary message, so the list, and the tools a request
+// offers, are the same after the checkpoint as before it, and a loaded tool
+// whose search and calls were summarized stays loaded.
+func LoadedTools(messages []types.Message) []string {
 	var names []string
 	seen := make(map[string]bool)
 	add := func(name string) {
@@ -175,18 +191,26 @@ func loadedNames(messages []types.Message) []string {
 		}
 	}
 	for _, message := range messages {
-		result, ok := message.(types.ToolResultMessage)
-		if !ok || result.IsError {
-			continue
-		}
-		if result.ToolName != ToolSearchName {
-			add(result.ToolName)
-			continue
-		}
-		var details toolSearchDetails
-		if json.Unmarshal(result.Details, &details) == nil {
-			for _, name := range details.Loaded {
+		switch message := message.(type) {
+		case types.UserMessage:
+			for _, name := range message.LoadedTools {
 				add(name)
+			}
+		case types.ToolResultMessage:
+			if message.IsError {
+				continue
+			}
+			add(message.ToolName)
+			if message.ToolName != ToolSearchName {
+				continue
+			}
+			// Every tool_search result this package writes has these
+			// details; a result without them loaded nothing.
+			var details toolSearchDetails
+			if json.Unmarshal(message.Details, &details) == nil {
+				for _, name := range details.Loaded {
+					add(name)
+				}
 			}
 		}
 	}

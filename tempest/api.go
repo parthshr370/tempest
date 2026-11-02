@@ -157,6 +157,29 @@ type HookCommand = hooks.Command
 // Tool is an embeddable tool implementation.
 type Tool = agent.AgentTool
 
+// ToolSearch configures deferred tool loading (StackConfig.ToolSearch):
+// when a large set of deferrable tools (MCP, extension, or a Tool with
+// Deferrable set) is held behind the tool_search tool and loaded on demand.
+// The zero value is automatic deferral at DefaultToolSearchThreshold.
+type ToolSearch = agent.ToolSearch
+
+// ToolSearchMode says when deferrable tools are deferred.
+type ToolSearchMode = agent.ToolSearchMode
+
+const (
+	// ToolSearchAuto defers once the deferrable schemas reach the
+	// threshold, and then for the rest of the conversation.
+	ToolSearchAuto = agent.ToolSearchAuto
+	// ToolSearchAlways defers whenever there are deferrable tools.
+	ToolSearchAlways = agent.ToolSearchAlways
+	// ToolSearchNever sends every schema with every request.
+	ToolSearchNever = agent.ToolSearchNever
+)
+
+// DefaultToolSearchThreshold is the estimated schema size, in tokens, at
+// which ToolSearchAuto defers.
+const DefaultToolSearchThreshold = agent.DefaultToolSearchThreshold
+
 // Reminder is a short instruction added at the tail of a model request when
 // its cadence matches and its conditions hold, at most MaxFires times per
 // run. It never changes the system prompt or tools, so the provider's

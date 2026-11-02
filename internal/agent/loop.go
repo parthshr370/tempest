@@ -549,7 +549,11 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			// The tools this request offers: with deferral, the eager tools,
 			// tool_search and the loaded deferred tools. The executor runs
 			// only what the provider was offered.
-			view := toolView(current.Tools, current.Messages, config.ToolSearch)
+			isSticky := config.toolSearchLatch != nil && config.toolSearchLatch.Load()
+			view, isDeferring := toolView(current.Tools, current.Messages, config.ToolSearch, isSticky)
+			if isDeferring && config.toolSearchLatch != nil {
+				config.toolSearchLatch.Store(true)
+			}
 			release, stop, err := run.accounting.admit(ctx, config.Model)
 			if stop != "" || err != nil {
 				release()

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
@@ -243,6 +244,11 @@ type AgentLoopConfig struct {
 	// ToolSearch configures deferred tool loading; nil means the zero
 	// [ToolSearch], automatic deferral at the default threshold.
 	ToolSearch *ToolSearch
+	// toolSearchLatch holds whether the conversation has deferred (see
+	// [ToolSearch]); the loop sets it on the first request that defers. An
+	// [Agent] keeps one per conversation. Nil leaves auto mode to the
+	// threshold and the transcript.
+	toolSearchLatch *atomic.Bool
 }
 
 // Budget caps one run. Zero fields are unlimited. The loop checks the budget
