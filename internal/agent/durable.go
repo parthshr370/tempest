@@ -211,7 +211,7 @@ func AccountProviderUsage(ctx context.Context, source, model string, usage types
 	}
 	childID := ""
 	if run, _ := ctx.Value(localRunKey{}).(*loopRun); run != nil && !run.root {
-		run.result.Usage.Add(usage)
+		run.addUsage(usage)
 		childID = run.config.SessionID
 	}
 	return a.record(ctx, source, model, usage, childID)

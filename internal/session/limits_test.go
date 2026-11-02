@@ -3,11 +3,14 @@ package session
 import (
 	"context"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/faux"
+	"go.harness.dev/harness/internal/retry"
 	"go.harness.dev/harness/internal/session/journal"
 )
 
@@ -117,4 +120,65 @@ func TestRunLimitsHoldAcrossCrashResume(t *testing.T) {
 			t.Fatalf("result = %+v calls = %d, want both calls run and the run completed", result, f.CallCount())
 		}
 	})
+}
+
+// A failed attempt that reported usage without a message_start is
+// journaled as an errored message with its own usage receipt, charged once,
+// and counts against the caps before the request is sent again.
+func TestFailedAttemptWithoutStartIsJournaledOnce(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		budget    agent.Budget
+		wantStop  agent.StopReason
+		wantSent  int
+		wantInput int
+	}{
+		{"uncapped", agent.Budget{}, agent.StopCompleted, 2, 200},
+		{"cap reached by the failed attempt", agent.Budget{MaxInputTokens: 100}, agent.StopMaxInputTokens, 1, 100},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := queueStore(t)
+			var sent atomic.Int32
+			provider := func(_ context.Context, model types.Model, _ types.Context, _ *types.SimpleStreamOptions) *stream.AssistantStream {
+				out := stream.NewAssistantStream(model.API, model.Provider, model.ID)
+				if sent.Add(1) == 1 {
+					out.Push(types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, StopReason: types.StopError, ErrorCode: string(retry.CodeStreamInterrupted), ErrorMessage: "stream dropped", Usage: types.Usage{Input: 100, TotalTokens: 100}}})
+				} else {
+					answer := types.AssistantMessage{API: model.API, Provider: model.Provider, Model: model.ID, Content: []types.ContentBlock{types.NewText("done")}, StopReason: types.StopStop, Usage: types.Usage{Input: 100, Output: 5, TotalTokens: 105}}
+					out.Push(types.StreamEvent{Type: types.EvStart, Partial: &answer})
+					out.Push(types.StreamEvent{Type: types.EvDone, Reason: types.StopStop, Message: &answer})
+				}
+				out.End()
+				return out
+			}
+			policy := retry.DefaultConfig()
+			policy.MaxAttempts = 2
+			policy.Sleeper = noRetryDelay{}
+			retrier, err := retry.New(retry.StreamFunc(provider), policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			model := types.Model{API: "test", Provider: "test", ID: "m", ContextWindow: 1000}
+			a := agent.NewAgent(agent.AgentOptions{InitialState: &agent.AgentState{Model: model}, StreamFn: retrier.Stream, SessionID: store.ID(), Budget: test.budget})
+			defer AttachJournal(a, store)()
+			result, err := a.PromptText(ctx, "go")
+			if err != nil || result.Err != nil || result.StopReason != test.wantStop || int(sent.Load()) != test.wantSent {
+				t.Fatalf("result = %+v after %d attempts, err = %v; want %q after %d", result, sent.Load(), err, test.wantStop, test.wantSent)
+			}
+			loaded, err := journal.Load(ctx, store.Path())
+			if err != nil {
+				t.Fatal(err)
+			}
+			assistants := 0
+			for _, message := range loaded.Messages {
+				if _, ok := message.(types.AssistantMessage); ok {
+					assistants++
+				}
+			}
+			if loaded.UsageTotal.Input != test.wantInput || result.Usage.Input != test.wantInput || assistants != test.wantSent {
+				t.Fatalf("journaled input = %d, run input = %d, assistant messages = %d; want %d, %d, %d", loaded.UsageTotal.Input, result.Usage.Input, assistants, test.wantInput, test.wantInput, test.wantSent)
+			}
+		})
+	}
 }

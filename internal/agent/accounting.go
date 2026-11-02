@@ -158,9 +158,9 @@ func (run *loopRun) accountUsage(ctx context.Context, message types.AssistantMes
 }
 
 func (run *loopRun) chargeUsage(ctx context.Context, message types.AssistantMessage) error {
-	run.result.Usage.Add(message.Usage)
 	source := run.config.bindings.lastReceipt()
 	if !run.root {
+		run.addUsage(message.Usage)
 		return run.accounting.record(ctx, source, message.Model, message.Usage, run.config.SessionID)
 	}
 	a := run.accounting
@@ -174,4 +174,18 @@ func (run *loopRun) chargeUsage(ctx context.Context, message types.AssistantMess
 	}
 	a.usage.Add(message.Usage)
 	return nil
+}
+
+// addUsage charges usage to a child run's own spend.
+func (run *loopRun) addUsage(usage types.Usage) {
+	run.accounting.mu.Lock()
+	defer run.accounting.mu.Unlock()
+	run.usage.Add(usage)
+}
+
+// ownUsage returns a child run's own spend.
+func (run *loopRun) ownUsage() types.Usage {
+	run.accounting.mu.Lock()
+	defer run.accounting.mu.Unlock()
+	return run.usage
 }

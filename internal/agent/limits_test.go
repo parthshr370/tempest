@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.harness.dev/harness/internal/engine/stream"
 	"go.harness.dev/harness/internal/engine/types"
@@ -147,11 +148,14 @@ func TestUnmeasuredChildResponseStopsATokenCappedRoot(t *testing.T) {
 	}
 }
 
-// failedAfterUsage is an attempt that streams, reports usage, then drops:
-// what a provider bills for although its stream failed.
-func failedAfterUsage(usage types.Usage) func(context.Context, *stream.AssistantStream) {
+// failedAfterUsage is an attempt that reports usage, then drops: what a
+// provider bills for although its stream failed. Unless started, it sends
+// no message_start first, as some providers do not.
+func failedAfterUsage(usage types.Usage, started bool) func(context.Context, *stream.AssistantStream) {
 	return func(_ context.Context, events *stream.AssistantStream) {
-		events.Push(types.StreamEvent{Type: types.EvStart})
+		if started {
+			events.Push(types.StreamEvent{Type: types.EvStart})
+		}
 		events.Push(types.StreamEvent{Type: types.EvError, Reason: types.StopError, Err: &types.AssistantMessage{
 			StopReason: types.StopError, ErrorCode: string(retry.CodeStreamInterrupted), ErrorMessage: "stream dropped", Usage: usage,
 		}})
@@ -161,6 +165,8 @@ func failedAfterUsage(usage types.Usage) func(context.Context, *stream.Assistant
 // A request is sent again, as a retry or to a backup, only while the run is
 // under its caps: an attempt that failed after its usage reached a cost or
 // token cap ends the run at that cap instead of paying for another attempt.
+// The failed attempt is charged once whether or not its stream opened a
+// message, and listeners see it start and end like any other.
 func TestRetryAndBackupAreReadmittedAfterAFailedAttempt(t *testing.T) {
 	spent := types.Usage{Input: 100, TotalTokens: 100, Cost: types.Cost{Total: 0.01}}
 	for _, test := range []struct {
@@ -177,59 +183,182 @@ func TestRetryAndBackupAreReadmittedAfterAFailedAttempt(t *testing.T) {
 		{"backup: total cap", Budget{MaxTotalTokens: 100}, true, StopMaxTotalTokens, 1},
 		{"backup: cost cap", Budget{MaxCostUSD: 0.01}, true, StopMaxCost, 1},
 		{"backup: under the caps", Budget{MaxInputTokens: 101, MaxCostUSD: 0.02}, true, StopCompleted, 2},
+		{"retry: uncapped", Budget{}, false, StopCompleted, 2},
+		{"backup: uncapped", Budget{}, true, StopCompleted, 2},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			policy := retry.DefaultConfig()
-			policy.Sleeper = instantSleeper{}
-			primary := &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){failedAfterUsage(spent), answeredAttempt}}
-			model := types.Model{API: "test", Provider: "test", ID: "primary"}
-			providers := []*scriptedProvider{primary}
-			var streamFn StreamFn
-			if test.backup {
-				policy.MaxAttempts = 1
-				primary.attempts = primary.attempts[:1]
-				providers = append(providers, &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){answeredAttempt}})
-				var candidates []retry.Candidate
-				for i, provider := range providers {
-					retrier, err := retry.New(provider, policy)
+		for _, started := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s, message_start sent: %t", test.name, started), func(t *testing.T) {
+				policy := retry.DefaultConfig()
+				policy.Sleeper = instantSleeper{}
+				primary := &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){failedAfterUsage(spent, started), answeredAttempt}}
+				model := types.Model{API: "test", Provider: "test", ID: "primary"}
+				providers := []*scriptedProvider{primary}
+				var streamFn StreamFn
+				if test.backup {
+					policy.MaxAttempts = 1
+					primary.attempts = primary.attempts[:1]
+					providers = append(providers, &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){answeredAttempt}})
+					var candidates []retry.Candidate
+					for i, provider := range providers {
+						retrier, err := retry.New(provider, policy)
+						if err != nil {
+							t.Fatal(err)
+						}
+						candidate := model
+						if i > 0 {
+							candidate.ID = "backup"
+						}
+						candidates = append(candidates, retry.Candidate{Model: candidate, Stream: retrier})
+					}
+					chain, err := retry.NewFallback(candidates)
 					if err != nil {
 						t.Fatal(err)
 					}
-					candidate := model
-					if i > 0 {
-						candidate.ID = "backup"
+					streamFn = chain.Stream
+				} else {
+					policy.MaxAttempts = 2
+					retrier, err := retry.New(primary, policy)
+					if err != nil {
+						t.Fatal(err)
 					}
-					candidates = append(candidates, retry.Candidate{Model: candidate, Stream: retrier})
+					streamFn = retrier.Stream
 				}
-				chain, err := retry.NewFallback(candidates)
+				a := NewAgent(AgentOptions{InitialState: &AgentState{Model: model}, StreamFn: streamFn, Budget: test.budget})
+				var starts, ends int
+				a.Subscribe(func(_ context.Context, e AgentEvent) error {
+					if _, ok := e.Message.(types.AssistantMessage); ok {
+						switch e.Type {
+						case EventMessageStart:
+							starts++
+						case EventMessageEnd:
+							ends++
+						}
+					}
+					return nil
+				})
+				result, err := a.PromptText(context.Background(), "go")
 				if err != nil {
 					t.Fatal(err)
 				}
-				streamFn = chain.Stream
-			} else {
-				policy.MaxAttempts = 2
-				retrier, err := retry.New(primary, policy)
-				if err != nil {
-					t.Fatal(err)
+				sent := 0
+				for _, provider := range providers {
+					sent += provider.calls()
 				}
-				streamFn = retrier.Stream
-			}
-			a := NewAgent(AgentOptions{InitialState: &AgentState{Model: model}, StreamFn: streamFn, Budget: test.budget})
-			result, err := a.PromptText(context.Background(), "go")
-			if err != nil {
-				t.Fatal(err)
-			}
-			sent := 0
-			for _, provider := range providers {
-				sent += provider.calls()
-			}
-			if result.Err != nil || result.StopReason != test.wantStop || sent != test.wantSent {
-				t.Fatalf("result = %+v after %d attempts, want %q after %d", result, sent, test.wantStop, test.wantSent)
-			}
-			if want := 100 * test.wantSent; promptTokens(result.Usage) != want {
-				t.Fatalf("prompt tokens = %d, want %d", promptTokens(result.Usage), want)
+				if result.Err != nil || result.StopReason != test.wantStop || sent != test.wantSent {
+					t.Fatalf("result = %+v after %d attempts, want %q after %d", result, sent, test.wantStop, test.wantSent)
+				}
+				if want := 100 * test.wantSent; promptTokens(result.Usage) != want {
+					t.Fatalf("prompt tokens = %d, want %d", promptTokens(result.Usage), want)
+				}
+				if starts != sent || ends != sent {
+					t.Fatalf("assistant message_start %d, message_end %d for %d attempts", starts, ends, sent)
+				}
+			})
+		}
+	}
+}
+
+// Provider work a tool joins to the run may outlive the tool and gate its
+// attempts while the loop charges the next response, for the root and for
+// a child alike. Run with -race: the gate must not read the loop's own
+// counters unsynchronized.
+func TestJoinedWorkGatesAttemptsWhileTheRunSpends(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		root, child Budget
+	}{
+		{"uncapped", Budget{}, Budget{}},
+		{"root token cap", Budget{MaxTotalTokens: 10000}, Budget{}},
+		{"child token cap", Budget{}, Budget{MaxTotalTokens: 10000}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var root *Agent
+			// observing joins the root's run from the calling run's tool and
+			// keeps gating attempts after the tool returned, until the root's
+			// run ends.
+			observing := executorTool("work", "", ExecParallel, func(ctx context.Context, _ string, _ json.RawMessage, _ AgentToolUpdateCallback) (AgentToolResult, error) {
+				joined, _, done, ok := root.JoinRun(ctx)
+				if !ok {
+					return AgentToolResult{}, errors.New("join refused")
+				}
+				// The admission is released at once: this work sends no
+				// request, and holding it would stall the run's next one.
+				release, err := AdmitProvider(joined, reminderModel)
+				release()
+				if err != nil {
+					done()
+					return AgentToolResult{}, err
+				}
+				observe := GateAttempts(joined, &types.SimpleStreamOptions{})
+				started := make(chan struct{})
+				go func() {
+					defer done()
+					close(started)
+					for joined.Err() == nil {
+						if observe(types.StreamEvent{Type: types.EvRetry}) != nil {
+							return
+						}
+					}
+				}()
+				<-started
+				return AgentToolResult{Content: []types.ContentBlock{types.NewText("ok")}}, nil
+			})
+			delegate := executorTool("delegate", "", ExecParallel, func(ctx context.Context, _ string, _ json.RawMessage, _ AgentToolUpdateCallback) (AgentToolResult, error) {
+				child := newLimitAgent(meteredScript(toolCallMessage("work"), textAnswer()), test.child, observing)
+				result, err := child.PromptText(ctx, "sub task")
+				if err == nil && result.StopReason != StopCompleted {
+					err = fmt.Errorf("child result = %+v", result)
+				}
+				return AgentToolResult{Content: []types.ContentBlock{types.NewText(string(result.StopReason))}}, err
+			})
+			root = newLimitAgent(meteredScript(toolCallMessage("work", "delegate"), textAnswer()), test.root, observing, delegate)
+			result, err := root.PromptText(context.Background(), "go")
+			if err != nil || result.Err != nil || result.StopReason != StopCompleted {
+				t.Fatalf("result = %+v, err = %v", result, err)
 			}
 		})
+	}
+}
+
+// signalingSleeper reports when the retry backoff begins.
+type signalingSleeper struct{ entered chan struct{} }
+
+func (s signalingSleeper) Sleep(context.Context, time.Duration) error {
+	close(s.entered)
+	return nil
+}
+
+// Without a cost or token cap nothing decides whether a retry may be sent,
+// so the backoff starts as soon as the failure is announced, while
+// listeners still handle it, as it did before the caps existed.
+func TestUncappedRetryBackoffDoesNotWaitForListeners(t *testing.T) {
+	entered := make(chan struct{})
+	provider := &scriptedProvider{attempts: []func(context.Context, *stream.AssistantStream){stalledAttempt, answeredAttempt}}
+	policy := retry.DefaultConfig()
+	policy.MaxAttempts = 2
+	policy.Sleeper = signalingSleeper{entered}
+	retrier, err := retry.New(provider, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAgent(AgentOptions{InitialState: &AgentState{Model: reminderModel}, StreamFn: retrier.Stream})
+	var waited bool
+	a.Subscribe(func(_ context.Context, e AgentEvent) error {
+		if e.Type == EventModelRetry {
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				waited = true
+			}
+		}
+		return nil
+	})
+	result, err := a.PromptText(context.Background(), "go")
+	if err != nil || result.Err != nil || result.StopReason != StopCompleted || provider.calls() != 2 {
+		t.Fatalf("result = %+v after %d attempts, err = %v", result, provider.calls(), err)
+	}
+	if waited {
+		t.Fatal("the retry backoff waited for the retry listener")
 	}
 }
 

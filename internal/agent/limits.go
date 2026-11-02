@@ -88,20 +88,36 @@ func (a *runAccounting) checkMeasured(own Budget, message types.AssistantMessage
 	return nil
 }
 
+// spendCapped reports whether b caps cost or tokens: the spend a failed
+// attempt adds before its request is sent again.
+func spendCapped(b Budget) bool { return b.MaxCostUSD > 0 || tokenCapped(b) }
+
+// capsAttempts reports whether the spend of a failed attempt can stop
+// run's request from being sent again: whether the root's shared caps, or
+// run's own when it is a child, cap cost or tokens. run may be nil.
+func (a *runAccounting) capsAttempts(run *loopRun) bool {
+	return spendCapped(a.limits) || run != nil && !run.root && spendCapped(run.config.Budget)
+}
+
 // attemptStop decides whether a request may be sent again after attempts
 // that failed, as a retry or to a backup: not once the spend, with pending
 // (those attempts' usage not yet charged), has reached a cost or token cap,
-// the root run's shared ones or run's own (run may be nil). A reached cap
-// is a *providerBudgetStop, which ends the run at that cap.
+// the root run's shared ones or a child run's own (run may be nil). A
+// reached cap is a *providerBudgetStop, which ends the run at that cap.
+// Provider work joined to the run calls this from other goroutines while
+// the loop charges, so both spends are read under the accounting's lock.
 func (a *runAccounting) attemptStop(run *loopRun, pending types.Usage) error {
-	if err := a.failure(); err != nil {
-		return err
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil {
+		return a.err
 	}
-	shared := a.total()
+	shared := a.usage
 	shared.Add(pending)
 	stop, err := spendStop(a.limits, shared)
-	if stop == "" && err == nil && run != nil {
-		own := run.result.Usage
+	// The root's own caps are the shared ones.
+	if stop == "" && err == nil && run != nil && !run.root && spendCapped(run.config.Budget) {
+		own := run.usage
 		own.Add(pending)
 		stop, err = spendStop(run.config.Budget, own)
 	}
@@ -113,15 +129,22 @@ func (a *runAccounting) attemptStop(run *loopRun, pending types.Usage) error {
 
 // attemptGate makes a stream's retry and fallback layers wait, before they
 // send a request again, for its consumer to answer the EvRetry or
-// EvFallback event that announced the failed attempt.
+// EvFallback event that announced the failed attempt. retry is nil when
+// retries are not gated.
 type attemptGate struct{ retry, fallback chan error }
 
-// gateAttempts installs a gate in opts. A fallback hook already in opts runs
-// once the gate admits the switch.
-func gateAttempts(opts *types.SimpleStreamOptions) *attemptGate {
-	g := &attemptGate{retry: make(chan error, 1), fallback: make(chan error, 1)}
+// gateAttempts installs a gate in opts on every switch to a backup, and
+// on every retry when retries is set. Only a cap can refuse a retry, so
+// without one the retry's backoff starts at once, while the consumer still
+// handles the failure. A fallback hook already in opts runs once the gate
+// admits the switch.
+func gateAttempts(opts *types.SimpleStreamOptions, retries bool) *attemptGate {
+	g := &attemptGate{fallback: make(chan error, 1)}
+	if retries {
+		g.retry = make(chan error, 1)
+		opts.AdmitRetry = func(ctx context.Context, _ int) error { return g.wait(ctx, g.retry) }
+	}
 	switched := opts.AdmitFallback
-	opts.AdmitRetry = func(ctx context.Context, _ int) error { return g.wait(ctx, g.retry) }
 	opts.AdmitFallback = func(ctx context.Context, fallback types.ModelFallback) error {
 		if err := g.wait(ctx, g.fallback); err != nil || switched == nil {
 			return err
@@ -148,6 +171,9 @@ func (g *attemptGate) answer(event types.StreamEvent, err error) {
 	if event.Type == types.EvFallback && event.Fallback != nil {
 		answer = g.fallback
 	}
+	if answer == nil {
+		return
+	}
 	select {
 	case <-answer:
 	default:
@@ -163,14 +189,15 @@ func (g *attemptGate) answer(event types.StreamEvent, err error) {
 // token caps. The caller passes observe every event it reads; observe
 // returns the refusal, a *providerBudgetStop or the run's failure, which
 // the caller returns once the stream has ended. A fallback hook already in
-// opts runs once the gate admits the switch.
+// opts runs once the gate admits the switch. A run without cost or token
+// caps leaves opts as they are.
 func GateAttempts(ctx context.Context, opts *types.SimpleStreamOptions) (observe func(types.StreamEvent) error) {
 	a, _ := ctx.Value(accountingKey{}).(*runAccounting)
-	if a == nil {
+	run, _ := ctx.Value(localRunKey{}).(*loopRun)
+	if a == nil || !a.capsAttempts(run) {
 		return func(types.StreamEvent) error { return nil }
 	}
-	run, _ := ctx.Value(localRunKey{}).(*loopRun)
-	gate := gateAttempts(opts)
+	gate := gateAttempts(opts, true)
 	var pending types.Usage
 	return func(event types.StreamEvent) error {
 		if event.Type != types.EvRetry && event.Type != types.EvFallback {
@@ -208,7 +235,7 @@ func (run *loopRun) admitToolCalls(ctx context.Context, message types.AssistantM
 	a.receiptsMu.Lock()
 	defer a.receiptsMu.Unlock()
 	a.mu.Lock()
-	used := a.usage.ToolCalls
+	used, own := a.usage.ToolCalls, run.usage.ToolCalls
 	_, charged := a.sources[source]
 	a.mu.Unlock()
 	if source != "" && charged {
@@ -217,7 +244,7 @@ func (run *loopRun) admitToolCalls(ctx context.Context, message types.AssistantM
 	if limit := a.limits.MaxToolCalls; limit > 0 && used+calls > limit {
 		return toolCallRefusal(calls, used, limit), nil
 	}
-	if limit, own := run.config.MaxToolCalls, run.result.Usage.ToolCalls; !run.root && limit > 0 && own+calls > limit {
+	if limit := run.config.MaxToolCalls; !run.root && limit > 0 && own+calls > limit {
 		return toolCallRefusal(calls, own, limit), nil
 	}
 	usage := types.Usage{ToolCalls: calls}
@@ -228,7 +255,9 @@ func (run *loopRun) admitToolCalls(ctx context.Context, message types.AssistantM
 	if err := a.recordLocked(ctx, source, "", usage, childID, "", true); err != nil {
 		return "", err
 	}
-	run.result.Usage.Add(usage)
+	if !run.root {
+		run.addUsage(usage)
+	}
 	return "", nil
 }
 
