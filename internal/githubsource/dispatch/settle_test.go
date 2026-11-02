@@ -191,6 +191,113 @@ func TestSubmitErrorAfterAcceptanceSettlesTheSubmission(t *testing.T) {
 	}
 }
 
+// unreadableReceipt is lostAdmissionAck whose submission reads of one
+// request ID fail while fail is set, once.
+type unreadableReceipt struct {
+	lostAdmissionAck
+	requestID string
+	fail      atomic.Bool
+}
+
+func (s *unreadableReceipt) Read(ctx context.Context, query durable.Query) (durable.Page, error) {
+	if query.Kind == durable.SubmissionKind && query.ID == s.requestID && s.fail.CompareAndSwap(true, false) {
+		return durable.Page{}, errors.New("receipt temporarily unreadable")
+	}
+	return s.Log.Read(ctx, query)
+}
+
+// TestUnreadableReceiptBeforeSubmitKeepsTheLease: an attempt's first
+// receipt lookup failing does not prove that an earlier attempt's input was
+// refused. The error must leave the dispatch live, not abandon it and
+// release the reservation of accepted work.
+func TestUnreadableReceiptBeforeSubmitKeepsTheLease(t *testing.T) {
+	w := newWorld(t, nil)
+	store := &unreadableReceipt{lostAdmissionAck: lostAdmissionAck{Log: durable.NewMemory()}, requestID: "gh:ambiguous-retry"}
+	host, err := tempest.OpenHost(w.ctx, tempest.HostOptions{SessionDir: t.TempDir(), Store: store, Registry: w.registry, Stack: &tempest.StackConfig{Model: w.worker.provider.Model(), StreamFn: w.worker.stream}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close(context.Background())
+	session, err := host.Create(w.ctx, tempest.AgentOptions{Cwd: w.clone, Extensions: []extension.Selection{{ID: model.ExtensionID, Required: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := model.AdmittedDispatch{Dispatch: model.DispatchIntent{RequestID: store.requestID}, Budget: w.config.Budgets.Run}
+	submission, err := w.dispatcherNow().submit(w.ctx, session, admitted)
+	if err != nil || submission.State != submissionAccepted {
+		t.Fatalf("ambiguous first Submit: receipt %+v err %v, want the accepted receipt", submission, err)
+	}
+	store.fail.Store(true)
+	_, err = w.dispatcherNow().submit(w.ctx, session, admitted)
+	if store.fail.Load() {
+		t.Fatal("the retry never looked up its receipt")
+	}
+	var abandonable *failure
+	if err == nil || errors.As(err, &abandonable) {
+		t.Fatalf("unreadable receipt of accepted work: err %v, want a non-abandoning error", err)
+	}
+	if submission, err = session.Submission(w.ctx, store.requestID); err != nil || submission.State != submissionAccepted {
+		t.Fatalf("persisted acceptance: %+v %v", submission, err)
+	}
+}
+
+// TestRestartWithUnreadableReceiptAdoptsTheSubmission: the worker accepted
+// the launch and the process died before control recorded it. After the
+// restart the receipt is unreadable once; the dispatch must stay live with
+// its reservation and settle the accepted submission on a later pass,
+// never be requeued as if nothing was submitted.
+func TestRestartWithUnreadableReceiptAdoptsTheSubmission(t *testing.T) {
+	w := newWorld(t, nil)
+	event := w.mentionEvent(37, "start")
+	ticket := ticketOf(event)
+	w.worker.script(ticket, text("done"))
+	crashOnAcceptance := func(commit durable.Commit) {
+		for _, change := range commit.Changes {
+			var submission durable.Submission
+			if change.Kind == durable.SubmissionKind && json.Unmarshal(change.Value, &submission) == nil && submission.State == submissionAccepted {
+				w.crash()
+			}
+		}
+	}
+	w.faults.committed.Store(&crashOnAcceptance)
+	w.ingest(event)
+	w.eventually("crash after the worker accepted the launch", w.crashed.Load)
+	w.faults.committed.Store(nil)
+	id := model.NewDispatchID(ticket, 1)
+	launch := w.dispatchRecord(id)
+	if launch.State != model.DispatchPreparing || launch.SubmissionID != "" {
+		t.Fatalf("dispatch %s with submission %q before restart, want preparing and unrecorded", launch.State, launch.SubmissionID)
+	}
+	var unreadable atomic.Bool
+	unreadable.Store(true)
+	failOnce := func(query durable.Query) error {
+		if query.Kind == durable.SubmissionKind && query.ID == launch.RequestID && unreadable.CompareAndSwap(true, false) {
+			return errors.New("receipt temporarily unreadable")
+		}
+		return nil
+	}
+	w.faults.read.Store(&failOnce)
+	w.restart()
+	var d model.DispatchIntent
+	w.eventually("the dispatch to settle or requeue", func() bool {
+		d = w.dispatchRecord(id)
+		return d.State == model.DispatchFinished || d.State == model.DispatchCancelled || d.State == model.DispatchQueued
+	})
+	if unreadable.Load() {
+		t.Fatal("the restart never looked up the launch receipt")
+	}
+	if d.State != model.DispatchFinished || d.Attempts != 0 || d.SubmissionID == "" {
+		t.Fatalf("dispatch %s attempts=%d submission=%q (%s), want finished on its first attempt with the accepted submission", d.State, d.Attempts, d.SubmissionID, d.CancelReason)
+	}
+	receipt, err := w.session(w.detail(ticket).Ticket.SessionID).Submission(w.ctx, launch.RequestID)
+	if err != nil || receipt.ID != d.SubmissionID {
+		t.Fatalf("launch receipt %+v err %v, dispatch submission %s", receipt, err, d.SubmissionID)
+	}
+	if dispatches := w.detail(ticket).Dispatches; len(dispatches) != 1 {
+		t.Errorf("got %d dispatches, want only the adopted launch", len(dispatches))
+	}
+}
+
 // TestStopAfterUnrecordedSubmission: the worker accepted the launch but the
 // process died before control recorded it, and the operator then stopped
 // the Ticket. The restart finds the receipt, cancels the run and charges its

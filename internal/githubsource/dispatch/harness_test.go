@@ -230,12 +230,25 @@ func testExtension(gateway func() model.WorkerGateway) extension.Definition {
 // process death would; what was committed before stays.
 type hostStore struct {
 	log      *durable.Log
+	faults   *storeFaults
 	mu       sync.Mutex
 	crashed  bool
 	releases []func()
 }
 
+// storeFaults injects worker store faults that outlive a restart: read
+// fails a matching read, committed observes every landed commit.
+type storeFaults struct {
+	read      atomic.Pointer[func(durable.Query) error]
+	committed atomic.Pointer[func(durable.Commit)]
+}
+
 func (s *hostStore) Read(ctx context.Context, query durable.Query) (durable.Page, error) {
+	if fault := s.faults.read.Load(); fault != nil {
+		if err := (*fault)(query); err != nil {
+			return durable.Page{}, err
+		}
+	}
 	return s.log.Read(ctx, query)
 }
 
@@ -246,7 +259,13 @@ func (s *hostStore) Commit(ctx context.Context, commit durable.Commit) (durable.
 	if crashed {
 		return durable.Receipt{}, errCrash
 	}
-	return s.log.Commit(ctx, commit)
+	receipt, err := s.log.Commit(ctx, commit)
+	if err == nil {
+		if observe := s.faults.committed.Load(); observe != nil {
+			(*observe)(commit)
+		}
+	}
+	return receipt, err
 }
 
 func (s *hostStore) Close(context.Context) error { return nil }
@@ -363,6 +382,7 @@ type world struct {
 	clock                 *fakeClock
 	worker                *workerScript
 	log                   *durable.Log
+	faults                storeFaults
 	registry              *extension.Registry
 	crashed               atomic.Bool
 	crashAt               atomic.Value
@@ -462,7 +482,7 @@ func (w *world) currentHost() *tempest.Host {
 // starts Run, as a process start would.
 func (w *world) boot() {
 	w.t.Helper()
-	store := &hostStore{log: w.log}
+	store := &hostStore{log: w.log, faults: &w.faults}
 	host, err := tempest.OpenHost(w.ctx, tempest.HostOptions{
 		SessionDir: w.sessions,
 		Store:      store,

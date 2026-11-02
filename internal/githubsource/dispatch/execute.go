@@ -88,14 +88,28 @@ const maxBackoffDoublings = 4
 // worktree, prepare command, worker session with its identity document,
 // binding, run budget, then the durable submission and its receipt in
 // control. Each step adopts what an earlier attempt already did.
+//
+// Any *failure it returns abandons the dispatch and releases its
+// reservation, so it may only be returned once no submission can exist. An
+// admitted dispatch, and one whose Ticket has no bound session, cannot have
+// submitted: control records preparing, and the binding, before the worker
+// is given input. A preparing dispatch of a bound Ticket may have: a process
+// can stop, or an acknowledgement be lost, between the worker accepting the
+// submission and control recording it. Its receipt is looked up first, and
+// only a proven absence lets launch go on.
 func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted model.AdmittedDispatch) (*tempest.Session, error) {
 	if admitted.Dispatch.State == model.DispatchAdmitted {
 		if err := d.store.Preparing(ctx, admitted.Dispatch.ID, d.clock.Now()); err != nil {
 			return nil, err
 		}
+	} else if admitted.Ticket.SessionID != "" {
+		adopted, err := d.adoptSubmitted(ctx, admitted)
+		if err != nil || adopted != nil {
+			return adopted, err
+		}
 	}
 	if execution.isStopped() {
-		return d.launchStopped(ctx, admitted)
+		return nil, errStoppedBeforeStart
 	}
 	checkout, err := d.worktree(ctx, admitted)
 	if err != nil {
@@ -114,7 +128,7 @@ func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted 
 		return nil, err
 	}
 	if execution.isStopped() {
-		return d.adoptSubmitted(ctx, session, admitted)
+		return nil, errStoppedBeforeStart
 	}
 	submission, err := d.submit(ctx, session, admitted)
 	if err != nil {
@@ -129,34 +143,25 @@ func (d *Dispatcher) launch(ctx context.Context, execution *execution, admitted 
 	return session, nil
 }
 
-// errStoppedBeforeStart abandons a stopped Ticket's dispatch once the
-// worker session proves it holds no submission for it.
+// errStoppedBeforeStart abandons a stopped Ticket's dispatch once launch
+// proved the dispatch holds no submission.
 var errStoppedBeforeStart = permanentFailure("ticket stopped before its worker started", nil)
 
-// launchStopped handles a Ticket stopped before control recorded its
-// dispatch's receipt. Control saying "preparing" does not prove nothing was
-// submitted: a process can stop between the worker accepting the
-// submission and control recording it. A bound session is asked first; only
-// an unbound Ticket, which cannot have submitted, is abandoned outright.
-func (d *Dispatcher) launchStopped(ctx context.Context, admitted model.AdmittedDispatch) (*tempest.Session, error) {
-	if admitted.Ticket.SessionID == "" {
-		return nil, errStoppedBeforeStart
-	}
+// adoptSubmitted looks up a preparing dispatch's launch receipt in its
+// Ticket's bound worker session. An existing submission is recorded in
+// control and its session returned, so settle runs, cancels or withdraws it
+// and charges what it spent, unknown included. A proven absence returns no
+// session. A session that cannot be opened or a receipt that cannot be read
+// proves neither: the plain error leaves the dispatch live, with its
+// reservation, for a later pass to look up again.
+func (d *Dispatcher) adoptSubmitted(ctx context.Context, admitted model.AdmittedDispatch) (*tempest.Session, error) {
 	session, err := d.host.Open(ctx, admitted.Ticket.SessionID)
 	if err != nil {
 		return nil, fmt.Errorf("open worker session %s: %w", admitted.Ticket.SessionID, err)
 	}
-	return d.adoptSubmitted(ctx, session, admitted)
-}
-
-// adoptSubmitted records the dispatch's existing submission in control and
-// returns its session, so settle cancels or withdraws it and charges what it
-// spent, unknown included. When the session proves no submission exists the
-// stopped dispatch is abandoned.
-func (d *Dispatcher) adoptSubmitted(ctx context.Context, session *tempest.Session, admitted model.AdmittedDispatch) (*tempest.Session, error) {
 	existing, err := session.Submission(ctx, admitted.Dispatch.RequestID)
 	if errors.Is(err, tempest.ErrQueueNotFound) {
-		return nil, errStoppedBeforeStart
+		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read worker submission: %w", err)
@@ -183,8 +188,11 @@ func (d *Dispatcher) submit(ctx context.Context, session *tempest.Session, admit
 	if err == nil {
 		return existing, nil
 	}
+	// Only a proven absence may lead to Submit, or to an abandon that
+	// releases the reservation. An unreadable receipt leaves the dispatch
+	// live for a later pass to look up again.
 	if !errors.Is(err, tempest.ErrQueueNotFound) {
-		return tempest.Submission{}, transientFailure("read worker submission", err)
+		return tempest.Submission{}, fmt.Errorf("read worker submission: %w", err)
 	}
 	prompt, err := d.render(ctx, admitted)
 	if err != nil {
