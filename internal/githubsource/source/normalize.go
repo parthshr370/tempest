@@ -21,6 +21,7 @@ type ghUser struct {
 }
 
 type ghIssue struct {
+	ID          int64      `json:"id"`
 	Number      int        `json:"number"`
 	Title       string     `json:"title"`
 	Body        *string    `json:"body"`
@@ -84,6 +85,8 @@ type ghReview struct {
 }
 
 type ghNotification struct {
+	// ID is the thread ID, a decimal string.
+	ID        string    `json:"id"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Subject   struct {
 		Title string `json:"title"`

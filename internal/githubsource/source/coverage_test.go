@@ -369,18 +369,21 @@ func rangeInts(from, to int) []int {
 }
 
 // TestOverlapWindowContainsTheLastRowAndReachesPastIt pins the window
-// arithmetic: the reply contains offset end-1 and reaches at least 49 rows
-// past it, so a walk both proves continuity and progresses.
+// arithmetic: the reply contains offset end-1 and reaches some way past
+// it (49 rows for 100-row pages, 21 for 50), so a walk both proves
+// continuity and progresses.
 func TestOverlapWindowContainsTheLastRowAndReachesPastIt(t *testing.T) {
 	t.Parallel()
-	if page, size := overlapWindow(0); page != 1 || size != listPageSize {
-		t.Fatalf("overlapWindow(0) = %d, %d", page, size)
-	}
-	for end := 1; end <= 200000; end++ {
-		page, size := overlapWindow(end)
-		start := (page - 1) * size
-		if size < 1 || size > listPageSize || start > end-1 || start+size-1 < end-1 || start+size-end < 49 {
-			t.Fatalf("overlapWindow(%d) = page %d of %d: rows [%d, %d)", end, page, size, start, start+size)
+	for perPage, gain := range map[int]int{listPageSize: 49, notificationsPage: 21} {
+		if page, size := overlapWindow(0, perPage); page != 1 || size != perPage {
+			t.Fatalf("overlapWindow(0, %d) = %d, %d", perPage, page, size)
+		}
+		for end := 1; end <= 200000; end++ {
+			page, size := overlapWindow(end, perPage)
+			start := (page - 1) * size
+			if size < 1 || size > perPage || start > end-1 || start+size-1 < end-1 || start+size-end < gain {
+				t.Fatalf("overlapWindow(%d, %d) = page %d of %d: rows [%d, %d)", end, perPage, page, size, start, start+size)
+			}
 		}
 	}
 }

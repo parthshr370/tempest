@@ -54,10 +54,12 @@ func (s *Source) pollWatched(ctx context.Context, rd *round) error {
 type prTracker struct {
 	record    model.PullRequest
 	committed []byte
+	// readAt is the Date of the pulls reply the record came from.
+	readAt time.Time
 }
 
-func newPRTracker(record model.PullRequest, known *model.PullRequest) *prTracker {
-	tracker := &prTracker{record: record}
+func newPRTracker(record model.PullRequest, known *model.PullRequest, readAt time.Time) *prTracker {
+	tracker := &prTracker{record: record, readAt: readAt}
 	if known != nil {
 		tracker.committed = mustJSON(*known)
 	}
@@ -70,6 +72,15 @@ func (t *prTracker) pending() []model.PullRequest {
 		return nil
 	}
 	return []model.PullRequest{t.record}
+}
+
+// attach adds the record to batch when it changed. The batch is then read
+// at the pulls reply's Date: control orders PR snapshots by ReadAt, and
+// the local clock must not decide which snapshot is newer.
+func (t *prTracker) attach(batch *model.IntakeBatch) {
+	if prs := t.pending(); prs != nil {
+		batch.PRs, batch.ReadAt = prs, t.readAt
+	}
 }
 
 func (t *prTracker) markCommitted() {
@@ -141,9 +152,13 @@ func (s *Source) readThread(ctx context.Context, rd *round, watched model.Watche
 		if err != nil {
 			return err
 		}
-		pr = newPRTracker(pullRecord(pull, watched.PR), watched.PR)
+		pulledAt, err := serverDate(response)
+		if err != nil {
+			return err
+		}
+		pr = newPRTracker(pullRecord(pull, watched.PR), watched.PR, pulledAt)
 		header.Events = append(header.Events, pullFacts(pull, watched.PR, ref, observedAt)...)
-		header.PRs = pr.pending()
+		pr.attach(&header)
 	}
 	if len(header.Events) > 0 || len(header.Threads) > 0 || len(header.PRs) > 0 {
 		if err := s.ingest(ctx, rd, header); err != nil {
@@ -299,6 +314,11 @@ func (s *Source) commentEntries(ref model.ThreadRef, inline bool) func([]byte, t
 // review not yet on the PR record becomes an event, a dismissal not yet
 // recorded a dismissed event; each review is kept on the record pinned to
 // the commit it reviewed.
+//
+// GitHub promises this listing chronological, not in ID order. Every
+// listing sampled so far was also in ID order, which the scan's walk
+// assumes and checks: a reply out of ID order makes the scan read the
+// reviews whole instead of skipping a lower ID listed later.
 func (s *Source) readReviews(ctx context.Context, rd *round, ref model.ThreadRef, old model.Position, pr *prTracker) (bool, error) {
 	return s.scan(ctx, rd, scanSpec{
 		resource: threadResource(ref.Number, "reviews"),
@@ -360,7 +380,9 @@ func (s *Source) readPRCI(ctx context.Context, rd *round, ref model.ThreadRef, p
 	pr.record.CI = &ci
 	url := fmt.Sprintf("https://github.com/%s/pull/%d/checks", s.repo, ref.Number)
 	event := ciEvent(model.PRCIID(ref.Number, sha, ci.Fingerprint), model.EventPRCI, ref, ci, url, s.clock.Now())
-	if err := s.ingest(ctx, rd, model.IntakeBatch{Resource: threadResource(ref.Number, "ci"), Events: []model.Event{event}, PRs: pr.pending()}); err != nil {
+	batch := model.IntakeBatch{Resource: threadResource(ref.Number, "ci"), Events: []model.Event{event}}
+	pr.attach(&batch)
+	if err := s.ingest(ctx, rd, batch); err != nil {
 		return err
 	}
 	pr.markCommitted()

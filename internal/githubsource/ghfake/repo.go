@@ -1114,12 +1114,12 @@ func (r *Repo) getCombinedStatus(w http.ResponseWriter, request *http.Request) {
 	}
 }
 
-// listNotifications serves the inbox newest first, with since (updated at
-// or after), before (updated strictly before), Last-Modified,
-// If-Modified-Since and X-Poll-Interval like GitHub, at most 50 rows a
-// page. Last-Modified is when the listing last changed: a late-indexed
-// notification changes it when it appears, although its updated_at is
-// older.
+// listNotifications serves the inbox newest first, ties by descending
+// numeric ID, with since (updated at or after), before (updated strictly
+// before), Last-Modified, If-Modified-Since and X-Poll-Interval like
+// GitHub, at most 50 rows a page. Last-Modified is when the listing last
+// changed: a late-indexed notification changes it when it appears,
+// although its updated_at is older.
 func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1163,7 +1163,9 @@ func (r *Repo) listNotifications(w http.ResponseWriter, request *http.Request) {
 		if order := b.UpdatedAt.Compare(a.UpdatedAt); order != 0 {
 			return order
 		}
-		return strings.Compare(b.ID, a.ID)
+		// IDs are decimal strings without leading zeros: a longer one is
+		// larger.
+		return cmp.Or(cmp.Compare(len(b.ID), len(a.ID)), strings.Compare(b.ID, a.ID))
 	})
 	if page, ok := window(w, request, rows, defaultNotificationsPage, maxNotificationsPage); ok {
 		reply(w, request, page)

@@ -1,9 +1,12 @@
 package source
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -26,7 +29,9 @@ import (
 // below it are listed oldest first in time windows (since, before) that
 // each fit one page, and Since moves up to the end of the windows read, so
 // a long inbox is worked through across rounds instead of reread from the
-// top. Every request is a first page, which a deletion cannot shift.
+// top. Every request is a first page, which a deletion cannot shift, but
+// for one second holding more than a page; LastID keeps the progress
+// through such a second (see second).
 func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 	stored, found, err := s.intake.Cursor(ctx, model.CursorNotifications)
 	if err != nil {
@@ -74,19 +79,27 @@ func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 	complete, covered := headComplete, base
 	var backlogErr error
 	if !headComplete {
-		covered, complete, backlogErr = read.backlog(ctx, base, rows[len(rows)-1].UpdatedAt.Add(time.Second))
+		resume := int64(0)
+		if base.Equal(stored.Since) {
+			resume = stored.LastID
+		}
+		covered, complete, backlogErr = read.backlog(ctx, base, rows[len(rows)-1].UpdatedAt.Add(time.Second), resume)
 	}
 	// Coverage settles one lookback behind GitHub's clock. A complete
 	// listing keeps its URL, and so its validator, unless moving the
 	// cursor drops listed rows: for one page, once its newest row settled;
 	// for more, as far as rows settled. An incomplete one moves the cursor
-	// up as far as it read.
+	// up as far as it read, into a dense second only once it settled.
 	settled := date.Add(-s.lookback)
 	cursor := stored
-	cursor.Key, cursor.Since, cursor.LastModified = model.CursorNotifications, base, ""
+	cursor.Key, cursor.Since, cursor.LastID, cursor.LastModified = model.CursorNotifications, base, 0, ""
 	switch target := earlier(settled, newest.Add(time.Second)); {
 	case !complete:
 		cursor.Since = later(base, earlier(settled, covered))
+		if read.partialAt.Equal(covered) && cursor.Since.Equal(covered) && !covered.Add(time.Second).After(settled) {
+			// The second at covered was read in part, in ID order.
+			cursor.LastID = read.partial
+		}
 	case newest.IsZero():
 	case headComplete && !newest.Add(time.Second).After(settled), !headComplete && read.oldest.Before(target):
 		cursor.Since = later(base, target)
@@ -99,11 +112,13 @@ func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 	if err := read.commit(ctx, cursor, found, stored); err != nil {
 		return err
 	}
-	if backlogErr != nil {
+	switch {
+	case backlogErr != nil:
 		return backlogErr
-	}
-	if !complete && !covered.After(base) {
-		return fmt.Errorf("notifications: one second holds more rows than a round may read; the cursor stays at %s", base.Format(time.RFC3339))
+	case read.unverified != nil:
+		return read.unverified
+	case !complete && !covered.After(base) && !read.advanced:
+		return fmt.Errorf("notifications: a round's requests ended at %s without progress; the cursor stays", covered.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -118,7 +133,18 @@ type notificationRead struct {
 	// requests counts the round's listing requests, the head included;
 	// the backlog stops at limit.
 	requests, limit int
+	// partialAt is the second where the backlog stopped when it walked
+	// that second in ID order, and partial the lowest ID it read there.
+	partialAt time.Time
+	partial   int64
+	// advanced reports that a second was read past where it started.
+	advanced bool
+	// unverified explains a second the round could not prove read.
+	unverified error
 }
+
+// errRoundBound ends a listing at the round's request bound.
+var errRoundBound = errors.New("round request bound reached")
 
 // flag marks the repository's Issue or PR thread of row, keeping the
 // newest notification per thread.
@@ -147,54 +173,75 @@ func (n *notificationRead) flag(row ghNotification) {
 // read by their first page. A window that fits one page covers itself and
 // moves from up; the next one is twice as wide. A window that does not fit
 // still covers the newest rows of its first page: when it reaches to, to
-// drops to its oldest row (below it, when that whole page is one second,
-// which is then read by page number), and the next window is half as
-// wide. It returns from, the end of the contiguous coverage from the
-// start, and whether coverage reached to. A round spends at most MaxPages
-// plus the halving bound on it.
-func (n *notificationRead) backlog(ctx context.Context, from, to time.Time) (time.Time, bool, error) {
+// drops to just past its oldest row, and the next window is half as wide.
+// When that whole page is one second, to drops below it and the second is
+// read once the windows reach it, so coverage stays contiguous and a
+// round that stops inside it can resume there. A one-second window that
+// does not fit is read as a second. resume, when set, is where the last
+// round stopped inside the second from. It returns from, the end of the
+// contiguous coverage from the start, and whether coverage reached to. A
+// round spends at most MaxPages plus the search bound on it.
+func (n *notificationRead) backlog(ctx context.Context, from, to time.Time, resume int64) (time.Time, bool, error) {
 	n.limit = 1 + n.s.maxPages + scanSeekProbes
 	n.requests = 1
-	width := to.Sub(from)
-	for from.Before(to) {
-		if n.requests >= n.limit {
-			return from, false, nil
-		}
-		until := from.Add(width)
-		if until.After(to) {
-			until = to
-		}
-		rows, next, err := n.list(ctx, from, until)
-		if err != nil {
+	if resume > 0 {
+		if done, err := n.second(ctx, from, resume); !done || err != nil {
 			return from, false, err
 		}
-		switch {
-		case !next:
-			from, width = until, 2*width
-			continue
-		case until.Sub(from) <= time.Second:
-			// One second holds more than a page.
-			if done, err := n.second(ctx, from); !done || err != nil {
+		from = from.Add(time.Second)
+	}
+	// dense are full seconds found at the top of windows, newest first;
+	// nothing lies between them.
+	var dense []time.Time
+	for {
+		width := to.Sub(from)
+		for from.Before(to) {
+			if n.requests >= n.limit {
+				return from, false, nil
+			}
+			until := from.Add(width)
+			if until.After(to) {
+				until = to
+			}
+			rows, next, err := n.list(ctx, from, until)
+			if err != nil {
 				return from, false, err
 			}
-			from, width = until, 2*width
-			continue
-		case until.Equal(to) && len(rows) > 0:
-			// Rows of the window newer than its first page's oldest are all
-			// on that page.
-			oldest := rows[len(rows)-1].UpdatedAt
-			to = later(from.Add(time.Second), oldest.Add(time.Second))
-			if rows[0].UpdatedAt.Equal(oldest) && oldest.After(from) {
-				// A full page in one second at the top: read that second.
-				if done, err := n.second(ctx, oldest); !done || err != nil {
+			switch {
+			case !next:
+				from, width = until, 2*width
+				continue
+			case until.Sub(from) <= time.Second:
+				// One second holds more than a page.
+				if done, err := n.second(ctx, from, 0); !done || err != nil {
 					return from, false, err
 				}
-				to = oldest
+				from, width = until, 2*width
+				continue
+			case until.Equal(to) && len(rows) > 0:
+				// Rows of the window newer than its first page's oldest are
+				// all on that page.
+				oldest := rows[len(rows)-1].UpdatedAt
+				to = later(from.Add(time.Second), oldest.Add(time.Second))
+				if rows[0].UpdatedAt.Equal(oldest) && oldest.After(from) {
+					dense, to = append(dense, oldest), oldest
+				}
 			}
+			width = max(time.Second, (earlier(until, to).Sub(from) / 2).Truncate(time.Second))
 		}
-		width = max(time.Second, (earlier(until, to).Sub(from) / 2).Truncate(time.Second))
+		if len(dense) == 0 {
+			return from, true, nil
+		}
+		at := dense[len(dense)-1]
+		dense = dense[:len(dense)-1]
+		if done, err := n.second(ctx, at, 0); !done || err != nil {
+			return from, false, err
+		}
+		from, to = at.Add(time.Second), at.Add(time.Second)
+		if len(dense) > 0 {
+			to = dense[len(dense)-1]
+		}
 	}
-	return from, true, nil
 }
 
 // list flags the first page of rows updated in [since, before) and
@@ -215,31 +262,77 @@ func (n *notificationRead) list(ctx context.Context, since, before time.Time) ([
 	return rows, response.NextPath != "", nil
 }
 
-// second flags every row of one second by page number: no narrower window
-// exists. done is false when the round's bound stopped it.
-func (n *notificationRead) second(ctx context.Context, at time.Time) (bool, error) {
+// second flags every row of one second, which no narrower window splits,
+// by page number. An update moves a notification out of a past second and
+// shifts the rest back, so no page offset is trusted: the second is a
+// ranked walk in descending ID order (GitHub's tie order, checked on every
+// reply), from below after when it is set. A round that stops in it
+// leaves partial, the lowest ID read, for the next round to go on from. A
+// second listed out of ID order is read whole instead, which only a round
+// that holds all of it can verify. done is false when the round's bound
+// stopped it.
+func (n *notificationRead) second(ctx context.Context, at time.Time, after int64) (bool, error) {
 	query := notificationQuery(at, at.Add(time.Second))
-	for page := 1; ; page++ {
+	fetch := func(ctx context.Context, page, perPage int) (listing, error) {
 		if n.requests >= n.limit {
-			return false, nil
+			return listing{}, errRoundBound
 		}
-		query.Set("page", strconv.Itoa(page))
+		query := maps.Clone(query)
+		query.Set("per_page", strconv.Itoa(perPage))
+		if page > 1 {
+			query.Set("page", strconv.Itoa(page))
+		}
 		response, err := n.s.get(ctx, n.rd, model.GHRequest{Path: "notifications", Query: query})
 		n.requests++
 		if err != nil {
-			return false, err
+			return listing{}, err
 		}
 		rows, err := decode[[]ghNotification](response, "notifications")
 		if err != nil {
-			return false, err
+			return listing{}, err
 		}
-		for _, row := range rows {
+		entries := make([]entry, len(rows))
+		for i, row := range rows {
 			n.flag(row)
+			// An ID that does not parse ranks as zero, which the walk
+			// reports as out of order.
+			entries[i].id, _ = strconv.ParseInt(row.ID, 10, 64)
 		}
-		if response.NextPath == "" {
-			return true, nil
+		return listing{start: (page - 1) * perPage, rows: entries, next: response.NextPath != ""}, nil
+	}
+	walk := ranked{fetch: fetch, rank: func(row entry) int64 { return -row.id }, perPage: notificationsPage, last: math.MinInt64}
+	if after > 0 {
+		walk.last = -after
+	}
+	first := walk.last
+	// stop records how far the walk got when something ended it early.
+	stop := func(err error) (bool, error) {
+		if walk.last > math.MinInt64 {
+			n.partialAt, n.partial = at, -walk.last
+		}
+		n.advanced = n.advanced || walk.last > first
+		if errors.Is(err, errRoundBound) {
+			err = nil
+		}
+		return false, err
+	}
+	for !walk.complete {
+		if walk.probes >= scanSeekProbes {
+			return stop(nil)
+		}
+		if _, err := walk.next(ctx); err != nil {
+			return stop(err)
+		}
+		if walk.inverted {
+			done, err := readWhole(ctx, fetch, notificationsPage, n.limit, func([]entry) {})
+			if errors.Is(err, errRoundBound) || err == nil && !done {
+				n.unverified = fmt.Errorf("notifications: the second %s is not listed in ID order and holds more rows than a round may read; the cursor stays", at.Format(time.RFC3339))
+				return false, nil
+			}
+			return done, err
 		}
 	}
+	return true, nil
 }
 
 // commit stores the flags and, with the last of them, the cursor.
@@ -301,7 +394,7 @@ func (s *Source) pollIssuesStream(ctx context.Context, rd *round) error {
 			}
 			entries := make([]entry, 0, len(rows))
 			for _, row := range rows {
-				item := entry{updated: row.UpdatedAt}
+				item := entry{updated: row.UpdatedAt, id: row.ID}
 				wanted := s.observe.Issues
 				if row.PullRequest != nil {
 					wanted = s.observe.Pulls
@@ -340,7 +433,7 @@ func (s *Source) streamComments(inline bool) func([]byte, time.Time, time.Time) 
 		}
 		entries := make([]entry, 0, len(rows))
 		for _, row := range rows {
-			item := entry{updated: row.UpdatedAt}
+			item := entry{updated: row.UpdatedAt, id: row.ID}
 			apiURL, isPR := row.IssueURL, strings.Contains(row.HTMLURL, "/pull/")
 			if inline {
 				apiURL, isPR = row.PullRequestURL, true
@@ -357,22 +450,41 @@ func (s *Source) streamComments(inline bool) func([]byte, time.Time, time.Time) 
 	}
 }
 
-// pollStream reads one observe stream in updated order from its cursor.
-// The first enabled round only records EnabledAt, from GitHub's clock:
-// nothing older is imported, and local skew cannot move the start.
+// position is a place in an observe stream's updated order: every row
+// updated before at, and with id set the rows updated in the second at
+// that GitHub lists up to the one with that ID (in ascending ID order).
+type position struct {
+	at time.Time
+	id int64
+}
+
+func (p position) compare(o position) int {
+	if order := p.at.Compare(o.at); order != 0 {
+		return order
+	}
+	return cmp.Compare(p.id, o.id)
+}
+
+// pollStream reads one observe stream in updated order. The first enabled
+// round only records EnabledAt, from GitHub's clock: nothing older is
+// imported, and local skew cannot move the start.
 //
-// Each request is the first page from a since: after a page the next
-// request starts at the page's last updated_at, so a deletion cannot shift
-// an unread row onto a page already read. Only when one timestamp holds
-// more than a page does the read page through that timestamp by number.
-// Each page commits with the cursor at its last updated_at; rereads start
-// a lookback before it. Pages that only reread the lookback are bounded,
-// and past that bound the round skips to the cursor, so a dense lookback
-// cannot starve progress. The ETag is kept only while the cursor, and so
-// the request URL, is unchanged.
+// The cursor is settled coverage: it moves only over rows read at least a
+// lookback after their update, so a row indexed late cannot appear below
+// it. Rows past it were read already, up to the stream's frontier, which
+// the Source keeps in memory only: a restart loses nothing but rereads.
+// A round reads MaxPages fresh pages from the frontier, then rereads from
+// the cursor towards the frontier, at most rereadPageFactor*MaxPages
+// pages, which catches late rows early and moves the cursor over what has
+// settled. Nothing is skipped: a reread cut by its bound starts again at
+// the cursor next round, and the cursor catches up as rows settle.
 //
-// model.Cursor has no ID to resume within one timestamp, so a timestamp
-// with more rows than one round reads is not resumable; see the report.
+// Each request is the first page from a since, so a deletion cannot shift
+// an unread row onto a page already read. Only a second holding more than
+// a page is paged by number, as a ranked walk in ascending ID order, and
+// the cursor's LastID keeps the progress through it. The ETag is kept only
+// while the cursor, and so the first request's URL, is unchanged and its
+// reply was the whole listing.
 func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) error {
 	stored, found, err := s.intake.Cursor(ctx, spec.key)
 	if err != nil {
@@ -391,59 +503,32 @@ func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) err
 		baseline := model.Cursor{Key: spec.key, EnabledAt: date, Since: date}
 		return s.ingest(ctx, rd, model.IntakeBatch{Resource: resource, Cursor: &baseline})
 	}
-	read := &streamRead{s: s, rd: rd, spec: spec, stored: stored, cursor: stored}
-	since := later(s.rereadFrom(stored.Since), stored.EnabledAt)
-	for first := true; ; first = false {
-		query := listQuery(since, true)
-		for key, values := range spec.extra {
-			query[key] = values
-		}
-		request := model.GHRequest{Path: spec.path, Query: query}
-		if first {
-			request.ETag = stored.ETag
-		}
-		response, err := s.get(ctx, rd, request)
-		if err != nil {
-			return err
-		}
-		if response.Status == http.StatusNotModified {
-			return nil
-		}
-		if first {
-			read.etag = response.ETag
-		}
-		last, err := read.page(ctx, response)
-		if err != nil {
-			return err
-		}
-		for next := response.NextPath; next != "" && !last.After(since); next = response.NextPath {
-			// The whole page has the timestamp since: page through it.
-			if read.exhausted() {
-				return nil
-			}
-			if response, err = s.get(ctx, rd, model.GHRequest{Path: next}); err != nil {
-				return err
-			}
-			if last, err = read.page(ctx, response); err != nil {
-				return err
-			}
-		}
-		if response.NextPath == "" {
-			break
-		}
-		since = last
-		if read.rereads >= rereadPageFactor*s.maxPages && since.Before(stored.Since) {
-			// The lookback alone outgrew the round: skip to the cursor.
-			since = stored.Since
-		}
-		if read.exhausted() {
-			return nil
-		}
+	read := &streamRead{s: s, rd: rd, spec: spec, stored: stored, cursor: stored, cover: position{at: stored.Since, id: stored.LastID}}
+	read.front = s.frontiers[spec.key]
+	if read.front.compare(read.cover) < 0 {
+		read.front = read.cover
 	}
-	if read.pages == 1 && read.cursor.Since.Equal(stored.Since) && read.etag != read.cursor.ETag {
-		// A one-page read that moved nothing: remember its validator.
+	first, err := s.get(ctx, rd, model.GHRequest{Path: spec.path, Query: read.query(read.cover.at), ETag: stored.ETag})
+	if err != nil {
+		return err
+	}
+	if first.Status == http.StatusNotModified {
+		return nil
+	}
+	if read.front.compare(read.cover) > 0 {
+		err = read.walk(ctx, &streamWalk{r: read, pos: read.front}, false)
+	}
+	if err == nil {
+		err = read.walk(ctx, &streamWalk{r: read, pos: read.cover, first: &first}, true)
+	}
+	s.frontiers[spec.key] = read.front
+	if err != nil {
+		return err
+	}
+	if first.NextPath == "" && sameCursor(read.cursor, stored) && first.ETag != stored.ETag {
+		// The first reply was the whole listing and its URL is unchanged.
 		cursor := read.cursor
-		cursor.ETag = read.etag
+		cursor.ETag = first.ETag
 		return s.ingest(ctx, rd, model.IntakeBatch{Resource: resource, Cursor: &cursor})
 	}
 	return nil
@@ -455,49 +540,216 @@ type streamRead struct {
 	rd     *round
 	spec   streamSpec
 	stored model.Cursor
-	cursor model.Cursor
-	etag   string
-	// pages counts pages read; rereads those with nothing past the cursor.
-	pages, fresh, rereads int
+	// cursor is the committed cursor, cover its position; front is the
+	// frontier.
+	cursor        model.Cursor
+	cover, front  position
+	fresh, reread int
 }
 
-// exhausted reports the round's page bound: MaxPages pages past the cursor
-// and the lookback reread allowance.
-func (r *streamRead) exhausted() bool {
-	return r.fresh >= r.s.maxPages || r.pages >= (rereadPageFactor+1)*r.s.maxPages
+func (r *streamRead) query(since time.Time) url.Values {
+	query := listQuery(since, true)
+	for key, values := range r.spec.extra {
+		query[key] = values
+	}
+	return query
 }
 
-// page commits one listed page in bounded runs and returns its last
-// updated_at.
-func (r *streamRead) page(ctx context.Context, response model.GHResponse) (time.Time, error) {
-	entries, err := r.spec.entries(response.Body, r.stored.EnabledAt, r.s.clock.Now())
-	if err != nil {
-		return time.Time{}, err
+// walk reads w until the listing ends or the round's page bounds: pages
+// past the frontier are fresh and bounded by MaxPages, pages below it
+// rereads with their own bound, so rereading from the cursor still runs in
+// a round whose fresh pages are spent. A walk from the cursor moves the
+// cursor as long as every row it passed had settled when read, and then up
+// to where rows settle.
+func (r *streamRead) walk(ctx context.Context, w *streamWalk, fromCover bool) error {
+	settling := fromCover
+	for !w.done {
+		if w.pos.compare(r.front) < 0 && r.reread >= rereadPageFactor*r.s.maxPages || w.pos.compare(r.front) >= 0 && r.fresh >= r.s.maxPages {
+			return nil
+		}
+		w.searched = false
+		rows, err := w.next(ctx)
+		if err != nil {
+			return err
+		}
+		if w.pos.compare(r.front) > 0 {
+			// A step that found the walk's place in a second ends with a
+			// part of a page; its requests count against the search bound.
+			if !w.searched {
+				r.fresh++
+			}
+			r.front = w.pos
+		} else {
+			r.reread++
+		}
+		cover := r.cover
+		if settling {
+			line := position{at: w.date.Add(-r.s.lookback)}
+			if settling = w.pos.compare(line) <= 0; settling {
+				cover = w.pos
+			} else if line.compare(cover) > 0 {
+				cover = line
+			}
+		}
+		if err := r.commit(ctx, rows, cover); err != nil {
+			return err
+		}
 	}
-	r.pages++
-	if len(entries) == 0 {
-		return time.Time{}, nil
+	return nil
+}
+
+// commit stores the events of rows in bounded runs, the last with the
+// cursor at cover when that moved it.
+func (r *streamRead) commit(ctx context.Context, rows []entry, cover position) error {
+	next := r.cursor
+	if cover.compare(r.cover) > 0 {
+		next.Since, next.LastID, next.ETag = cover.at, cover.id, ""
 	}
-	last := entries[len(entries)-1].updated
-	if last.After(r.stored.Since) {
-		r.fresh++
-	} else {
-		r.rereads++
+	runs := split(rows)
+	if len(runs) == 0 {
+		runs = [][]entry{nil}
 	}
-	for _, run := range split(entries) {
-		next := r.cursor
-		next.Since = later(r.cursor.Since, run[len(run)-1].updated)
-		events := eventsOf(run)
-		if len(events) == 0 && sameCursor(next, r.cursor) {
+	for i, run := range runs {
+		batch := model.IntakeBatch{Resource: string(r.spec.key), Events: eventsOf(run)}
+		if i == len(runs)-1 && !sameCursor(next, r.cursor) {
+			batch.Cursor = &next
+		}
+		if len(batch.Events) == 0 && batch.Cursor == nil {
 			continue
 		}
-		next.ETag = ""
-		if err := r.s.ingest(ctx, r.rd, model.IntakeBatch{Resource: string(r.spec.key), Events: events, Cursor: &next}); err != nil {
-			return time.Time{}, err
+		if err := r.s.ingest(ctx, r.rd, batch); err != nil {
+			return err
 		}
-		r.cursor = next
 	}
-	return last, nil
+	r.cursor, r.cover = next, furthest(r.cover, cover)
+	return nil
+}
+
+// furthest returns the later of two positions.
+func furthest(a, b position) position {
+	if b.compare(a) > 0 {
+		return b
+	}
+	return a
+}
+
+// streamWalk reads an observe stream in updated order from a position, a
+// step at a time.
+type streamWalk struct {
+	r   *streamRead
+	pos position
+	// first is a reply already read for the first page from pos.at.
+	first *model.GHResponse
+	// bucket walks the second pos.at by ID when it holds more than a page;
+	// tail is what its newest reply listed past that second.
+	bucket   *ranked
+	tail     []entry
+	tailNext bool
+	// searched reports that the last step searched for its place.
+	searched bool
+	// date is the Date of the newest reply.
+	date time.Time
+	done bool
+}
+
+// next reads one step and returns its rows; pos is then where the rows
+// read reach.
+func (w *streamWalk) next(ctx context.Context) ([]entry, error) {
+	if w.bucket != nil {
+		return w.bucketNext(ctx)
+	}
+	response, rows, err := w.page(ctx, 1, listPageSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		w.done = true
+		return nil, nil
+	}
+	last := rows[len(rows)-1].updated
+	if response.NextPath == "" {
+		w.done = true
+		w.pos = furthest(w.pos, position{at: last})
+		return rows, nil
+	}
+	if !slices.ContainsFunc(rows, func(row entry) bool { return !row.updated.Equal(w.pos.at) }) {
+		// One second holds more than a page: walk it by ID.
+		w.first = &response
+		w.bucket = &ranked{fetch: w.bucketPage, rank: entryID, perPage: listPageSize, last: w.pos.id}
+		return w.bucketNext(ctx)
+	}
+	if !last.After(w.pos.at) {
+		return nil, fmt.Errorf("%s: listing out of updated order at %s", w.r.spec.path, w.pos.at.Format(time.RFC3339))
+	}
+	w.pos = position{at: last}
+	return rows, nil
+}
+
+// bucketNext reads one step of the second pos.at.
+func (w *streamWalk) bucketNext(ctx context.Context) ([]entry, error) {
+	bucket, at := w.bucket, w.pos.at.Format(time.RFC3339)
+	if bucket.probes >= scanSeekProbes {
+		return nil, fmt.Errorf("%s: lost its place among the rows updated in the second %s; the cursor stays", w.r.spec.path, at)
+	}
+	w.searched = !bucket.located
+	fresh, err := bucket.next(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if bucket.inverted {
+		return nil, fmt.Errorf("%s: the rows updated in the second %s outnumber a page and are not listed in ID order; the cursor stays", w.r.spec.path, at)
+	}
+	w.pos.id = bucket.last
+	if !bucket.complete {
+		return fresh, nil
+	}
+	// The second ended in this reply; what follows it there is contiguous.
+	w.bucket = nil
+	if len(w.tail) > 0 {
+		w.pos = position{at: w.tail[len(w.tail)-1].updated}
+	}
+	w.done = !w.tailNext
+	return append(fresh, w.tail...), nil
+}
+
+// bucketPage lists one page from pos.at and returns its rows of that
+// second; a row past it ends the second.
+func (w *streamWalk) bucketPage(ctx context.Context, page, perPage int) (listing, error) {
+	response, rows, err := w.page(ctx, page, perPage)
+	if err != nil {
+		return listing{}, err
+	}
+	cut := 0
+	for cut < len(rows) && rows[cut].updated.Equal(w.pos.at) {
+		cut++
+	}
+	w.tail, w.tailNext = rows[cut:], response.NextPath != ""
+	return listing{start: (page - 1) * perPage, rows: rows[:cut], next: w.tailNext && cut == len(rows)}, nil
+}
+
+// page lists one page of rows updated at or after pos.at.
+func (w *streamWalk) page(ctx context.Context, page, perPage int) (model.GHResponse, []entry, error) {
+	var response model.GHResponse
+	if w.first != nil && page == 1 && perPage == listPageSize {
+		response, w.first = *w.first, nil
+	} else {
+		query := w.r.query(w.pos.at)
+		query.Set("per_page", strconv.Itoa(perPage))
+		if page > 1 {
+			query.Set("page", strconv.Itoa(page))
+		}
+		var err error
+		if response, err = w.r.s.get(ctx, w.r.rd, model.GHRequest{Path: w.r.spec.path, Query: query}); err != nil {
+			return response, nil, err
+		}
+	}
+	date, err := serverDate(response)
+	if err != nil {
+		return response, nil, err
+	}
+	w.date = date
+	rows, err := w.r.spec.entries(response.Body, w.r.stored.EnabledAt, w.r.s.clock.Now())
+	return response, rows, err
 }
 
 // pollBranchCI watches the default branch head's settled CI. The first

@@ -40,9 +40,9 @@ const (
 	// lowBudgetDivisor: below Limit/lowBudgetDivisor remaining requests a
 	// round reads only flagged threads.
 	lowBudgetDivisor = 10
-	// rereadPageFactor bounds observe-stream pages that only reread the
-	// lookback to this multiple of MaxPages; past it the round skips to the
-	// cursor, so the lookback cannot starve progress.
+	// rereadPageFactor bounds the observe-stream pages a round rereads from
+	// the cursor towards the frontier to this multiple of MaxPages; a
+	// longer reread starts at the cursor again next round.
 	rereadPageFactor = 4
 	// rateLimitRetry is the wait after a 429 that names no Retry-After.
 	rateLimitRetry = time.Minute
@@ -79,7 +79,10 @@ type Source struct {
 	text          text
 
 	// polling serializes rounds: the poll loop and poll_now share a Source.
-	polling sync.Mutex
+	// It guards frontiers, how far each observe stream was read by this
+	// process: in memory only, since losing it only costs a reread.
+	polling   sync.Mutex
+	frontiers map[model.CursorKey]position
 	// mu guards health and blockedUntil.
 	mu           sync.Mutex
 	health       model.SourceHealth
@@ -116,6 +119,7 @@ func New(options Options) (*Source, error) {
 		maxPages:      cmp.Or(poll.MaxPages, defaultMaxPages),
 		observe:       options.Config.Observe,
 		text:          newText(options.Account.Login, maxBody),
+		frontiers:     map[model.CursorKey]position{},
 		health:        model.SourceHealth{Healthy: true},
 	}, nil
 }
@@ -319,7 +323,7 @@ func decodeBytes[T any](raw []byte, what string) (T, error) {
 
 // sameCursor compares cursors by instant, not by time representation.
 func sameCursor(a, b model.Cursor) bool {
-	return a.Key == b.Key && a.Since.Equal(b.Since) && a.LastModified == b.LastModified && a.ETag == b.ETag &&
+	return a.Key == b.Key && a.Since.Equal(b.Since) && a.LastID == b.LastID && a.LastModified == b.LastModified && a.ETag == b.ETag &&
 		a.EnabledAt.Equal(b.EnabledAt) && a.BranchSHA == b.BranchSHA && a.Fingerprint == b.Fingerprint
 }
 
@@ -334,15 +338,6 @@ func listQuery(since time.Time, sorted bool) url.Values {
 		query.Set("since", since.UTC().Format(time.RFC3339))
 	}
 	return query
-}
-
-// rereadFrom is where a stream positioned at since is reread from: the
-// lookback before it, or nothing (from the start) when never read.
-func (s *Source) rereadFrom(since time.Time) time.Time {
-	if since.IsZero() {
-		return time.Time{}
-	}
-	return since.Add(-s.lookback)
 }
 
 func (s *Source) repoPath(format string, args ...any) string {
