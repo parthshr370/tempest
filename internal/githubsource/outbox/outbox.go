@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,11 @@ type Options struct {
 	// Interval bounds how long a due retry waits without a Wake. Default
 	// 15 seconds.
 	Interval time.Duration
+	// PushRepository replaces the push destination
+	// https://github.com/<repository>.git with a local bare repository path,
+	// pushed over git's file protocol. Only hermetic end-to-end tests set it;
+	// the operator file has no such field.
+	PushRepository string
 }
 
 const (
@@ -136,6 +142,12 @@ func New(options Options) (*Outbox, error) {
 	git, err := newGitRunner(config, owner, name)
 	if err != nil {
 		return nil, err
+	}
+	if options.PushRepository != "" {
+		if !filepath.IsAbs(options.PushRepository) {
+			return nil, fmt.Errorf("outbox: push repository %q is not absolute", options.PushRepository)
+		}
+		git.url, git.protocol = options.PushRepository, "file"
 	}
 	logger := options.Logger
 	if logger == nil {
