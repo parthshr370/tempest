@@ -255,6 +255,9 @@ type Repo struct {
 	statuses      []*CommitStatus
 	branches      map[string]string
 	notifications []*Notification
+	// rateMu guards the rate budget apart from mu, which a route may hold
+	// while it writes its status.
+	rateMu        sync.Mutex
 	rateLimit     int
 	rateRemaining int
 	rateReset     time.Time
@@ -311,8 +314,8 @@ func (r *Repo) SetPollInterval(seconds int) {
 // budget, which each non-304 reply then decrements. A limit of 0 removes
 // the rate headers.
 func (r *Repo) SetRateLimit(limit, remaining int, reset time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
 	r.rateLimit, r.rateRemaining, r.rateReset = limit, remaining, reset
 }
 
@@ -635,37 +638,57 @@ func (r *Repo) routes(server *Server) {
 }
 
 // rated adds the Date header from the repository clock, which is GitHub's
-// clock (the source takes its cursors from it), adds rate-limit headers
-// and charges the budget for replies that are not 304, which GitHub does
-// not count.
+// clock (the source takes its cursors from it), charges the budget for a
+// reply that is not 304, which GitHub does not count, and reports the
+// budget left after it in the rate-limit headers.
 func (r *Repo) rated(handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, request *http.Request) {
 		r.mu.Lock()
 		w.Header().Set("Date", r.now.UTC().Format(http.TimeFormat))
-		if r.rateLimit > 0 {
-			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(r.rateLimit))
-			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(max(r.rateRemaining-1, 0)))
-			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(r.rateReset.Unix(), 10))
-		}
 		r.mu.Unlock()
-		recorder := &statusRecorder{ResponseWriter: w}
+		recorder := &statusRecorder{ResponseWriter: w, charge: r.charge}
 		handler(recorder, request)
-		r.mu.Lock()
-		if r.rateLimit > 0 && recorder.status != http.StatusNotModified {
-			r.rateRemaining = max(r.rateRemaining-1, 0)
+		if recorder.status == 0 {
+			recorder.WriteHeader(http.StatusOK)
 		}
-		r.mu.Unlock()
 	}
 }
 
+// charge takes one request from the budget unless status is 304 and
+// reports what is left in header.
+func (r *Repo) charge(header http.Header, status int) {
+	r.rateMu.Lock()
+	defer r.rateMu.Unlock()
+	if r.rateLimit == 0 {
+		return
+	}
+	if status != http.StatusNotModified {
+		r.rateRemaining = max(r.rateRemaining-1, 0)
+	}
+	header.Set("X-RateLimit-Limit", strconv.Itoa(r.rateLimit))
+	header.Set("X-RateLimit-Remaining", strconv.Itoa(r.rateRemaining))
+	header.Set("X-RateLimit-Reset", strconv.FormatInt(r.rateReset.Unix(), 10))
+}
+
+// statusRecorder charges a reply once, when its status is written.
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+	charge func(header http.Header, status int)
 }
 
 func (s *statusRecorder) WriteHeader(status int) {
+	if s.status != 0 {
+		return
+	}
 	s.status = status
+	s.charge(s.Header(), status)
 	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusRecorder) Write(body []byte) (int, error) {
+	s.WriteHeader(http.StatusOK)
+	return s.ResponseWriter.Write(body)
 }
 
 // reply writes value with a content ETag and answers a matching

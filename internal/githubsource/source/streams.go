@@ -112,6 +112,7 @@ func (s *Source) pollNotifications(ctx context.Context, rd *round) error {
 	if err := read.commit(ctx, cursor, found, stored); err != nil {
 		return err
 	}
+	s.stall.clear(cursor.Since)
 	switch {
 	case backlogErr != nil:
 		return backlogErr
@@ -265,13 +266,18 @@ func (n *notificationRead) list(ctx context.Context, since, before time.Time) ([
 // second flags every row of one second, which no narrower window splits,
 // by page number. An update moves a notification out of a past second and
 // shifts the rest back, so no page offset is trusted: the second is a
-// ranked walk in descending ID order (GitHub's tie order, checked on every
-// reply), from below after when it is set. A round that stops in it
-// leaves partial, the lowest ID read, for the next round to go on from. A
-// second listed out of ID order is read whole instead, which only a round
-// that holds all of it can verify. done is false when the round's bound
-// stopped it.
+// ranked walk in descending ID order (GitHub's observed tie order, checked
+// at every join), from the row with ID after when it is set. A round that
+// stops in it leaves partial, the lowest ID read, for the next round to go
+// on from. A second the walk cannot prove is read whole instead, with as
+// many requests as polling has left in the rate window; one larger than
+// that stalls (see notificationStall). done is false when the round's
+// bound or a stall stopped it.
 func (n *notificationRead) second(ctx context.Context, at time.Time, after int64) (bool, error) {
+	if stall := n.s.stall; stall.at.Equal(at) && n.s.clock.Now().Before(stall.retryAt) {
+		n.unverified = stall.err()
+		return false, nil
+	}
 	query := notificationQuery(at, at.Add(time.Second))
 	fetch := func(ctx context.Context, page, perPage int) (listing, error) {
 		if n.requests >= n.limit {
@@ -302,12 +308,12 @@ func (n *notificationRead) second(ctx context.Context, at time.Time, after int64
 	}
 	walk := ranked{fetch: fetch, rank: func(row entry) int64 { return -row.id }, perPage: notificationsPage, last: math.MinInt64}
 	if after > 0 {
-		walk.last = -after
+		walk.last, walk.anchored = -after, true
 	}
 	first := walk.last
 	// stop records how far the walk got when something ended it early.
 	stop := func(err error) (bool, error) {
-		if walk.last > math.MinInt64 {
+		if walk.anchored {
 			n.partialAt, n.partial = at, -walk.last
 		}
 		n.advanced = n.advanced || walk.last > first
@@ -323,16 +329,63 @@ func (n *notificationRead) second(ctx context.Context, at time.Time, after int64
 		if _, err := walk.next(ctx); err != nil {
 			return stop(err)
 		}
-		if walk.inverted {
-			done, err := readWhole(ctx, fetch, notificationsPage, n.limit, func([]entry) {})
-			if errors.Is(err, errRoundBound) || err == nil && !done {
-				n.unverified = fmt.Errorf("notifications: the second %s is not listed in ID order and holds more rows than a round may read; the cursor stays", at.Format(time.RFC3339))
-				return false, nil
-			}
-			return done, err
+		if walk.broken {
+			return n.secondWhole(ctx, at, fetch)
 		}
 	}
+	n.s.stall.clear(at.Add(time.Second))
 	return true, nil
+}
+
+// secondWhole reads the second at whole, with every request polling has
+// left in the rate window if that is more than the round's bound. A second
+// larger than that stalls: retrying it at once would spend as much again.
+func (n *notificationRead) secondWhole(ctx context.Context, at time.Time, fetch fetcher) (bool, error) {
+	n.limit = max(n.limit, n.requests+n.rd.windowLeft())
+	done, err := readWhole(ctx, fetch, notificationsPage, n.limit, func([]entry) {})
+	switch {
+	case errors.Is(err, errRoundBound), err == nil && !done:
+		n.s.stall.note(at, n.s.clock.Now(), n.s.interval)
+		n.unverified = n.s.stall.err()
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	n.s.stall.clear(at.Add(time.Second))
+	return true, nil
+}
+
+// notificationStall is a notification second that the walk could not
+// prove and that held more rows than polling had requests left to read it
+// whole. Reading it again soon costs as much and fails the same way, so
+// the backlog retries it only after a wait that doubles from the poll
+// interval up to the rate window, and reports it every round meanwhile.
+// The cursor stays below it, and the head still flags the newest rows.
+type notificationStall struct {
+	at      time.Time
+	wait    time.Duration
+	retryAt time.Time
+}
+
+func (s *notificationStall) note(at, now time.Time, interval time.Duration) {
+	wait := interval
+	if s.at.Equal(at) {
+		wait = min(2*s.wait, rateWindow)
+	}
+	*s = notificationStall{at: at, wait: wait, retryAt: now.Add(wait)}
+}
+
+// clear ends a stall once coverage reaches covered, past its second: the
+// second was read, or every row left it.
+func (s *notificationStall) clear(covered time.Time) {
+	if !s.at.IsZero() && covered.After(s.at) {
+		*s = notificationStall{}
+	}
+}
+
+func (s *notificationStall) err() error {
+	return fmt.Errorf("notifications: the second %s cannot be proven in ID order and holds more rows than polling may read whole in this rate window; the cursor stays below it and the read is retried after %s",
+		s.at.Format(time.RFC3339), s.retryAt.Format(time.RFC3339))
 }
 
 // commit stores the flags and, with the last of them, the cursor.
@@ -474,17 +527,23 @@ func (p position) compare(o position) int {
 // it. Rows past it were read already, up to the stream's frontier, which
 // the Source keeps in memory only: a restart loses nothing but rereads.
 // A round reads MaxPages fresh pages from the frontier, then rereads from
-// the cursor towards the frontier, at most rereadPageFactor*MaxPages
-// pages, which catches late rows early and moves the cursor over what has
-// settled. Nothing is skipped: a reread cut by its bound starts again at
-// the cursor next round, and the cursor catches up as rows settle.
+// the cursor only as far as rows have settled, which moves the cursor:
+// the reread window is what settled since the cursor, one round's activity
+// when the stream keeps up and more after a round that could not reread,
+// at most rereadPageFactor*MaxPages pages. A late row past that line is
+// read when the cursor reaches it, at most a lookback after its update.
+// Observe streams are context, read last and only while the round's
+// request allowance lasts, so they lag under load instead of spending the
+// budget of notifications and watched threads. Nothing is skipped: a
+// reread cut short starts again at the cursor next round.
 //
 // Each request is the first page from a since, so a deletion cannot shift
 // an unread row onto a page already read. Only a second holding more than
 // a page is paged by number, as a ranked walk in ascending ID order, and
-// the cursor's LastID keeps the progress through it. The ETag is kept only
-// while the cursor, and so the first request's URL, is unchanged and its
-// reply was the whole listing.
+// the cursor's LastID keeps the progress through it; a second the walk
+// cannot prove is read whole. The ETag is kept only while the cursor, and
+// so the first request's URL, is unchanged and its reply was the whole
+// listing.
 func (s *Source) pollStream(ctx context.Context, rd *round, spec streamSpec) error {
 	stored, found, err := s.intake.Cursor(ctx, spec.key)
 	if err != nil {
@@ -555,16 +614,20 @@ func (r *streamRead) query(since time.Time) url.Values {
 	return query
 }
 
-// walk reads w until the listing ends or the round's page bounds: pages
-// past the frontier are fresh and bounded by MaxPages, pages below it
-// rereads with their own bound, so rereading from the cursor still runs in
-// a round whose fresh pages are spent. A walk from the cursor moves the
-// cursor as long as every row it passed had settled when read, and then up
-// to where rows settle.
+// walk reads w until the listing ends, the round's page bounds or its
+// request allowance: pages past the frontier are fresh and bounded by
+// MaxPages, pages below it rereads with their own bound, so rereading from
+// the cursor still runs in a round whose fresh pages are spent. A walk
+// from the cursor moves the cursor as long as every row it passed had
+// settled when read, and then up to where rows settle; below the frontier
+// it stops there, since the rows up to the frontier were read already.
 func (r *streamRead) walk(ctx context.Context, w *streamWalk, fromCover bool) error {
 	settling := fromCover
 	for !w.done {
 		if w.pos.compare(r.front) < 0 && r.reread >= rereadPageFactor*r.s.maxPages || w.pos.compare(r.front) >= 0 && r.fresh >= r.s.maxPages {
+			return nil
+		}
+		if w.first == nil && r.rd.spare() <= 0 {
 			return nil
 		}
 		w.searched = false
@@ -593,6 +656,9 @@ func (r *streamRead) walk(ctx context.Context, w *streamWalk, fromCover bool) er
 		}
 		if err := r.commit(ctx, rows, cover); err != nil {
 			return err
+		}
+		if fromCover && !settling && w.pos.compare(r.front) < 0 {
+			return nil
 		}
 	}
 	return nil
@@ -675,7 +741,7 @@ func (w *streamWalk) next(ctx context.Context) ([]entry, error) {
 	if !slices.ContainsFunc(rows, func(row entry) bool { return !row.updated.Equal(w.pos.at) }) {
 		// One second holds more than a page: walk it by ID.
 		w.first = &response
-		w.bucket = &ranked{fetch: w.bucketPage, rank: entryID, perPage: listPageSize, last: w.pos.id}
+		w.bucket = &ranked{fetch: w.bucketPage, rank: entryID, perPage: listPageSize, last: w.pos.id, anchored: w.pos.id > 0}
 		return w.bucketNext(ctx)
 	}
 	if !last.After(w.pos.at) {
@@ -696,8 +762,8 @@ func (w *streamWalk) bucketNext(ctx context.Context) ([]entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bucket.inverted {
-		return nil, fmt.Errorf("%s: the rows updated in the second %s outnumber a page and are not listed in ID order; the cursor stays", w.r.spec.path, at)
+	if bucket.broken {
+		return w.bucketWhole(ctx)
 	}
 	w.pos.id = bucket.last
 	if !bucket.complete {
@@ -710,6 +776,28 @@ func (w *streamWalk) bucketNext(ctx context.Context) ([]entry, error) {
 	}
 	w.done = !w.tailNext
 	return append(fresh, w.tail...), nil
+}
+
+// bucketWhole reads the second pos.at whole when the walk cannot prove it
+// in ID order from the row read last, within the requests a scan reads
+// whole with. With every row of the second read, the position moves past
+// it.
+func (w *streamWalk) bucketWhole(ctx context.Context) ([]entry, error) {
+	var rows []entry
+	done, err := readWhole(ctx, w.bucketPage, listPageSize, w.r.s.maxPages+scanSeekProbes, func(fresh []entry) { rows = append(rows, fresh...) })
+	if err != nil {
+		return nil, err
+	}
+	if !done {
+		return nil, fmt.Errorf("%s: the rows updated in the second %s cannot be proven in ID order and outnumber what a round reads whole; the cursor stays", w.r.spec.path, w.pos.at.Format(time.RFC3339))
+	}
+	w.bucket = nil
+	w.pos = position{at: w.pos.at.Add(time.Second)}
+	if len(w.tail) > 0 {
+		w.pos = position{at: w.tail[len(w.tail)-1].updated}
+	}
+	w.done = !w.tailNext
+	return append(rows, w.tail...), nil
 }
 
 // bucketPage lists one page from pos.at and returns its rows of that

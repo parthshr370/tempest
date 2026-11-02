@@ -2,6 +2,7 @@ package source
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,13 +17,22 @@ import (
 // stateGone is the Thread state of an issue GitHub answers 410 for.
 const stateGone = "gone"
 
-// pollWatched reads every watched thread, flagged ones first. When the
-// rate budget is low only flagged threads are read.
+// pollWatched reads watched threads, flagged ones first and within each
+// group the one read longest ago first, while the round's allowance
+// lasts. The first flagged thread is read even when it is spent, so flags
+// always progress; the rest wait for a later round, which reads them
+// before the threads read this one.
 func (s *Source) pollWatched(ctx context.Context, rd *round) error {
 	watched, err := s.intake.Watched(ctx, rd.started)
 	if err != nil {
 		return fmt.Errorf("list watched threads: %w", err)
 	}
+	lastRead := make(map[int]int, len(watched))
+	for _, item := range watched {
+		number := item.Thread.Ref.Number
+		lastRead[number] = s.readRound[number]
+	}
+	s.readRound = lastRead
 	slices.SortStableFunc(watched, func(a, b model.WatchedThread) int {
 		if a.Thread.NeedsReconcile != b.Thread.NeedsReconcile {
 			if a.Thread.NeedsReconcile {
@@ -30,15 +40,21 @@ func (s *Source) pollWatched(ctx context.Context, rd *round) error {
 			}
 			return 1
 		}
-		return a.Thread.Ref.Number - b.Thread.Ref.Number
+		return cmp.Or(lastRead[a.Thread.Ref.Number]-lastRead[b.Thread.Ref.Number], a.Thread.Ref.Number-b.Thread.Ref.Number)
 	})
+	read := 0
 	for _, item := range watched {
 		if rd.stopped() {
 			return nil
 		}
-		if item.Thread.State == stateGone || (rd.lowBudget() && !item.Thread.NeedsReconcile) {
+		if item.Thread.State == stateGone {
 			continue
 		}
+		if rd.spare() <= 0 && (read > 0 || !item.Thread.NeedsReconcile) {
+			return nil
+		}
+		read++
+		s.readRound[item.Thread.Ref.Number] = s.rounds
 		if err := s.readThread(ctx, rd, item); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -317,8 +333,10 @@ func (s *Source) commentEntries(ref model.ThreadRef, inline bool) func([]byte, t
 //
 // GitHub promises this listing chronological, not in ID order. Every
 // listing sampled so far was also in ID order, which the scan's walk
-// assumes and checks: a reply out of ID order makes the scan read the
-// reviews whole instead of skipping a lower ID listed later.
+// assumes and checks at every join, a resumed scan's first included: a
+// reply out of ID order, or one that does not list the review the scan
+// stopped at, makes the scan read the reviews whole instead of skipping a
+// lower ID listed later.
 func (s *Source) readReviews(ctx context.Context, rd *round, ref model.ThreadRef, old model.Position, pr *prTracker) (bool, error) {
 	return s.scan(ctx, rd, scanSpec{
 		resource: threadResource(ref.Number, "reviews"),

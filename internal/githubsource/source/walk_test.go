@@ -117,7 +117,7 @@ func TestNotificationLeavingADenseSecondShiftsNothingPast(t *testing.T) {
 				return inbox(request, rows, now)
 			})
 			for range 3 {
-				if err := e.source.pollNotifications(context.Background(), &round{}); err != nil {
+				if err := e.source.pollNotifications(context.Background(), e.source.newRound()); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -155,7 +155,7 @@ func TestNotificationSecondLargerThanARoundResumes(t *testing.T) {
 	bound := 1 + 1 + scanSeekProbes
 	for index := range 4 {
 		before := requests
-		err := e.source.pollNotifications(context.Background(), &round{})
+		err := e.source.pollNotifications(context.Background(), e.source.newRound())
 		sent := requests - before
 		t.Logf("round %d: %d requests, cursor %+v, err %v", index, sent, e.intake.cursors[model.CursorNotifications], err)
 		if err != nil {
@@ -219,7 +219,7 @@ func TestObserveSecondLargerThanARoundResumes(t *testing.T) {
 	// Each round reads one fresh page past where the last stopped; the
 	// overlap that proves each step costs a row a page.
 	for range 7 {
-		if err := e.source.pollCommentsStream(context.Background(), &round{}); err != nil {
+		if err := e.source.pollCommentsStream(context.Background(), e.source.newRound()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -255,7 +255,7 @@ func TestObserveLateRowBehindTheFrontierIsRead(t *testing.T) {
 	})
 	seen := func() bool { return e.intake.hasEvent(model.CommentID(late.ID, late.CreatedAt)) }
 	for index := 0; index < 12 && !seen(); index++ {
-		if err := e.source.pollCommentsStream(context.Background(), &round{}); err != nil {
+		if err := e.source.pollCommentsStream(context.Background(), e.source.newRound()); err != nil {
 			t.Fatal(err)
 		}
 		if index == 5 {
@@ -302,7 +302,7 @@ func TestScanOutOfIDOrderReadsWhole(t *testing.T) {
 		},
 		position: func(*model.IntakeBatch, model.Position) {},
 	}
-	if done, err := e.source.scan(context.Background(), &round{}, spec); err != nil || !done {
+	if done, err := e.source.scan(context.Background(), e.source.newRound(), spec); err != nil || !done {
 		t.Fatalf("done %t, err %v", done, err)
 	}
 	for _, id := range ids {
@@ -376,7 +376,7 @@ func TestObserveCursorSettlesUnderSteadyLoad(t *testing.T) {
 			now = now.Add(5 * time.Second)
 		}
 		now = now.Add(10 * time.Minute)
-		if err := e.source.pollCommentsStream(context.Background(), &round{}); err != nil {
+		if err := e.source.pollCommentsStream(context.Background(), e.source.newRound()); err != nil {
 			t.Fatal(err)
 		}
 	}

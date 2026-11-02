@@ -18,9 +18,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,15 +39,24 @@ const (
 	notificationsPage = 50
 	// unhealthyAfter consecutive failed rounds turn health unhealthy.
 	unhealthyAfter = 3
-	// lowBudgetDivisor: below Limit/lowBudgetDivisor remaining requests a
-	// round reads only flagged threads.
-	lowBudgetDivisor = 10
+	// pollSharePercent is the part of the account's primary rate limit that
+	// polling spends per rate window. The rest stays for the outbox, the
+	// worker tools and anything else signed in as the account.
+	pollSharePercent = 40
+	// assumedRateLimit stands in for the primary limit until a reply
+	// reports one: GitHub's authenticated REST limit per window.
+	assumedRateLimit = 5000
+	// rateWindow is the length of GitHub's primary rate-limit window.
+	rateWindow = time.Hour
 	// rereadPageFactor bounds the observe-stream pages a round rereads from
 	// the cursor towards the frontier to this multiple of MaxPages; a
 	// longer reread starts at the cursor again next round.
 	rereadPageFactor = 4
 	// rateLimitRetry is the wait after a 429 that names no Retry-After.
 	rateLimitRetry = time.Minute
+	// replyCacheRounds is how many rounds a reply kept for revalidation
+	// survives unused.
+	replyCacheRounds = 3
 )
 
 // Options configures a Source.
@@ -79,10 +90,16 @@ type Source struct {
 	text          text
 
 	// polling serializes rounds: the poll loop and poll_now share a Source.
-	// It guards frontiers, how far each observe stream was read by this
-	// process: in memory only, since losing it only costs a reread.
+	// It guards the state below, how far this process got, which lives in
+	// memory only, since losing it only costs a reread: each observe
+	// stream's frontier, the round each watched thread was last read in, a
+	// stalled notification second and the replies kept for revalidation.
 	polling   sync.Mutex
 	frontiers map[model.CursorKey]position
+	rounds    int
+	readRound map[int]int
+	stall     notificationStall
+	replies   map[string]storedReply
 	// mu guards health and blockedUntil.
 	mu           sync.Mutex
 	health       model.SourceHealth
@@ -120,6 +137,8 @@ func New(options Options) (*Source, error) {
 		observe:       options.Config.Observe,
 		text:          newText(options.Account.Login, maxBody),
 		frontiers:     map[model.CursorKey]position{},
+		readRound:     map[int]int{},
+		replies:       map[string]storedReply{},
 		health:        model.SourceHealth{Healthy: true},
 	}, nil
 }
@@ -139,6 +158,10 @@ type round struct {
 	report  model.PollReport
 	// rate is the newest budget any reply reported.
 	rate model.RateLimit
+	// window is what polling may still spend in the rate window when the
+	// round starts and allowance the round's share of it; spent counts the
+	// requests GitHub charged, every reply but a 304.
+	window, allowance, spent int
 	// limitedUntil is set when a rate limit stopped the round.
 	limitedUntil time.Time
 	// pollInterval is GitHub's X-Poll-Interval for notifications.
@@ -147,26 +170,50 @@ type round struct {
 
 func (rd *round) stopped() bool { return !rd.limitedUntil.IsZero() }
 
-// lowBudget reports a remaining budget under a tenth of the limit.
-func (rd *round) lowBudget() bool {
-	return rd.rate.Limit > 0 && rd.rate.Remaining*lowBudgetDivisor < rd.rate.Limit
+// spare is what is left of the round's allowance.
+func (rd *round) spare() int { return rd.allowance - rd.spent }
+
+// windowLeft is what is left of the rate window's share.
+func (rd *round) windowLeft() int { return max(0, rd.window-rd.spent) }
+
+// budget sets the round's allowance from the newest rate limit GitHub
+// reported, the last round's at the start and then each reply's: polling's
+// share of the window's limit less everything used in that window before
+// the round (by this source or anything else on the account), spread
+// evenly over the rounds left until the window resets. Notifications and
+// the first flagged thread read even when it is spent, so flags always
+// progress; the rest read only while it lasts, observe streams last. The
+// local clock only schedules here: a skewed clock misjudges how many
+// rounds remain, never what was read.
+func (s *Source) budget(rd *round) {
+	limit, reset := rd.rate.Limit, rd.rate.Reset
+	// The newest reply already counts what the round spent.
+	before := min(limit, rd.rate.Remaining+rd.spent)
+	if limit <= 0 {
+		limit, before = assumedRateLimit, assumedRateLimit
+	}
+	if !reset.After(rd.started) {
+		// The window last reported has ended: a new one starts full.
+		before, reset = limit, rd.started.Add(rateWindow)
+	}
+	rd.window = max(0, limit*pollSharePercent/100-(limit-before))
+	rounds := max(1, int((reset.Sub(rd.started)+s.interval-1)/s.interval))
+	rd.allowance = rd.window / rounds
 }
 
 // errRoundStopped ends the remaining reads of a rate-limited round.
 var errRoundStopped = errors.New("round stopped by a rate limit")
 
-// Poll runs one bounded round: notifications, enabled observe streams,
-// then watched threads with their PRs. Each resource fails on its own and
-// a failure commits nothing past what was read. The error is non-nil only
-// when ctx ended.
+// Poll runs one bounded round in priority order: notifications, watched
+// threads with their PRs, default-branch CI, then the enabled observe
+// streams. Each resource fails on its own and a failure commits nothing
+// past what was read. The error is non-nil only when ctx ended.
 func (s *Source) Poll(ctx context.Context) (model.PollReport, error) {
 	s.polling.Lock()
 	defer s.polling.Unlock()
-	rd := &round{started: s.clock.Now()}
-	rd.report.StartedAt = rd.started
+	rd := s.newRound()
 	s.mu.Lock()
 	blocked := s.blockedUntil
-	rd.rate = s.health.RateLimit
 	s.mu.Unlock()
 	if rd.started.Before(blocked) {
 		// Still inside a rate-limit wait: no request is sent.
@@ -178,20 +225,22 @@ func (s *Source) Poll(ctx context.Context) (model.PollReport, error) {
 	steps := []struct {
 		resource string
 		run      func(context.Context, *round) error
-		always   bool
+		// budgeted steps start only while the round's allowance lasts;
+		// the others spend it first and follow their own bounds.
+		budgeted bool
 	}{
-		{"notifications", s.pollNotifications, true},
-		{string(model.CursorIssues), s.pollIssuesStream, false},
-		{string(model.CursorComments), s.pollCommentsStream, false},
-		{string(model.CursorReviewComments), s.pollReviewCommentsStream, false},
-		{string(model.CursorBranchCI), s.pollBranchCI, false},
-		{"watched", s.pollWatched, true},
+		{"notifications", s.pollNotifications, false},
+		{"watched", s.pollWatched, false},
+		{string(model.CursorBranchCI), s.pollBranchCI, true},
+		{string(model.CursorIssues), s.pollIssuesStream, true},
+		{string(model.CursorComments), s.pollCommentsStream, true},
+		{string(model.CursorReviewComments), s.pollReviewCommentsStream, true},
 	}
 	for _, step := range steps {
 		if rd.stopped() {
 			break
 		}
-		if !step.always && rd.lowBudget() {
+		if step.budgeted && rd.spare() <= 0 {
 			continue
 		}
 		if err := step.run(ctx, rd); err != nil {
@@ -202,6 +251,20 @@ func (s *Source) Poll(ctx context.Context) (model.PollReport, error) {
 		}
 	}
 	return s.finish(rd), nil
+}
+
+// newRound starts a round with its request budget from the rate limit the
+// last round saw.
+func (s *Source) newRound() *round {
+	rd := &round{started: s.clock.Now()}
+	rd.report.StartedAt = rd.started
+	s.mu.Lock()
+	rd.rate = s.health.RateLimit
+	s.mu.Unlock()
+	s.rounds++
+	s.forgetReplies()
+	s.budget(rd)
+	return rd
 }
 
 // finish computes the next poll time and folds the round into health.
@@ -244,16 +307,29 @@ func (s *Source) fail(rd *round, resource string, err error) {
 	rd.report.Errors = append(rd.report.Errors, failure)
 }
 
-// get sends one request, tracking the rate budget and stopping the round
-// on a rate limit.
+// get sends one request, charging the round's budget unless GitHub
+// answers 304, which it does not count, and stopping the round on a rate
+// limit.
+//
+// A first-page request without validators of its own is revalidated: the
+// last reply to the same URL is kept with its ETag, and a 304 (free) means
+// that reply is still current, so the caller gets it back with the 304's
+// headers (GitHub's Date and the rate), as if GitHub had sent it again. An
+// unchanged watched thread therefore costs no budget. Replies unused for
+// replyCacheRounds rounds are dropped.
 func (s *Source) get(ctx context.Context, rd *round, request model.GHRequest) (model.GHResponse, error) {
 	if rd.stopped() {
 		return model.GHResponse{}, errRoundStopped
 	}
 	request.Method = http.MethodGet
+	key, stored, revalidated := s.validator(&request)
 	response, err := s.client.Do(ctx, request)
+	if response.Status != http.StatusNotModified {
+		rd.spent++
+	}
 	if response.RateLimit.Limit > 0 {
 		rd.rate = response.RateLimit
+		s.budget(rd)
 	}
 	var ghErr *model.GHError
 	if errors.As(err, &ghErr) && (ghErr.Status == http.StatusTooManyRequests || (ghErr.Status == http.StatusForbidden && ghErr.RetryAfter > 0)) {
@@ -266,7 +342,51 @@ func (s *Source) get(ctx context.Context, rd *round, request model.GHRequest) (m
 	if err != nil {
 		return response, fmt.Errorf("GET %s: %w", request.Path, err)
 	}
+	switch {
+	case key == "":
+	case response.Status == http.StatusNotModified && revalidated:
+		header := stored.Header.Clone()
+		maps.Copy(header, response.Header)
+		stored.Header, stored.RateLimit = header, response.RateLimit
+		if response.PollInterval > 0 {
+			stored.PollInterval = response.PollInterval
+		}
+		response = stored
+		s.replies[key] = storedReply{response: response, round: s.rounds}
+	case response.Status == http.StatusOK && response.ETag != "":
+		s.replies[key] = storedReply{response: response, round: s.rounds}
+	}
 	return response, nil
+}
+
+// storedReply is a reply kept for revalidation, with the round that last
+// used it.
+type storedReply struct {
+	response model.GHResponse
+	round    int
+}
+
+// validator returns the cache key of a request get revalidates, empty for
+// one that carries its own validators or asks past the first page, and
+// sets the stored reply's ETag on it when there is one.
+func (s *Source) validator(request *model.GHRequest) (string, model.GHResponse, bool) {
+	path, query, _ := strings.Cut(request.Path, "?")
+	inline, err := url.ParseQuery(query)
+	if err != nil || request.ETag != "" || request.LastModified != "" || request.Query.Has("page") || inline.Has("page") {
+		return "", model.GHResponse{}, false
+	}
+	maps.Copy(inline, request.Query)
+	key := path + "?" + inline.Encode()
+	stored, found := s.replies[key]
+	if found {
+		request.ETag = stored.response.ETag
+	}
+	return key, stored.response, found
+}
+
+// forgetReplies drops stored replies no round used lately.
+func (s *Source) forgetReplies() {
+	maps.DeleteFunc(s.replies, func(_ string, stored storedReply) bool { return s.rounds-stored.round >= replyCacheRounds })
 }
 
 // walk reads a snapshot listing (check runs, commit statuses) from first

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -36,7 +37,7 @@ import (
 //
 // GitHub documents ascending ID order for conversation and unsorted inline
 // comments, but lists reviews only "in chronological order". A review
-// listing out of ID order is caught by the walk and read whole instead.
+// listing the walk cannot prove in ID order is read whole instead.
 
 // scanSpec describes one thread stream.
 type scanSpec struct {
@@ -52,8 +53,8 @@ type scanSpec struct {
 }
 
 // scanSeekProbes bounds requests that read no new row in one ranked walk:
-// the search for its start (two per doubling of the listing's page count)
-// and the steps back after rows moved.
+// the search for the row it resumes after (two per doubling of the
+// listing's page count) and the steps back after rows moved.
 const scanSeekProbes = 64
 
 // listing is one reply of a paged listing: rows from offset start.
@@ -68,46 +69,63 @@ type fetcher func(ctx context.Context, page, perPage int) (listing, error)
 
 // ranked walks a listing that GitHub pages by number and sorts by a rank
 // unique to each row (an ID, or a negated ID for a descending listing),
-// from just past a rank already read. It proves its own coverage: every
-// request after the first overlaps the highest rank read so far. A reply
-// whose first row is at or below it continues the listing without a gap,
-// because one reply is one sorted snapshot; one that starts above it
-// means rows moved back, and the walk steps back instead of trusting the
-// offset. Page sizes vary so that consecutive requests overlap at all. A
-// walk that does not start at the beginning first finds its place by a
-// doubling then halving search for its rank.
+// from just past a row already read. Its coverage rests on one invariant,
+// checked at every join: a reply continues the walk only when it lists the
+// row the walk read last, and the walk takes only the rows after that row
+// in that reply, whose ranks must strictly ascend from it. Rows only leave
+// these listings or join at their end, so every row before that one was
+// read already, and one reply is one snapshot, so no row lies unread
+// between it and the rows after it. Page sizes vary so that consecutive
+// requests overlap at all.
 //
-// The sort is checked, not trusted: every adjacent pair of rows the walk
-// passes is in one reply, and a reply whose ranks do not strictly ascend
-// marks the walk inverted. An inverted walk proves nothing; its reader
+// A reply without that row proves nothing. When all its rows rank above
+// the row, rows moved back and the walk steps back to look for it;
+// otherwise the row left the listing or the listing is not in rank order,
+// and the walk is broken. A walk that resumes from a row an earlier round
+// read first searches for the page holding it, doubling then halving by
+// rank. The search only decides where to look: nothing counts as read
+// until a reply lists that row, and a search that does not find it breaks
+// the walk. A broken walk proves nothing past its last join; its reader
 // falls back to reading the listing whole.
 type ranked struct {
 	fetch fetcher
 	rank  func(entry) int64
 	// perPage is the route's largest page.
 	perPage int
-	// last is the highest rank read: rows ranked at or below it were read
-	// before the walk or by it. end is the offset just past last in the
-	// newest reply that proved it, once located.
-	last    int64
-	end     int
-	located bool
+	// last is the rank of the row read last, which anchored reports. An
+	// unanchored walk starts at the listing's first row. end is the offset
+	// just past last in the newest reply that listed it, once located.
+	last     int64
+	anchored bool
+	end      int
+	located  bool
 	// probes counts requests that read nothing new.
 	probes   int
 	complete bool
-	inverted bool
+	// broken reports a reply out of rank order or one that does not list
+	// the row read last where it must.
+	broken bool
 }
 
 // next reads one step of the walk, its search for its place counting as
 // one, and returns the rows it proved new.
 func (w *ranked) next(ctx context.Context) ([]entry, error) {
 	if !w.located {
-		return w.locate(ctx)
+		if w.anchored {
+			return w.locate(ctx)
+		}
+		w.located = true
 	}
 	page, perPage := overlapWindow(w.end, w.perPage)
 	got, err := w.get(ctx, page, perPage)
-	if err != nil || w.inverted {
+	if err != nil || w.broken {
 		return nil, err
+	}
+	if !w.anchored {
+		return w.accept(got, 0), nil
+	}
+	if at := w.find(got); at >= 0 {
+		return w.accept(got, at+1), nil
 	}
 	if got.start > 0 && (len(got.rows) == 0 || w.rank(got.rows[0]) > w.last) {
 		// Rows moved back past the reply's start: everything read so far
@@ -116,29 +134,34 @@ func (w *ranked) next(ctx context.Context) ([]entry, error) {
 		w.probes++
 		return nil, nil
 	}
-	return w.accept(got), nil
+	w.broken = true
+	return nil, nil
 }
 
-// locate finds where the walk stands: pages double until one reaches past
-// last, then halve between the last page wholly at or below it and the
-// first page wholly above it.
+// locate searches for the page that lists the row read last: pages double
+// until one reaches past it, then halve between the last page wholly below
+// it and the first page wholly above it. A page that spans its rank
+// without it, or two adjacent pages that bracket it, mean it is not listed
+// where the order puts it: the walk is broken.
 func (w *ranked) locate(ctx context.Context) ([]entry, error) {
 	low, high := 0, 0
 	for page := 1; w.probes < scanSeekProbes; w.probes++ {
 		got, err := w.get(ctx, page, w.perPage)
-		if err != nil || w.inverted {
+		if err != nil || w.broken {
 			return nil, err
 		}
+		if at := w.find(got); at >= 0 {
+			w.located = true
+			return w.accept(got, at+1), nil
+		}
 		switch {
-		case page == 1 || len(got.rows) > 0 && w.rank(got.rows[0]) <= w.last:
-			// The reply continues the listing from at or below last.
-			if len(got.rows) == 0 || w.rank(got.rows[len(got.rows)-1]) > w.last || !got.next {
-				w.located = true
-				return w.accept(got), nil
-			}
+		case page > 1 && (len(got.rows) == 0 || w.rank(got.rows[0]) > w.last):
+			high = page
+		case got.next && len(got.rows) > 0 && w.rank(got.rows[len(got.rows)-1]) < w.last:
 			low = page
 		default:
-			high = page
+			w.broken = true
+			return nil, nil
 		}
 		switch {
 		case high == 0:
@@ -146,8 +169,7 @@ func (w *ranked) locate(ctx context.Context) ([]entry, error) {
 		case high-low > 1:
 			page = (low + high) / 2
 		default:
-			// last is at the end of page low: continue from there.
-			w.end, w.located = low*w.perPage, true
+			w.broken = true
 			return nil, nil
 		}
 	}
@@ -162,23 +184,23 @@ func (w *ranked) get(ctx context.Context, page, perPage int) (listing, error) {
 	}
 	for i := 1; i < len(got.rows); i++ {
 		if w.rank(got.rows[i]) <= w.rank(got.rows[i-1]) {
-			w.inverted = true
+			w.broken = true
 		}
 	}
 	return got, nil
 }
 
-// accept takes a reply that continues the listing: rows above last are
-// new to the walk.
-func (w *ranked) accept(got listing) []entry {
-	var fresh []entry
-	for _, row := range got.rows {
-		if w.rank(row) > w.last {
-			fresh = append(fresh, row)
-		}
-	}
-	if len(got.rows) > 0 {
-		w.last = max(w.last, w.rank(got.rows[len(got.rows)-1]))
+// find returns the index in got of the row read last, or -1.
+func (w *ranked) find(got listing) int {
+	return slices.IndexFunc(got.rows, func(row entry) bool { return w.rank(row) == w.last })
+}
+
+// accept takes the rows of a reply that continues the walk from index
+// from on: the rows after the row read last, or a first page whole.
+func (w *ranked) accept(got listing, from int) []entry {
+	fresh := got.rows[from:len(got.rows):len(got.rows)]
+	if len(fresh) > 0 {
+		w.last, w.anchored = w.rank(fresh[len(fresh)-1]), true
 	}
 	w.end = got.start + len(got.rows)
 	w.complete = !got.next
@@ -188,13 +210,13 @@ func (w *ranked) accept(got listing) []entry {
 	return fresh
 }
 
-// readWhole reads a listing that is not in rank order from its first page,
-// passing every row to take, within budget requests. Each reply after the
-// first overlaps the last row of the one before at its offset, and that
-// row's ID still being there proves that no row before it left in
-// between, so nothing moved onto a page already read; a reply that moved
-// starts the listing again. Rows only leave the listings this reads (a
-// review, notification or comment updated out of a second, or deleted);
+// readWhole reads a listing that a ranked walk could not prove from its
+// first page, passing every row to take, within budget requests. Each
+// reply after the first overlaps the last row of the one before at its
+// offset, and that row's ID still being there proves that no row before it
+// left in between, so nothing moved onto a page already read; a reply that
+// moved starts the listing again. Rows only leave the listings this reads
+// (a review, notification or comment updated out of a second, or deleted);
 // none enter below their end. It reports whether it reached the end.
 func readWhole(ctx context.Context, fetch fetcher, perPage, budget int, take func([]entry)) (bool, error) {
 	end, mark := 0, int64(0)
@@ -238,9 +260,10 @@ type scanner struct {
 	// active reports a listed row updated at or after the old position.
 	active   bool
 	complete bool
-	// unordered is set once the listing was found out of ID order.
-	unordered bool
-	pages     int
+	// unproven is set once the walk could not prove the listing in ID order
+	// from the row read last, and the listing was read whole.
+	unproven bool
+	pages    int
 	// held is the newest run, committed with the position at the end.
 	held []entry
 }
@@ -249,7 +272,7 @@ type scanner struct {
 // and the new position. It reports whether the scan finished this round.
 func (s *Source) scan(ctx context.Context, rd *round, spec scanSpec) (bool, error) {
 	sc := &scanner{s: s, rd: rd, spec: spec, query: url.Values{}}
-	sc.walk = ranked{fetch: sc.fetch, rank: entryID, perPage: listPageSize, last: spec.old.LastID}
+	sc.walk = ranked{fetch: sc.fetch, rank: entryID, perPage: listPageSize, last: spec.old.LastID, anchored: spec.old.LastID > 0}
 	err := sc.run(ctx)
 	if commitErr := sc.commit(ctx); err == nil {
 		err = commitErr
@@ -269,7 +292,7 @@ func (sc *scanner) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if walk.inverted {
+		if walk.broken {
 			return sc.readWhole(ctx)
 		}
 		sc.take(fresh)
@@ -278,18 +301,19 @@ func (sc *scanner) run(ctx context.Context) error {
 	return nil
 }
 
-// readWhole reads a listing found out of ID order in full, so a lower ID
-// listed after a higher one is not skipped. Only a read that reaches the
-// end moves the position; a longer listing keeps it and fails the stream,
-// so the round reports it instead of skipping.
+// readWhole reads a listing the walk could not prove in full, so a lower
+// ID listed after a higher one, or after the row a resumed scan stopped
+// at, is not skipped. Only a read that reaches the end moves the position;
+// a longer listing keeps it and fails the stream, so the round reports it
+// instead of skipping.
 func (sc *scanner) readWhole(ctx context.Context) error {
-	sc.unordered = true
+	sc.unproven = true
 	complete, err := readWhole(ctx, sc.fetch, listPageSize, sc.s.maxPages+scanSeekProbes, sc.take)
 	if err != nil {
 		return err
 	}
 	if sc.complete = complete; !complete {
-		return fmt.Errorf("%s is not listed in ID order and is longer than a round reads whole; its position stays", sc.spec.path)
+		return fmt.Errorf("%s cannot be proven in ID order and is longer than a round reads whole; its position stays", sc.spec.path)
 	}
 	return nil
 }
@@ -353,8 +377,8 @@ func (sc *scanner) flush(ctx context.Context) error {
 // position: one second past its start when it finished and there is
 // something to move (a resumed scan, or new activity in a window), its
 // start and LastID when it stopped short. A scan that read nothing new and
-// finished keeps its position, and so its request URL. A listing out of ID
-// order has no LastID worth keeping: unfinished, it keeps its position.
+// finished keeps its position, and so its request URL. A listing read
+// whole has no LastID worth keeping: unfinished, it keeps its position.
 func (sc *scanner) commit(ctx context.Context) error {
 	if err := sc.flush(ctx); err != nil {
 		return err
@@ -368,7 +392,7 @@ func (sc *scanner) commit(ctx context.Context) error {
 	switch {
 	case sc.complete && (old.LastID > 0 || sc.spec.windowed && sc.active):
 		position = &model.Position{Since: started.Add(time.Second)}
-	case !sc.complete && !sc.unordered && sc.walk.last > old.LastID && !started.IsZero():
+	case !sc.complete && !sc.unproven && sc.walk.last > old.LastID && !started.IsZero():
 		position = &model.Position{Since: started, LastID: sc.walk.last}
 	}
 	if len(sc.held) == 0 && position == nil && sc.spec.pr.pending() == nil {
