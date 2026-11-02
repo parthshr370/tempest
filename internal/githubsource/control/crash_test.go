@@ -124,6 +124,14 @@ func crashScenario() []crashStep {
 		{"operator resolves", operator(func(ctx context.Context, o *Operator, now time.Time) error {
 			return o.ResolveEffect(ctx, model.OperatorRequest{ID: "resolve-1", Target: string(gen1(a, "reply-1")), Reason: "seen on GitHub", At: now}, model.EffectConfirmed)
 		})},
+		{"a second comment", enqueue(a, "reply-2", model.EffectRequest{Kind: model.EffectComment, Payload: model.EffectPayload{Body: "CI is green"}})},
+		{"a second comment attempt", attempt(gen1(a, "reply-2"))},
+		{"a second comment unknown", settle(gen1(a, "reply-2"), model.EffectSettlement{State: model.EffectUnknown, Error: "not found"})},
+		{"operator resends", operator(func(ctx context.Context, o *Operator, now time.Time) error {
+			return o.ResolveEffect(ctx, model.OperatorRequest{ID: "resend-1", Target: string(gen1(a, "reply-2")), Reason: "not on GitHub", At: now}, model.EffectPending)
+		})},
+		{"a resent comment attempt", attempt(gen1(a, "reply-2"))},
+		{"a resent comment confirmed", settle(gen1(a, "reply-2"), model.EffectSettlement{State: model.EffectConfirmed, Result: &model.EffectReply{RemoteID: 77}})},
 		{"a ready", func(ctx context.Context, s *Store, now time.Time) error {
 			_, err := s.Report(ctx, model.WorkerCall{SessionID: sessionOf(a), ToolCallID: "rep-2", At: now}, model.ReportRequest{Status: model.ReportReady, Summary: "PR open"})
 			return err
@@ -295,6 +303,16 @@ func checkScenarioOutcome(t *testing.T, records map[string]string) {
 	}
 	if _, ok := records[model.NamespaceDecision+"/"+string(model.CommentID(3, epoch))]; !ok {
 		t.Fatal("denied mention has no decision")
+	}
+	resentID := model.NewOutboxID(a, 1, "reply-2")
+	var resent model.OutboxIntent
+	var resentAt int
+	var audit model.OperatorCommand
+	decode(t, records, model.NamespaceOutbox+"/"+string(resentID), &resent)
+	decode(t, records, namespaceResend+"/"+string(resentID), &resentAt)
+	decode(t, records, model.NamespaceOperator+"/resend-1", &audit)
+	if resent.State != model.EffectConfirmed || resent.Attempts != 2 || resentAt != 1 || audit.Method != methodResend || audit.Target != string(resentID) {
+		t.Fatalf("resent reply: %+v at %d, audit %+v", resent, resentAt, audit)
 	}
 }
 
