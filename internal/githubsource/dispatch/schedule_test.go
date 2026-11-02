@@ -2,6 +2,8 @@ package dispatch
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -272,4 +274,38 @@ func liveJobs(t *testing.T, w *world, session *tempest.Session) int {
 		}
 	}
 	return live
+}
+
+// TestDispatchPrepareRunsOnceAndFailureHolds runs the operator's prepare
+// argv in a new worktree once, not again on a wake, and holds a Ticket
+// whose prepare fails without starting its worker.
+func TestDispatchPrepareRunsOnceAndFailureHolds(t *testing.T) {
+	w := newWorld(t, func(w *world) {
+		w.config.Workers.Prepare = []string{"sh", "-c", "test ! -e ../fail-prepare && echo prepared >> ../prepare-count"}
+	})
+	event := w.mentionEvent(20, "needs deps")
+	ticket := ticketOf(event)
+	w.ingest(event)
+	w.settled(model.NewDispatchID(ticket, 1))
+	w.ingest(w.commentEvent(20, "one more thing"))
+	w.settled(model.NewDispatchID(ticket, 2))
+	countFile := filepath.Join(w.config.StateDir, "worktrees", "prepare-count")
+	if count, err := os.ReadFile(countFile); err != nil || strings.Count(string(count), "prepared") != 1 {
+		t.Fatalf("prepare ran %q times (%v), want once", count, err)
+	}
+
+	if err := os.WriteFile(filepath.Join(w.config.StateDir, "worktrees", "fail-prepare"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failing := w.mentionEvent(21, "broken deps")
+	failingTicket := ticketOf(failing)
+	w.ingest(failing)
+	dispatch := w.settled(model.NewDispatchID(failingTicket, 1))
+	detail := w.detail(failingTicket)
+	if dispatch.State != model.DispatchCancelled || detail.Ticket.Hold != model.HoldFailed || !strings.Contains(detail.Ticket.HoldReason, "prepare command failed") {
+		t.Fatalf("failed prepare: dispatch %+v ticket %+v", dispatch, detail.Ticket)
+	}
+	if detail.Ticket.SessionID != "" || len(w.worker.requests(failingTicket)) != 0 {
+		t.Fatalf("worker started after a failed prepare: %+v", detail.Ticket)
+	}
 }
