@@ -16,7 +16,9 @@ Each definition has a stable ID and an explicit code revision. Tool names become
 `ext__<bundle>__<tool>`, escaping `_` as `-u` and `-` as `-h` in each
 component so distinct identities cannot collide. Their immutable identity is
 `<bundle>/<tool>`. A wrapper names that identity, not a display name. Built-ins
-use `builtin/<tool>`.
+use `builtin/<tool>`. Extension tools count toward the
+[tool search](tools.md#deferred-tools) threshold like MCP tools: past it they are
+listed by name and loaded on demand from the request's generation.
 
 `Registry.Install` publishes a validated generation atomically. Running requests
 keep their selected generation through the response and its tools. Later requests

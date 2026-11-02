@@ -437,6 +437,50 @@ An interrupted debug call settles as outcome unknown and is never replayed.
 Debug adapters are not restored on resume. Subsequent inspection reports that the
 debug session is gone and requires an explicit new launch or attach.
 
+## Deferred tools
+
+MCP servers and extensions can add hundreds of tools, and every schema sent with every
+request is paid for on every request, cached or not. Tempest holds MCP and extension
+tool schemas back behind one tool, `tool_search`, once their estimated size (name,
+description and parameters at 4 characters a token) reaches 10000 tokens. Built-in
+tools always stay in the list. The `tool_search` description lists the deferred tools
+by name, so the model knows what exists:
+
+```
+tool_search {"query": "create issue"}            # best keyword matches, up to limit (default 5, max 20)
+tool_search {"query": "mcp__github__get_issue"}  # exact names load just those tools
+```
+
+A search ranks words in a tool's name above words only in its description and loads
+its matches at once: from the next response on they are in the tool list and the model
+calls them like any tool. A deferred tool that was not loaded is not offered; a call
+to it fails with "Tool X is not loaded. Call tool_search with its name to load it".
+
+Loading keeps the provider's prompt cache. The tool list is the built-in tools in
+their usual order, then `tool_search`, then the loaded tools in the order they were
+first loaded. A load only appends, so the request changes once per load and is
+byte-identical on every request after it, and a loaded tool stays loaded for the rest
+of the conversation. Which tools are loaded is read from the conversation itself (the
+`tool_search` results and successful calls of deferred tools), so a resumed or forked session
+offers the same list without any extra record. Providers cache the tool list ahead of
+the conversation (Anthropic places it before the system prompt), so one load costs one
+cache write of the conversation so far; deferral saves the deferred schemas on every
+request.
+
+Deferral changes what is offered, never what is allowed. A loaded tool is the same
+tool under the same name: `-allow-tool`, `-deny-tool`, an MCP server's `permission`,
+PreToolUse hooks and plan mode apply to it exactly as when it is offered up front.
+`tool_search` itself only shows names and descriptions, so it is read-only and plan
+mode keeps it. It searches only the tools this session or child was given, so it
+cannot reveal or load a tool outside a child's or preset's allowlist. When an MCP
+server sends `tools/list_changed`, the next run searches the new list; a loaded tool
+the server removed leaves the tool list and a call to it fails as an unknown tool.
+
+The `tool_search` setting controls deferral: `{"mode": "auto", "threshold_tokens":
+10000}` is the default, `"always"` defers every MCP and extension tool, and `"never"`
+sends every schema with every request. A repository may only defer more than the
+operator; see [Project settings and trust](configuration.md#project-settings-and-trust).
+
 ## Tool reference
 
 Every argument that is a duration names its unit: `timeout_seconds` on `bash`,
@@ -486,6 +530,7 @@ before it calls.
 
 - `skill`: load a skill body on demand when skills are loaded (also via `skill://`).
 - `attachment`: read resolved session attachments *(behind `-attach`)*.
+- `tool_search`: load deferred MCP and extension tools by keyword or exact name, when the session has some. See [Deferred tools](#deferred-tools).
 
 ### Web *(behind `-enable-web`)*
 

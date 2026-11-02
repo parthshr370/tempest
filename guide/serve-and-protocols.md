@@ -77,6 +77,11 @@ runs **deny** them. Opt into one exact tool with `-allow-tool mcp__issues__looku
 or trust all current and future tools of a locally configured server with
 `"permission":"allow"`. `-deny-tool` always wins.
 
+When the configured servers' tool schemas together reach the `tool_search`
+threshold (about 10000 tokens by default), their tools are listed by name only and
+the model loads the ones it needs with `tool_search`; a loaded tool keeps every rule
+above. See [Deferred tools](tools.md#deferred-tools).
+
 Server startup itself executes arbitrary code before tool approval: configuration
 and credentials must come from a trusted operator. Environment and header values are
 not interpolated or stored in the journal; resume must resupply runtime MCP
