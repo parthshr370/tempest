@@ -217,9 +217,11 @@ progress either.
 
 An unchanged answer does not prove an unchanged workspace: a command that appends to
 a file and prints nothing answers the same every time it runs. So any successful call
-that may change things, even one that repeated its answer, starts every workspace
-read's count over and forgives a notice about a read. Its own unchanged answers count
-only toward `repeated_poll`, the outer bound for commands whose answer does not change.
+that may change things, even one that repeated its answer, starts every successful
+workspace read's count over and forgives a notice about one. A read that keeps
+failing the same way keeps its count, like any other failure. The call's own
+unchanged answers count only toward `repeated_poll`, the outer bound for commands
+whose answer does not change.
 
 | Pattern | Reported when | Default |
 |---|---|---|

@@ -32,8 +32,9 @@ import (
 // progress for workspace reads, though not for anything else: its unchanged
 // answer does not show an unchanged workspace (a command that appends to a
 // file and prints nothing answers the same every time), so what a read sees
-// may have changed. Every read's count starts over and a nudge about a read
-// is forgiven. The call's own repeats count toward repeated poll, the outer
+// may have changed. Every successful read's count starts over and a nudge
+// about one is forgiven; a failed read keeps its count like any failure. The
+// call's own repeats count toward repeated poll, the outer
 // bound for a command whose answer does not change. An undo/redo loop of two
 // edits is caught there too: an edit's result is its diff and the content
 // hash of the file it wrote, the same each time it is redone.
@@ -243,6 +244,10 @@ func (call loopCall) describe() string {
 	return call.tool + " " + quoted(string(call.args))
 }
 
+func (call loopCall) isSuccessfulRead() bool {
+	return call.readsWorkspace && !call.failed
+}
+
 // pattern is the pattern a repeat of call counts toward and its threshold;
 // a zero threshold means the call is never reported.
 func (t LoopThresholds) pattern(call loopCall) (LoopPattern, int) {
@@ -369,17 +374,18 @@ func (c *loopCounts) observe(batch loopBatch) {
 	}
 }
 
-// forgetReads starts every workspace read's count over and forgives the
-// nudges about reads: a call that may have changed the workspace ran, so a
-// read's unchanged answer before it says nothing about its answer after.
+// forgetReads starts every successful workspace read's count over and
+// forgives the nudges about them: a call that may have changed the workspace
+// ran, so a read's unchanged answer before it says nothing about its answer
+// after. A failed read keeps its count and nudge, as every failure does.
 func (c *loopCounts) forgetReads() {
 	for key := range c.streak {
-		if c.last[key].call.readsWorkspace {
+		if c.last[key].call.isSuccessfulRead() {
 			delete(c.streak, key)
 		}
 	}
 	for key := range c.nudged {
-		if _, call, _ := strings.Cut(key, "\x00"); c.last[call].call.readsWorkspace {
+		if _, call, _ := strings.Cut(key, "\x00"); c.last[call].call.isSuccessfulRead() {
 			delete(c.nudged, key)
 		}
 	}

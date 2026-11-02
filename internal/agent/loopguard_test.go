@@ -715,6 +715,28 @@ func TestLoopGuardUnchangedCommandStartsReadsOver(t *testing.T) {
 	})
 }
 
+// TestLoopGuardUnchangedCommandKeepsFailedReads: an unchanged command
+// forgives a workspace read's unchanged answer, not its unchanged failure. An
+// identical failure between runs of a stable command is nudged on the third
+// failure and stopped on the sixth, whether or not the failing tool reads the
+// workspace.
+func TestLoopGuardUnchangedCommandKeepsFailedReads(t *testing.T) {
+	for _, reads := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reads workspace %v", reads), func(t *testing.T) {
+			failing := executorTool("read", `{"type":"object"}`, ExecParallel, func(context.Context, string, json.RawMessage, AgentToolUpdateCallback) (AgentToolResult, error) {
+				return AgentToolResult{}, errors.New("no such file")
+			})
+			if reads {
+				failing.ReadsWorkspace = func(json.RawMessage) bool { return true }
+			}
+			calls := cycle(12, func(int) []call { return []call{{"bash", `{"command":"status"}`}, {"read", `{"path":"missing.txt"}`}} })
+			a, result, _ := runCalls(t, nil, calls, lookTool("bash"), failing)
+			wantLoopStop(t, result, LoopRepeatedResult, 3, "read")
+			wantNotices(t, a.State().Messages, map[int]string{5: loopNudgePrefix, 11: loopStopPrefix})
+		})
+	}
+}
+
 // TestLoopGuardStopsUndoRedo: two edits undoing each other answer the same
 // each time they are redone (an edit's result is its diff and the written
 // file's content hash), so each leg repeats and the polling bound nudges,
