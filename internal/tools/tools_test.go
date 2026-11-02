@@ -587,8 +587,8 @@ func TestBashToolMissingCwdAndTimeoutValidation(t *testing.T) {
 		t.Fatalf("missing cwd err = %v", err)
 	}
 	bash, _ = NewTool(BashTool, t.TempDir(), ToolsOptions{})
-	_, err = executeTool(t, bash, map[string]any{"command": "true", "timeout": maxTimeoutSeconds + 1})
-	if err == nil || !strings.Contains(err.Error(), "Invalid timeout") {
+	_, err = executeTool(t, bash, map[string]any{"command": "true", "timeout_seconds": maxTimeoutSeconds + 1})
+	if err == nil || !strings.Contains(err.Error(), "Invalid timeout_seconds") {
 		t.Fatalf("timeout err = %v", err)
 	}
 }
@@ -951,7 +951,7 @@ func TestToolCancellation(t *testing.T) {
 	dir := t.TempDir()
 	bash, _ := NewTool(BashTool, dir, ToolsOptions{})
 	start := time.Now()
-	_, err := executeTool(t, bash, map[string]any{"command": "sleep 2", "timeout": 1})
+	_, err := executeTool(t, bash, map[string]any{"command": "sleep 2", "timeout_seconds": 1})
 	if err == nil || !strings.Contains(err.Error(), "Command timed out after 1 seconds") {
 		t.Fatalf("timeout err = %v", err)
 	}

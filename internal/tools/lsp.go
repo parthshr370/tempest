@@ -456,6 +456,9 @@ func lspToolError(name ToolName, err error) error {
 
 // strictObjectSchema is an object schema that rejects undeclared arguments.
 func strictObjectSchema(properties schema.JSON, required ...string) json.RawMessage {
+	if required == nil {
+		required = []string{}
+	}
 	document := schema.JSON{"type": "object", "additionalProperties": false, "properties": properties, "required": required}
 	encoded, err := json.Marshal(document)
 	if err != nil {

@@ -892,7 +892,7 @@ func newEditTool(cwd string, options ToolsOptions) agent.AgentTool {
 }
 
 // newBashTool builds the command runner rooted at cwd. It accepts command and
-// optional timeout, honoring shell and command-prefix overrides from options.
+// optional timeout_seconds, honoring shell and command-prefix overrides from options.
 func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	shell := options.ShellPath
 	if shell == "" {
@@ -902,7 +902,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 	if timeoutDefault <= 0 {
 		timeoutDefault = 10 * time.Minute
 	}
-	parameters := schema.JSON{"command": schema.String(), "timeout": schema.Number()}
+	parameters := schema.JSON{"command": schema.String(), "timeout_seconds": schema.JSON{"type": "integer", "minimum": 1, "maximum": maxTimeoutSeconds, "description": fmt.Sprintf("seconds before the command is killed, default %d", int(timeoutDefault/time.Second))}}
 	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
 	if options.Work != nil && !options.Child {
 		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, pty, stdin, ready_log, ready_port and ready_timeout_ms already imply it"}
@@ -912,13 +912,14 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 		parameters["ready_log"] = schema.JSON{"type": "string", "description": "runs the command as a background service: RE2 regex; the call returns once an output line matches"}
 		parameters["ready_port"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": 65535, "description": "runs the command as a background service: the call returns once 127.0.0.1:<port> accepts TCP connections"}
 		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline for ready_log/ready_port, default 30000; on timeout the process is killed"}
-		description += " A plain command runs in the foreground and returns its output; it needs none of async, name, pty, stdin or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or its timeout passes, and wait, logs and cancel take its name or id. A background job's stdin is /dev/null, so a command that reads input sees end of file; stdin:true keeps a pipe open for write_stdin, and pty:true runs the command on a terminal for interactive programs. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
+		parameters["timeout_seconds"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": maxTimeoutSeconds, "description": fmt.Sprintf("seconds before the command or background job is killed, default %d; a ready_log/ready_port service has no limit unless this is set", int(timeoutDefault/time.Second))}
+		description += " A plain command runs in the foreground and returns its output; it needs none of async, name, pty, stdin or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or timeout_seconds passes, and wait, logs and cancel take its name or id. A background job's stdin is /dev/null, so a command that reads input sees end of file; stdin:true keeps a pipe open for write_stdin, and pty:true runs the command on a terminal for interactive programs. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(BashTool),
 			Description: description,
-			Parameters:  schema.Object(parameters, "command"),
+			Parameters:  strictObjectSchema(parameters, "command"),
 		},
 		Label: string(BashTool),
 		// The permission gate sees prepared arguments, so it judges the
@@ -927,7 +928,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 		Execute: func(ctx context.Context, _ string, params json.RawMessage, onUpdate agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 			var input struct {
 				Command        string `json:"command"`
-				Timeout        *int   `json:"timeout"`
+				Timeout        *int   `json:"timeout_seconds"`
 				Async          bool   `json:"async"`
 				Name           string `json:"name"`
 				ReadyLog       string `json:"ready_log"`
@@ -968,7 +969,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 				return agent.AgentToolResult{}, fmt.Errorf("Working directory does not exist: %s\nCannot execute bash commands.", cwd)
 			}
 			if input.Timeout != nil && *input.Timeout > maxTimeoutSeconds {
-				return agent.AgentToolResult{}, fmt.Errorf("Invalid timeout: maximum is %d seconds", maxTimeoutSeconds)
+				return agent.AgentToolResult{}, fmt.Errorf("Invalid timeout_seconds: maximum is %d", maxTimeoutSeconds)
 			}
 			command := input.Command
 			if options.CommandPrefix != "" {

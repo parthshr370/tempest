@@ -263,11 +263,12 @@ exits first, or the deadline passes (the process is then killed, reason
 `ready_timeout`), the call fails with the output tail.
 
 A ready service does not keep the run open. It runs until it exits, until it is
-cancelled, or until the run ends, which stops it. Unless `timeout` is given it is not
-bounded by the bash timeout.
+cancelled, or until the run ends, which stops it. Unless `timeout_seconds` is given it
+is not bounded by the bash timeout.
 
 `jobs` lists `name` and `readiness`. `cancel` and `logs` take `name` in place of
-`job_id`, and `wait` takes `names` besides `job_ids`. A name resolves to its running
+`job_id`, and `wait` takes `names` besides `job_ids` and waits up to `timeout_seconds`
+(default 30, at most 300). A name resolves to its running
 job, else the one started last. Starting a name that is already running fails with
 the job holding it; restart a service with `cancel {"name":…}` and start it again.
 

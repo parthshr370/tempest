@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -26,12 +25,12 @@ func newEvalTool(kernels *evalkernel.Manager) agent.AgentTool {
 	return agent.AgentTool{
 		Tool: types.Tool{
 			Name:        string(EvalTool),
-			Description: "Execute a cell in a persistent session-owned Python (py) or JavaScript (js) kernel. Variables survive calls in that language. Python shows repr of the trailing expression; JS uses a synchronous VM under Node or Bun (require is available; no top-level await; timers and Promise callbacks run between cells). stdout/stderr and tracebacks are captured. timeout defaults to 30 seconds; 0 disables the execution deadline, not transport-failure detection. A timeout interrupts only the kernel, retaining state when the runtime cooperates; Bun without VM interruption requires a hard kill and loses state. reset:true replaces only this language's process before running code. After session resume or rewind, previously used languages require reset:true and setup again. Destructive code requires per-call approval; cloud deny rules still apply in bypass. Cells may have arbitrary side effects and are never replayed automatically. For figures, save a PNG inside the workspace and call view_image; eval does not implicitly render figures or image bytes.",
-			Parameters: schema.Object(schema.JSON{
-				"language": schema.JSON{"type": "string", "enum": []string{"py", "js"}},
-				"code":     schema.String(),
-				"timeout":  schema.JSON{"type": "number", "minimum": 0, "maximum": maxTimeoutSeconds, "default": 30},
-				"reset":    schema.Bool(),
+			Description: "Execute a cell in a persistent session-owned Python (py) or JavaScript (js) kernel. Variables survive calls in that language. Python shows repr of the trailing expression; JS uses a synchronous VM under Node or Bun (require is available; no top-level await; timers and Promise callbacks run between cells). stdout/stderr and tracebacks are captured. timeout_seconds defaults to 30; 0 disables the execution deadline, not transport-failure detection. A timeout interrupts only the kernel, retaining state when the runtime cooperates; Bun without VM interruption requires a hard kill and loses state. reset:true replaces only this language's process before running code. After session resume or rewind, previously used languages require reset:true and setup again. Destructive code requires per-call approval; cloud deny rules still apply in bypass. Cells may have arbitrary side effects and are never replayed automatically. For figures, save a PNG inside the workspace and call view_image; eval does not implicitly render figures or image bytes.",
+			Parameters: strictObjectSchema(schema.JSON{
+				"language":        schema.JSON{"type": "string", "enum": []string{"py", "js"}},
+				"code":            schema.String(),
+				"timeout_seconds": schema.JSON{"type": "number", "minimum": 0, "maximum": maxTimeoutSeconds, "default": 30},
+				"reset":           schema.Bool(),
 			}, "language", "code"),
 		},
 		Label: string(EvalTool),
@@ -39,7 +38,7 @@ func newEvalTool(kernels *evalkernel.Manager) agent.AgentTool {
 			input := struct {
 				Language string   `json:"language"`
 				Code     string   `json:"code"`
-				Timeout  *float64 `json:"timeout"`
+				Timeout  *float64 `json:"timeout_seconds"`
 				Reset    bool     `json:"reset"`
 			}{}
 			if err := decodeParams(params, &input); err != nil {
@@ -50,7 +49,7 @@ func newEvalTool(kernels *evalkernel.Manager) agent.AgentTool {
 				timeout = *input.Timeout
 			}
 			if math.IsNaN(timeout) || math.IsInf(timeout, 0) || timeout < 0 || timeout > maxTimeoutSeconds {
-				return agent.AgentToolResult{}, errors.New("eval timeout must be between 0 and 2147483 seconds")
+				return agent.AgentToolResult{}, fmt.Errorf("eval timeout_seconds must be between 0 and %d", maxTimeoutSeconds)
 			}
 			result, err := kernels.Eval(ctx, evalkernel.Request{Language: input.Language, Code: input.Code, Timeout: time.Duration(timeout * float64(time.Second)), Reset: input.Reset})
 			text := result.Output.Content

@@ -64,7 +64,7 @@ func TestAsyncBashServiceArguments(t *testing.T) {
 	if text := textOf(result); !strings.Contains(text, `"name":"web"`) || !strings.Contains(text, `"readiness":"ready"`) || !strings.Contains(text, `"ready_match":"listening"`) {
 		t.Fatalf("handle=%s", text)
 	}
-	if _, err = tool.Execute(context.Background(), "raw", json.RawMessage(`{"command":"serve","async":true,"ready_port":8080,"timeout":30}`), nil); err != nil || controller.bash.TimeoutSeconds != 30 {
+	if _, err = tool.Execute(context.Background(), "raw", json.RawMessage(`{"command":"serve","async":true,"ready_port":8080,"timeout_seconds":30}`), nil); err != nil || controller.bash.TimeoutSeconds != 30 {
 		t.Fatalf("explicit timeout=%d %v", controller.bash.TimeoutSeconds, err)
 	}
 	if _, err = tool.Execute(context.Background(), "raw", json.RawMessage(`{"command":"serve","async":true,"name":"plain"}`), nil); err != nil || controller.bash.TimeoutSeconds != 60 {
@@ -76,7 +76,7 @@ func TestAsyncBashServiceArguments(t *testing.T) {
 		args string
 		want work.BashSpec
 	}{
-		{`{"command":"bash scripts/make_marker.sh","name":"make_marker","timeout":60}`, work.BashSpec{Command: "bash scripts/make_marker.sh", TimeoutSeconds: 60, Name: "make_marker"}},
+		{`{"command":"bash scripts/make_marker.sh","name":"make_marker","timeout_seconds":60}`, work.BashSpec{Command: "bash scripts/make_marker.sh", TimeoutSeconds: 60, Name: "make_marker"}},
 		{`{"command":"serve","name":"web","ready_port":8080}`, work.BashSpec{Command: "serve", TimeoutSeconds: maxTimeoutSeconds, Name: "web", ReadyPort: 8080}},
 		{`{"command":"serve","ready_log":"listening","async":false}`, work.BashSpec{Command: "serve", TimeoutSeconds: maxTimeoutSeconds, ReadyLog: "listening"}},
 	} {
@@ -101,7 +101,7 @@ func TestManagementToolsAcceptServiceNames(t *testing.T) {
 	}{
 		{CancelTool, `{"name":"web"}`, "job_web", ""},
 		{LogsTool, `{"name":"web"}`, "job_web", ""},
-		{WaitTool, `{"names":["web"],"job_ids":["job_other"],"timeout":0}`, "job_other,job_web", ""},
+		{WaitTool, `{"names":["web"],"job_ids":["job_other"],"timeout_seconds":0}`, "job_other,job_web", ""},
 		{CancelTool, `{"name":"web","job_id":"job_web"}`, "", "not both"},
 		// A call that names no job is told which jobs exist.
 		{CancelTool, `{}`, "", "job_web"},
