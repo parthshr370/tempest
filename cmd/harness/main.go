@@ -142,6 +142,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	opts.Budget = withRunLimits(opts.Budget, opts.Config.RunLimits())
 	setupLogging(opts.Config.LogLevel(), opts.Config.LogFile(), opts.Config.LogFileMaxBytes())
 	logConfigWarnings(opts.Config)
 	tel := startTelemetry(opts.Config, false)
@@ -825,6 +826,7 @@ func addConfigFlags(fs *flag.FlagSet, values *config.FlagValues) {
 	fs.StringVar(&values.SessionDir.Value, "session-dir", "", "session data directory")
 	fs.StringVar(&values.MCPConfig.Value, "mcp-config", "", "operator-selected MCP server JSON file (empty disables MCP)")
 	addIntelligenceFlags(fs, values)
+	addRunLimitFlags(fs, values)
 	fs.StringVar(&values.AnthropicBaseURL.Value, "anthropic-base-url", "", "Anthropic-compatible base URL")
 	fs.StringVar(&values.OpenAIBaseURL.Value, "openai-base-url", "", "OpenAI-compatible base URL")
 	fs.StringVar(&values.AnthropicAPIKey.Value, "anthropic-api-key", "", "Anthropic API key")
@@ -888,8 +890,48 @@ func markConfigFlag(name string, values *config.FlagValues) {
 	case "faux-script":
 		values.FauxScript.Set = true
 	default:
-		markIntelligenceFlag(name, values)
+		if !markRunLimitFlag(name, values) {
+			markIntelligenceFlag(name, values)
+		}
 	}
+}
+
+// addRunLimitFlags registers the cumulative per-run token and tool-call
+// caps. They resolve through the settings layers, so a settings file or
+// HARNESS_MAX_* can set them too.
+func addRunLimitFlags(fs *flag.FlagSet, values *config.FlagValues) {
+	fs.IntVar(&values.MaxInputTokens.Value, "max-input-tokens", 0, "stop the run once its model calls were sent this many prompt tokens, cached ones included (0 = unlimited; per run, not per request)")
+	fs.IntVar(&values.MaxOutputTokens.Value, "max-output-tokens", 0, "stop the run once its model calls produced this many output tokens (0 = unlimited; per run, unlike -max-tokens)")
+	fs.IntVar(&values.MaxTotalTokens.Value, "max-total-tokens", 0, "stop the run once its prompt plus output tokens reach this many (0 = unlimited)")
+	fs.IntVar(&values.MaxToolCalls.Value, "max-tool-calls", 0, "run at most this many tool calls; a response whose calls don't all fit runs none and stops the run (0 = unlimited)")
+}
+
+// markRunLimitFlag records a set flag from addRunLimitFlags and reports
+// whether name was one.
+func markRunLimitFlag(name string, values *config.FlagValues) bool {
+	switch name {
+	case "max-input-tokens":
+		values.MaxInputTokens.Set = true
+	case "max-output-tokens":
+		values.MaxOutputTokens.Set = true
+	case "max-total-tokens":
+		values.MaxTotalTokens.Set = true
+	case "max-tool-calls":
+		values.MaxToolCalls.Set = true
+	default:
+		return false
+	}
+	return true
+}
+
+// withRunLimits adds the resolved token and tool-call caps to a budget
+// whose turn, cost and wall-time caps came from flags.
+func withRunLimits(budget, limits agent.Budget) agent.Budget {
+	budget.MaxInputTokens = limits.MaxInputTokens
+	budget.MaxOutputTokens = limits.MaxOutputTokens
+	budget.MaxTotalTokens = limits.MaxTotalTokens
+	budget.MaxToolCalls = limits.MaxToolCalls
+	return budget
 }
 
 // addIntelligenceFlags registers operator execution settings and the settings

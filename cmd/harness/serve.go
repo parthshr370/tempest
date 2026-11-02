@@ -87,6 +87,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.IntVar(&maxTurns, "max-turns", 0, "default maximum model turns")
 	fs.Float64Var(&maxCost, "max-cost", 0, "default maximum model cost in USD")
 	fs.DurationVar(&maxWall, "max-wall-time", 0, "default maximum run duration")
+	addRunLimitFlags(fs, &values)
 	if err := fs.Parse(args); err != nil {
 		return parseExitCode(usageFailure(err))
 	}
@@ -120,6 +121,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 			values.EnableTask.Set = true
 		case "enable-web":
 			values.EnableWeb.Set = true
+		default:
+			markRunLimitFlag(f.Name, &values)
 		}
 	})
 	cfg, err := (config.Config{Flags: values}).Resolve()
@@ -149,7 +152,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		stack.Model = model
 		stack.StreamFn = provider.StreamSimple
 	}
-	budget := tempest.Budget{MaxTurns: maxTurns, MaxCostUSD: maxCost, MaxWallTime: maxWall}
+	budget := withRunLimits(tempest.Budget{MaxTurns: maxTurns, MaxCostUSD: maxCost, MaxWallTime: maxWall}, cfg.RunLimits())
 	if maxTurns < 0 || maxCost < 0 || maxWall < 0 {
 		fmt.Fprintln(stderr, "budget limits must not be negative")
 		return 1

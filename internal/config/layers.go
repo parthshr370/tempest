@@ -375,6 +375,10 @@ var settingInputs = []settingInput{
 	{key: "plan_reasoning", env: "HARNESS_PLAN_REASONING", flag: "plan-reasoning", field: func(f *FlagValues) flagInput { return &f.PlanReasoning }},
 	{key: "smol_reasoning", env: "HARNESS_SMOL_REASONING", flag: "smol-reasoning", field: func(f *FlagValues) flagInput { return &f.SmolReasoning }},
 	{key: "max_tokens", env: "HARNESS_MAX_TOKENS", flag: "max-tokens", kind: inputInt, field: func(f *FlagValues) flagInput { return &f.MaxTokens }},
+	{key: "max_input_tokens", env: "HARNESS_MAX_INPUT_TOKENS", flag: "max-input-tokens", kind: inputInt, field: func(f *FlagValues) flagInput { return &f.MaxInputTokens }},
+	{key: "max_output_tokens", env: "HARNESS_MAX_OUTPUT_TOKENS", flag: "max-output-tokens", kind: inputInt, field: func(f *FlagValues) flagInput { return &f.MaxOutputTokens }},
+	{key: "max_total_tokens", env: "HARNESS_MAX_TOTAL_TOKENS", flag: "max-total-tokens", kind: inputInt, field: func(f *FlagValues) flagInput { return &f.MaxTotalTokens }},
+	{key: "max_tool_calls", env: "HARNESS_MAX_TOOL_CALLS", flag: "max-tool-calls", kind: inputInt, field: func(f *FlagValues) flagInput { return &f.MaxToolCalls }},
 	{key: "permission_mode_default", env: "HARNESS_PERMISSION_MODE", flag: "permission-mode", field: func(f *FlagValues) flagInput { return &f.PermissionMode }},
 	{key: "bash_timeout", env: "HARNESS_BASH_TIMEOUT", flag: "bash-timeout", field: func(f *FlagValues) flagInput { return &f.BashTimeout }},
 	{key: "log_level", env: "HARNESS_LOG_LEVEL", flag: "log-level", field: func(f *FlagValues) flagInput { return &f.LogLevel }},
@@ -648,6 +652,10 @@ var projectGates = map[string]trustGate{
 	"bash_timeout":                gateExecutable,
 	"log_file_max_bytes":          gateExecutable,
 	"loop_detection":              gateExecutable,
+	"max_input_tokens":            gateExecutable,
+	"max_output_tokens":           gateExecutable,
+	"max_total_tokens":            gateExecutable,
+	"max_tool_calls":              gateExecutable,
 	// otel chooses where spans, metrics and their headers (often an API
 	// key) are sent, and whether message content goes with them.
 	"otel": gateCredentials,
@@ -739,6 +747,14 @@ func narrowsPermissions(key string, value *settingsNode, operator *fileSettings)
 		return withinCap(value, operator.RetryMaxDelayMS, defaultRetryMaxDelayMS)
 	case "log_file_max_bytes":
 		return withinCap(value, operator.LogFileMaxBytes, defaultLogFileMax)
+	case "max_input_tokens":
+		return lowersRunLimit(value, operator.MaxInputTokens)
+	case "max_output_tokens":
+		return lowersRunLimit(value, operator.MaxOutputTokens)
+	case "max_total_tokens":
+		return lowersRunLimit(value, operator.MaxTotalTokens)
+	case "max_tool_calls":
+		return lowersRunLimit(value, operator.MaxToolCalls)
 	case "bash_timeout":
 		ceiling, err := time.ParseDuration(cmp.Or(settingString(operator.BashTimeout), defaultBashTimeout))
 		var spec string
@@ -815,6 +831,18 @@ func withinCap[N int | int64](value *settingsNode, operator *N, builtin N) bool 
 		ceiling = *operator
 	}
 	return limit <= ceiling
+}
+
+// lowersRunLimit reports whether value keeps or tightens the operator's
+// per-run cap. Zero means unlimited, so a repository may set any positive
+// cap under an operator with none, and at most the operator's cap otherwise;
+// its own zero or null would lift the operator's cap.
+func lowersRunLimit(value *settingsNode, operator *int) bool {
+	limit, whole := wholeNumber[int](value)
+	if !whole || limit < 1 {
+		return false
+	}
+	return operator == nil || *operator <= 0 || limit <= *operator
 }
 
 // profileGate classifies a setting of a profile as a repository would change
@@ -1085,6 +1113,10 @@ func checkRequirements(requirements []managedRequirement, stack []*settingsLayer
 func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[string]string, error) {
 	defaults := map[string]*settingsNode{
 		"max_tokens":                  numberNode(strconv.Itoa(adapter.DefaultMaxTokens)),
+		"max_input_tokens":            numberNode("0"),
+		"max_output_tokens":           numberNode("0"),
+		"max_total_tokens":            numberNode("0"),
+		"max_tool_calls":              numberNode("0"),
 		"log_file_max_bytes":          numberNode(strconv.FormatInt(defaultLogFileMax, 10)),
 		"enable_task":                 boolNode(false),
 		"plan":                        boolNode(false),
