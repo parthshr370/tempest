@@ -271,6 +271,48 @@ func TestToolSearchMCPListChanged(t *testing.T) {
 	}
 }
 
+// Session.Reset starts a new conversation: auto deferral stays on for new
+// prompts after the catalog shrinks under the threshold, and after a reset
+// the threshold decides again, as it would for a freshly opened session.
+func TestToolSearchSessionResetDecidesAgain(t *testing.T) {
+	fixture := newCatalogMCP(t, "alpha", "beta", "gamma", "delta")
+	provider := faux.New(faux.Options{})
+	provider.SetResponses(faux.Respond(faux.Text("one")), faux.Respond(faux.Text("two")), faux.Respond(faux.Text("three")))
+	requests := &providerRecorder{}
+	policy := &agent.ToolSearch{Mode: agent.ToolSearchAuto, ThresholdTokens: 60}
+	session := openToolSearch(t, Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), New: &NewSession{MCPServers: []MCPServerConfig{fixture.config("allow")}}, Stack: &StackConfig{Model: provider.Model(), StreamFn: requests.wrap(provider), ToolSearch: policy}})
+	if _, err := session.Prompt(t.Context(), Prompt{Text: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	fixture.replace("alpha")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(session.core.mcp.Tools()) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("tools/list_changed did not refresh the catalog")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := session.Prompt(t.Context(), Prompt{Text: "same conversation"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Reset(t.Context(), "", "reset"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.Prompt(t.Context(), Prompt{Text: "new conversation"}); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{agent.ToolSearchName}, {agent.ToolSearchName}, {"mcp__cat__alpha"}}
+	sent := requests.all()
+	if len(sent) != len(want) {
+		t.Fatalf("sent %d requests, want %d", len(sent), len(want))
+	}
+	for i, request := range sent {
+		if got := mcpNames(request.input.Tools); !slices.Equal(got, want[i]) {
+			t.Fatalf("request %d MCP tools = %v, want %v", i, got, want[i])
+		}
+	}
+}
+
 // Resume rebuilds the loaded set from the journal: the first request after
 // it offers the tool list the conversation ended with, byte for byte.
 func TestToolSearchResumeReproducesToolList(t *testing.T) {

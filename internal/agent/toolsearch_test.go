@@ -463,6 +463,44 @@ func TestToolSearchAutoStaysDeferred(t *testing.T) {
 	}
 }
 
+// SetMessages with a non-empty transcript (a compaction, a rewind) keeps
+// the conversation and its deferral; an empty one (a context reset or
+// handoff) starts a new conversation, which decides by the threshold again
+// like [Agent.Reset].
+func TestToolSearchAutoEmptyTranscriptDecidesAgain(t *testing.T) {
+	var catalog deferredCatalog
+	full := catalog.tools()
+	chars := 0
+	for _, tool := range full[1:] {
+		chars += len(tool.Name) + len(tool.Description) + len(tool.Parameters)
+	}
+	policy := &ToolSearch{Mode: ToolSearchAuto, ThresholdTokens: (chars + 3) / 4}
+	script := &sentRequests{}
+	a := newSearchAgent(full, script, policy, nil)
+	if _, err := a.PromptText(context.Background(), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	a.SetTools(full[:2])
+	a.SetMessages([]types.Message{types.UserMessage{Content: types.StringContent("summary")}})
+	if _, err := a.PromptText(context.Background(), "after compaction"); err != nil {
+		t.Fatal(err)
+	}
+	a.SetMessages(nil)
+	if _, err := a.PromptText(context.Background(), "after reset"); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"read", ToolSearchName}, {"read", ToolSearchName}, {"read", "mcp__gh__create_issue"}}
+	sent := script.sent()
+	if len(sent) != len(want) {
+		t.Fatalf("sent %d requests, want %d", len(sent), len(want))
+	}
+	for i, request := range sent {
+		if got := request.names(); !slices.Equal(got, want[i]) {
+			t.Fatalf("request %d tools = %v, want %v", i, got, want[i])
+		}
+	}
+}
+
 // A conversation reopened in a new Agent (resume, fork) under the
 // threshold keeps deferring when its transcript shows a tool_search call,
 // so its loaded tools keep their places.

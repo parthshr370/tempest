@@ -60,10 +60,11 @@ const (
 // Auto mode is sticky: once a conversation defers, it keeps deferring while
 // it has deferrable tools, even when a catalog change takes their schemas
 // back under the threshold, so the request layout does not flip with the
-// catalog. The latch lives in the [Agent] until [Agent.Reset]; a
-// conversation reopened in a new Agent (resume, fork) also defers from its
-// first request when its transcript shows a tool_search call, and otherwise
-// decides by the threshold again.
+// catalog. The latch lives in the [Agent] until the conversation ends:
+// [Agent.Reset] or [Agent.SetMessages] with an empty history (a context
+// reset or handoff). A conversation reopened in a new Agent (resume, fork)
+// also defers from its first request when its transcript shows a
+// tool_search call, and otherwise decides by the threshold again.
 type ToolSearch struct {
 	// Mode is when to defer; empty means [ToolSearchAuto].
 	Mode ToolSearchMode

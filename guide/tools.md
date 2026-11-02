@@ -483,9 +483,10 @@ The `tool_search` setting controls deferral: `{"mode": "auto", "threshold_tokens
 10000}` is the default, `"always"` defers every MCP and extension tool, and `"never"`
 sends every schema with every request. In `"auto"` mode deferral, once on, stays on
 for the rest of the conversation even when a tool list change takes the schemas back under
-the threshold, so the tool list does not flip between the two layouts. A resumed or
-forked session keeps deferring when it has called `tool_search`; otherwise its first
-request decides by the threshold again. A repository may only defer more than the
+the threshold, so the tool list does not flip between the two layouts. A context reset
+or handoff starts a new conversation, whose first request decides by the threshold
+again. A resumed or forked session keeps deferring when it has called `tool_search`;
+otherwise its first request decides by the threshold again. A repository may only defer more than the
 operator; see [Project settings and trust](configuration.md#project-settings-and-trust).
 
 ## Tool reference

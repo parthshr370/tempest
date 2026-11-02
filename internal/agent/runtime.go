@@ -182,7 +182,7 @@ type Agent struct {
 	ended         bool
 	outputSchema  *outputschema.Schema
 	// toolSearchLatch is set once a request of this conversation defers
-	// tools (see [ToolSearch]); Reset clears it.
+	// tools (see [ToolSearch]); Reset and an empty SetMessages clear it.
 	toolSearchLatch atomic.Bool
 
 	emitMu sync.Mutex
@@ -494,11 +494,16 @@ func (a *Agent) SetTools(tools []AgentTool) {
 	a.state.Tools = copyAgentTools(tools)
 }
 
-// SetMessages replaces the conversation history.
+// SetMessages replaces the conversation history. An empty history (a
+// context reset or handoff) starts a new conversation, so it also clears the
+// tool-search latch as [Agent.Reset] does; queues and settings are kept.
 func (a *Agent) SetMessages(messages []types.Message) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.state.Messages = copyAgentMessages(messages)
+	if len(messages) == 0 {
+		a.toolSearchLatch.Store(false)
+	}
 }
 
 // SetSystemPrompt replaces the system prompt.
