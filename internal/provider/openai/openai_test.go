@@ -93,7 +93,7 @@ func TestConvertMessagesGroupsToolResults(t *testing.T) {
 		},
 	}
 
-	messages := convertMessages(model, ctx)
+	messages, _ := convertMessages(model, ctx)
 	if len(messages) < 2 {
 		t.Fatalf("messages len = %d: %#v", len(messages), messages)
 	}

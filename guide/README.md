@@ -15,7 +15,7 @@ These pages hold the command, tool, and protocol reference.
 | [Execution environments](environments.md) | Local and remote workspaces, capabilities, identity fencing, cancellation, and daemon setup |
 | [Permissions](permissions.md) | Tool tiers, plan mode, destructive-command guard, and cloud policies |
 | [Checkpoints](checkpoints.md) | Captures, rewind, protected paths, retention, and recovery bounds |
-| [Skills and context](skills-and-context.md) | `AGENTS.md`, `RULES.md`, skill format, discovery, and imports |
+| [Skills and context](skills-and-context.md) | `AGENTS.md`, `RULES.md`, request reminders, skill format, discovery, and imports |
 
 ## Extending your workflow
 

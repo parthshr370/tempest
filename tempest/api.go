@@ -62,6 +62,11 @@ type Options struct {
 	// Hooks replaces the session's hook settings and is used as given. Leave it
 	// nil to resolve them from settings, which add a trusted project's hooks.
 	Hooks *HookSettings
+	// Reminders replaces the session's reminders: short instructions added
+	// at the tail of model requests on a cadence or condition. Nil keeps the
+	// reminders of Stack, or of the settings when Stack is nil; an empty
+	// slice turns them off. It applies to new and resumed sessions.
+	Reminders []Reminder
 	// Registry contains operator-installed executable bundles.
 	Registry *extension.Registry
 	// Extensions selects ordered named bundles for this conversation.
@@ -151,6 +156,27 @@ type HookCommand = hooks.Command
 
 // Tool is an embeddable tool implementation.
 type Tool = agent.AgentTool
+
+// Reminder is a short instruction added at the tail of a model request when
+// its cadence matches and its conditions hold, at most MaxFires times per
+// run. It never changes the system prompt or tools, so the provider's
+// prompt cache keeps the conversation prefix.
+type Reminder = agent.Reminder
+
+// ReminderCondition narrows when a Reminder fires.
+type ReminderCondition = agent.ReminderCondition
+
+// ReminderScope says how long a fired Reminder stays in front of the model.
+type ReminderScope = agent.ReminderScope
+
+const (
+	// ReminderRequest shows a firing in its own request only; it is never
+	// stored in the transcript or journal. This is the default.
+	ReminderRequest = agent.ReminderRequest
+	// ReminderConversation appends a firing to the transcript, so it is
+	// journaled, replayed on resume and sent with every later request.
+	ReminderConversation = agent.ReminderConversation
+)
 
 // MCPServerConfig is an operator-selected MCP endpoint.
 type MCPServerConfig = mcpconfig.Server

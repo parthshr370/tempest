@@ -27,6 +27,9 @@ type RunState struct {
 	UsageSources   map[string]types.Usage
 	// Fallback is the backup model a resumed logical run had switched to.
 	Fallback *FallbackChoice
+	// Reminders counts each reminder's committed firings in a resumed
+	// logical run, by name, so MaxFires holds across a crash.
+	Reminders map[string]int
 }
 
 // FallbackChoice is a recorded switch to a backup model: its position in the

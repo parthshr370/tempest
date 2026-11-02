@@ -269,12 +269,13 @@ func (r *compactionRunner) summarizeUsing(ctx context.Context, messages []ptypes
 		replacement = append(replacement, ptypes.UserMessage{Content: ptypes.StringContent("PreCompact hook context: " + text), Timestamp: 1})
 	}
 	// A deterministic timestamp lets an unreferenced pre-crash sidecar be reused.
+	// A kept reminder is never merged into, so its timestamp is not the summary's.
 	if len(replacement) > 0 {
 		if user, ok := replacement[0].(ptypes.UserMessage); ok {
 			originalTimestamp := int64(0)
 			for _, entry := range entries {
 				if entry.ID == prep.FirstKeptEntryID {
-					if prior, ok := entry.Message.(ptypes.UserMessage); ok {
+					if prior, ok := entry.Message.(ptypes.UserMessage); ok && prior.Reminder == "" {
 						originalTimestamp = prior.Timestamp
 					}
 					break

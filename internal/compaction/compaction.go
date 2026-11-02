@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -189,18 +190,20 @@ func SerializeConversation(messages []ptypes.Message) string {
 }
 
 // serializeParts is SerializeConversation's text for each message, the
-// assistant's split into its parts.
+// assistant's split into its parts. Conversation reminders are left out:
+// they are the harness's text, not the user's, and ApplyCompaction keeps
+// them verbatim instead.
 func serializeParts(messages []ptypes.Message) []string {
 	parts := []string{}
 	for _, msg := range messages {
 		switch value := msg.(type) {
 		case ptypes.UserMessage:
-			if content := userContentText(value.Content); content != "" {
+			if content := userContentText(value.Content); content != "" && value.Reminder == "" {
 				parts = append(parts, "[User]: "+content)
 			}
 		case *ptypes.UserMessage:
 			if value != nil {
-				if content := userContentText(value.Content); content != "" {
+				if content := userContentText(value.Content); content != "" && value.Reminder == "" {
 					parts = append(parts, "[User]: "+content)
 				}
 			}
@@ -743,6 +746,18 @@ func jsonStringValue(value any) string {
 		return "null"
 	}
 	return string(data)
+}
+
+func asUser(message ptypes.Message) (ptypes.UserMessage, bool) {
+	switch value := message.(type) {
+	case ptypes.UserMessage:
+		return value, true
+	case *ptypes.UserMessage:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return ptypes.UserMessage{}, false
 }
 
 func asAssistant(message ptypes.Message) (ptypes.AssistantMessage, bool) {
@@ -1314,24 +1329,57 @@ func Compact(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, p
 // ApplyCompaction rebuilds the conversation after a compaction: the summary as a
 // synthetic user turn, then every kept entry from prep.FirstKeptEntryID onward.
 // When the first kept message is itself a user message the summary is merged into
-// it, since Anthropic rejects two consecutive user turns and a non-split cut
-// commonly lands on a user message.
+// it, so the rebuilt context opens with one user turn (a non-split cut commonly
+// lands on a user message). A conversation reminder is never merged into: it
+// keeps its own message so later compactions still know it. Consecutive user
+// messages are valid; Anthropic merges them into one turn.
+//
+// Conversation reminders are not summarized, and only the newest copy of
+// each survives: a copy in the kept part stays where it is and older kept
+// copies are dropped; the newest copy of each one only the summarized part
+// holds follows the summary verbatim. A reminder so stays in front of the
+// model for the rest of the conversation and its copies collapse to one.
 func ApplyCompaction(pathEntries []SessionEntry, prep *CompactionPreparation, summary string) []ptypes.Message {
 	if prep == nil {
 		return buildSessionContext(pathEntries)
 	}
-	kept := keptMessages(pathEntries, prep.FirstKeptEntryID)
+	carried, kept := newestReminders(slices.Concat(prep.MessagesToSummarize, prep.TurnPrefixMessages), keptMessages(pathEntries, prep.FirstKeptEntryID))
 	summaryText := compactionSummaryPrefix + summary + compactionSummarySuffix
 	if len(kept) > 0 {
-		if user, ok := kept[0].(ptypes.UserMessage); ok {
-			return append([]ptypes.Message{mergeSummaryIntoUser(summaryText, user)}, kept[1:]...)
-		}
-		if user, ok := kept[0].(*ptypes.UserMessage); ok && user != nil {
-			return append([]ptypes.Message{mergeSummaryIntoUser(summaryText, *user)}, kept[1:]...)
+		if user, ok := asUser(kept[0]); ok && user.Reminder == "" {
+			return slices.Concat([]ptypes.Message{mergeSummaryIntoUser(summaryText, user)}, carried, kept[1:])
 		}
 	}
 	result := []ptypes.Message{ptypes.UserMessage{Content: ptypes.StringContent(summaryText), Timestamp: time.Now().UnixMilli()}}
-	return append(result, kept...)
+	return slices.Concat(result, carried, kept)
+}
+
+// newestReminders keeps the newest copy of each conversation reminder across
+// summarized and kept. It returns the copies only summarized holds, in their
+// order, and kept without its older copies; every other message is unchanged.
+func newestReminders(summarized, kept []ptypes.Message) (carried, newest []ptypes.Message) {
+	seen := map[string]bool{}
+	newest = make([]ptypes.Message, 0, len(kept))
+	for i := len(kept) - 1; i >= 0; i-- {
+		if user, ok := asUser(kept[i]); ok && user.Reminder != "" {
+			if seen[user.Reminder] {
+				continue
+			}
+			seen[user.Reminder] = true
+		}
+		newest = append(newest, kept[i])
+	}
+	slices.Reverse(newest)
+	for i := len(summarized) - 1; i >= 0; i-- {
+		user, ok := asUser(summarized[i])
+		if !ok || user.Reminder == "" || seen[user.Reminder] {
+			continue
+		}
+		seen[user.Reminder] = true
+		carried = append(carried, user)
+	}
+	slices.Reverse(carried)
+	return carried, newest
 }
 
 // keptMessages returns the messages from firstKeptEntryID to the end of the path.

@@ -108,6 +108,8 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 			if fallback := loaded.LogicalFallback(state.LogicalRunID); fallback != nil {
 				state.Fallback = &agent.FallbackChoice{Index: fallback.FallbackIndex, Model: fallback.To}
 			}
+			// Reminder bounds hold for the whole logical run.
+			state.Reminders = loaded.LogicalReminders(state.LogicalRunID)
 		}
 		r.runID = state.RunID
 		clear(r.toolStarts)
@@ -124,6 +126,10 @@ func (r *recorder) record(ctx context.Context, ev agent.AgentEvent) error {
 	case agent.EventMessageEnd:
 		assistant, isAssistant := recordAssistant(ev.Message)
 		entry := journal.MessageEntry{Meta: meta, Message: ev.Message, QueueID: ev.QueueID, Metered: isAssistant}
+		// A firing commits with the message that carries its effect.
+		for _, fire := range ev.Reminders {
+			entry.Reminders = append(entry.Reminders, journal.ReminderFire{Name: fire.Name, Scope: string(fire.Scope)})
+		}
 		if result, ok := ev.Message.(ptypes.ToolResultMessage); ok {
 			// The context files appended to this result commit with it.
 			entry.ContextFiles = r.store.TakeContextFiles(contextCallKey(ctx, result.ToolCallID))

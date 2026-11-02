@@ -23,9 +23,10 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 		maxTokens = opts.MaxTokens
 	}
 
+	messages, reusable := convertMessages(model, c)
 	params := map[string]any{
 		"model":    model.ID,
-		"messages": convertMessages(model, c),
+		"messages": messages,
 		"stream":   true,
 		"stream_options": map[string]any{
 			"include_usage": true,
@@ -91,7 +92,7 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 		}
 	}
 
-	applyPromptCache(params, model, opts)
+	applyPromptCache(params, model, opts, messages[:reusable], reusable < len(messages))
 	return params
 }
 
@@ -99,19 +100,23 @@ func buildParams(model types.Model, c types.Context, opts *Options) map[string]a
 const maxPromptCacheKeyLength = 64
 
 // applyPromptCache asks the endpoint to keep one session's requests on one
-// prompt cache, so each turn reuses the previous turn's prefix.
+// prompt cache, so each turn reuses the previous turn's prefix. reusable is
+// the leading part of the wire messages later requests resend; hasTail says a
+// request-scope tail follows it.
 //
 // OpenAI and OpenRouter accept prompt_cache_key: OpenAI routes requests that
 // share a key and prefix to the same cache, and OpenRouter forwards the key
 // upstream. OpenRouter's own sticky-routing key is session_id; with it set,
 // every turn after the first reaches the provider endpoint that already holds
 // the cache, instead of only after a cache hit has been observed. Anthropic
-// models behind OpenRouter cache only with an explicit cache_control; the
-// top-level form puts the breakpoint on the last block and moves it forward as
-// the conversation grows. Other OpenAI-compatible servers get none of these
-// fields, because their dialect is unknown and strict servers reject unknown
-// fields. CacheRetention "none" turns all of it off.
-func applyPromptCache(params map[string]any, model types.Model, opts *Options) {
+// models behind OpenRouter cache only with an explicit cache_control. The
+// top-level form puts the breakpoint on the last cacheable block and moves it
+// forward as the conversation grows; with a request-scope tail that block is
+// in the tail, which the next request does not send, so such a request marks
+// the last reusable block instead. Other OpenAI-compatible servers get none of
+// these fields, because their dialect is unknown and strict servers reject
+// unknown fields. CacheRetention "none" turns all of it off.
+func applyPromptCache(params map[string]any, model types.Model, opts *Options, reusable []map[string]any, hasTail bool) {
 	if opts != nil && opts.CacheRetention == cacheRetentionNone {
 		return
 	}
@@ -134,7 +139,11 @@ func applyPromptCache(params map[string]any, model types.Model, opts *Options) {
 		return
 	}
 	if cacheControl && isAnthropicSlug(model.ID) {
-		params["cache_control"] = map[string]string{"type": "ephemeral"}
+		if hasTail {
+			markCacheBreakpoint(reusable)
+		} else {
+			params["cache_control"] = ephemeralCacheControl()
+		}
 	}
 	if opts == nil || opts.SessionID == "" {
 		return
@@ -188,11 +197,54 @@ func hasToolHistory(messages []types.Message) bool {
 	return false
 }
 
-// convertMessages transforms the context into OpenAI wire-format messages,
-// prepending the system prompt and coalescing consecutive tool results.
-func convertMessages(model types.Model, c types.Context) []map[string]any {
-	params := []map[string]any{}
+// ephemeralCacheControl is Anthropic's default cache_control marker.
+func ephemeralCacheControl() map[string]string {
+	return map[string]string{"type": "ephemeral"}
+}
 
+// markCacheBreakpoint puts an explicit cache_control on the last non-empty
+// text of messages, turning string content into one text part to carry it.
+// A message with no text, such as an assistant turn holding only tool calls,
+// cannot carry one, so the breakpoint falls back to an earlier message.
+func markCacheBreakpoint(messages []map[string]any) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		switch content := messages[i]["content"].(type) {
+		case string:
+			if strings.TrimSpace(content) != "" {
+				messages[i]["content"] = []map[string]any{{"type": "text", "text": content, "cache_control": ephemeralCacheControl()}}
+				return
+			}
+		case []map[string]any:
+			for j := len(content) - 1; j >= 0; j-- {
+				if content[j]["type"] == "text" {
+					content[j]["cache_control"] = ephemeralCacheControl()
+					return
+				}
+			}
+		}
+	}
+}
+
+// convertMessages transforms the context into OpenAI wire-format messages,
+// prepending the system prompt and coalescing consecutive tool results. The
+// first reusable of them are the system prompt and the messages before the
+// request-scope tail (see types.Context.SplitRequestScoped).
+func convertMessages(model types.Model, c types.Context) (params []map[string]any, reusable int) {
+	params = []map[string]any{}
+	if c.SystemPrompt != "" {
+		params = append(params, map[string]any{
+			"role":    "system",
+			"content": util.SanitizeSurrogates(c.SystemPrompt),
+		})
+	}
+	prefix, tail := c.SplitRequestScoped()
+	params = appendWireMessages(params, model, prefix)
+	reusable = len(params)
+	return appendWireMessages(params, model, tail), reusable
+}
+
+// appendWireMessages appends messages to params in wire format.
+func appendWireMessages(params []map[string]any, model types.Model, messages []types.Message) []map[string]any {
 	normalizeID := func(id string, _ types.Model, _ types.AssistantMessage) string {
 		if model.OpenAICompat != nil && model.OpenAICompat.RequiresMistralToolIDs != nil && *model.OpenAICompat.RequiresMistralToolIDs {
 			sum := sha256.Sum256([]byte(id))
@@ -200,14 +252,7 @@ func convertMessages(model types.Model, c types.Context) []map[string]any {
 		}
 		return id
 	}
-	transformedMessages := transform.TransformMessages(c.Messages, model, normalizeID)
-
-	if c.SystemPrompt != "" {
-		params = append(params, map[string]any{
-			"role":    "system",
-			"content": util.SanitizeSurrogates(c.SystemPrompt),
-		})
-	}
+	transformedMessages := transform.TransformMessages(messages, model, normalizeID)
 
 	for i := 0; i < len(transformedMessages); i++ {
 		msg := transformedMessages[i]

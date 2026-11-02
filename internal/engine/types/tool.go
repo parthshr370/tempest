@@ -11,8 +11,22 @@ type Tool struct {
 }
 
 // Context is the provider request input (02-map-ai-agent.md A13).
+// RequestScoped counts the trailing Messages sent with this request only
+// (request-scope reminders): the next request no longer carries them, so a
+// provider that places cache breakpoints places them before these (see
+// SplitRequestScoped).
 type Context struct {
-	SystemPrompt string    `json:"systemPrompt,omitempty"`
-	Messages     []Message `json:"messages"`
-	Tools        []Tool    `json:"tools,omitempty"`
+	SystemPrompt  string    `json:"systemPrompt,omitempty"`
+	Messages      []Message `json:"messages"`
+	Tools         []Tool    `json:"tools,omitempty"`
+	RequestScoped int       `json:"requestScoped,omitempty"`
+}
+
+// SplitRequestScoped splits Messages into the prefix later requests resend
+// and the RequestScoped tail sent with this request only. A cache breakpoint
+// belongs in the prefix: one on the tail caches bytes the next request does
+// not send, so that request cannot read it.
+func (c Context) SplitRequestScoped() (prefix, tail []Message) {
+	split := len(c.Messages) - min(max(c.RequestScoped, 0), len(c.Messages))
+	return c.Messages[:split], c.Messages[split:]
 }
