@@ -201,9 +201,11 @@ func (s *Store) newGeneration(ticket *model.Ticket, reason model.AssignmentReaso
 	s.queueDispatch(ticket, kind, now, time.Time{}, 0)
 }
 
-// reopenTicket reopens an ended, non-stopped Ticket under its Mandate for
-// an authoritative mention.
-func (s *Store) reopenTicket(id model.TicketID, event model.EventID, now time.Time) {
+// reopenTicket reopens an ended, non-stopped Ticket for an authoritative
+// mention. The new generation gets its own Mandate, keyed
+// AssignmentKey(ticket, gen), naming the reopening actor: admission
+// revalidates that actor, not the original requester.
+func (s *Store) reopenTicket(id model.TicketID, event model.Event, now time.Time) {
 	ticket := s.tickets.edit(string(id))
 	if ticket == nil || ticket.Lifecycle != model.LifecycleEnded || ticket.Stopped {
 		return
@@ -214,8 +216,12 @@ func (s *Store) reopenTicket(id model.TicketID, event model.EventID, now time.Ti
 	for _, ref := range s.ownThreads(ticket) {
 		s.subscribe(ref, ticket.ID, "")
 	}
-	s.addInput(ticket, event, model.InputAuthoritative, true, now)
+	s.addInput(ticket, event.ID, model.InputAuthoritative, true, now)
 	s.newGeneration(ticket, model.ReasonReopen, model.DispatchLaunch, now)
+	s.mandates.add(model.AssignmentKey(ticket.ID, ticket.Gen), model.Mandate{
+		Ticket: ticket.ID, Repo: s.settings.repo, Thread: event.Thread, Actor: event.Actor,
+		Basis: model.BasisExplicitMention, RequestEvent: event.ID, PolicyDigest: s.policy.Digest, CreatedAt: now,
+	})
 }
 
 // stopTicket ends a Ticket as stopped, permanently: queued dispatches and
@@ -294,8 +300,13 @@ func (s *Store) unfinished(ticket *model.Ticket) bool {
 	if dispatch := s.latestDispatch(ticket); dispatch != nil && live(dispatch.State) {
 		return true
 	}
-	for seq := ticket.HandledSeq + 1; seq <= ticket.InputSeq; seq++ {
-		input, ok := s.inputs.get(model.InputKey(ticket.ID, seq))
+	return s.authoritativeIn(ticket.ID, ticket.HandledSeq, ticket.InputSeq)
+}
+
+// authoritativeIn reports an authoritative Input with after < Seq <= through.
+func (s *Store) authoritativeIn(id model.TicketID, after, through uint64) bool {
+	for seq := after + 1; seq <= through; seq++ {
+		input, ok := s.inputs.get(model.InputKey(id, seq))
 		if ok && input.Class == model.InputAuthoritative {
 			return true
 		}
@@ -305,9 +316,10 @@ func (s *Store) unfinished(ticket *model.Ticket) bool {
 
 // completion decides whether an open Ticket ends now: the completion set
 // (own PRs if any, else every link) all closed ends it merged or closed by
-// the latest close; otherwise a current-generation dropped or ready report
-// (ready only without PR links). Unfinished work defers every end.
-func completion(ticket model.Ticket, prs map[int]model.PullRequest, unfinished bool) (model.Outcome, bool) {
+// the latest close; otherwise a dropped or ready report (ready only without
+// PR links). report is the report that may end the Ticket, nil when none
+// does (see endingReport). Unfinished work defers every end.
+func completion(ticket model.Ticket, prs map[int]model.PullRequest, report *model.Report, unfinished bool) (model.Outcome, bool) {
 	if ticket.Lifecycle != model.LifecycleOpen || unfinished {
 		return "", false
 	}
@@ -341,8 +353,7 @@ func completion(ticket model.Ticket, prs map[int]model.PullRequest, unfinished b
 			return model.OutcomeClosed, true
 		}
 	}
-	report := ticket.LastReport
-	if report == nil || report.Gen != ticket.Gen {
+	if report == nil {
 		return "", false
 	}
 	switch {
@@ -352,6 +363,38 @@ func completion(ticket model.Ticket, prs map[int]model.PullRequest, unfinished b
 		return model.OutcomeCompleted, true
 	}
 	return "", false
+}
+
+// endingReport returns the Ticket's LastReport when it may end the Ticket:
+// it is of the current generation, it was made during the newest dispatch
+// that ran (queued and cancelled dispatches never ran), that dispatch
+// finished completed, and the report covers every authoritative Input the
+// dispatch consumed (a continuation may consume one after the report). A
+// report followed by a failed, budget-stopped, aborted or unknown run, or a
+// later dispatch that finished without a report, ends nothing.
+func (s *Store) endingReport(ticket *model.Ticket) *model.Report {
+	report := ticket.LastReport
+	if report == nil || report.Gen != ticket.Gen {
+		return nil
+	}
+	during, ok := s.reports.get(string(ticket.ID))
+	if !ok {
+		return nil
+	}
+	for seq := ticket.DispatchSeq; seq > 0; seq-- {
+		dispatch, ok := s.dispatches.get(string(model.NewDispatchID(ticket.ID, seq)))
+		if !ok || dispatch.State == model.DispatchQueued || dispatch.State == model.DispatchCancelled {
+			continue
+		}
+		if dispatch.ID != *during || dispatch.State != model.DispatchFinished || dispatch.Outcome == nil || dispatch.Outcome.StopReason != "completed" {
+			return nil
+		}
+		if s.authoritativeIn(ticket.ID, report.ThroughInput, dispatch.ThroughInput) {
+			return nil
+		}
+		return report
+	}
+	return nil
 }
 
 // evaluateEnd runs the completion rule for a Ticket and ends it if due.
@@ -368,7 +411,7 @@ func (s *Store) evaluateEnd(id model.TicketID, now time.Time) {
 			prs[link.Number] = *pr
 		}
 	}
-	outcome, end := completion(*edit, prs, s.unfinished(edit))
+	outcome, end := completion(*edit, prs, s.endingReport(edit), s.unfinished(edit))
 	if !end {
 		return
 	}
@@ -380,12 +423,13 @@ func (s *Store) evaluateEnd(id model.TicketID, now time.Time) {
 }
 
 // bindOwnPR links a PR this Ticket's branch produced as own. A PR binds to
-// at most one open Ticket.
-func (s *Store) bindOwnPR(id model.TicketID, number int, now time.Time) bool {
+// at most one open Ticket. A PR not read yet gets a placeholder with a zero
+// UpdatedAt: no GitHub fact about it is known, so the first one applies.
+func (s *Store) bindOwnPR(id model.TicketID, number int) bool {
 	key := strconv.Itoa(number)
 	pr := s.prs.edit(key)
 	if pr == nil {
-		pr = s.prs.put(key, model.PullRequest{Number: number, HeadRef: model.TicketBranch(id), HeadRepo: s.settings.repo, State: "open", UpdatedAt: now})
+		pr = s.prs.put(key, model.PullRequest{Number: number, HeadRef: model.TicketBranch(id), HeadRepo: s.settings.repo, State: "open"})
 	}
 	if pr.Owner != "" && pr.Owner != id {
 		if other, ok := s.tickets.get(string(pr.Owner)); ok && other.Lifecycle == model.LifecycleOpen {

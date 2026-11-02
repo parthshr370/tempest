@@ -59,13 +59,26 @@ func (s *Store) dispatchClass(ticket *model.Ticket, dispatch *model.DispatchInte
 	return model.SlotNormal
 }
 
-// authorized revalidates a Mandate at admission: its actor must still be
-// listed, unless the operator retried the Ticket.
+// authorized revalidates the current generation's authority at admission.
+// Walking back from the current generation, the first generation an
+// operator retry or a reopen started decides: a retry is the operator's
+// authority, a reopen is its reopening actor's Mandate. Recovery
+// generations inherit; generation 1 is the request's Mandate. A Mandate
+// authorizes only while its actor is listed.
 func (s *Store) authorized(ticket *model.Ticket) bool {
-	if s.retried[ticket.ID] {
-		return true
+	for gen := ticket.Gen; gen > 1; gen-- {
+		assignment, ok := s.assignments.get(model.AssignmentKey(ticket.ID, gen))
+		if !ok {
+			continue
+		}
+		if assignment.Reason == model.ReasonRetry {
+			return true
+		}
+		if assignment.Reason == model.ReasonReopen {
+			break
+		}
 	}
-	mandate, ok := s.mandates.get(string(ticket.ID))
+	mandate, ok := s.mandate(ticket)
 	if !ok {
 		return false
 	}
@@ -75,6 +88,18 @@ func (s *Store) authorized(ticket *model.Ticket) bool {
 		}
 	}
 	return false
+}
+
+// mandate returns the Mandate of the Ticket's current generation: the
+// newest reopen Mandate (keyed AssignmentKey(ticket, gen)) at or below the
+// current generation, else the request's Mandate (keyed by TicketID).
+func (s *Store) mandate(ticket *model.Ticket) (model.Mandate, bool) {
+	for gen := ticket.Gen; gen > 1; gen-- {
+		if mandate, ok := s.mandates.get(model.AssignmentKey(ticket.ID, gen)); ok {
+			return mandate, true
+		}
+	}
+	return s.mandates.get(string(ticket.ID))
 }
 
 func (s *Store) runBudget(reservation model.Spend) model.RunBudget {
@@ -88,7 +113,7 @@ func (s *Store) runBudget(reservation model.Spend) model.RunBudget {
 
 func (s *Store) admitted(dispatch *model.DispatchIntent) model.AdmittedDispatch {
 	ticket, _ := s.tickets.get(string(dispatch.Ticket))
-	mandate, _ := s.mandates.get(string(dispatch.Ticket))
+	mandate, _ := s.mandate(ticket)
 	return model.AdmittedDispatch{Dispatch: clone(*dispatch), Ticket: clone(*ticket), Mandate: mandate, Budget: s.runBudget(dispatch.Reservation)}
 }
 
@@ -116,7 +141,7 @@ func (s *Store) AdmitNext(ctx context.Context, now time.Time) ([]model.AdmittedD
 			continue
 		}
 		if !s.authorized(ticket) {
-			mandate, _ := s.mandates.get(id)
+			mandate, _ := s.mandate(ticket)
 			setHold(s.tickets.edit(id), model.HoldRevoked, fmt.Sprintf("mandate actor %s (%d) is no longer listed", mandate.Actor.Login, mandate.Actor.ID))
 			continue
 		}
@@ -322,11 +347,28 @@ func (s *Store) Submitted(ctx context.Context, id model.DispatchID, receipt mode
 	if receipt.RequestID != "" && receipt.RequestID != dispatch.RequestID {
 		return fmt.Errorf("control: dispatch %s expects request %s, got %s", id, dispatch.RequestID, receipt.RequestID)
 	}
+	ticket := s.tickets.edit(string(dispatch.Ticket))
+	if receipt.ThroughInput > ticket.InputSeq {
+		return fmt.Errorf("control: ticket %s has %d inputs, dispatch %s cannot consume through %d", ticket.ID, ticket.InputSeq, id, receipt.ThroughInput)
+	}
 	if dispatch.State == model.DispatchSubmitted {
-		if dispatch.SubmissionID == receipt.SubmissionID {
+		if dispatch.SubmissionID != receipt.SubmissionID {
+			return errState("dispatch "+string(id), "submitted as "+dispatch.SubmissionID, "record submission "+receipt.SubmissionID)
+		}
+		// The same submission again is a replay, or a continuation run under
+		// the same lease (BeginContinue, or the recovery steer under the same
+		// RequestID) that consumed the queued Inputs through a higher seq.
+		if receipt.ThroughInput <= dispatch.ThroughInput {
 			return nil
 		}
-		return errState("dispatch "+string(id), "submitted as "+dispatch.SubmissionID, "record submission "+receipt.SubmissionID)
+		edit := s.dispatches.edit(string(id))
+		edit.ThroughInput = receipt.ThroughInput
+		if receipt.RunID != "" {
+			edit.RunID = receipt.RunID
+		}
+		ticket.DeliveredSeq = max(ticket.DeliveredSeq, edit.ThroughInput)
+		_, err = s.commit(ctx, fmt.Sprintf("submitted:%s:%d", id, edit.ThroughInput))
+		return err
 	}
 	edit := s.dispatches.edit(string(id))
 	edit.State, edit.SubmissionID, edit.RunID = model.DispatchSubmitted, receipt.SubmissionID, receipt.RunID
@@ -335,7 +377,6 @@ func (s *Store) Submitted(ctx context.Context, id model.DispatchID, receipt mode
 		edit.SubmittedAt = s.clock.Now()
 	}
 	edit.ThroughInput = max(edit.ThroughInput, receipt.ThroughInput)
-	ticket := s.tickets.edit(string(dispatch.Ticket))
 	ticket.DeliveredSeq = max(ticket.DeliveredSeq, edit.ThroughInput)
 	_, err = s.commit(ctx, "submitted:"+string(id))
 	return err
@@ -442,7 +483,10 @@ func (s *Store) Finished(ctx context.Context, id model.DispatchID, outcome model
 func (s *Store) afterRun(ticket *model.Ticket, dispatch *model.DispatchIntent, outcome model.RunOutcome, now time.Time) {
 	switch classifyStop(outcome, now) {
 	case stopCompleted:
-		ticket.HandledSeq = max(ticket.HandledSeq, dispatch.ThroughInput, ticket.DeliveredSeq)
+		// The dispatch consumed what it was submitted with (raised by
+		// continuation receipts); Inputs only accepted by the session queue
+		// after that stay unhandled and wake the next dispatch.
+		ticket.HandledSeq = max(ticket.HandledSeq, dispatch.ThroughInput)
 		if class, ok := s.pendingWake(ticket); ok {
 			s.wake(ticket, class, now)
 		}

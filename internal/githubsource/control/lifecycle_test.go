@@ -11,7 +11,6 @@ import (
 func TestCompletionTable(t *testing.T) {
 	ready := &model.Report{Status: model.ReportReady, Gen: 1}
 	dropped := &model.Report{Status: model.ReportDropped, Gen: 1}
-	staleReady := &model.Report{Status: model.ReportReady, Gen: 1}
 	prs := map[int]model.PullRequest{
 		5: {Number: 5, ClosedAt: epoch.Add(time.Hour)},
 		6: {Number: 6, ClosedAt: epoch.Add(2 * time.Hour)},
@@ -26,7 +25,6 @@ func TestCompletionTable(t *testing.T) {
 	}{
 		{name: "ready without links completes", ticket: model.Ticket{Gen: 1, LastReport: ready}, outcome: model.OutcomeCompleted, end: true},
 		{name: "unfinished defers", ticket: model.Ticket{Gen: 1, LastReport: ready}, unfinished: true},
-		{name: "stale report from older generation", ticket: model.Ticket{Gen: 2, LastReport: staleReady}},
 		{name: "ready with open own PR waits", ticket: model.Ticket{Gen: 1, LastReport: ready, PRs: []model.PRLink{{Number: 5, Own: true}}}},
 		{name: "own PR merged", ticket: model.Ticket{Gen: 1, PRs: []model.PRLink{{Number: 5, Own: true, Closed: true, Merged: true}}}, outcome: model.OutcomeMerged, end: true},
 		{name: "one of two own PRs closed waits", ticket: model.Ticket{Gen: 1, PRs: []model.PRLink{{Number: 5, Own: true, Closed: true, Merged: true}, {Number: 6, Own: true}}}},
@@ -43,7 +41,9 @@ func TestCompletionTable(t *testing.T) {
 			if tc.ticket.Lifecycle == "" {
 				tc.ticket.Lifecycle = model.LifecycleOpen
 			}
-			outcome, end := completion(tc.ticket, prs, tc.unfinished)
+			// The table gives the report that applies; endingReport's
+			// generation and dispatch fence is tested through the Store.
+			outcome, end := completion(tc.ticket, prs, tc.ticket.LastReport, tc.unfinished)
 			if outcome != tc.outcome || end != tc.end {
 				t.Fatalf("got %q %v, want %q %v", outcome, end, tc.outcome, tc.end)
 			}
@@ -102,6 +102,15 @@ func TestCommentWhileFinishingDefersEnd(t *testing.T) {
 	if len(admitted) != 1 || admitted[0].Dispatch.Kind != model.DispatchWake || admitted[0].Dispatch.ThroughInput != 2 {
 		t.Fatalf("wake: %+v", admitted)
 	}
+	// The first dispatch's ready report does not end the Ticket for the
+	// wake: a dispatch that finishes without its own report is quiescent.
+	h.finish(admitted[0].Dispatch.ID, completed(100_000))
+	if ticket := h.ticket(id); ticket.Lifecycle != model.LifecycleOpen {
+		t.Fatalf("earlier dispatch's report reused: %+v", ticket)
+	}
+	h.ingest("thread", comment(21, false, 3, alice, "is it done?", h.clock.Now()))
+	admitted = h.runAll()
+	h.report(id, "r2", model.ReportReady)
 	h.finish(admitted[0].Dispatch.ID, completed(100_000))
 	if ticket := h.ticket(id); ticket.Lifecycle != model.LifecycleEnded || ticket.Outcome != model.OutcomeCompleted {
 		t.Fatalf("deferred end not applied: %+v", ticket)

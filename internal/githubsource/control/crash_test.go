@@ -102,6 +102,12 @@ func crashScenario() []crashStep {
 			return err
 		}},
 		{"a delivered", func(ctx context.Context, s *Store, now time.Time) error { return s.Delivered(ctx, a, 1, 2) }},
+		// A queue receipt is not consumption: the dispatcher's continuation
+		// under the same lease records that the run read Input 2.
+		{"a continuation consumed", func(ctx context.Context, s *Store, now time.Time) error {
+			dispatch := model.NewDispatchID(a, 1)
+			return s.Submitted(ctx, dispatch, model.SubmissionReceipt{RequestID: model.LaunchRequestID(a, 1, 1), SubmissionID: "sub-" + string(dispatch), ThroughInput: 2, At: now})
+		}},
 		{"a progress report", func(ctx context.Context, s *Store, now time.Time) error {
 			_, err := s.Report(ctx, model.WorkerCall{SessionID: sessionOf(a), ToolCallID: "rep-1", At: now}, model.ReportRequest{Status: model.ReportProgress, Summary: "working"})
 			return err

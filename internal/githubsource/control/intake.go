@@ -155,7 +155,7 @@ func (s *Store) stageEvents(events []model.Event) ([]model.Decision, error) {
 		}
 		event = s.boundBody(event)
 		s.events.add(string(event.ID), event)
-		s.applyPRFact(event, now)
+		s.applyPRFact(event)
 		decision, err := s.decide(event, now)
 		if err != nil {
 			return nil, err
@@ -196,7 +196,7 @@ func (s *Store) decide(event model.Event, now time.Time) (model.Decision, error)
 	case actRequest:
 		decision.Tickets = []model.TicketID{s.createTicket(event, now)}
 	case actReopen:
-		s.reopenTicket(result.Tickets[0], event.ID, now)
+		s.reopenTicket(result.Tickets[0], event, now)
 		decision.Tickets = result.Tickets
 	case actInput:
 		for _, id := range result.Tickets {
@@ -235,7 +235,7 @@ func (s *Store) subscribers(event model.Event) []subscriber {
 		if !ok {
 			continue
 		}
-		sub := subscriber{ID: id, Lifecycle: ticket.Lifecycle, Stopped: ticket.Stopped}
+		sub := subscriber{ID: id, Lifecycle: ticket.Lifecycle, Stopped: ticket.Stopped, EndedAt: ticket.EndedAt}
 		if event.Kind == model.EventPRHead {
 			sub.OwnHead = s.pushedSHA(id, event.CommitSHA)
 		}
@@ -260,7 +260,16 @@ func (s *Store) pushedSHA(id model.TicketID, sha string) bool {
 
 // applyPRFact updates the PR record an event describes. Facts for a PR no
 // Ticket follows and no batch described are not stored.
-func (s *Store) applyPRFact(event model.Event, now time.Time) {
+//
+// State facts (pr_closed, pr_merged, pr_reopened) are ordered per PR by
+// GitHub's time, not arrival: PullRequest.UpdatedAt is the GitHub time of
+// the newest snapshot or state fact applied, and a state fact older than
+// it is stale and leaves the record alone; one with the same timestamp
+// breaks the tie by prStateRank. A pr_head older than UpdatedAt is stale
+// too, but does not move UpdatedAt: the source emits it with the
+// snapshot's updated_at, which a close in the same read shares. CI is
+// pinned to the head SHA and reviews accumulate, so neither needs order.
+func (s *Store) applyPRFact(event model.Event) {
 	if !event.Thread.IsPR || event.Thread.Number == 0 {
 		return
 	}
@@ -271,10 +280,13 @@ func (s *Store) applyPRFact(event model.Event, now time.Time) {
 		if !ok || len(thread.Tickets) == 0 {
 			return
 		}
-		pr = s.prs.put(key, model.PullRequest{Number: event.Thread.Number, State: "open", UpdatedAt: now})
+		pr = s.prs.put(key, model.PullRequest{Number: event.Thread.Number, State: "open"})
 	}
 	switch event.Kind {
 	case model.EventPRHead:
+		if event.At.Before(pr.UpdatedAt) {
+			return
+		}
 		pr.HeadSHA = event.CommitSHA
 		if pr.CI != nil && pr.CI.SHA != pr.HeadSHA {
 			pr.CI = nil
@@ -299,13 +311,38 @@ func (s *Store) applyPRFact(event model.Event, now time.Time) {
 				pr.Reviews[i].State = "DISMISSED"
 			}
 		}
-	case model.EventPRClosed:
-		pr.State, pr.Merged, pr.ClosedAt = "closed", false, event.At
-	case model.EventPRMerged:
-		pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = "closed", true, event.CommitSHA, event.At
-	case model.EventPRReopened:
-		pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = "open", false, "", time.Time{}
+	case model.EventPRClosed, model.EventPRMerged, model.EventPRReopened:
+		state, merged := "closed", event.Kind == model.EventPRMerged
+		if event.Kind == model.EventPRReopened {
+			state = "open"
+		}
+		if event.At.Before(pr.UpdatedAt) || event.At.Equal(pr.UpdatedAt) && prStateRank(state, merged) < prStateRank(pr.State, pr.Merged) {
+			return
+		}
+		pr.UpdatedAt = event.At
+		switch event.Kind {
+		case model.EventPRClosed:
+			pr.State, pr.Merged, pr.ClosedAt = state, false, event.At
+		case model.EventPRMerged:
+			pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, true, event.CommitSHA, event.At
+		case model.EventPRReopened:
+			pr.State, pr.Merged, pr.MergeSHA, pr.ClosedAt = state, false, "", time.Time{}
+		}
 	}
+}
+
+// prStateRank orders PR states whose facts share one GitHub timestamp
+// (GitHub reports whole seconds). Merged is final. A reopen in the same
+// second as a close must follow it, so open outranks closed: a tie never
+// ends a Ticket on a PR that may be open.
+func prStateRank(state string, merged bool) int {
+	switch {
+	case merged:
+		return 2
+	case state == "open":
+		return 1
+	}
+	return 0
 }
 
 // stageReadState moves the cursor and thread positions forward and adopts
@@ -426,13 +463,13 @@ func (s *Store) applyPR(next model.PullRequest, now time.Time) {
 		next.CI = nil
 	}
 	s.prs.put(key, next)
-	s.autoBind(next, now)
+	s.autoBind(next)
 	s.refreshLinks(next.Number, now)
 }
 
 // autoBind binds an open PR the account opened from a Ticket branch of this
 // repository, covering an open_pr whose outcome was never settled.
-func (s *Store) autoBind(pr model.PullRequest, now time.Time) {
+func (s *Store) autoBind(pr model.PullRequest) {
 	if pr.State != "open" || pr.Owner != "" || pr.Author.ID != s.settings.account || !strings.EqualFold(pr.HeadRepo, s.settings.repo) {
 		return
 	}
@@ -444,7 +481,7 @@ func (s *Store) autoBind(pr model.PullRequest, now time.Time) {
 	if !exists || ticket.Lifecycle != model.LifecycleOpen {
 		return
 	}
-	s.bindOwnPR(model.TicketID(id), pr.Number, now)
+	s.bindOwnPR(model.TicketID(id), pr.Number)
 }
 
 // refreshLinks syncs PR state into open subscribed Tickets and re-runs

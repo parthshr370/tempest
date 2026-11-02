@@ -2,19 +2,31 @@ package control
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"go.harness.dev/harness/internal/githubsource/model"
 )
 
-// addSpend sums two amounts; unknown cost is sticky.
+// sum adds two ledger amounts conservatively: a negative amount counts as
+// zero and the result saturates at math.MaxInt64, so neither a malformed
+// usage report nor an integer overflow can make a ledger look less spent.
+func sum(a, b int64) int64 {
+	a, b = max(a, 0), max(b, 0)
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// addSpend sums two amounts with sum; unknown cost is sticky.
 func addSpend(a, b model.Spend) model.Spend {
 	return model.Spend{
-		MicroUSD:     a.MicroUSD + b.MicroUSD,
-		InputTokens:  a.InputTokens + b.InputTokens,
-		OutputTokens: a.OutputTokens + b.OutputTokens,
-		TotalTokens:  a.TotalTokens + b.TotalTokens,
-		ToolCalls:    a.ToolCalls + b.ToolCalls,
+		MicroUSD:     sum(a.MicroUSD, b.MicroUSD),
+		InputTokens:  sum(a.InputTokens, b.InputTokens),
+		OutputTokens: sum(a.OutputTokens, b.OutputTokens),
+		TotalTokens:  sum(a.TotalTokens, b.TotalTokens),
+		ToolCalls:    sum(a.ToolCalls, b.ToolCalls),
 		CostUnknown:  a.CostUnknown || b.CostUnknown,
 	}
 }
@@ -28,21 +40,26 @@ func reserved(ledger model.Ledger) model.Spend {
 	return total
 }
 
-// leftMicro is what a ledger can still reserve in micro-USD, never negative:
-// a settled overrun can push Spent past the allowance.
+// room is what is left of allowance+granted after spent+reserved, never
+// negative: a settled overrun can push the use past the allowance. Both
+// sides are saturated sums in [0, MaxInt64], so the difference cannot
+// overflow.
+func room(allowance, granted, spent, reserved int64) int64 {
+	return max(sum(allowance, granted)-sum(spent, reserved), 0)
+}
+
+// leftMicro is what a ledger can still reserve in micro-USD.
 func leftMicro(ledger model.Ledger) int64 {
-	left := ledger.Allowance.MicroUSD + ledger.Granted.MicroUSD - ledger.Spent.MicroUSD - reserved(ledger).MicroUSD
-	return max(left, 0)
+	return room(ledger.Allowance.MicroUSD, ledger.Granted.MicroUSD, ledger.Spent.MicroUSD, reserved(ledger).MicroUSD)
 }
 
 // leftTokens is the token room of a ledger; ok is false when the ledger
 // has no token allowance, which means tokens are not capped by it.
 func leftTokens(ledger model.Ledger) (int64, bool) {
-	allowance := ledger.Allowance.TotalTokens + ledger.Granted.TotalTokens
 	if ledger.Allowance.TotalTokens == 0 {
 		return 0, false
 	}
-	return max(allowance-ledger.Spent.TotalTokens-reserved(ledger).TotalTokens, 0), true
+	return room(ledger.Allowance.TotalTokens, ledger.Granted.TotalTokens, ledger.Spent.TotalTokens, reserved(ledger).TotalTokens), true
 }
 
 // reservation computes what one dispatch reserves: the run cap lowered to

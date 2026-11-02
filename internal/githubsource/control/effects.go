@@ -144,7 +144,7 @@ func (s *Store) Settle(ctx context.Context, id model.OutboxID, settlement model.
 		intent.SettledAt = now
 	}
 	if intent.State == model.EffectConfirmed && intent.Kind == model.EffectOpenPR && intent.Result != nil && intent.Result.RemoteID > 0 {
-		s.bindOwnPR(intent.Ticket, int(intent.Result.RemoteID), now)
+		s.bindOwnPR(intent.Ticket, int(intent.Result.RemoteID))
 	}
 	s.work.outbox = true
 	if _, err := s.commit(ctx, fmt.Sprintf("settle:%s:%d", id, current.Attempts)); err != nil {

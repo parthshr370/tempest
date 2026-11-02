@@ -85,13 +85,18 @@ func (s *Store) Report(ctx context.Context, call model.WorkerCall, request model
 		at = s.clock.Now()
 	}
 	ticket := s.tickets.edit(string(current.ID))
-	through := ticket.DeliveredSeq
+	// A report covers what its dispatch consumed (ThroughInput), not what
+	// the session's queue merely accepted (DeliveredSeq): an accepted Input
+	// may still be unread when the worker reports.
+	through := ticket.HandledSeq
+	var during model.DispatchID
 	if dispatch := s.latestDispatch(ticket); dispatch != nil && dispatch.State == model.DispatchSubmitted {
-		through = max(through, dispatch.ThroughInput)
+		through, during = max(through, dispatch.ThroughInput), dispatch.ID
 	}
 	ticket.LastReport = &model.Report{Status: request.Status, Summary: request.Summary, Question: request.Question, Gen: ticket.Gen, ThroughInput: through, ToolCallID: call.ToolCallID, At: at}
+	s.reports.put(string(ticket.ID), during)
 	if request.Status != model.ReportProgress {
-		ticket.HandledSeq = max(ticket.HandledSeq, through)
+		ticket.HandledSeq = through
 	}
 	switch request.Status {
 	case model.ReportBlocked:
@@ -445,6 +450,6 @@ func (s *Store) statusText(ticket *model.Ticket, now time.Time) string {
 		fmt.Fprintf(&text, "PR #%d: %s, %s.\n", link.Number, state, relation)
 	}
 	ledger, _ := s.peekLedgers(ticket.ID, now)
-	fmt.Fprintf(&text, "Budget: %s spent of %s.\n", usd(ledger.Spent.MicroUSD), usd(ledger.Allowance.MicroUSD+ledger.Granted.MicroUSD))
+	fmt.Fprintf(&text, "Budget: %s spent of %s.\n", usd(ledger.Spent.MicroUSD), usd(sum(ledger.Allowance.MicroUSD, ledger.Granted.MicroUSD)))
 	return text.String()
 }

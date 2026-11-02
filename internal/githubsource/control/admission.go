@@ -2,6 +2,7 @@ package control
 
 import (
 	"strings"
+	"time"
 
 	"go.harness.dev/harness/internal/githubsource/model"
 )
@@ -12,6 +13,8 @@ type subscriber struct {
 	ID        model.TicketID
 	Lifecycle model.Lifecycle
 	Stopped   bool
+	// EndedAt is when an ended Ticket ended.
+	EndedAt time.Time
 	// OwnHead is true for a pr_head event whose SHA this Ticket's outbox
 	// pushed: the worker caused it and is not woken by it.
 	OwnHead bool
@@ -123,6 +126,16 @@ func admit(event model.Event, view admissionView) verdict {
 	if event.Mention && listed && (event.Kind == model.EventIssueOpened || event.Kind == model.EventPROpened || event.Kind == model.EventComment) {
 		if len(open) > 0 {
 			return verdict{Rule: 4, Kind: model.DecisionInput, Action: actInput, Reason: "authorized mention on an open ticket", Class: model.InputAuthoritative, Wakes: true, Tickets: open}
+		}
+		// With no open Ticket, a mention must be fresh: GitHub's time of the
+		// event (Event.At, a comment's created/updated time) strictly after
+		// the EndedAt of every ended Ticket on the thread. An older mention
+		// discovered late was written while that work was open or before it
+		// ended; it neither reopens it nor starts a new Ticket.
+		for _, sub := range view.Subscribers {
+			if sub.Lifecycle == model.LifecycleEnded && !event.At.After(sub.EndedAt) {
+				return verdict{Rule: 4, Kind: model.DecisionIgnored, Reason: "mention at " + event.At.UTC().Format(time.RFC3339) + " predates the end of ticket " + string(sub.ID) + " at " + sub.EndedAt.UTC().Format(time.RFC3339)}
+			}
 		}
 		for i := len(view.Subscribers) - 1; i >= 0; i-- {
 			sub := view.Subscribers[i]

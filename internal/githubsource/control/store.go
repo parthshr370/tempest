@@ -64,6 +64,10 @@ type Store struct {
 	prs         *docTable[model.PullRequest]
 	outbox      *docTable[model.OutboxIntent]
 	ledgers     *docTable[model.Ledger]
+	// reports maps a Ticket to the dispatch during which its LastReport was
+	// made, so completion applies only a report of the dispatch that
+	// finished.
+	reports *docTable[model.DispatchID]
 
 	policies  *entryTable[model.Policy]
 	events    *entryTable[model.Event]
@@ -78,7 +82,6 @@ type Store struct {
 	threadEvents   map[int][]model.EventID
 	reviewComments map[int64]int
 	ticketOutbox   map[model.TicketID][]model.OutboxID
-	retried        map[model.TicketID]bool
 
 	// work records what the current transaction created for the dispatch
 	// and outbox loops; Ingest reports it.
@@ -199,12 +202,20 @@ func resolve(config model.Config, policy model.Policy, repo model.RepoMeta) (set
 	return s, nil
 }
 
-// micro converts dollars to integer micro-USD.
+// micro converts dollars to integer micro-USD, saturating at the int64
+// range: Go leaves an out-of-range float conversion implementation-defined.
 func micro(usd float64) int64 {
 	if math.IsNaN(usd) || math.IsInf(usd, 0) {
 		return 0
 	}
-	return int64(math.Round(usd * 1e6))
+	switch value := math.Round(usd * 1e6); {
+	case value >= math.MaxInt64:
+		return math.MaxInt64
+	case value <= math.MinInt64:
+		return math.MinInt64
+	default:
+		return int64(value)
+	}
 }
 
 // PolicyDigest is the digest stored as a Policy's identity: the admission
@@ -290,6 +301,10 @@ func (s *Store) Close(ctx context.Context) error {
 const (
 	metaRepo  = "repo"
 	metaPause = "pause"
+	// namespaceReport holds one document per Ticket, id TicketID, value the
+	// DispatchID during which Ticket.LastReport was made. It is control's
+	// own bookkeeping; the shared model does not read it.
+	namespaceReport = "gh/report"
 )
 
 func (s *Store) reset() {
@@ -312,12 +327,12 @@ func (s *Store) reset() {
 	s.threadEvents = make(map[int][]model.EventID)
 	s.reviewComments = make(map[int64]int)
 	s.ticketOutbox = make(map[model.TicketID][]model.OutboxID)
-	s.retried = make(map[model.TicketID]bool)
+	s.reports = newDocTable[model.DispatchID](namespaceReport)
 }
 
 // tables lists every table in the fixed order changes are written.
 func (s *Store) tables() []table {
-	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.outbox, s.ledgers, s.ops}
+	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.outbox, s.ledgers, s.reports, s.ops}
 }
 
 // load rebuilds the projection from the journal's current records.
@@ -346,14 +361,8 @@ func (s *Store) load(ctx context.Context) error {
 		model.NamespaceDecision: s.decisions.load,
 		model.NamespaceMandate:  s.mandates.load,
 		model.NamespaceInput:    s.inputs.load,
-		model.NamespaceOperator: func(record durable.Record) error {
-			var op model.OperatorCommand
-			if err := json.Unmarshal(record.Value, &op); err != nil {
-				return fmt.Errorf("decode operator command %s: %w", record.ID, err)
-			}
-			s.indexOp(op)
-			return s.ops.load(record)
-		},
+		model.NamespaceOperator: s.ops.load,
+		namespaceReport:         s.reports.load,
 	}
 	var seq uint64
 	for _, kind := range []durable.Kind{durable.DocumentKind, durable.EntryKind} {
@@ -396,12 +405,6 @@ func (s *Store) indexEvent(event model.Event) {
 	s.threadEvents[event.Thread.Number] = append(s.threadEvents[event.Thread.Number], event.ID)
 	if event.CommentID != 0 && (event.Kind == model.EventReviewComment || event.Kind == model.EventReviewCommentEdited) {
 		s.reviewComments[event.CommentID] = event.Thread.Number
-	}
-}
-
-func (s *Store) indexOp(op model.OperatorCommand) {
-	if op.Method == methodRetry {
-		s.retried[model.TicketID(op.Target)] = true
 	}
 }
 
@@ -481,11 +484,6 @@ func (s *Store) commit(ctx context.Context, id string) (durable.Receipt, error) 
 				var event model.Event
 				if err := json.Unmarshal(c.value, &event); err == nil {
 					s.indexEvent(event)
-				}
-			case model.NamespaceOperator:
-				var op model.OperatorCommand
-				if err := json.Unmarshal(c.value, &op); err == nil {
-					s.indexOp(op)
 				}
 			case model.NamespaceOutbox:
 				if c.revision == 0 {
