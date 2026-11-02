@@ -1317,9 +1317,10 @@ func Compact(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, p
 // ApplyCompaction rebuilds the conversation after a compaction: the summary as a
 // synthetic user turn, then every kept entry from prep.FirstKeptEntryID onward.
 // When the first kept message is itself a user message the summary is merged into
-// it, since Anthropic rejects two consecutive user turns and a non-split cut
-// commonly lands on a user message. A conversation reminder is never merged
-// into: it keeps its own message so later compactions still know it.
+// it, so the rebuilt context opens with one user turn (a non-split cut commonly
+// lands on a user message). A conversation reminder is never merged into: it
+// keeps its own message so later compactions still know it. Consecutive user
+// messages are valid; Anthropic merges them into one turn.
 //
 // Conversation reminders in the summarized part are not summarized: the
 // newest copy of each one the kept part does not hold follows the summary
