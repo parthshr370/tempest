@@ -135,8 +135,9 @@ type providerBudgetStop struct{ reason StopReason }
 
 func (e *providerBudgetStop) Error() string { return "provider budget: " + string(e.reason) }
 
-// AdmitProvider shares root cost admission with compaction calls. The caller must
-// persist and account the response before releasing the returned token.
+// AdmitProvider shares root cost and token admission with compaction calls.
+// The caller must persist and account the response before releasing the
+// returned token.
 func AdmitProvider(ctx context.Context, model types.Model) (func(), error) {
 	a, _ := ctx.Value(accountingKey{}).(*runAccounting)
 	if a == nil {
@@ -221,6 +222,11 @@ func (a *runAccounting) record(ctx context.Context, source, model string, usage 
 func (a *runAccounting) recordForRun(ctx context.Context, source, model string, usage types.Usage, childID, ownerRunID string, charge bool) error {
 	a.receiptsMu.Lock()
 	defer a.receiptsMu.Unlock()
+	return a.recordLocked(ctx, source, model, usage, childID, ownerRunID, charge)
+}
+
+// recordLocked journals and charges one receipt; the caller holds receiptsMu.
+func (a *runAccounting) recordLocked(ctx context.Context, source, model string, usage types.Usage, childID, ownerRunID string, charge bool) error {
 	a.mu.Lock()
 	prior, seen := a.sources[source]
 	a.mu.Unlock()

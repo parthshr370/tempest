@@ -10,15 +10,16 @@
 // The run completes ([StopCompleted]) when the model replies with no tool
 // calls and no steering or follow-up message is queued. It also ends on
 // Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
-// turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime]), or a
-// failure ([StopError]). A run with an output schema whose final answer still
-// fails it after one correction turn ends with [StopOutputInvalid]. A run
-// whose model sends one tool call unchanged until it has failed the same way
-// [RepeatedFailureLimit] times in a row ends with [StopRepeatedFailure] after
-// that turn (see repeat.go), and one whose model repeats a loop it was
-// already told about ends with [StopLoopDetected] (see loopguard.go). A run
-// that starts emits agent_start first and exactly one agent_end last;
-// agent_end carries the [RunResult].
+// turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime] and the
+// token caps), a response whose tool calls would pass the tool-call cap
+// ([StopMaxToolCalls]), or a failure ([StopError]). A run with an output
+// schema whose final answer still fails it after one correction turn ends
+// with [StopOutputInvalid]. A run whose model sends one tool call unchanged
+// until it has failed the same way [RepeatedFailureLimit] times in a row ends
+// with [StopRepeatedFailure] after that turn (see repeat.go), and one whose
+// model repeats a loop it was already told about ends with [StopLoopDetected]
+// (see loopguard.go). A run that starts emits agent_start first and exactly
+// one agent_end last; agent_end carries the [RunResult].
 //
 // # Goroutine ownership
 //
@@ -417,7 +418,7 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 	if budget.MaxTurns > 0 && run.initialTurns+run.result.Turns >= budget.MaxTurns {
 		return StopMaxTurns, nil
 	}
-	if stop, err := run.accounting.costStop(); stop != "" || err != nil {
+	if stop, err := run.accounting.capStop(); stop != "" || err != nil {
 		return stop, err
 	}
 	if budget.MaxCostUSD > 0 {
@@ -429,6 +430,9 @@ func (run *loopRun) boundaryStop(ctx context.Context) (StopReason, error) {
 		if run.result.Usage.Cost.Total >= budget.MaxCostUSD {
 			return StopMaxCost, nil
 		}
+	}
+	if stop := tokenStop(budget, run.result.Usage); stop != "" {
+		return stop, nil
 	}
 	if budget.MaxWallTime > 0 && time.Since(run.started) >= budget.MaxWallTime {
 		return StopMaxWallTime, nil
@@ -625,6 +629,27 @@ func (run *loopRun) turns(ctx context.Context, current AgentContext) error {
 			var handoff *string
 			if hasToolCalls(message) {
 				run.stopHookContinuations = 0
+				refusal, err := run.admitToolCalls(ctx, message)
+				if err != nil {
+					return err
+				}
+				if refusal != "" {
+					// The batch would pass the tool-call cap: none of it runs,
+					// every call is answered, and the turn ends the run.
+					toolResults, err = refuseToolCalls(ctx, message, refusal, *config, run.emit)
+					if err != nil {
+						return err
+					}
+					for _, result := range toolResults {
+						current.Messages = append(current.Messages, result)
+						run.messages = append(run.messages, result)
+					}
+					if err := run.emit(ctx, TurnEnd(message, toolResults)); err != nil {
+						return err
+					}
+					run.result.StopReason = StopMaxToolCalls
+					return nil
+				}
 				executedToolBatch, err := executeToolCalls(ctx, current, message, *config, run.emit)
 				if err != nil {
 					return err

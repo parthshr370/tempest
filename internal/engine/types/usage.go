@@ -52,7 +52,8 @@ func (c Cost) MarshalJSON() ([]byte, error) {
 // Usage is token accounting for a turn. Optional fields CacheWrite1h / Reasoning
 // are pointers so "absent" is distinguishable from 0. CacheWrite1h is the
 // subset of CacheWrite written with one-hour retention; Reasoning is a subset
-// of Output.
+// of Output. ToolCalls is never set by a provider: a run's totals count the
+// tool calls it admitted for execution.
 type Usage struct {
 	Input        int  `json:"input"`
 	Output       int  `json:"output"`
@@ -62,6 +63,7 @@ type Usage struct {
 	Reasoning    *int `json:"reasoning,omitempty"`
 	TotalTokens  int  `json:"totalTokens"`
 	Cost         Cost `json:"cost"`
+	ToolCalls    int  `json:"toolCalls,omitempty"`
 }
 
 // Add folds one call's usage into a total without sharing optional counters.
@@ -71,6 +73,7 @@ func (u *Usage) Add(other Usage) {
 	u.CacheRead += other.CacheRead
 	u.CacheWrite += other.CacheWrite
 	u.TotalTokens += other.TotalTokens
+	u.ToolCalls += other.ToolCalls
 	if other.CacheWrite1h != nil {
 		sum := *other.CacheWrite1h
 		if u.CacheWrite1h != nil {
