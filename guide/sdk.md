@@ -140,7 +140,9 @@ creates a session. `Open(ctx, id)` reuses a live owner or opens its journal.
 newest first, including archived run summaries. Missing journal files stay out of
 the listing. `CloseSession(ctx, id)` closes one owner; `Close(ctx)` closes the host.
 `HostOptions.MCPServers` supplies runtime endpoints when a create or resume omits
-its own MCP selection.
+its own MCP selection. `AgentOptions.Extensions` selects one session's bundles
+from `HostOptions.Registry` in place of `HostOptions.Extensions` (nil keeps the
+host selection); the selection is journaled, so reopening restores it.
 
 Opening and listing do not run accepted input. Call `ResumePending(ctx)` explicitly
 to schedule durable pending work in currently open sessions. It attempts every

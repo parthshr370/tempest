@@ -30,6 +30,7 @@ const (
 	methodUnpause = "unpause"
 	methodGrant   = "grant"
 	methodResolve = "resolve_effect"
+	methodResend  = "resend_effect"
 )
 
 // Status summarizes the repository from the control journal.
@@ -298,20 +299,41 @@ func (o *Operator) Grant(ctx context.Context, request model.OperatorRequest, amo
 	})
 }
 
-// ResolveEffect settles an unknown intent as confirmed or failed after the
-// operator checked GitHub.
+// ResolveEffect settles an unknown intent after the operator checked
+// GitHub: confirmed (the write is there), failed (abandon it), or pending,
+// which sends it again. A resend is the only way an unknown write is ever
+// repeated; the operator asserts it is absent. The intent becomes its
+// Ticket's oldest unsettled write, so it publishes before the Ticket's
+// later pending writes, and gets a fresh attempt limit. A stopped Ticket's
+// intent cannot be resent.
 func (o *Operator) ResolveEffect(ctx context.Context, request model.OperatorRequest, state model.EffectState) error {
 	s := o.store
-	if state != model.EffectConfirmed && state != model.EffectFailed {
-		return fmt.Errorf("control: an unknown effect resolves only to confirmed or failed, not %q", state)
+	method := methodResolve
+	switch state {
+	case model.EffectConfirmed, model.EffectFailed:
+	case model.EffectPending:
+		method = methodResend
+	default:
+		return fmt.Errorf("control: an unknown effect resolves only to confirmed, failed or pending (resend), not %q", state)
 	}
-	return s.operate(ctx, request, methodResolve, nil, func(now time.Time) error {
+	return s.operate(ctx, request, method, nil, func(now time.Time) error {
 		current, ok := s.outbox.get(request.Target)
 		if !ok {
 			return fmt.Errorf("control: outbox intent %s: %w", request.Target, model.ErrNotFound)
 		}
 		if current.State != model.EffectUnknown {
 			return errState("outbox intent "+request.Target, current.State, "resolve")
+		}
+		if state == model.EffectPending {
+			if ticket, ok := s.tickets.get(string(current.Ticket)); ok && ticket.Stopped {
+				return fmt.Errorf("control: outbox intent %s: %w", request.Target, model.ErrStopped)
+			}
+			intent := s.outbox.edit(request.Target)
+			intent.State, intent.SettledAt, intent.RetryAt, intent.Result = model.EffectPending, time.Time{}, time.Time{}, nil
+			intent.LastError = "sent again by operator: " + request.Reason
+			s.resends.put(request.Target, intent.Attempts)
+			s.work.outbox = true
+			return nil
 		}
 		intent := s.outbox.edit(request.Target)
 		intent.State, intent.SettledAt = state, now

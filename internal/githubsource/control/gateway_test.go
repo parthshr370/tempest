@@ -163,15 +163,17 @@ func TestOutboxDueAttemptSettle(t *testing.T) {
 		t.Fatalf("next intent: %+v", due)
 	}
 	// An unknown outcome blocks nothing but needs the operator; only
-	// confirmed or failed resolve it.
+	// confirmed, failed or pending (resend) resolve it.
 	h.store.Attempt(h.ctx, second.ID, h.clock.Now())
 	h.store.Settle(h.ctx, second.ID, model.EffectSettlement{State: model.EffectUnknown, Error: "listing failed"})
 	if stage := h.detail(id).Stage; stage != model.StageDelivery {
 		t.Fatalf("stage %s", stage)
 	}
 	operator := h.store.Operator()
-	if err := operator.ResolveEffect(h.ctx, model.OperatorRequest{ID: "res-0", Target: string(second.ID)}, model.EffectPending); err == nil {
-		t.Fatal("unknown resolved to pending")
+	for _, state := range []model.EffectState{model.EffectAttempting, model.EffectCancelled, model.EffectUnknown} {
+		if err := operator.ResolveEffect(h.ctx, model.OperatorRequest{ID: "res-0", Target: string(second.ID)}, state); err == nil {
+			t.Fatalf("unknown resolved to %s", state)
+		}
 	}
 	if err := operator.ResolveEffect(h.ctx, model.OperatorRequest{ID: "res-1", Target: string(second.ID), Reason: "checked"}, model.EffectConfirmed); err != nil {
 		t.Fatal(err)

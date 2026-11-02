@@ -409,6 +409,12 @@ overrides its `HARNESS_*` variable. Protocol clients cannot choose language-serv
 commands or cloud grants. Tools and language servers run on the server host, not
 the client.
 
+`-github owner/repo` with `-github-config /abs/file.json` (serve only; both or
+neither) also runs the [GitHub ticket runner](github.md) for that repository: it
+polls GitHub as a dedicated account and runs one worker session per requested
+Ticket. It cannot be combined with `-extension-config`. Read its trust model
+before enabling it: workers run without a sandbox.
+
 SIGINT or SIGTERM stops admission, cancels runs, and flushes journals before exit,
 even if a stdio client keeps stdin open. A second signal exits with code 130;
 `-shutdown-timeout` bounds the graceful wait.
@@ -528,6 +534,16 @@ Recent and active snapshots are not a contiguous id page. Use `tempest/wait` wit
 `jobIds` for full details, `tempest/cancel_job`, `tempest/logs` or
 `tempest/cleanup_job` for management. Cancelling or disconnecting a wait stops only
 the wait, not the jobs.
+
+### GitHub ticket runner
+
+With `-github`, `initialize` also advertises `agentCapabilities._meta.tempest.github`
+and the `_tempest/github/*` methods: status, Ticket and event listings, operator
+stop, retry, pause, grant and `resolve_effect`, `poll_now`, and a watch whose
+`_tempest/github/update` notifications follow each control commit, with
+`_tempest/github/gap` for a slow watcher. See
+[operator controls](github.md#operator-controls-over-acp). Without `-github` these
+methods fail with `-32601`.
 
 ### Example exchange
 

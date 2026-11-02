@@ -76,8 +76,8 @@ func (s *Store) Attempt(ctx context.Context, id model.OutboxID, now time.Time) (
 			return model.OutboxIntent{}, err
 		}
 		return clone(*s.mustIntent(id)), fmt.Errorf("control: outbox intent %s: %w", id, model.ErrStopped)
-	case current.Attempts >= maxEffectAttempts:
-		intent.State, intent.LastError, intent.SettledAt = model.EffectFailed, fmt.Sprintf("gave up after %d attempts: %s", current.Attempts, current.LastError), now
+	case current.Attempts-s.resentAt(id) >= maxEffectAttempts:
+		intent.State, intent.LastError, intent.SettledAt = model.EffectFailed, fmt.Sprintf("gave up after %d attempts: %s", current.Attempts-s.resentAt(id), current.LastError), now
 		if _, err := s.commit(ctx, fmt.Sprintf("attempt:%s:%d", id, current.Attempts+1)); err != nil {
 			return model.OutboxIntent{}, err
 		}
@@ -97,6 +97,15 @@ func (s *Store) mustIntent(id model.OutboxID) *model.OutboxIntent {
 		panic("control: committed outbox intent " + string(id) + " missing from the projection")
 	}
 	return intent
+}
+
+// resentAt is an intent's Attempts at its latest operator resend, zero if
+// never resent. The attempt limit counts the attempts after it.
+func (s *Store) resentAt(id model.OutboxID) int {
+	if attempts, ok := s.resends.get(string(id)); ok {
+		return *attempts
+	}
+	return 0
 }
 
 // Settle records an attempt's outcome. Pending (absence proven, retry

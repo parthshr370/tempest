@@ -82,18 +82,24 @@ func TestCommentRestartAtEveryBoundary(t *testing.T) {
 		if err := w.publish(); !errors.Is(err, errCrash) {
 			t.Fatalf("publish = %v, want the crash", err)
 		}
-		if got := w.intent(ticket, intent.ID); got.State != model.EffectAttempting {
-			t.Fatalf("state = %s, want attempting", got.State)
-		}
 		w.restart()
 		// Nothing was sent, but a death after the request leaves the same
-		// journal and the same listing: unknown, for an operator.
+		// journal and the same listing. The listing may lag, so the first
+		// read that does not find it settles nothing.
 		if err := w.publish(); err != nil {
 			t.Fatal(err)
 		}
+		if got := w.intent(ticket, intent.ID); got.State != model.EffectAttempting {
+			t.Fatalf("after one read: %+v, want attempting", got)
+		}
+		// Still not found after the window: unknown, for an operator.
+		w.reread()
 		got := w.intent(ticket, intent.ID)
-		if got.State != model.EffectUnknown || !strings.Contains(got.LastError, "operator") {
+		if got.State != model.EffectUnknown || !strings.Contains(got.LastError, "operator") || !strings.Contains(got.LastError, fmt.Sprintf("not found in %d reads", absentReads)) {
 			t.Fatalf("after reconcile: %+v, want unknown", got)
+		}
+		if elapsed := got.SettledAt.Sub(got.AttemptedAt); elapsed < absentWindow {
+			t.Fatalf("settled unknown %s after the attempt, want at least %s", elapsed, absentWindow)
 		}
 		w.clock.Advance(24 * time.Hour)
 		w.drain()
@@ -206,9 +212,7 @@ func TestCommentReconcilePagesAndScopes(t *testing.T) {
 	}
 	_ = w.publish()
 	w.restart()
-	if err := w.publish(); err != nil {
-		t.Fatal(err)
-	}
+	w.reread()
 	if got := w.intent(ticket, intent.ID); got.State != model.EffectUnknown {
 		t.Fatalf("state = %s, want unknown: the forged markers are not the write", got.State)
 	}

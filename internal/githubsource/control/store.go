@@ -68,6 +68,9 @@ type Store struct {
 	// made, so completion applies only a report of the dispatch that
 	// finished.
 	reports *docTable[model.DispatchID]
+	// resends maps an outbox intent an operator sent again to its Attempts
+	// at that resend.
+	resends *docTable[int]
 	// prAsOf maps a PR to the GitHub time as of which its record's state is
 	// known (orderPRState), as committed. heldAsOf holds a later as-of that
 	// only confirmed the committed state, in memory: it is written with the
@@ -318,6 +321,11 @@ const (
 	// namespacePRAsOf holds one document per PR, id the number, value the
 	// as-of time of its state. Control's own bookkeeping too.
 	namespacePRAsOf = "gh/pr-asof"
+	// namespaceResend holds one document per outbox intent an operator
+	// sent again, id the OutboxID, value its Attempts at the latest
+	// resend: the attempt limit counts from there. Control's own
+	// bookkeeping too.
+	namespaceResend = "gh/resend"
 )
 
 func (s *Store) reset() {
@@ -342,13 +350,14 @@ func (s *Store) reset() {
 	s.ticketOutbox = make(map[model.TicketID][]model.OutboxID)
 	s.reports = newDocTable[model.DispatchID](namespaceReport)
 	s.prAsOf = newDocTable[time.Time](namespacePRAsOf)
+	s.resends = newDocTable[int](namespaceResend)
 	s.heldAsOf = make(map[string]time.Time)
 	s.asOfUsed = make(map[string]bool)
 }
 
 // tables lists every table in the fixed order changes are written.
 func (s *Store) tables() []table {
-	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.prAsOf, s.outbox, s.ledgers, s.reports, s.ops}
+	return []table{s.meta, s.policies, s.cursors, s.threads, s.events, s.decisions, s.tickets, s.mandates, s.inputs, s.assignments, s.dispatches, s.sessions, s.prs, s.prAsOf, s.outbox, s.resends, s.ledgers, s.reports, s.ops}
 }
 
 // load rebuilds the projection from the journal's current records.
@@ -380,6 +389,7 @@ func (s *Store) load(ctx context.Context) error {
 		model.NamespaceOperator: s.ops.load,
 		namespaceReport:         s.reports.load,
 		namespacePRAsOf:         s.prAsOf.load,
+		namespaceResend:         s.resends.load,
 	}
 	var seq uint64
 	for _, kind := range []durable.Kind{durable.DocumentKind, durable.EntryKind} {

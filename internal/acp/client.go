@@ -77,6 +77,8 @@ type Client struct {
 	// github is the GitHub ticket runner served on this connection, nil
 	// when serve runs without -github.
 	github GitHub
+	// githubWatch is the connection's _tempest/github/watch, if any.
+	githubWatch *githubWatcher
 }
 
 // NewClient binds a connection to the process-wide registry and permission broker.
@@ -122,6 +124,10 @@ func (c *Client) Close() {
 	for id, w := range c.watches {
 		w.stop()
 		delete(c.watches, id)
+	}
+	if c.githubWatch != nil {
+		c.githubWatch.stop()
+		c.githubWatch = nil
 	}
 	c.mu.Unlock()
 }
@@ -224,7 +230,11 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		c.initialized = true
 		c.notices = p.ClientCapabilities.Session.Notices
 		c.mu.Unlock()
-		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"_meta": map[string]any{"tempest": map[string]any{"durable": map[string]any{"version": 1, "tasks": true, "methods": []string{"_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read", "_tempest/durable/create_task", "_tempest/durable/get_task", "_tempest/durable/tasks", "_tempest/durable/cancel_task", "_tempest/durable/retry_task", "_tempest/durable/cancel_all", "_tempest/durable/resume_pending", "_tempest/durable/next_wake", "_tempest/durable/fork", "_tempest/durable/reset", "_tempest/durable/compact", "_tempest/durable/search_history"}, "notifications": []string{"_tempest/durable/update"}}}}, "loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
+		meta := map[string]any{"durable": map[string]any{"version": 1, "tasks": true, "methods": []string{"_tempest/durable/submit", "_tempest/durable/get_submission", "_tempest/durable/withdraw", "_tempest/durable/commit", "_tempest/durable/read", "_tempest/durable/create_task", "_tempest/durable/get_task", "_tempest/durable/tasks", "_tempest/durable/cancel_task", "_tempest/durable/retry_task", "_tempest/durable/cancel_all", "_tempest/durable/resume_pending", "_tempest/durable/next_wake", "_tempest/durable/fork", "_tempest/durable/reset", "_tempest/durable/compact", "_tempest/durable/search_history"}, "notifications": []string{"_tempest/durable/update"}}}
+		if c.github != nil {
+			meta["github"] = githubCapability(c.github)
+		}
+		return map[string]any{"protocolVersion": 1, "agentCapabilities": map[string]any{"_meta": map[string]any{"tempest": meta}, "loadSession": true, "mcpCapabilities": map[string]any{"http": true, "sse": false}, "sessionCapabilities": map[string]any{"list": map[string]any{}, "resume": map[string]any{}, "close": map[string]any{}}, "promptCapabilities": map[string]any{"image": true, "embeddedContext": true}}, "agentInfo": map[string]any{"name": "tempest", "version": build.Current().Version}}, nil
 	}
 	c.mu.Lock()
 	initialized := c.initialized
@@ -237,6 +247,9 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		return c.handleDurable(ctx, method, raw)
 	case "tempest/steer", "tempest/follow_up", "tempest/cancel_queued", "tempest/jobs", "tempest/wait", "tempest/cancel_job", "tempest/logs", "tempest/cleanup_job":
 		return c.handleWork(ctx, method, raw)
+	}
+	if strings.HasPrefix(method, githubPrefix) {
+		return c.handleGitHub(ctx, method, raw)
 	}
 	switch method {
 	case "session/new", "session/load", "session/resume":
