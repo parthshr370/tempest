@@ -125,13 +125,15 @@ func (c *Client) handleDurable(ctx context.Context, method string, raw json.RawM
 }
 
 func promptCompletion(result tempest.RunResult, err error) (any, *rpc.Error) {
-	if result.StopReason == "error" || result.StopReason == "output_invalid" || result.StopReason == "repeated_failure" {
+	if result.StopReason == "error" || result.StopReason == "output_invalid" || result.StopReason == "repeated_failure" || result.StopReason == "loop_detected" {
 		code, name, message := -32009, "run_error", "run failed"
 		switch result.StopReason {
 		case "output_invalid":
 			code, name = -32022, "output_invalid"
 		case "repeated_failure":
 			code, name = -32023, "repeated_failure"
+		case "loop_detected":
+			code, name = -32026, "loop_detected"
 		}
 		if result.Err != nil {
 			message = result.Err.Error()

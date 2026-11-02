@@ -85,7 +85,10 @@ func newManagementTool(name ToolName, controller work.Controller) agent.AgentToo
 		parameters = schema.ObjectRequired(schema.JSON{"job_id": schema.String(), "name": schema.JSON{"type": "string", "description": "a background bash job's name, in place of job_id"}, "offset": schema.Number(), "limit": schema.Number()}, []string{})
 		description = "Read bounded background bash output using raw byte offsets, by job_id or by background bash job name. Task output is its result artifact, not logs."
 	}
-	return agent.AgentTool{Tool: types.Tool{Name: string(name), Description: description, Parameters: parameters}, Label: string(name), Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
+	// jobs, wait and logs watch jobs change state, so the loop guard treats
+	// them as polling; cancel acts.
+	polls := name != CancelTool
+	return agent.AgentTool{Tool: types.Tool{Name: string(name), Description: description, Parameters: parameters}, Label: string(name), Polls: polls, Execute: func(ctx context.Context, _ string, params json.RawMessage, _ agent.AgentToolUpdateCallback) (agent.AgentToolResult, error) {
 		var input struct {
 			Cursor  string   `json:"cursor"`
 			Limit   int      `json:"limit"`

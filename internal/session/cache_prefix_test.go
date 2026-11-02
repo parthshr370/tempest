@@ -31,67 +31,82 @@ const toolTurns = 24
 // A real stack talking to an OpenRouter-shaped endpoint must send requests in
 // which every turn extends the previous one byte for byte: the same tools, the
 // same session cache key, and every earlier message unchanged. Anything that
-// rewrites history between turns costs the provider's prompt cache.
+// rewrites history between turns costs the provider's prompt cache. The loop
+// guard's notices are no exception: with it on, the same reads end the run
+// with loop_detected, and every request still extends the last.
 func TestStackRequestsKeepByteStablePrefix(t *testing.T) {
-	cwd := t.TempDir()
-	if err := os.WriteFile(filepath.Join(cwd, "a.go"), []byte("package a\n\nfunc A() int { return 1 }\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := journal.Create(context.Background(), t.TempDir(), cwd, journal.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
+	for _, testCase := range []struct {
+		name       string
+		thresholds *agent.LoopThresholds
+		stop       agent.StopReason
+		requests   int
+	}{
+		{"loop guard off", &agent.LoopThresholds{}, agent.StopCompleted, toolTurns + 1},
+		// Nudged on the third identical read, stopped on the sixth.
+		{"loop guard on", nil, agent.StopLoopDetected, 6},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			cwd := t.TempDir()
+			if err := os.WriteFile(filepath.Join(cwd, "a.go"), []byte("package a\n\nfunc A() int { return 1 }\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store, err := journal.Create(context.Background(), t.TempDir(), cwd, journal.Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = store.Close() })
 
-	var mu sync.Mutex
-	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, readErr := io.ReadAll(r.Body)
-		if readErr != nil {
-			t.Errorf("read request: %v", readErr)
-		}
-		mu.Lock()
-		bodies = append(bodies, body)
-		turn := len(bodies)
-		mu.Unlock()
-		w.Header().Set("Content-Type", "text/event-stream")
-		if turn <= toolTurns {
-			call := fmt.Sprintf(`{"index":0,"id":"call_%02d","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.go\"}"}}`, turn)
-			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[%s]}}]}\n\n", call)
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cost\":0.001}}\n\n")
-		} else {
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
-			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cost\":0.001}}\n\n")
-		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer server.Close()
+			var mu sync.Mutex
+			var bodies [][]byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, readErr := io.ReadAll(r.Body)
+				if readErr != nil {
+					t.Errorf("read request: %v", readErr)
+				}
+				mu.Lock()
+				bodies = append(bodies, body)
+				turn := len(bodies)
+				mu.Unlock()
+				w.Header().Set("Content-Type", "text/event-stream")
+				if turn <= toolTurns {
+					call := fmt.Sprintf(`{"index":0,"id":"call_%02d","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.go\"}"}}`, turn)
+					fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[%s]}}]}\n\n", call)
+					fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cost\":0.001}}\n\n")
+				} else {
+					fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n")
+					fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"cost\":0.001}}\n\n")
+				}
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer server.Close()
 
-	model := ptypes.Model{ID: "deepseek/deepseek-v4.1-flash", API: "openai-completions", Provider: "openrouter", BaseURL: server.URL, ContextWindow: 200000, MaxTokens: 1024, Cost: ptypes.ModelCost{Unknown: true}}
-	streamFn := func(ctx context.Context, m ptypes.Model, c ptypes.Context, opts *ptypes.SimpleStreamOptions) *stream.AssistantStream {
-		withKey := *opts
-		withKey.APIKey = "test-key"
-		return openai.StreamSimple(ctx, m, c, &withKey)
-	}
-	stack, err := BuildAgentStack(StackConfig{Cwd: cwd, Model: model, StreamFn: streamFn, Journal: store})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := stack.Agent.PromptText(context.Background(), "read a.go until told to stop")
-	if err != nil || result.Err != nil {
-		t.Fatalf("run err=%v result=%v", err, result.Err)
-	}
-	if result.Usage.Cost.Unknown || result.Usage.Cost.Total < 0.001*toolTurns {
-		t.Fatalf("billed cost not accounted: %+v", result.Usage.Cost)
-	}
+			model := ptypes.Model{ID: "deepseek/deepseek-v4.1-flash", API: "openai-completions", Provider: "openrouter", BaseURL: server.URL, ContextWindow: 200000, MaxTokens: 1024, Cost: ptypes.ModelCost{Unknown: true}}
+			streamFn := func(ctx context.Context, m ptypes.Model, c ptypes.Context, opts *ptypes.SimpleStreamOptions) *stream.AssistantStream {
+				withKey := *opts
+				withKey.APIKey = "test-key"
+				return openai.StreamSimple(ctx, m, c, &withKey)
+			}
+			stack, err := BuildAgentStack(StackConfig{Cwd: cwd, Model: model, StreamFn: streamFn, Journal: store, LoopThresholds: testCase.thresholds})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := stack.Agent.PromptText(context.Background(), "read a.go until told to stop")
+			if err != nil || result.StopReason != testCase.stop {
+				t.Fatalf("run err=%v result=%+v, want %s", err, result, testCase.stop)
+			}
+			if result.Usage.Cost.Unknown || result.Usage.Cost.Total < 0.001*float64(testCase.requests-1) {
+				t.Fatalf("billed cost not accounted: %+v", result.Usage.Cost)
+			}
 
-	mu.Lock()
-	defer mu.Unlock()
-	if len(bodies) != toolTurns+1 {
-		t.Fatalf("requests = %d, want %d", len(bodies), toolTurns+1)
-	}
-	for index := 1; index < len(bodies); index++ {
-		assertRequestExtends(t, index, bodies[index-1], bodies[index], store.ID())
+			mu.Lock()
+			defer mu.Unlock()
+			if len(bodies) != testCase.requests {
+				t.Fatalf("requests = %d, want %d", len(bodies), testCase.requests)
+			}
+			for index := 1; index < len(bodies); index++ {
+				assertRequestExtends(t, index, bodies[index-1], bodies[index], store.ID())
+			}
+		})
 	}
 }
 

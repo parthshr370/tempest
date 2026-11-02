@@ -94,6 +94,9 @@ func TestRepeatedIdenticalFailureWarnsThenStops(t *testing.T) {
 	}
 }
 
+// TestRepeatedFailureStreakResetsOnDifferentCallOrSuccess checks the failure
+// streak alone; with the loop guard on, the same transcript is a repeated
+// result loop (TestLoopGuardCountsFailuresAcrossOtherCalls).
 func TestRepeatedFailureStreakResetsOnDifferentCallOrSuccess(t *testing.T) {
 	f := faux.New(faux.Options{})
 	stuck := RepeatedFailureLimit - 1
@@ -104,7 +107,11 @@ func TestRepeatedFailureStreakResetsOnDifferentCallOrSuccess(t *testing.T) {
 	args = append(args, `{"id":"x","ok":true}`)
 	args = append(args, repeatArgs(`{"id":"x"}`, stuck)...)
 	f.SetResponses(append(probeSteps(args...), faux.Respond(faux.Text("done")))...)
-	a := newBudgetAgent(f, Budget{MaxTurns: 40}, probeTool())
+	a := newRuntimeAgent(f, func(opts *AgentOptions) {
+		opts.InitialState.Tools = []AgentTool{probeTool()}
+		opts.Budget = Budget{MaxTurns: 40}
+		opts.LoopThresholds = &LoopThresholds{}
+	})
 
 	result, err := a.PromptText(context.Background(), "go")
 	if err != nil {

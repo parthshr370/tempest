@@ -159,6 +159,7 @@ Every run ends with one of these:
 | `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
 | `error` | The provider failed, or the session journal could not be written. | 1 |
 | `repeated_failure` | The model sent the same tool call, with the same arguments, until it had failed with the same error five times in a row. | 1 |
+| `loop_detected` | The model kept repeating a loop (see [Loops](#loops)) after a host notice told it about that loop. | 1 |
 
 ### Budgets
 
@@ -190,9 +191,115 @@ arguments or the approach must change.
 The fifth identical failure in a row ends the run with `repeated_failure` after that
 turn. `error` in the report names the call and its error, and over ACP
 `session/prompt` fails with `-32023 repeated_failure`. Any other tool result or a
-user message (a new prompt included) resets the count, and a successful result is
-never changed. The count is read from the transcript, so continuing a resumed
+user message (a new prompt included, a conversation reminder excepted) resets the
+count, and a successful result is never changed. The same failure coming back after
+other calls is the [loop guard's](#loops). The count is read from the transcript, so continuing a resumed
 session (`Session.Continue`, `tempest/continue`) carries it on.
+
+### Loops
+
+A model can also be stuck while its calls succeed, or while other calls come between
+its failures: re-reading a file that has not changed, re-running a command with the
+same output, flipping between two calls, or giving the same final answer to a Stop
+hook that keeps sending it back. The loop guard works from one rule: a loop is
+repeated work with no progress in between.
+
+A call is its tool and its arguments after JSON canonicalization; its result is its
+outcome (error or not) and content. A call that returns what it returned the last
+time is a repeat. A call that returns something new (a first call, or a known call
+with a changed answer) is not, and when it succeeded and its tool may change things,
+it is progress: an edit, a write, a command, an MCP or extension tool, a subagent,
+anything but a workspace read. Progress starts every count over. Workspace reads
+(`read`, `grep`, `find`, `ls`, `ast_grep`, `view_image` on workspace paths, not on
+`job://`, `history://` or other internal URLs) are never progress: their answer
+changes only when something else changed the workspace. A failed call is never
+progress either.
+
+An unchanged answer does not prove an unchanged workspace: a command that appends to
+a file and prints nothing answers the same every time it runs. So any successful call
+that may change things, even one that repeated its answer, starts every successful
+workspace read's count over and forgives a notice about one. A read that keeps
+failing the same way keeps its count, like any other failure. The call's own
+unchanged answers count only toward `repeated_poll`, the outer bound for commands
+whose answer does not change.
+
+| Pattern | Reported when | Default |
+|---|---|---|
+| `repeated_result` | A failed call, or a workspace read, returned the same result N times with no progress in between. | 3 |
+| `repeated_poll` | Any other successful call (a command, an MCP or extension tool) returned the same result N times with no progress in between. Such a call may be polling for a change outside the workspace, so it gets more room. | 10 |
+| `repeated_text` | N replies in a row had no tool call and the same text, ignoring case and whitespace, with only Stop, SubagentStop or extension `on_yield` hook feedback between them. | 3 |
+
+So an edit followed by the same test run, whether the test output changes or not, is
+never a loop: each new edit is progress. Re-reading an unchanged file between edits
+or between runs of a silent command is not either. Two stateful tools whose answers
+keep changing are not. Re-reading the same unchanged file three times with nothing
+in between is, and so is A, B, A, B where both keep giving the same answers. An
+undo/redo of two edits is the latter: an edit's result is its diff and the content
+hash of the file it wrote, the same each time it is redone, so each leg counts toward
+`repeated_poll`.
+
+Each repeat must come within 10 calls of the one before; a call made again after 10
+or more other calls starts a new count. Identical calls in one reply count once: the
+model made them before seeing any of their results. Each of their results is still
+looked at in order, so a changed result among them is new (progress when it succeeded
+and its tool may change things), and the last is what the call's next run is compared
+with. The checks run once per tool batch, after its last result, and once before each
+model call for repeated text; a pattern is reported only when the newest batch or
+reply continues it.
+
+The first report of a loop is a notice at the tail of the transcript, starting with
+`[Loop notice from the host]`: appended to the batch's last tool result, or for
+repeated text sent as a user message after the hook feedback. It names the call and
+tells the model to change its approach or say what is blocking it. For
+`repeated_poll` it says instead that a model whose calls make progress the result
+does not show may go on, better with a command that prints what it changed, how
+many more unchanged results stop the run, and how to wait in one call. Counting
+starts over after a notice, so the loop has to build up anew. If the same pattern
+is reported again, for the same call or one that was repeating with it (the other
+leg of A, B, A, B), with no
+progress since the notice, the host appends a `[Loop stop from the host]` notice and
+the run ends with `loop_detected` after that turn. A different pattern gets its own
+notice first, and after progress the next report is a notice again. The system prompt
+and earlier messages never change, so the cached prompt prefix is kept.
+
+`error` in the report says which loop it was, `loop` in the
+[run report](#the-run-report) gives its `pattern`, `tools` and `count`, and over ACP
+`session/prompt` fails with `-32026 loop_detected`. Every notice and stop is also
+published as a `tempest/loop_guard` update, and a tool result that got a notice (from
+this guard or the repeated-failure guard) is sent again as a `tool_call_update` with
+its full content, notice included, after the call's completed update. History
+replayed from the journal (`session/load`) or rebuilt after a rewind or compaction
+announces every call with its `tool_call`, and the call's completed update already
+carries the notice.
+
+Waiting is not a loop. `wait`, `jobs`, `logs` and `write_stdin` are polling tools:
+their successful calls are never reported. A command polling for a server, such as
+`curl -s localhost:8080/health` returning the same "starting" answer, gets nine
+unchanged answers with no notice, a notice on the tenth and the stop after ten more
+(twenty probes, a few minutes of model turns); an answer that changes starts the count
+over. The better way to wait is one call: `timeout 120 sh -c 'until curl -sf URL; do
+sleep 2; done'` is a single result whatever it waits for (bounded by `bash_timeout`),
+or run the server as a background job and use `wait`. A probe that fails, such as
+`curl -sf` while nothing listens, is a failure: the repeated-failure guard stops five
+in a row, and between other calls the third identical failure gets this guard's
+notice.
+
+The repeated-failure guard keeps its own notice and stop for consecutive identical
+failures; the loop guard does not report a result that guard already noted, but still
+checks the rest of the batch, so a batch with an unchanged success and repeated
+failures cannot slip past both.
+
+Like the failure count, the guard reads everything from the transcript, so a resumed
+or replayed session reaches the same decisions and never repeats a notice. Any user
+message (a new prompt, a steer, a job notice, a compaction summary) starts the count
+over, except a conversation [reminder](skills-and-context.md#reminders), which
+restates instructions and is not new input; request-scope reminders never enter the
+transcript. `Continue` adds no message, so it carries the count on. After a
+`loop_detected` stop, the next repetition of the same loop stops a continued run again
+at once, while a model that moved on is not stopped by the loop it left.
+
+The thresholds are the `loop_detection` setting, and `0` turns a pattern off; see
+[Configuration](configuration.md#settings-file).
 
 ### Background work and shutdown
 
@@ -253,8 +360,9 @@ In text mode the last assistant text goes to stdout, and a stop reason other tha
 ```
 
 `cost_usd` is `null` when any call's price was unknown. `error` appears on `error`,
-`output_invalid` and `repeated_failure` stops. `message` is the transcript's last
-message.
+`output_invalid`, `repeated_failure` and `loop_detected` stops, and `loop`
+(`pattern`, `tools`, `count`, `action`) on `loop_detected`. `message` is the
+transcript's last message.
 
 ### Structured final answers
 
@@ -296,9 +404,11 @@ contains the actual `tempest/gap` marker and the final report, stderr explains t
 incomplete stream, and the command exits 1. A broken pipe cancels and joins the run.
 
 Streams include the same `tempest/queue`, `tempest/job`, `tempest/job_output`,
-`tempest/message`, `tempest/compaction` and `tempest/model_fallback` updates as ACP
-and Go watchers. `tempest/model_fallback` carries `runId`, `from`, `to`, `reason`,
-`attempts` and `fallbackIndex`. Output events only announce byte availability; read
+`tempest/message`, `tempest/compaction`, `tempest/model_fallback` and
+`tempest/loop_guard` updates as ACP and Go watchers. `tempest/model_fallback` carries
+`runId`, `from`, `to`, `reason`, `attempts` and `fallbackIndex`; `tempest/loop_guard`
+carries `runId`, `pattern`, `tools`, `count` and `action` (`nudge` or `stop`). Output
+events only announce byte availability; read
 command logs separately. Child transcripts and thinking are not forwarded into the
 parent stream, but every agent-to-agent message is, as `tempest/message`. The final
 run-report shape is unchanged.

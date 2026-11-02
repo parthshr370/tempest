@@ -373,7 +373,11 @@ func newLocalTool(toolName ToolName, cwd string, options ToolsOptions) (agent.Ag
 		return newIntegrateTool(cwd, options), nil
 	case ViewImageTool:
 		return newViewImageTool(cwd, options), nil
-	case ASTGrepTool, ASTEditTool:
+	case ASTGrepTool:
+		tool, err := newASTTool(toolName, cwd, options)
+		tool.ReadsWorkspace = workspaceRead
+		return tool, err
+	case ASTEditTool:
 		return newASTTool(toolName, cwd, options)
 	case GHTool, GHCheckoutTool:
 		if toolName == GHCheckoutTool && options.Child {
@@ -615,6 +619,26 @@ func withHashlineStore(options ToolsOptions) ToolsOptions {
 	return options
 }
 
+// workspaceRead is a read tool's ReadsWorkspace: a call that names no
+// internal URL (job://, history://, local://, an MCP resource, a web page)
+// reads only workspace files, which change only when the workspace does.
+// Arguments that do not decode are not taken as a workspace read.
+func workspaceRead(arguments json.RawMessage) bool {
+	var input struct {
+		Path  string   `json:"path"`
+		Paths []string `json:"paths"`
+	}
+	if json.Unmarshal(arguments, &input) != nil {
+		return false
+	}
+	for _, path := range append(input.Paths, input.Path) {
+		if strings.Contains(path, "://") {
+			return false
+		}
+	}
+	return true
+}
+
 // newReadTool builds the file reader rooted at cwd. It accepts one path with
 // optional offset and limit for paging, or several paths read in one call
 // under a shared output budget.
@@ -622,6 +646,7 @@ func newReadTool(cwd string, options ToolsOptions) agent.AgentTool {
 	// One os.Root per tool keeps every read inside the working directory.
 	reader := fileReader{cwd: cwd, options: options, getRoot: rootOnce(cwd)}
 	return agent.AgentTool{
+		ReadsWorkspace: workspaceRead,
 		Tool: types.Tool{
 			Name: string(ReadTool),
 			Description: fmt.Sprintf("Read a file. Text output starts with [path#TAG], where TAG is a 4-hex tag of the file's content: hashline sections and edit anchors carry it to reject edits to a changed file, and hashline edits only lines a read or grep displayed under it. Rows are LINE:TEXT. Reading a whole file returns all of it as numbered rows when it fits in %d lines and %dKB. A larger Go file returns a structural outline instead (one row per declaration with its path:START-END range, no bodies) so you can read just the range you need; any other larger file returns its first page with the offset to continue. mode=outline asks for the outline of a Go file of any size; mode=raw always pages numbered rows. Use path:START-END or path:START+COUNT for a line range, or offset and limit for paging. "+
@@ -1010,6 +1035,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 // pattern plus optional path or paths, glob, case, literal, context, and limit inputs.
 func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 	return agent.AgentTool{
+		ReadsWorkspace: workspaceRead,
 		Tool: types.Tool{
 			Name:        string(GrepTool),
 			Description: fmt.Sprintf("Search file contents for a pattern. Returns matching lines grouped under each file's [path#TAG] header with line numbers. path may be an internal URL (skill://, job://, history://, local://). To search several workspace files or directories in one call, pass paths (up to %d) instead of path; matches from all of them share limit.", maxGrepPaths),
@@ -1165,6 +1191,7 @@ func newGrepTool(cwd string, options ToolsOptions) agent.AgentTool {
 // plus optional path and limit inputs.
 func newFindTool(cwd string) agent.AgentTool {
 	return agent.AgentTool{
+		ReadsWorkspace: workspaceRead,
 		Tool: types.Tool{
 			Name:        string(FindTool),
 			Description: "Search for files by glob pattern. Returns matching file paths relative to the search directory.",
@@ -1283,6 +1310,7 @@ func newFindTool(cwd string) agent.AgentTool {
 // and limit inputs, including hidden entries so agents see the real workspace.
 func newLsTool(cwd string) agent.AgentTool {
 	return agent.AgentTool{
+		ReadsWorkspace: workspaceRead,
 		Tool: types.Tool{
 			Name:        string(LsTool),
 			Description: "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles.",

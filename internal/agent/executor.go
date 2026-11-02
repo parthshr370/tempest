@@ -21,11 +21,13 @@ import (
 // tool calls: the result messages (in source order) and whether the batch
 // signaled turn termination. RepeatedFailure is set when a call in the batch
 // failed the same way RepeatedFailureLimit times in a row; it is the run's
-// StopRepeatedFailure error.
+// StopRepeatedFailure error. Loop is set when the loop guard stops the run;
+// it is the run's StopLoopDetected error.
 type ExecutedToolCallBatch struct {
 	Messages        []types.ToolResultMessage
 	Terminate       bool
 	RepeatedFailure error
+	Loop            *LoopError
 	Handoff         *string
 }
 
@@ -100,6 +102,7 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
 	var repeated error
+	var loop *LoopError
 
 	for index, toolCall := range toolCalls {
 		ctx := toolCallContext(ctx, config, index)
@@ -127,6 +130,12 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 		if streak := noteRepeatedFailure(ctx, currentContext.Messages, assistantMessage, messages, toolCall, &message); streak >= RepeatedFailureLimit && repeated == nil {
 			repeated = repeatedFailureError(toolCall, streak, message)
 		}
+		if index == len(toolCalls)-1 {
+			var err error
+			if loop, err = noteLoop(ctx, config, currentContext, messages, &message, emit); err != nil {
+				return ExecutedToolCallBatch{}, err
+			}
+		}
 		if err := emitToolResultMessage(ctx, message, emit); err != nil {
 			return ExecutedToolCallBatch{}, err
 		}
@@ -134,7 +143,7 @@ func executeToolCallsSequential(ctx context.Context, currentContext AgentContext
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Handoff: toolBatchHandoff(finalizedCalls)}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Loop: loop, Handoff: toolBatchHandoff(finalizedCalls)}, nil
 }
 
 // executeToolCallsParallel runs tool calls concurrently. Results are written
@@ -223,11 +232,18 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 	finalizedCalls := make([]finalizedOutcome, 0, len(toolCalls))
 	messages := make([]types.ToolResultMessage, 0, len(toolCalls))
 	var repeated error
+	var loop *LoopError
 	for i := range toolCalls {
 		finalized := slots[i]
 		message := createToolResultMessage(finalized)
 		if streak := noteRepeatedFailure(ctx, currentContext.Messages, assistantMessage, messages, toolCalls[i], &message); streak >= RepeatedFailureLimit && repeated == nil {
 			repeated = repeatedFailureError(toolCalls[i], streak, message)
+		}
+		if i == len(toolCalls)-1 {
+			var err error
+			if loop, err = noteLoop(ctx, config, currentContext, messages, &message, safeEmit); err != nil {
+				return ExecutedToolCallBatch{}, err
+			}
 		}
 		// The result goes out under its own occurrence, so the recorder ties it
 		// to that canonical call even when provider ids repeat in the batch.
@@ -238,7 +254,7 @@ func executeToolCallsParallel(ctx context.Context, currentContext AgentContext, 
 		messages = append(messages, message)
 	}
 
-	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Handoff: toolBatchHandoff(finalizedCalls)}, nil
+	return ExecutedToolCallBatch{Messages: messages, Terminate: shouldTerminateToolBatch(finalizedCalls), RepeatedFailure: repeated, Loop: loop, Handoff: toolBatchHandoff(finalizedCalls)}, nil
 }
 
 // shouldTerminateToolBatch reports whether the batch should end the turn.

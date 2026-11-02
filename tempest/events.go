@@ -3,6 +3,7 @@ package tempest
 import (
 	"encoding/json"
 	"fmt"
+	"iter"
 	"strings"
 	"sync"
 	"time"
@@ -88,6 +89,11 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 		}
 		fallback := ev.Fallback
 		return []Update{update("tempest/model_fallback", map[string]any{"runId": m.runID, "from": fallback.From.Provider + ":" + fallback.From.ID, "to": fallback.To.Provider + ":" + fallback.To.ID, "reason": fallback.Reason, "attempts": fallback.Attempts, "fallbackIndex": fallback.Index}, at)}
+	case agent.EventLoopGuard:
+		if ev.Loop == nil {
+			return nil
+		}
+		return []Update{update("tempest/loop_guard", map[string]any{"runId": m.runID, "pattern": ev.Loop.Pattern, "tools": ev.Loop.Tools, "count": ev.Loop.Count, "action": ev.Loop.Action}, at)}
 	case agent.EventAgentStart:
 		m.started = at
 		m.turn = 0
@@ -175,6 +181,19 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 			}
 			out = append(out, update("usage_update", p, at))
 			return out
+		case types.ToolResultMessage:
+			// A guard's notice is added to the result after its
+			// tool_execution_end went out (a batch is judged once all its
+			// results are in), so the completed call's content is sent
+			// again with the notice. Results without one need nothing more.
+			if !agent.HostNoticed(msg.Content) {
+				return nil
+			}
+			status := "completed"
+			if msg.IsError {
+				status = "failed"
+			}
+			return []Update{update("tool_call_update", map[string]any{"toolCallId": msg.ToolCallID, "status": status, "content": toolContent(msg)}, at)}
 		}
 	case agent.EventUsage:
 		m.usage.Total.Add(ev.Usage)
@@ -258,6 +277,36 @@ func (m *eventMapper) mapEvent(ev agent.AgentEvent) []Update {
 	}
 	return nil
 }
+
+// replayEvents is how a transcript replays through the mapper, on load and
+// when the history is rebuilt after a rewind or compaction alike: each
+// message's end, with its tool calls' starts after an assistant message, and
+// a tool result as its call's end. The end carries the result's full
+// content, a guard's notice included, so the result's message end, whose
+// only update is that notice for a live call that already ended, is left out.
+func replayEvents(messages []Message) iter.Seq[agent.AgentEvent] {
+	return func(yield func(agent.AgentEvent) bool) {
+		for _, msg := range messages {
+			m := normalizeMessage(msg)
+			if result, ok := m.(types.ToolResultMessage); ok {
+				if !yield(agent.ToolExecutionEnd(result.ToolCallID, result.ToolName, result, result.IsError)) {
+					return
+				}
+				continue
+			}
+			if !yield(agent.MessageEnd(msg)) {
+				return
+			}
+			assistant, _ := m.(types.AssistantMessage)
+			for _, b := range assistant.Content {
+				if b.Type == types.BlockToolCall && !yield(agent.ToolExecutionStart(b.ID, b.Name, b.Arguments)) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func normalizeMessage(msg Message) Message {
 	switch v := msg.(type) {
 	case *types.UserMessage:

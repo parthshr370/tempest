@@ -126,6 +126,9 @@ type StackConfig struct {
 	ConfiguredTools []agent.AgentTool
 	PromptAdditions []string
 	BashTimeout     time.Duration
+	// LoopThresholds configures the loop guard of the session and its task
+	// children; nil means agent.DefaultLoopThresholds.
+	LoopThresholds *agent.LoopThresholds
 	// AdmitProcess holds the host slot for each actual subprocess lifetime.
 	AdmitProcess func(context.Context) (func(), error)
 	// Hooks are the session's hook settings. Resolved hooks are inherited by
@@ -245,6 +248,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 		ListingPolicy:        cfg.WorkspaceListing(),
 		Reminders:            cfg.Reminders(),
+		LoopThresholds:       new(cfg.LoopDetection()),
 		MCP: MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir()), Sampling: MCPSamplingSettings{
 			ModelSpec: cfg.MCPSamplingModel(), MaxTokens: cfg.MCPSamplingMaxTokens(), AllowHeadless: cfg.MCPSamplingAllowHeadless(),
 		}},
@@ -689,6 +693,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Child:            cfg.Child,
 		Reminders:        rootReminders(cfg),
 		Trace:            cfg.Telemetry.Tracing(),
+		LoopThresholds:   cfg.LoopThresholds,
 	})
 	agentName := ""
 	if cfg.Child {

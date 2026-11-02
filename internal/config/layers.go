@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/obs"
 )
 
@@ -646,6 +647,7 @@ var projectGates = map[string]trustGate{
 	"retry_max_delay_ms":          gateExecutable,
 	"bash_timeout":                gateExecutable,
 	"log_file_max_bytes":          gateExecutable,
+	"loop_detection":              gateExecutable,
 	// otel chooses where spans, metrics and their headers (often an API
 	// key) are sent, and whether message content goes with them.
 	"otel": gateCredentials,
@@ -695,9 +697,10 @@ var planModeNode = &settingsNode{scalar: json.RawMessage(`"plan"`)}
 // permissions, capabilities and resource caps the layers below it set, so it
 // applies without trust: plan mode, web tools off, a deny list, which an
 // untrusted repository adds to the lists below it (unionProjectDenies), the
-// session-start listing or retries off, and each cost or resource cap at
-// most at the operator's value. Every other value of these keys, null
-// included, could lift an operator's restriction.
+// session-start listing or retries off, each cost or resource cap at most at
+// the operator's value, and loop-detection thresholds no looser than the
+// operator's. Every other value of these keys, null included, could lift an
+// operator's restriction.
 func narrowsPermissions(key string, value *settingsNode, operator *fileSettings) bool {
 	if operator == nil {
 		operator = &fileSettings{}
@@ -744,8 +747,44 @@ func narrowsPermissions(key string, value *settingsNode, operator *fileSettings)
 		}
 		timeout, err := time.ParseDuration(spec)
 		return err == nil && timeout > 0 && timeout <= ceiling
+	case "loop_detection":
+		return tightensLoopDetection(value, operator.LoopDetection)
 	}
 	return false
+}
+
+// tightensLoopDetection reports whether every threshold a repository's
+// loop_detection object sets is a whole number from 2 up to the operator's
+// threshold, the built-in default when the operator set none. A detector the
+// operator turned off (0) takes any threshold of 2 or more.
+func tightensLoopDetection(value *settingsNode, operator *loopDetectionSettings) bool {
+	if value == nil || value.object == nil {
+		return false
+	}
+	if operator == nil {
+		operator = &loopDetectionSettings{}
+	}
+	defaults := agent.DefaultLoopThresholds
+	for name, member := range value.object {
+		var configured *int
+		var builtin int
+		switch name {
+		case "repeated_result":
+			configured, builtin = operator.RepeatedResult, defaults.RepeatedResult
+		case "repeated_poll":
+			configured, builtin = operator.RepeatedPoll, defaults.RepeatedPoll
+		case "repeated_text":
+			configured, builtin = operator.RepeatedText, defaults.RepeatedText
+		default:
+			return false
+		}
+		threshold, whole := wholeNumber[int](member)
+		ceiling := cmp.Or(configured, &builtin)
+		if !whole || threshold < 2 || *ceiling != 0 && threshold > *ceiling {
+			return false
+		}
+	}
+	return true
 }
 
 // offOrOperatorOn reports whether value is false, or true while the
@@ -1067,6 +1106,11 @@ func builtinDefaults(lookup func(string) string) (map[string]*settingsNode, map[
 			"max_bytes":        numberNode(strconv.Itoa(DefaultContextMaxBytes)),
 			"nested_max_bytes": numberNode(strconv.Itoa(DefaultContextNestedMaxBytes)),
 			"nested":           boolNode(true),
+		}},
+		"loop_detection": {object: map[string]*settingsNode{
+			"repeated_result": numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedResult)),
+			"repeated_poll":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedPoll)),
+			"repeated_text":   numberNode(strconv.Itoa(agent.DefaultLoopThresholds.RepeatedText)),
 		}},
 	}
 	fallback, err := stringsNode(DefaultContextFallback)

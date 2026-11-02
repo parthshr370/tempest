@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -209,5 +211,28 @@ func TestRepeatedFailureIsARunError(t *testing.T) {
 	var wire *rpc.Error
 	if !errors.As(err, &wire) || wire.Code != -32023 || f.CallCount() != agent.RepeatedFailureLimit {
 		t.Fatalf("repeated failure = %v after %d calls, want -32023 after %d", err, f.CallCount(), agent.RepeatedFailureLimit)
+	}
+}
+
+// TestLoopDetectedIsARunError: a prompt whose model keeps re-reading an
+// unchanged file after the loop notice fails with loop_detected.
+func TestLoopDetectedIsARunError(t *testing.T) {
+	f := faux.New(faux.Options{})
+	for range 6 {
+		f.AppendResponses(faux.Respond(faux.ToolCall("read", json.RawMessage(`{"path":"notes.txt"}`), "read-call")))
+	}
+	s := newServer(t, f, nil, permission.ModeBypass, nil)
+	c := connect(t, s)
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "notes.txt"), []byte("unchanged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := newSession(t, c, cwd)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := c.conn.Call(ctx, "session/prompt", map[string]any{"sessionId": id, "prompt": []any{map[string]string{"type": "text", "text": "go"}}}, nil)
+	var wire *rpc.Error
+	if !errors.As(err, &wire) || wire.Code != -32026 || !strings.Contains(wire.Message, "repeated_result") || f.CallCount() != 6 {
+		t.Fatalf("loop = %v after %d calls, want -32026 naming repeated_result after 6", err, f.CallCount())
 	}
 }
