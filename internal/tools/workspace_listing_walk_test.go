@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -164,30 +166,41 @@ func TestWorkspaceListingRgListsNonGitWorkspace(t *testing.T) {
 // Once its deadline passes the walking goroutine stops within a small bound,
 // even while ignore matching is what takes the time: the walk checks its
 // context at every entry and matching checks it as it goes.
+//
+// The deadline is fired from inside the walk, so machine speed can't let the
+// walk finish first: its gateRead-th context read, made while matching
+// .gitignore against the first entry, blocks until the deadline has passed
+// and then reports the context still live, as if the deadline came just
+// after that read. The walk must notice at a later read of its own.
 func TestWorkspaceListingWalkStopsPromptlyAfterDeadline(t *testing.T) {
-	const files, patterns = 2000, 50000
+	// Reads 1 and 2 are the entry checks for "." and ".gitignore"; matching
+	// .gitignore against patterns reads the context at least once every
+	// cancelPollInterval patterns, so read gateRead falls inside that match.
+	const gateRead, patterns = 10, 16 * cancelPollInterval
 	tree := map[string]string{}
 	var rules strings.Builder
 	for index := range patterns {
 		fmt.Fprintf(&rules, "*q%05d*z\n", index)
 	}
 	tree[".gitignore"] = rules.String()
-	for index := range files {
-		tree[fmt.Sprintf("d%02d/f%04d.go", index%50, index)] = ""
+	for index := range 10 {
+		tree[fmt.Sprintf("d/f%d.go", index)] = ""
 	}
 	dir := t.TempDir()
 	writeListingFiles(t, dir, tree)
 
-	const deadline, bound = 100 * time.Millisecond, 250 * time.Millisecond
-	ctx, cancel := context.WithTimeout(t.Context(), deadline)
-	defer cancel()
-	walk := startWorkspaceWalk(ctx, dir, files*2)
-	<-ctx.Done()
+	ctx := &gatedDeadlineContext{Context: t.Context(), gateRead: gateRead, gated: make(chan struct{}), expired: make(chan struct{})}
+	expire := sync.OnceFunc(func() { close(ctx.expired) })
+	walk := startWorkspaceWalk(ctx, dir, 100)
+	t.Cleanup(func() { expire(); <-walk.done })
 	select {
+	case <-ctx.gated:
 	case <-walk.done:
-		t.Fatal("the walk finished before its deadline; the workload no longer tests cancellation")
-	default:
+		t.Fatalf("the walk ended (%v) before context read %d; the workload no longer tests cancellation", walk.err, gateRead)
 	}
+
+	const bound = 250 * time.Millisecond
+	expire()
 	select {
 	case <-walk.done:
 	case <-time.After(bound):
@@ -195,6 +208,38 @@ func TestWorkspaceListingWalkStopsPromptlyAfterDeadline(t *testing.T) {
 	}
 	if !errors.Is(walk.err, context.DeadlineExceeded) {
 		t.Fatalf("walk ended with %v", walk.err)
+	}
+	// The deadline stopped the match it fired in: not even .gitignore, the
+	// entry being matched, was listed.
+	if listed := walk.snapshot().paths; len(listed) != 0 {
+		t.Fatalf("the walk listed %q after its deadline", listed)
+	}
+}
+
+// gatedDeadlineContext is a context whose deadline the test fires. Its
+// gateRead-th Err call closes gated, waits for expired and reports nil;
+// every other call reports context.DeadlineExceeded once expired is closed.
+type gatedDeadlineContext struct {
+	context.Context
+	reads    atomic.Int64
+	gateRead int64
+	gated    chan struct{}
+	expired  chan struct{}
+}
+
+func (ctx *gatedDeadlineContext) Done() <-chan struct{} { return ctx.expired }
+
+func (ctx *gatedDeadlineContext) Err() error {
+	if ctx.reads.Add(1) == ctx.gateRead {
+		close(ctx.gated)
+		<-ctx.expired
+		return nil
+	}
+	select {
+	case <-ctx.expired:
+		return context.DeadlineExceeded
+	default:
+		return nil
 	}
 }
 
