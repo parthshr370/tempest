@@ -74,6 +74,9 @@ type Client struct {
 	// remoteParent is the trace context the connection arrived with, the
 	// parent of runs whose prompt names none.
 	remoteParent tracecontext.SpanContext
+	// github is the GitHub ticket runner served on this connection, nil
+	// when serve runs without -github.
+	github GitHub
 }
 
 // NewClient binds a connection to the process-wide registry and permission broker.
