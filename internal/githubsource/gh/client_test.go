@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -284,6 +286,45 @@ func TestDoWithoutReplyIsStatusZero(t *testing.T) {
 	client = New(Options{Path: garbage, ConfigDir: t.TempDir()})
 	if _, err = client.Do(context.Background(), model.GHRequest{Path: "user"}); ghError(t, err).Status != 0 {
 		t.Fatalf("non-JSON body err = %v", err)
+	}
+}
+
+// TestBoundedCallKillsDescendants starts a gh whose child outlives it with
+// its own stdio, then trips the timeout and the output cap. Both must kill
+// the child as well: killing gh alone leaves it running.
+func TestBoundedCallKillsDescendants(t *testing.T) {
+	for _, mode := range []string{"timeout", "overflow"} {
+		t.Run(mode, func(t *testing.T) {
+			pidfile := filepath.Join(t.TempDir(), "child.pid")
+			body := "sleep 60 </dev/null >/dev/null 2>&1 &\necho $! > \"$PIDFILE\"\n"
+			if mode == "timeout" {
+				body += "wait\n"
+			} else {
+				body += "while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; done\n"
+			}
+			client := New(Options{Path: script(t, body), ConfigDir: t.TempDir(), Env: []string{"PIDFILE=" + pidfile}, CallTimeout: 2 * time.Second, MaxOutput: 512})
+			_, err := client.Do(context.Background(), model.GHRequest{Path: "user"})
+			if got := ghError(t, err); got.Status != 0 {
+				t.Fatalf("bounded call err = %+v", got)
+			}
+			raw, err := os.ReadFile(pidfile)
+			if err != nil {
+				t.Fatalf("child pid: %v", err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+			// A killed child stays a zombie until its new parent reaps it.
+			deadline := time.Now().Add(5 * time.Second)
+			for syscall.Kill(pid, 0) == nil {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s left gh's child %d running", mode, pid)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }
 

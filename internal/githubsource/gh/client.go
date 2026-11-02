@@ -13,6 +13,10 @@
 //     parseable): a *model.GHError with Status 0. For a write this means the
 //     request may or may not have reached GitHub.
 //   - the caller's context ended: the context's error, wrapped.
+//
+// gh runs in its own process group. The timeout, the output cap, the
+// caller's cancellation and the end of every call kill the whole group, so
+// nothing gh started outlives the call.
 package gh
 
 import (
@@ -28,10 +32,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"go.harness.dev/harness/internal/githubsource/model"
+	"go.harness.dev/harness/internal/procgroup"
 )
 
 // Defaults and caps of one call.
@@ -149,11 +155,19 @@ func (c *Client) Do(ctx context.Context, request model.GHRequest) (model.GHRespo
 	command.Env = c.env
 	command.Stdout = stdout
 	command.Stderr = stderr
+	// gh runs in its own process group so the timeout, the output cap and
+	// the end of the call reach every process it started, not gh alone.
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return procgroup.Signal(command.Process.Pid, syscall.SIGKILL) }
 	command.WaitDelay = waitDelay
 	if len(request.Body) > 0 {
 		command.Stdin = bytes.NewReader(request.Body)
 	}
 	runErr := command.Run()
+	if command.Process != nil {
+		// Nothing gh started may outlive the call.
+		_ = procgroup.Signal(command.Process.Pid, syscall.SIGKILL)
+	}
 	endpoint := args[len(args)-1]
 	switch {
 	case ctx.Err() != nil:
