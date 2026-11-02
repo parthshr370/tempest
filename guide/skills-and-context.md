@@ -210,7 +210,7 @@ Each reminder is sent as a user-role message
 | `first` | First request that may fire (default `every`). With `every: 4, first: 1` it fires on requests 1, 5, 9. |
 | `max_fires` | Most firings per run (default 1). Every reminder is bounded; a cadence needs its own `max_fires`. |
 | `when.final_turn` | Fires only on the last request a turn budget (`-max-turns`, SDK `Budget.MaxTurns`) allows; never without one. |
-| `when.context_percent` | Fires only when the context the last response reported is at least this percent of the model's window (`(0, 100]`). |
+| `when.context_percent` | Fires only when the context the conversation's latest response reported is at least this percent of the model's window (`(0, 100]`). That response may belong to an earlier run: a new prompt resends the whole conversation. A response that reported no usage is skipped. |
 | `when.tool_calls` | Fires only after at least this many tool calls since the reminder last fired in this run. |
 | `when.without_tool` | With `tool_calls`: a call to this tool also restarts the count. |
 
@@ -218,13 +218,15 @@ Every condition that is set must hold, and the cadence must match.
 
 - **Request scope** (default). The reminder goes after the transcript in the
   request it fires on and in no other. It is not in the transcript, the
-  journal, compaction or a resumed session. Anthropic's cache breakpoint is
-  placed before it, so the next request still reads the cache.
+  journal, compaction or a resumed session. The cache breakpoint (Anthropic,
+  and Claude through OpenRouter) is placed before it, so the next request
+  still reads the cache.
 - **Conversation scope.** The reminder is appended to the transcript as a
   message: it is journaled, sent with every later request, and replayed on
-  resume. Compaction does not summarize it: the newest copy of each
-  conversation reminder in the summarized part is kept after the summary, word
-  for word. A rewind restores the copies the checkpoint had.
+  resume. Compaction does not summarize it and keeps only the newest copy of
+  each conversation reminder: a copy in the kept part stays where it is, and a
+  copy only the summarized part holds follows the summary, word for word. A
+  rewind restores the copies the checkpoint had.
 - **Bounds and resume.** A firing is recorded on the journal line that commits
   it (the reminder's own message, or the answer to the request it rode on), by
   name only. A resumed run counts those firings, so `max_fires` holds across a

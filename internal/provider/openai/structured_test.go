@@ -102,7 +102,7 @@ func TestToolResultImagesFollowAsUserMessage(t *testing.T) {
 		types.ToolResultMessage{ToolCallID: "tc1", ToolName: "view_image", Content: []types.ContentBlock{types.NewText("Image a.png"), types.NewImage("aGk=", "image/png")}},
 		types.ToolResultMessage{ToolCallID: "tc2", ToolName: "read", Content: []types.ContentBlock{types.NewText("text")}},
 	}}
-	messages := convertMessages(model, ctx)
+	messages, _ := convertMessages(model, ctx)
 	roles := []string{}
 	for _, message := range messages {
 		roles = append(roles, message["role"].(string))
@@ -120,7 +120,7 @@ func TestToolResultImagesFollowAsUserMessage(t *testing.T) {
 
 	// A text-only model gets the transform's placeholder, never an image part.
 	model.Input = []string{"text"}
-	messages = convertMessages(model, ctx)
+	messages, _ = convertMessages(model, ctx)
 	if last := messages[len(messages)-1]; last["role"] != "tool" {
 		t.Fatalf("text-only model got an image message: %#v", last)
 	}

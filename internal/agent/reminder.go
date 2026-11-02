@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
 )
 
@@ -57,10 +58,12 @@ type ReminderCondition struct {
 	// FinalTurn holds on the last request a max-turns budget allows; never
 	// without one (final_turn).
 	FinalTurn bool `json:"final_turn,omitempty"`
-	// ContextPercent holds when the context the last response reported is
-	// at least this percent of the model's context window, in (0, 100]
-	// (context_percent). It never holds before the run's first response or
-	// for a model with no known window.
+	// ContextPercent holds when the context the conversation's latest
+	// response with usage reported is at least this percent of the model's
+	// context window, in (0, 100] (context_percent). The reading spans runs:
+	// a new prompt resends the whole conversation, so the previous run's
+	// last response bounds its first request from below. It never holds
+	// before any response reported usage or for a model with no known window.
 	ContextPercent float64 `json:"context_percent,omitempty"`
 	// ToolCalls holds once the run has made at least this many tool calls
 	// since the reminder last fired, and since WithoutTool was last called
@@ -219,7 +222,7 @@ func (s *reminderRun) holds(r Reminder, c requestContext) bool {
 		return false
 	}
 	if when.ContextPercent > 0 {
-		tokens := lastContextTokens(c.messages)
+		tokens := estimate.EstimateMessages(c.messages).UsageTokens
 		if c.model.ContextWindow <= 0 || tokens <= 0 || float64(tokens)*100 < when.ContextPercent*float64(c.model.ContextWindow) {
 			return false
 		}
@@ -234,23 +237,6 @@ func (s *reminderRun) holds(r Reminder, c requestContext) bool {
 		}
 	}
 	return true
-}
-
-// lastContextTokens is the context the last settled response reported: its
-// total tokens, or the sum of its parts when the provider gave no total.
-func lastContextTokens(messages []types.Message) int {
-	for i := len(messages) - 1; i >= 0; i-- {
-		assistant, ok := messages[i].(types.AssistantMessage)
-		if !ok || assistant.StopReason == types.StopError || assistant.StopReason == types.StopAborted {
-			continue
-		}
-		usage := assistant.Usage
-		if usage.TotalTokens != 0 {
-			return usage.TotalTokens
-		}
-		return usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
-	}
-	return 0
 }
 
 // pendingCopy reports whether messages hold a copy of the named reminder

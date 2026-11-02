@@ -748,6 +748,18 @@ func jsonStringValue(value any) string {
 	return string(data)
 }
 
+func asUser(message ptypes.Message) (ptypes.UserMessage, bool) {
+	switch value := message.(type) {
+	case ptypes.UserMessage:
+		return value, true
+	case *ptypes.UserMessage:
+		if value != nil {
+			return *value, true
+		}
+	}
+	return ptypes.UserMessage{}, false
+}
+
 func asAssistant(message ptypes.Message) (ptypes.AssistantMessage, bool) {
 	switch value := message.(type) {
 	case ptypes.AssistantMessage:
@@ -1322,22 +1334,19 @@ func Compact(ctx context.Context, streamFn agent.StreamFn, model ptypes.Model, p
 // keeps its own message so later compactions still know it. Consecutive user
 // messages are valid; Anthropic merges them into one turn.
 //
-// Conversation reminders in the summarized part are not summarized: the
-// newest copy of each one the kept part does not hold follows the summary
-// verbatim, so a reminder stays in front of the model for the rest of the
-// conversation and its copies collapse to one.
+// Conversation reminders are not summarized, and only the newest copy of
+// each survives: a copy in the kept part stays where it is and older kept
+// copies are dropped; the newest copy of each one only the summarized part
+// holds follows the summary verbatim. A reminder so stays in front of the
+// model for the rest of the conversation and its copies collapse to one.
 func ApplyCompaction(pathEntries []SessionEntry, prep *CompactionPreparation, summary string) []ptypes.Message {
 	if prep == nil {
 		return buildSessionContext(pathEntries)
 	}
-	kept := keptMessages(pathEntries, prep.FirstKeptEntryID)
-	carried := carriedReminders(slices.Concat(prep.MessagesToSummarize, prep.TurnPrefixMessages), kept)
+	carried, kept := newestReminders(slices.Concat(prep.MessagesToSummarize, prep.TurnPrefixMessages), keptMessages(pathEntries, prep.FirstKeptEntryID))
 	summaryText := compactionSummaryPrefix + summary + compactionSummarySuffix
 	if len(kept) > 0 {
-		if user, ok := kept[0].(*ptypes.UserMessage); ok && user != nil {
-			kept[0] = *user
-		}
-		if user, ok := kept[0].(ptypes.UserMessage); ok && user.Reminder == "" {
+		if user, ok := asUser(kept[0]); ok && user.Reminder == "" {
 			return slices.Concat([]ptypes.Message{mergeSummaryIntoUser(summaryText, user)}, carried, kept[1:])
 		}
 	}
@@ -1345,26 +1354,32 @@ func ApplyCompaction(pathEntries []SessionEntry, prep *CompactionPreparation, su
 	return slices.Concat(result, carried, kept)
 }
 
-// carriedReminders returns the newest copy of each conversation reminder in
-// summarized that kept does not hold, in the order of those copies.
-func carriedReminders(summarized, kept []ptypes.Message) []ptypes.Message {
-	held := map[string]bool{}
-	for _, message := range kept {
-		if user, ok := message.(ptypes.UserMessage); ok && user.Reminder != "" {
-			held[user.Reminder] = true
+// newestReminders keeps the newest copy of each conversation reminder across
+// summarized and kept. It returns the copies only summarized holds, in their
+// order, and kept without its older copies; every other message is unchanged.
+func newestReminders(summarized, kept []ptypes.Message) (carried, newest []ptypes.Message) {
+	seen := map[string]bool{}
+	newest = make([]ptypes.Message, 0, len(kept))
+	for i := len(kept) - 1; i >= 0; i-- {
+		if user, ok := asUser(kept[i]); ok && user.Reminder != "" {
+			if seen[user.Reminder] {
+				continue
+			}
+			seen[user.Reminder] = true
 		}
+		newest = append(newest, kept[i])
 	}
-	var carried []ptypes.Message
+	slices.Reverse(newest)
 	for i := len(summarized) - 1; i >= 0; i-- {
-		user, ok := summarized[i].(ptypes.UserMessage)
-		if !ok || user.Reminder == "" || held[user.Reminder] {
+		user, ok := asUser(summarized[i])
+		if !ok || user.Reminder == "" || seen[user.Reminder] {
 			continue
 		}
-		held[user.Reminder] = true
+		seen[user.Reminder] = true
 		carried = append(carried, user)
 	}
 	slices.Reverse(carried)
-	return carried
+	return carried, newest
 }
 
 // keptMessages returns the messages from firstKeptEntryID to the end of the path.

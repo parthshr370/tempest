@@ -229,6 +229,39 @@ func TestReminderContextPercentThreshold(t *testing.T) {
 	}
 }
 
+// The context condition reads the conversation's latest known usage, not the
+// run's: a new prompt resends the whole conversation, so the previous run's
+// last response is a lower bound on the first request's context. A response
+// that reported no usage is skipped, not read as an empty context.
+func TestReminderContextPercentReadsLatestKnownUsage(t *testing.T) {
+	withTokens := func(message types.AssistantMessage, total int) types.AssistantMessage {
+		message.Usage = types.Usage{Input: total - 10, Output: 10, TotalTokens: total}
+		return message
+	}
+	answer := types.AssistantMessage{Content: []types.ContentBlock{types.NewText("done")}, StopReason: types.StopStop}
+	ctx := Reminder{Name: "ctx", Text: "context is filling up", MaxFires: 5, When: ReminderCondition{ContextPercent: 80}}
+
+	script := &scriptedRequests{script: []types.AssistantMessage{withTokens(answer, 950)}}
+	a := newReminderAgent(reminderModel, script, Budget{}, ctx)
+	for _, prompt := range []string{"first run", "second run"} {
+		if _, err := a.PromptText(context.Background(), prompt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := firedOn(script.tails(), "ctx"); !slices.Equal(got, []int{2}) {
+		t.Fatalf("fired on %v, want the second run's first request [2]", got)
+	}
+
+	script = &scriptedRequests{script: []types.AssistantMessage{withTokens(toolCallMessage("work"), 950), toolCallMessage("work"), answer}}
+	a = newReminderAgent(reminderModel, script, Budget{}, ctx)
+	if _, err := a.PromptText(context.Background(), "go"); err != nil {
+		t.Fatal(err)
+	}
+	if got := firedOn(script.tails(), "ctx"); !slices.Equal(got, []int{2, 3}) {
+		t.Fatalf("fired on %v, want [2 3]: response 2 reported no usage", got)
+	}
+}
+
 // The tool-call condition counts calls since the reminder last fired, and a
 // call to WithoutTool restarts the count.
 func TestReminderToolCallsWithoutTool(t *testing.T) {
