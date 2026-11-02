@@ -45,6 +45,22 @@ settings that supply a missing `ModelID`, and an empty slice turns backups off. 
 host that supplies its own `Stack.StreamFn` passes the chain's backups in
 `Stack.FallbackModels` so a resumed run can keep a recorded switch.
 
+`Options.Reminders` (`[]tempest.Reminder`) sets the session's
+[reminders](skills-and-context.md#reminders), for new and resumed sessions: nil
+keeps `Stack.Reminders`, or the settings' `reminders` when `Stack` is nil, and
+an empty slice turns them off. `Open` rejects an invalid list.
+
+```go
+session, err := tempest.Open(ctx, tempest.Options{
+    Cwd: cwd,
+    New: &tempest.NewSession{Model: "anthropic:claude-opus-4-8", Budget: tempest.Budget{MaxTurns: 30}},
+    Reminders: []tempest.Reminder{
+        {Name: "final", Text: "Last turn: give your final answer now.", When: tempest.ReminderCondition{FinalTurn: true}},
+        {Name: "tests", Text: "Run the tests before you finish.", Scope: tempest.ReminderConversation, Every: 10, MaxFires: 2},
+    },
+})
+```
+
 [The complete example](../examples/embed/main.go) uses the faux provider by
 default, so it needs no API key. Pass `-model` to use a real provider:
 

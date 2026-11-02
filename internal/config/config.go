@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/adapter"
+	"go.harness.dev/harness/internal/agent"
 	"go.harness.dev/harness/internal/cloudcmd"
 	"go.harness.dev/harness/internal/dap"
 	"go.harness.dev/harness/internal/hooks"
@@ -234,6 +235,7 @@ type ResolvedConfig struct {
 	permissionDenyTools    []string
 	retry                  RetrySettings
 	contextFiles           ContextFileSettings
+	reminders              []agent.Reminder
 	mcpServers             []mcpconfig.Server
 	mcpSamplingModel       string
 	mcpSamplingMaxTokens   int
@@ -368,6 +370,11 @@ func (c *ResolvedConfig) Settings() []Setting {
 // log them once.
 func (c *ResolvedConfig) Warnings() []string { return slices.Clone(c.warnings) }
 
+// Reminders returns the reminders added at the tail of model requests.
+func (c *ResolvedConfig) Reminders() []agent.Reminder {
+	return slices.Clone(c.reminders)
+}
+
 // ContextFiles returns the context file names and byte budgets.
 func (c *ResolvedConfig) ContextFiles() ContextFileSettings {
 	settings := c.contextFiles
@@ -492,6 +499,7 @@ type fileSettings struct {
 	ListingMaxBytes         *int                              `json:"workspace_listing_max_bytes"`
 	OTel                    *otelFileSettings                 `json:"otel"`
 	ContextFiles            *contextFilesSettings             `json:"context_files"`
+	Reminders               []agent.Reminder                  `json:"reminders"`
 }
 
 // contextFilesSettings is the context_files object; built-in defaults fill
@@ -653,6 +661,9 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := agent.ValidateReminders(settings.Reminders); err != nil {
+		return nil, &Error{Field: "reminders", Err: err}
+	}
 	debugAdapters, err := dap.Resolve(settings.DebugAdapters)
 	if err != nil {
 		return nil, &Error{Field: "debug_adapters", Err: err}
@@ -712,6 +723,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		workspace:              &workspaceSettings{resolver: resolver, root: root},
 		workspaceListing:       WorkspaceListing{Disabled: !settingValue(settings.WorkspaceListing), MaxFiles: listingMaxFiles, MaxBytes: listingMaxBytes},
 		contextFiles:           contextFiles,
+		reminders:              slices.Clone(settings.Reminders),
 		retry: RetrySettings{
 			Enabled:      settingValue(settings.RetryEnabled),
 			MaxAttempts:  retryMaxAttempts,

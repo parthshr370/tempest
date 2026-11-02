@@ -177,6 +177,71 @@ turns on `ls` and `find`.
   caps, never raise them above yours without trust; see
   [Configuration](configuration.md#project-settings-and-trust).
 
+## Reminders
+
+A reminder is a short instruction that tempest adds at the end of a model
+request when its cadence matches and its conditions hold. Long runs drift away
+from instructions given at the start; a reminder brings one back without
+touching the system prompt or the tool list, so the provider's prompt cache
+keeps everything before it.
+
+```json
+{
+  "reminders": [
+    {"name": "todo", "text": "Update your todo list before you go on.",
+     "when": {"tool_calls": 8, "without_tool": "todo_write"}, "max_fires": 3},
+    {"name": "final", "text": "This is your last turn: give your final answer now.",
+     "when": {"final_turn": true}},
+    {"name": "tests", "text": "Run the tests before you finish.",
+     "scope": "conversation", "every": 10, "max_fires": 2}
+  ]
+}
+```
+
+Each reminder is sent as a user-role message
+`<system-reminder>\n<text>\n</system-reminder>`.
+
+| Field | Meaning |
+|---|---|
+| `name` | Required and unique. Names the reminder in the journal and the transcript. |
+| `text` | Required. |
+| `scope` | `"request"` (default) or `"conversation"`; see below. |
+| `every` | Cadence in model requests (default 1). Requests are counted from 1 per run, the count the `-max-turns` budget uses, so a resumed run keeps its count. |
+| `first` | First request that may fire (default `every`). With `every: 4, first: 1` it fires on requests 1, 5, 9. |
+| `max_fires` | Most firings per run (default 1). Every reminder is bounded; a cadence needs its own `max_fires`. |
+| `when.final_turn` | Fires only on the last request a turn budget (`-max-turns`, SDK `Budget.MaxTurns`) allows; never without one. |
+| `when.context_percent` | Fires only when the context the last response reported is at least this percent of the model's window (`(0, 100]`). |
+| `when.tool_calls` | Fires only after at least this many tool calls since the reminder last fired in this run. |
+| `when.without_tool` | With `tool_calls`: a call to this tool also restarts the count. |
+
+Every condition that is set must hold, and the cadence must match.
+
+- **Request scope** (default). The reminder goes after the transcript in the
+  request it fires on and in no other. It is not in the transcript, the
+  journal, compaction or a resumed session. Anthropic's cache breakpoint is
+  placed before it, so the next request still reads the cache.
+- **Conversation scope.** The reminder is appended to the transcript as a
+  message: it is journaled, sent with every later request, and replayed on
+  resume. Compaction does not summarize it: the newest copy of each
+  conversation reminder in the summarized part is kept after the summary, word
+  for word. A rewind restores the copies the checkpoint had.
+- **Bounds and resume.** A firing is recorded on the journal line that commits
+  it (the reminder's own message, or the answer to the request it rode on), by
+  name only. A resumed run counts those firings, so `max_fires` holds across a
+  crash; a request whose answer was never journaled fires its reminder again.
+  A run never appends a second copy of a conversation reminder that is still
+  waiting for its answer. A compaction or rewind does not give firings back.
+  Each new prompt starts a new run with new counts. The tool-call count starts
+  over when a crashed run resumes.
+- **Who may set them.** Operator settings, profiles, `-c reminders=[...]` and
+  the Go SDK (`Options.Reminders`). A repository's own settings may not add
+  reminders without trust: the system prompt tells the model to treat tagged
+  system text as authoritative, and a repository's instructions belong in
+  `AGENTS.md`, framed as repository data. See
+  [Configuration](configuration.md#project-settings-and-trust).
+- **Subagents** get no reminders; the text is written for the root
+  conversation.
+
 ## Skill format
 
 A skill is a markdown file with YAML frontmatter between `---` lines at the very

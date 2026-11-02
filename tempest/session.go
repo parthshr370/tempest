@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -299,6 +300,12 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		// Caller-supplied hooks are the session's hooks as given.
 		cfg.Hooks, cfg.WorkspaceHooks = o.Hooks.Clone(), nil
 		cfg.HooksResolved = false
+	}
+	if o.Reminders != nil {
+		cfg.Reminders = slices.Clone(o.Reminders)
+	}
+	if err = agent.ValidateReminders(cfg.Reminders); err != nil {
+		return nil, err
 	}
 	if !localEnvironment {
 		if !cfg.Hooks.NoHooks && len(cfg.Hooks.Hooks) != 0 {

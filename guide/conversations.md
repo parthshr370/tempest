@@ -110,6 +110,10 @@ settings select the reserve, recent tail and optional soft threshold. The hard
 input threshold is the context window minus the reserve. A zero soft threshold
 is derived from that budget.
 
+A summary never covers a conversation-scope [reminder](skills-and-context.md#reminders):
+the newest copy of each reminder in the summarized part follows the summary word
+for word.
+
 Manual and automatic requests coalesce with the active cut. `Wait: false` admits
 and starts work without waiting. Completion and placement are distinct. An idle
 waiting caller can place the completed summary; a busy run places it at a later

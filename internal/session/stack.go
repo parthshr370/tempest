@@ -101,6 +101,10 @@ type StackConfig struct {
 	// ListingPolicy decides whether a new session takes a workspace listing
 	// and its caps. Resume and fork reuse the journaled listing instead.
 	ListingPolicy config.WorkspaceListing
+	// Reminders are added at the tail of the root agent's model requests
+	// (see agent.Reminder). A child stack (Child) gets none: the text is
+	// written for the root conversation.
+	Reminders []agent.Reminder
 
 	// InitialMessages seeds the agent transcript when resuming a session. Nil
 	// starts a fresh conversation.
@@ -240,6 +244,7 @@ func StackConfigFromConfig(cfg *config.ResolvedConfig) StackConfig {
 		DebugAdapters:        cfg.DebugAdapters(),
 		PermissionPolicy:     permission.Policy{CloudRules: cfg.CloudRules()},
 		ListingPolicy:        cfg.WorkspaceListing(),
+		Reminders:            cfg.Reminders(),
 		MCP: MCPClientSettings{CredentialDir: mcpoauth.DefaultDir(cfg.AgentDir()), Sampling: MCPSamplingSettings{
 			ModelSpec: cfg.MCPSamplingModel(), MaxTokens: cfg.MCPSamplingMaxTokens(), AllowHeadless: cfg.MCPSamplingAllowHeadless(),
 		}},
@@ -682,6 +687,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Hooks:            hookRunner,
 		Extensions:       extensionRuntime,
 		Child:            cfg.Child,
+		Reminders:        rootReminders(cfg),
 		Trace:            cfg.Telemetry.Tracing(),
 	})
 	agentName := ""
@@ -722,6 +728,14 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		}
 	}
 	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugger: debugger, ownedEnvironment: ownedEnvironment, detachTelemetry: detachTelemetry}, nil
+}
+
+// rootReminders are cfg's reminders for a root stack, none for a child.
+func rootReminders(cfg StackConfig) []agent.Reminder {
+	if cfg.Child {
+		return nil
+	}
+	return cfg.Reminders
 }
 
 // thinkingLevel maps a configured reasoning effort to the agent's level;

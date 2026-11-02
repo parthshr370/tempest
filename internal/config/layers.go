@@ -589,9 +589,10 @@ type trustGate int
 const (
 	gateNone trustGate = iota
 	// gateExecutable settings run code, read local files into the model
-	// context, write outside the repository, widen permissions, open a
-	// network channel the model can send repository contents through, or
-	// raise a resource cap above the operator's value.
+	// context, speak to the model in the harness's voice, write outside the
+	// repository, widen permissions, open a network channel the model can
+	// send repository contents through, or raise a resource cap above the
+	// operator's value.
 	gateExecutable
 	// gateCredentials settings choose where credentials are sent.
 	gateCredentials
@@ -632,6 +633,10 @@ var projectGates = map[string]trustGate{
 	"environment":                 gateOperator,
 	"environments":                gateOperator,
 	"workspace_listing":           gateExecutable,
+	// A reminder is sent as harness-authored system content, which the
+	// system prompt tells the model is authoritative. A repository's own
+	// instructions go in AGENTS.md, framed as repository data.
+	"reminders":                   gateExecutable,
 	"workspace_listing_max_files": gateExecutable,
 	"workspace_listing_max_bytes": gateExecutable,
 	"max_tokens":                  gateExecutable,
