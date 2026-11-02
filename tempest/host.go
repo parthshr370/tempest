@@ -62,6 +62,10 @@ type AgentOptions struct {
 	Cwd         string
 	New         *NewSession
 	Environment environment.Reference
+	// Extensions selects this session's bundles from HostOptions.Registry in
+	// place of HostOptions.Extensions; nil keeps the host selection. The
+	// selection is journaled, so reopening the session restores it.
+	Extensions []extension.Selection
 }
 
 // ListOptions selects a bounded page of published sessions.
@@ -346,6 +350,9 @@ func (host *Host) Create(ctx context.Context, agent AgentOptions) (created *Sess
 		options.Environment = agent.Environment
 	}
 	options.New = agent.New
+	if agent.Extensions != nil {
+		options.Extensions = append([]extension.Selection(nil), agent.Extensions...)
+	}
 	options.Resume = nil
 	options.hostCreate = true
 	if options.New == nil {
