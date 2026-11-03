@@ -410,8 +410,8 @@ func (s *Server) serveConn(c *rpc.Conn, parent tracecontext.SpanContext) error {
 	return client.Serve()
 }
 
-// Handler exposes the authenticated /acp upgrade, /a2a and /metrics, and the
-// unauthenticated /healthz.
+// Handler exposes /acp, /a2a and /metrics behind authorize, and the public
+// /healthz and agent card.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -427,7 +427,7 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]int{"sessions": sessions, "running": running})
 	})
-	mux.Handle("/acp", s.authorize(true, false, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/acp", s.authorize(true, true, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		parent, _ := tracecontext.Extract(r.Header)
 		ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 		if err != nil {

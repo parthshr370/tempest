@@ -343,10 +343,23 @@ Once bound, it prints one stderr line such as
 `-listen 127.0.0.1:0` the line shows the port the OS picked.
 
 Connect to `ws://127.0.0.1:7777/acp` with `Authorization: Bearer change-me` or
-`?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required off
-loopback; when one is configured, loopback connections need it too.
-`GET /healthz` is unauthenticated and reports session and running counts.
-`GET /metrics` serves Prometheus text behind the same token; see
+`?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. `/acp`, `/a2a` and
+`/metrics` follow one rule:
+
+- **With a token**, every request needs it, loopback included.
+- **Without a token**, `-listen` binds only to numeric loopback or `localhost`, and
+  the connection is not authenticated: any local process that can reach the port
+  has the full ACP surface, including `session/new` in any directory with client
+  stdio MCP commands. The request's `Host` header must be `localhost`, a literal
+  loopback address or the A2A base URL's host, so a DNS-rebinding web page, which
+  sends its own hostname, is refused with 403. Set a token whenever other users
+  share the machine.
+- **A browser `Origin` header**, when present, must equal the server's own origin
+  (the A2A base URL, or the bound `http://127.0.0.1:<port>`); any other origin gets
+  403. CLI and native clients send no `Origin` and are unaffected.
+
+`GET /healthz` and the agent card are public; `/healthz` reports session and
+running counts. `GET /metrics` serves Prometheus text; see
 [Telemetry](telemetry.md). WebSocket mode does not also serve stdio.
 
 ### A2A 1.0

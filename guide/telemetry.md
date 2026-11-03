@@ -219,9 +219,11 @@ end in `_total`. Label names get the same character mapping.
 ### `/metrics`
 
 `tempest serve -listen` mounts `GET /metrics` (and `HEAD`), which returns the
-Prometheus text format 0.0.4. It is behind the same bearer token as `/acp` and
-`/a2a`: when a token is configured, a scrape without
-`Authorization: Bearer <token>` gets `401`. The listen line names the route:
+Prometheus text format 0.0.4. It follows the same
+[access rule](serve-and-protocols.md#serve) as `/acp` and `/a2a`: when a token is
+configured, a scrape without `Authorization: Bearer <token>` gets `401`; without a
+token, its `Host` must be `localhost`, a loopback address or the A2A base URL's
+host. The listen line names the route:
 `tempest serve listening on http://127.0.0.1:7777 (ACP /acp, A2A /a2a, metrics /metrics)`.
 
 A Prometheus scrape job for a token-protected server:
