@@ -105,10 +105,22 @@ func TestDispatchRestartAtEveryStep(t *testing.T) {
 			w := newWorld(t, nil)
 			event := w.mentionEvent(9, "repair the gears")
 			ticket := ticketOf(event)
+			// Submit returns with the launch run started, and nothing
+			// orders its provider reply after the crash point: a reply
+			// that lands first completes the run, and its receipt then
+			// rightly settles the launch completed. The first reply is
+			// held until the process is dead. The run may also die
+			// before it asks, leaving the reply to the recovery, so the
+			// gate opens once the restarted process is up.
+			gate := make(chan struct{})
+			if point == "submit" || point == "running" {
+				w.worker.script(ticket, gated(gate))
+			}
 			w.crashAt.Store(point)
 			w.ingest(event)
 			w.eventually("the crash at "+point, w.crashed.Load)
 			w.restart()
+			close(gate)
 
 			launch := w.settled(model.NewDispatchID(ticket, 1))
 			sessions := w.sessionsIn(w.worktree(ticket))
