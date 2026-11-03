@@ -9,7 +9,7 @@ import (
 func TestKernelPermitCoversLifetimeAndStartFailure(t *testing.T) {
 	var active atomic.Int32
 	admit := func(context.Context) (func(), error) { active.Add(1); return func() { active.Add(-1) }, nil }
-	if _, err := startKernel(t.Context(), "/does-not-exist", "py", admit); err == nil {
+	if _, err := startKernel(t.Context(), "/does-not-exist", "py", nil, admit); err == nil {
 		t.Fatal("invalid cwd accepted")
 	}
 	if active.Load() != 0 {

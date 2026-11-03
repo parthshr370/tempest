@@ -150,8 +150,9 @@ pages do not imply disk indexing or a bounded memory working set.
 - **MCP client** for explicitly configured, trusted servers: tools, resources (`read mcp://`), prompts as `/<server>:<prompt>` commands, forwarded elicitation, progress and server logs, opt-in sampling on the smol model with user approval and charged to the run, and OAuth 2.1 sign-in (`tempest mcp login`) for HTTP servers. Large MCP and extension tool sets wait behind `tool_search` and load on demand, appended so the cached prompt prefix holds.
 - **MCP server** over stdio, exposing `tempest_run` to other clients.
 - **OpenTelemetry** traces and metrics over OTLP/HTTP JSON, plus Prometheus text at `/metrics`.
+- **GitHub ticket runner** (`serve -github`): polls one repository as a dedicated account, turns `@mentions` from listed people into Tickets with one worker session each, publishes comments, pushes and pull requests through an outbox that never blindly resends, and keeps finite per-Ticket and per-repository budgets. Merging stays manual, and there is no sandbox: use trusted repositories under a dedicated OS account.
 
-[Servers and protocols](guide/serve-and-protocols.md) · [Telemetry](guide/telemetry.md)
+[Servers and protocols](guide/serve-and-protocols.md) · [GitHub ticket runner](guide/github.md) · [Telemetry](guide/telemetry.md)
 
 ## Configuration
 

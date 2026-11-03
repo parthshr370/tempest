@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 
 	"go.harness.dev/harness/internal/agentfiles"
 	"go.harness.dev/harness/internal/extensionhost"
@@ -58,10 +59,19 @@ func configureExtensions(ctx context.Context, o Options, cfg *session.StackConfi
 		logger = slog.Default()
 	}
 	var documents []durable.DocumentDefinition
+	var environ []string
 	for _, definition := range lease.Definitions() {
 		documents = append(documents, definition.Documents...)
 		warnPresetClashes(logger, cfg.AgentFiles, definition)
+		if definition.Environ != nil {
+			if environ == nil {
+				environ = os.Environ()
+			}
+			// Non-nil even when empty: nil would inherit everything.
+			environ = append([]string{}, definition.Environ(environ)...)
+		}
 	}
+	cfg.ProcessEnv = environ
 	_ = lease.Close(ctx)
 	if err = store.RegisterDocuments(ctx, documents); err != nil {
 		return nil, errors.Join(err, close())

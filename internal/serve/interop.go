@@ -16,6 +16,7 @@ import (
 
 	model "github.com/a2aproject/a2a-go/v2/a2a"
 	"go.harness.dev/harness/internal/a2a"
+	"go.harness.dev/harness/internal/githubsource"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/tracecontext"
 	"go.harness.dev/harness/tempest"
@@ -79,12 +80,23 @@ func (s *Server) resumeOpen(ctx context.Context, cwd, id string, servers []tempe
 	ctx, cancel := s.openContext(ctx)
 	defer cancel()
 	settings := tempest.ResumeSession{SessionID: id, Budget: s.opts.DefaultNew.Budget, PermissionMode: s.opts.DefaultNew.PermissionMode, MCPServers: servers}
+	worker := s.worker(id)
+	if worker {
+		// A client watches a worker as the dispatcher runs it: with its
+		// journaled settings and no MCP servers.
+		if len(servers) > 0 {
+			return nil, tempest.ErrMCPConfigConflict
+		}
+		settings = githubsource.WorkerResume()
+	}
 	session, err = s.host.OpenWithOptions(ctx, id, settings)
 	if err != nil {
 		return nil, err
 	}
 	if cwd != "" && session.Snapshot().Cwd != cwd {
-		_ = s.host.CloseSession(context.Background(), session.ID())
+		if !worker {
+			_ = s.host.CloseSession(context.Background(), session.ID())
+		}
 		return nil, errors.New("workspace differs from resumed session")
 	}
 	s.mu.Lock()

@@ -15,6 +15,7 @@ import (
 	"go.harness.dev/harness/internal/a2a"
 	"go.harness.dev/harness/internal/acp"
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/githubsource"
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/rpc"
 	"go.harness.dev/harness/internal/session/journal"
@@ -39,6 +40,10 @@ type Options struct {
 	Cwd                string
 	// OnListen, when set, receives the bound address before ListenAndServe accepts connections.
 	OnListen func(net.Addr)
+	// GitHub, when set, runs the GitHub ticket runner for one repository
+	// beside ACP and A2A (serve -github). Its Config must come from
+	// githubsource.LoadConfig.
+	GitHub *githubsource.Options
 }
 
 type entry struct {
@@ -69,6 +74,9 @@ type Server struct {
 	cancel      context.CancelFunc
 	broker      *acp.Broker
 	reaperDone  chan struct{}
+	// github and registry are set only with Options.GitHub.
+	github   *githubsource.Service
+	registry *extension.Registry
 }
 
 // New resolves the default journal directory before accepting clients.
@@ -98,12 +106,33 @@ func New(opts Options) (*Server, error) {
 		cancel()
 		return nil, err
 	}
-	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, Elicitor: s.broker.Elicit, MCPServers: opts.DefaultNew.MCPServers, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
+	var github *githubsource.Service
+	var registry *extension.Registry
+	if opts.GitHub != nil {
+		var err error
+		if github, registry, err = openGitHub(ctx, opts); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	// Only the runner's dispatcher may run or change a worker session.
+	var authorize tempest.Authorizer
+	if github != nil {
+		authorize = github.Authorize
+	}
+	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, Elicitor: s.broker.Elicit, MCPServers: opts.DefaultNew.MCPServers, Registry: registry, Authorize: authorize, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
 	if err != nil {
 		cancel()
-		return nil, err
+		return nil, errors.Join(err, closeGitHub(context.Background(), github, registry))
 	}
 	s.host = host
+	if github != nil {
+		if err := github.Start(host); err != nil {
+			cancel()
+			return nil, errors.Join(err, host.Close(context.Background()), closeGitHub(context.Background(), github, registry))
+		}
+		s.github, s.registry = github, registry
+	}
 	go s.reaper()
 	return s, nil
 }
@@ -209,7 +238,7 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 			s.mu.Unlock()
 			return nil, tempest.ErrClosed
 		}
-		if e := s.sessions[id]; e != nil {
+		if e := s.live(id); e != nil {
 			if e.closing {
 				s.mu.Unlock()
 				return nil, tempest.ErrClosed
@@ -246,11 +275,30 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 	}
 }
 
+// live is the cached entry of id. The Host may close a session this server
+// still holds, as the GitHub dispatcher does when a dispatch finishes; such
+// an entry is dropped, so the next Resume reopens the Host's live session.
+// The caller holds s.mu.
+func (s *Server) live(id string) *entry {
+	e := s.sessions[id]
+	if e != nil && !e.closing && e.session.Closed() {
+		delete(s.sessions, id)
+		return nil
+	}
+	return e
+}
+
+// worker reports whether id is a GitHub worker session, whose lifetime the
+// runner's dispatcher owns.
+func (s *Server) worker(id string) bool {
+	return s.github != nil && s.github.Worker(id)
+}
+
 // Acquire prevents the idle reaper from closing a session until release.
 func (s *Server) Acquire(id string) (*tempest.Session, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e := s.sessions[id]
+	e := s.live(id)
 	if s.closed || e == nil || e.closing {
 		return nil, nil, journal.ErrSessionNotFound
 	}
@@ -261,7 +309,8 @@ func (s *Server) Acquire(id string) (*tempest.Session, func(), error) {
 }
 
 // CloseSession permanently retires a session, even if joining its run times out.
-// Its journal stays locked until that run finishes.
+// Its journal stays locked until that run finishes. A GitHub worker is only
+// released by this server: the dispatcher closes it.
 func (s *Server) CloseSession(ctx context.Context, id string) error {
 	s.mu.Lock()
 	e := s.sessions[id]
@@ -271,7 +320,10 @@ func (s *Server) CloseSession(ctx context.Context, id string) error {
 	}
 	e.closing = true
 	s.mu.Unlock()
-	err := s.host.CloseSession(ctx, id)
+	var err error
+	if !s.worker(id) {
+		err = s.host.CloseSession(ctx, id)
+	}
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
@@ -321,7 +373,10 @@ func (s *Server) reap(now time.Time) {
 	for _, e := range stale {
 		ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 		// Close permanently rejects admission, even when its wait expires.
-		_ = s.host.CloseSession(ctx, e.session.ID())
+		// The dispatcher owns a GitHub worker's lifetime.
+		if !s.worker(e.session.ID()) {
+			_ = s.host.CloseSession(ctx, e.session.ID())
+		}
 		cancel()
 		s.mu.Lock()
 		delete(s.sessions, e.session.ID())
@@ -346,7 +401,13 @@ func (s *Server) serveConn(c *rpc.Conn, parent tracecontext.SpanContext) error {
 	s.connections[c] = struct{}{}
 	s.mu.Unlock()
 	defer func() { _ = c.Close(); s.mu.Lock(); delete(s.connections, c); s.mu.Unlock() }()
-	return acp.NewClient(c, s, s.broker).WithRemoteParent(parent).Serve()
+	client := acp.NewClient(c, s, s.broker).WithRemoteParent(parent)
+	if s.github != nil {
+		// Never a typed nil: a nil *Service in the interface would advertise
+		// the github methods.
+		client = client.WithGitHub(s.github)
+	}
+	return client.Serve()
 }
 
 // Handler exposes the authenticated /acp upgrade, /a2a and /metrics, and the
@@ -457,6 +518,12 @@ func (s *Server) shutdown() {
 	s.cancel()
 	ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 	defer cancel()
+	if s.github != nil {
+		// The runner's loops stop before the Host closes, so no dispatch
+		// mistakes a closing Host for a failed launch; live dispatches keep
+		// their slots for the next start to reconcile.
+		s.closeErr = errors.Join(s.closeErr, s.github.Stop(ctx))
+	}
 	opened := make(chan struct{})
 	go func() { s.openers.Wait(); close(opened) }()
 	select {
@@ -486,6 +553,7 @@ func (s *Server) shutdown() {
 	default:
 	}
 	s.closeErr = errors.Join(s.closeErr, s.host.Close(ctx))
+	s.closeErr = errors.Join(s.closeErr, closeGitHub(ctx, s.github, s.registry))
 	if s.a2a != nil {
 		s.closeErr = errors.Join(s.closeErr, s.a2a.Close(ctx))
 	}

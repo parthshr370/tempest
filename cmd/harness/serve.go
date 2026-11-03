@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.harness.dev/harness/internal/config"
+	"go.harness.dev/harness/internal/githubsource"
 	"go.harness.dev/harness/internal/mcpserver"
 	"go.harness.dev/harness/internal/permission"
 	"go.harness.dev/harness/internal/serve"
@@ -55,6 +56,7 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	fs.SetOutput(stderr)
 	var values config.FlagValues
 	var listen, token, a2aBaseURL string
+	var githubRepo, githubConfig string
 	var extensionConfig string
 	var idleTimeout, permissionTimeout, shutdownTimeout, maxWall time.Duration
 	var maxTurns int
@@ -63,6 +65,8 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 		fs.StringVar(&listen, "listen", "", "HTTP/WebSocket listen address (empty serves ACP stdio)")
 		fs.StringVar(&token, "token", os.Getenv("TEMPEST_TOKEN"), "HTTP/WebSocket bearer token")
 		fs.StringVar(&a2aBaseURL, "a2a-base-url", "", "absolute advertised A2A public base URL")
+		fs.StringVar(&githubRepo, "github", "", "run the GitHub ticket runner for owner/repo (needs -github-config)")
+		fs.StringVar(&githubConfig, "github-config", "", "absolute path of the GitHub runner's operator JSON file")
 	}
 	fs.DurationVar(&idleTimeout, "idle-timeout", 30*time.Minute, "close idle sessions after this duration")
 	fs.DurationVar(&permissionTimeout, "permission-timeout", 5*time.Minute, "deny unanswered asks after this duration")
@@ -93,6 +97,10 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	}
 	if fs.NArg() != 0 {
 		fmt.Fprintln(stderr, unexpectedArgument(command, fs.Arg(0)))
+		return exitUsage
+	}
+	if (githubRepo == "") != (githubConfig == "") {
+		fmt.Fprintln(stderr, "-github and -github-config must be set together")
 		return exitUsage
 	}
 	fs.Visit(func(f *flag.Flag) {
@@ -213,7 +221,16 @@ func runServerCommand(command string, args []string, stdout, stderr io.Writer) i
 	onListen := func(addr net.Addr) {
 		fmt.Fprintf(stderr, "tempest serve listening on http://%s (%s)\n", addr, endpoints)
 	}
-	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, ExtensionProcesses: processes, OnListen: onListen})
+	var github *githubsource.Options
+	if githubRepo != "" {
+		githubCfg, err := githubsource.LoadConfig(githubConfig, githubRepo, cfg.SessionDir())
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		github = &githubsource.Options{Config: githubCfg}
+	}
+	server, err := serve.New(serve.Options{SessionDir: cfg.SessionDir(), Cwd: cwd, A2ABaseURL: a2aBaseURL, IdleTimeout: idleTimeout, PermissionTimeout: permissionTimeout, ShutdownTimeout: shutdownTimeout, Token: token, DefaultNew: defaults, Provider: provider, Stack: &stack, ExtensionProcesses: processes, OnListen: onListen, GitHub: github})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 1

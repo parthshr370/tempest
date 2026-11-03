@@ -38,6 +38,14 @@ inside the session working directory. The host records the exact system bytes, t
 schema digest, and selected revisions before dispatch. Historical frames do not
 rerender during recovery.
 
+A Go bundle may set `Environ`, a filter over the environment that the
+subprocesses of a session selecting it start with: `bash` commands, background
+jobs, eval kernels and debug adapters. Selected bundles apply in order to the
+process environment. The selection is journaled, so every open of the
+session applies the filter. The `github` worker bundle uses it to drop GitHub and
+git credential variables. MCP servers, language servers and extension processes
+already start from a short allowlist.
+
 ## Hooks and wrappers
 
 Hook events are `before_request`, `after_response`, `before_tool`, `after_tool`,

@@ -70,9 +70,9 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 	}
 	cmd := exec.CommandContext(processCtx, manager.options.ShellPath, "-c", command)
 	cmd.Dir = job.Cwd
-	// Nil keeps the inherited environment; a traced job adds TRACEPARENT,
-	// the span of the bash call that started it.
-	cmd.Env = tracecontext.Environ(processCtx, nil)
+	// Nil Env keeps the inherited environment; a traced job adds
+	// TRACEPARENT, the span of the bash call that started it.
+	cmd.Env = tracecontext.Environ(processCtx, manager.options.Env)
 	cmd.WaitDelay = pipeJoinDelay
 	cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 	streams, err := openStreams(cmd, spec.PTY, spec.Stdin)

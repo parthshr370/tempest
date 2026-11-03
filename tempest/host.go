@@ -62,6 +62,10 @@ type AgentOptions struct {
 	Cwd         string
 	New         *NewSession
 	Environment environment.Reference
+	// Extensions selects this session's bundles from HostOptions.Registry in
+	// place of HostOptions.Extensions; nil keeps the host selection. The
+	// selection is journaled, so reopening the session restores it.
+	Extensions []extension.Selection
 }
 
 // ListOptions selects a bounded page of published sessions.
@@ -346,6 +350,9 @@ func (host *Host) Create(ctx context.Context, agent AgentOptions) (created *Sess
 		options.Environment = agent.Environment
 	}
 	options.New = agent.New
+	if agent.Extensions != nil {
+		options.Extensions = append([]extension.Selection(nil), agent.Extensions...)
+	}
 	options.Resume = nil
 	options.hostCreate = true
 	if options.New == nil {
@@ -855,12 +862,23 @@ type Access struct {
 // Authorizer uses the host's authenticated context. Nil trusts the operator.
 type Authorizer func(context.Context, Access) error
 
+// Authorize applies the host's Authorizer to action, for controls that
+// take no context of their own, such as SetBudget and SetPermissionMode:
+// a protocol adapter calls it with the client's context first.
+func (session *Session) Authorize(ctx context.Context, action string) error {
+	return session.authorize(ctx, action, "", "")
+}
+
 func (session *Session) authorize(ctx context.Context, action, namespace, id string) error {
 	if session.core.authorize != nil {
 		return session.core.authorize(ctx, Access{SessionID: session.ID(), Action: action, Namespace: namespace, ID: id})
 	}
 	return ctx.Err()
 }
+
+// Closed reports whether the session was closed, by its holder or by the
+// Host. A closed Session is never reopened; Host.Open returns a new one.
+func (session *Session) Closed() bool { return session.checkOpen() != nil }
 func (session *Session) submissionContext(ctx context.Context) (context.Context, error) {
 	namespace := durable.ClientNamespace(ctx)
 	if namespace == "" && session.core.clientNamespace != nil {

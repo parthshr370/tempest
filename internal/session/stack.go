@@ -126,6 +126,11 @@ type StackConfig struct {
 	ConfiguredTools []agent.AgentTool
 	PromptAdditions []string
 	BashTimeout     time.Duration
+	// ProcessEnv is the environment the session's shell commands, jobs,
+	// eval kernels and debug adapters start with; nil inherits the process
+	// environment. Selected extension bundles set it (extension.Definition
+	// Environ).
+	ProcessEnv []string
 	// LoopThresholds configures the loop guard of the session and its task
 	// children; nil means agent.DefaultLoopThresholds.
 	LoopThresholds *agent.LoopThresholds
@@ -288,7 +293,7 @@ type AgentStack struct {
 	Checkpoints      *checkpoint.Manager
 	Compaction       *CompactionController
 	kernels          *evalkernel.Manager
-	debugger         *dap.Manager
+	debugAdapters    *dap.Manager
 	ownedEnvironment environment.Lease
 	detachTelemetry  func()
 }
@@ -299,7 +304,7 @@ func (s *AgentStack) Close() error {
 	if s.ownedEnvironment != nil {
 		environmentErr = s.ownedEnvironment.Close()
 	}
-	err := errors.Join(s.Compaction.Close(), s.debugger.Close(), s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()), environmentErr)
+	err := errors.Join(s.Compaction.Close(), s.debugAdapters.Close(), s.kernels.Close(), s.Agent.EndSessionHooks(context.Background()), environmentErr)
 	s.detachTelemetry()
 	return err
 }
@@ -492,13 +497,15 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		lostKernels = cfg.Loaded.EvalLanguages
 	}
 	var kernels *evalkernel.Manager
-	var debugger *dap.Manager
+	var debugAdapters *dap.Manager
 	if local {
 		kernels = evalkernel.New(cwd, tools.ToolOutputDir(sessionDataDir), lostKernels, cfg.AdmitProcess)
-		debugger, err = dap.New(cwd, tools.ToolOutputDir(sessionDataDir), cfg.DebugAdapters, cfg.AdmitProcess)
+		kernels.Env = cfg.ProcessEnv
+		debugAdapters, err = dap.New(cwd, tools.ToolOutputDir(sessionDataDir), cfg.DebugAdapters, cfg.AdmitProcess)
 		if err != nil {
 			return nil, err
 		}
+		debugAdapters.Env = cfg.ProcessEnv
 	}
 	var historySearch func(context.Context, string, string, int) (json.RawMessage, error)
 	if cfg.Journal != nil {
@@ -516,6 +523,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		MutationQueue:      cfg.MutationQueue,
 		EnableWeb:          cfg.EnableWeb,
 		BashTimeout:        cfg.BashTimeout,
+		Env:                cfg.ProcessEnv,
 		AdmitProcess:       cfg.AdmitProcess,
 		SearchURL:          cfg.WebSearchURL,
 		ConfiguredTools:    cfg.ConfiguredTools,
@@ -534,7 +542,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 		Kernels:            kernels,
 		AskUser:            cfg.AskUser,
 		SessionID:          sessionID,
-		Debugger:           debugger,
+		Debugger:           debugAdapters,
 		ApproveHookSettings: func(ctx context.Context, tool, callID string, paths []string) error {
 			return approveHookSettings(ctx, tool, callID, paths)
 		},
@@ -738,7 +746,7 @@ func BuildAgentStack(cfg StackConfig) (_ *AgentStack, err error) {
 			checkpoints.Install(messages)
 		}
 	}
-	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugger: debugger, ownedEnvironment: ownedEnvironment, detachTelemetry: detachTelemetry}, nil
+	return &AgentStack{Agent: agt, Model: model, StreamFn: cfg.StreamFn, ProjectDir: cwd, Checkpoints: checkpoints, Compaction: runner, kernels: kernels, debugAdapters: debugAdapters, ownedEnvironment: ownedEnvironment, detachTelemetry: detachTelemetry}, nil
 }
 
 // rootReminders are cfg's reminders for a root stack, none for a child.

@@ -24,6 +24,9 @@ func (s *Session) Checkpoints() []Checkpoint { return s.core.checkpoints.List() 
 
 // CreateCheckpoint saves files and the current idle conversation.
 func (s *Session) CreateCheckpoint(ctx context.Context, goal string) (Checkpoint, error) {
+	if err := s.authorize(ctx, "checkpoint", "", goal); err != nil {
+		return Checkpoint{}, err
+	}
 	c := s.core
 	c.admission.Lock()
 	defer c.admission.Unlock()
@@ -50,6 +53,9 @@ func (s *Session) CreateCheckpoint(ctx context.Context, goal string) (Checkpoint
 // Rewind restores workspace files and forks the conversation in the append-only journal.
 // The session must be idle and its jobs and children must have settled.
 func (s *Session) Rewind(ctx context.Context, o RewindOptions) error {
+	if err := s.authorize(ctx, "rewind", "", o.Checkpoint); err != nil {
+		return err
+	}
 	c := s.core
 	c.admission.Lock()
 	defer c.admission.Unlock()

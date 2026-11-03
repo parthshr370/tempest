@@ -138,6 +138,8 @@ type ToolsOptions struct {
 	MutationQueue *toolio.FileMutationQueue
 	ShellPath     string
 	CommandPrefix string
+	// Env is the environment of bash commands; nil inherits the process's.
+	Env []string
 	// BashTimeout defaults to ten minutes when unset.
 	BashTimeout     time.Duration
 	TodoStore       *progress.Store
@@ -991,8 +993,8 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			defer cancel()
 			cmd := exec.CommandContext(execCtx, shell, "-c", command)
 			cmd.Dir = cwd
-			// Nil keeps the inherited environment; a traced call adds TRACEPARENT.
-			cmd.Env = tracecontext.Environ(execCtx, nil)
+			// Nil Env keeps the inherited environment; a traced call adds TRACEPARENT.
+			cmd.Env = tracecontext.Environ(execCtx, options.Env)
 			if runtime.GOOS != "windows" {
 				cmd.WaitDelay = 2 * time.Second
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

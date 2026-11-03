@@ -33,6 +33,9 @@ type Manager struct {
 	admit     func(context.Context) (func(), error)
 	active    *adapterProcess
 	closed    bool
+	// Env is the environment adapters start with; nil inherits the
+	// process's. Set it before the first adapter starts.
+	Env []string
 }
 
 type adapterProcess struct {
@@ -468,6 +471,7 @@ func (m *Manager) spawn(ctx context.Context, adapter Adapter, attached bool, tar
 	}
 	command := exec.Command(adapter.Command, args...)
 	command.Dir = m.cwd
+	command.Env = m.Env
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	command.Stderr = process
 	command.WaitDelay = disconnectGrace
