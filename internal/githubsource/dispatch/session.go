@@ -32,7 +32,7 @@ func (d *Dispatcher) workerSession(ctx context.Context, admitted model.AdmittedD
 		return nil, err
 	}
 	if admitted.Ticket.SessionID != "" {
-		session, err := d.host.Open(ctx, admitted.Ticket.SessionID)
+		session, err := d.host.OpenWithOptions(ctx, admitted.Ticket.SessionID, WorkerResume())
 		if err != nil {
 			return nil, transientFailure("open worker session "+admitted.Ticket.SessionID, err)
 		}
@@ -65,7 +65,7 @@ func (d *Dispatcher) adoptOrCreate(ctx context.Context, cwd string, document mod
 	var chosen *tempest.Session
 	var orphans []string
 	for _, candidate := range candidates {
-		session, err := d.host.Open(ctx, candidate.SessionID)
+		session, err := d.host.OpenWithOptions(ctx, candidate.SessionID, WorkerResume())
 		if err != nil {
 			d.log.Warn("github dispatch: skip unopenable session in ticket worktree", "session", candidate.SessionID, "error", err)
 			continue
@@ -84,7 +84,7 @@ func (d *Dispatcher) adoptOrCreate(ctx context.Context, cwd string, document mod
 		}
 	}
 	if chosen == nil && len(orphans) > 0 {
-		session, err := d.host.Open(ctx, orphans[0])
+		session, err := d.host.OpenWithOptions(ctx, orphans[0], WorkerResume())
 		if err != nil {
 			return nil, transientFailure("open orphan worker session", err)
 		}
@@ -144,6 +144,14 @@ func (d *Dispatcher) unstartedSessions(ctx context.Context, cwd string) ([]tempe
 		return sessions[i].SessionID < sessions[j].SessionID
 	})
 	return sessions, nil
+}
+
+// WorkerResume reopens a worker session as createSession made it: the
+// model and permission mode come from its journal, and it has no MCP
+// servers. Every opener of a worker uses it, so a live worker is the same
+// whoever opened it first.
+func WorkerResume() tempest.ResumeSession {
+	return tempest.ResumeSession{MCPServers: []tempest.MCPServerConfig{}}
 }
 
 func (d *Dispatcher) createSession(ctx context.Context, cwd string) (*tempest.Session, error) {

@@ -66,7 +66,9 @@ func ParseConfig(raw []byte, repository, sessionDir string) (model.Config, error
 	if err := decoder.Decode(&config); err != nil {
 		return model.Config{}, fmt.Errorf("decode: %w", err)
 	}
-	if decoder.More() {
+	// More is false before a closing delimiter, so only a second decode
+	// reaching EOF proves nothing follows the object.
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return model.Config{}, errors.New("decode: trailing data after the JSON object")
 	}
 	if err := ValidateConfig(&config, repository, sessionDir); err != nil {

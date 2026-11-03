@@ -27,6 +27,16 @@ import (
 	"go.harness.dev/harness/tempest"
 )
 
+type authorityKey struct{}
+
+// Issued reports whether ctx comes from a Dispatcher's Run. A Host whose
+// Authorizer lets only such contexts run or change worker sessions keeps
+// every worker run inside a dispatch: its lease, its budget and Ticket stop.
+func Issued(ctx context.Context) bool {
+	issued, _ := ctx.Value(authorityKey{}).(bool)
+	return issued
+}
+
 // Options configures New.
 type Options struct {
 	// Host owns worker sessions. Its registry must hold the github extension
@@ -155,10 +165,12 @@ func (d *Dispatcher) Wake() {
 	}
 }
 
-// Run resumes every live dispatch from its committed step before admitting
-// anything new, then admits, executes, steers and stops work until ctx
-// ends. A dispatch is settled (Finished or Abandon) only from a proven
-// result; on shutdown its slot stays held for the next Run to reconcile.
+// Run starts resuming every live dispatch from its committed step before
+// its first admission, then admits, executes, steers and stops work until
+// ctx ends; admission does not wait for resumed dispatches to settle, whose
+// slots stay held meanwhile. A dispatch is settled (Finished or Abandon)
+// only from a proven result; on shutdown its slot stays held for the next
+// Run to reconcile. Its context carries the authority Issued reports.
 func (d *Dispatcher) Run(ctx context.Context) error {
 	if !d.running.CompareAndSwap(false, true) {
 		return errors.New("dispatch: Run is already running")
@@ -166,7 +178,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	defer d.running.Store(false)
 	var executors sync.WaitGroup
 	defer executors.Wait()
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(context.WithValue(ctx, authorityKey{}, true))
 	defer cancel()
 	active, err := d.store.Active(ctx)
 	if err != nil {

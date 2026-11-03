@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.harness.dev/harness/internal/githubsource/control"
@@ -26,8 +27,9 @@ import (
 	"go.harness.dev/harness/tempest/extension"
 )
 
-// tokenVariables select GitHub credentials ahead of GH_CONFIG_DIR. In the
-// serve process they would reach every worker shell, so startup refuses them.
+// tokenVariables select GitHub credentials ahead of GH_CONFIG_DIR. Worker
+// sessions drop them (ghext.WorkerEnviron), but every other session of the
+// serve process would inherit them, so startup refuses them.
 var tokenVariables = []string{"GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}
 
 const (
@@ -131,8 +133,8 @@ func Open(ctx context.Context, options Options) (*Service, error) {
 	if err := checkClone(ctx, config.Clone, remote, config.Repository, options.GitEnv); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(config.StateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("github: state directory: %w", err)
+	if err := privateStateDir(config.StateDir); err != nil {
+		return nil, err
 	}
 	path := filepath.Join(config.StateDir, "control.jsonl")
 	journal, err := durable.OpenFile(ctx, path)
@@ -158,15 +160,38 @@ func Open(ctx context.Context, options Options) (*Service, error) {
 }
 
 // checkEnvironment refuses a serve process that carries a GitHub token: it
-// would override the account's GH_CONFIG_DIR and reach worker shells.
+// would outrank the account's GH_CONFIG_DIR wherever it is inherited.
 func checkEnvironment(environ []string) error {
 	for _, entry := range environ {
 		key, _, _ := strings.Cut(entry, "=")
 		for _, name := range tokenVariables {
 			if key == name {
-				return fmt.Errorf("github: %s is set in the serve environment; unset it: worker shells would inherit it, and the account's credentials come only from account.ghConfigDir", name)
+				return fmt.Errorf("github: %s is set in the serve environment; unset it: the serve process's sessions would inherit it, and the account's credentials come only from account.ghConfigDir", name)
 			}
 		}
+	}
+	return nil
+}
+
+// privateStateDir creates the state directory 0700, or accepts an existing
+// one only if it is a directory this user owns that no other user can
+// write: it holds the control journal and the outbox's push repository.
+func privateStateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return fmt.Errorf("github: state directory: %w", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("github: state directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("github: state directory %s is not a directory (a symlink is refused)", path)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("github: state directory %s has mode %o, writable by other users; chmod go-w it", path, info.Mode().Perm())
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
+		return fmt.Errorf("github: state directory %s is owned by uid %d, not this user (%d)", path, stat.Uid, os.Getuid())
 	}
 	return nil
 }
@@ -270,9 +295,49 @@ func (s *Service) Extension() extension.Definition {
 	return ghext.Definition(s.store, ghext.Options{Wake: s.outbox.Wake, GitEnv: s.gitEnv})
 }
 
-// Start runs the dispatcher (which reconciles live dispatches before it
-// admits anything), the outbox (which reconciles attempting writes first)
-// and the poll loop until Stop. host's registry must hold Extension.
+// ErrWorkerSession refuses an operation on a worker session that did not
+// come from the dispatcher.
+var ErrWorkerSession = errors.New("github: worker sessions run and change only through the ticket runner")
+
+// readActions are the Authorizer actions that only read a session.
+var readActions = map[string]bool{"read": true, "get_submission": true, "get_task": true, "list_tasks": true, "search_history": true}
+
+// Authorize is the Host's Authorizer. A session bound to a Ticket runs and
+// changes only from the dispatcher's context, so every worker run is a
+// dispatch with its slot, budget and stop; other clients may read it and
+// watch it. Pause, stop, retry and grant go through Control.
+func (s *Service) Authorize(ctx context.Context, access tempest.Access) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if readActions[access.Action] || dispatch.Issued(ctx) {
+		return nil
+	}
+	if ticket, ok := s.store.BoundTicket(access.SessionID); ok {
+		return fmt.Errorf("%w: session %s is the worker of Ticket %s; %s is refused", ErrWorkerSession, access.SessionID, ticket, access.Action)
+	}
+	return nil
+}
+
+// Worker reports whether sessionID is bound to a Ticket as its worker.
+func (s *Service) Worker(sessionID string) bool {
+	_, ok := s.store.BoundTicket(sessionID)
+	return ok
+}
+
+// WorkerResume is how anyone reopens a worker session: with the model and
+// permission mode it journaled and no MCP servers, as the dispatcher
+// created it.
+func WorkerResume() tempest.ResumeSession { return dispatch.WorkerResume() }
+
+// Start runs the dispatcher, the outbox and the poll loop concurrently
+// until Stop; a Service starts once, and a restart opens a new one. The
+// dispatcher resumes its live dispatches from their committed step before
+// its first admission, but does not wait for them to settle; the outbox
+// reconciles writes left attempting in its first pass. What restart keeps
+// is per Ticket: a held slot is released only from a proven receipt, and
+// one Ticket's writes run in order. host's registry must hold Extension
+// and its Authorizer must be Authorize.
 func (s *Service) Start(host *tempest.Host) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,7 +413,8 @@ func (s *Service) pollLoop(ctx context.Context) {
 }
 
 // Stop ends the loops and waits for them, or for ctx. Live dispatches keep
-// their slots in the journal for the next Start to reconcile.
+// their slots in the journal for the next process's Service to reconcile;
+// this Service does not start again.
 func (s *Service) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	cancel, unsubscribe := s.cancel, s.unsubscribe
@@ -372,7 +438,9 @@ func (s *Service) Stop(ctx context.Context) error {
 }
 
 // Close stops the loops and releases the control journal. Call it after
-// the Host closed, so no worker tool call meets a closed journal.
+// the Host closed, so no worker tool call meets a closed journal. If the
+// Host's close timed out, a worker still finishing then gets an error from
+// the github tools; it cannot commit a write.
 func (s *Service) Close(ctx context.Context) error {
 	err := s.Stop(ctx)
 	s.mu.Lock()

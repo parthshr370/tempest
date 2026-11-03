@@ -26,6 +26,17 @@ func (s *Store) boundTicket(sessionID string) (*model.Ticket, error) {
 	return ticket, nil
 }
 
+// BoundTicket is the Ticket a session is bound to as its worker.
+func (s *Store) BoundTicket(sessionID string) (model.TicketID, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	binding, ok := s.sessions.get(sessionID)
+	if !ok {
+		return "", false
+	}
+	return binding.Ticket, true
+}
+
 // writable rejects writes for stopped and ended Tickets.
 func writable(ticket *model.Ticket) error {
 	if ticket.Stopped {

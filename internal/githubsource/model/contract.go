@@ -214,8 +214,9 @@ type InputView struct {
 
 // Dispatcher runs admitted work in worker sessions.
 type Dispatcher interface {
-	// Run reconciles active dispatches, then admits and executes work until
-	// ctx ends. It never releases a slot it cannot prove settled.
+	// Run starts reconciling active dispatches, then admits and executes
+	// work until ctx ends, without waiting for the reconciled ones to
+	// settle. It never releases a slot it cannot prove settled.
 	Run(ctx context.Context) error
 	// Wake nudges Run after a commit that may have created work.
 	Wake()
@@ -309,7 +310,10 @@ type Control interface {
 	// Grant adds allowance to a Ticket ledger, or the current repository
 	// ledger when Target is empty.
 	Grant(ctx context.Context, request OperatorRequest, amount Spend) error
-	// ResolveEffect settles an unknown intent as confirmed or failed.
+	// ResolveEffect settles an unknown intent as confirmed or failed, or,
+	// with EffectPending, sends it again: an audited resend (wire state
+	// "resend") that keeps its attempt count and is refused for a stopped
+	// Ticket.
 	ResolveEffect(ctx context.Context, request OperatorRequest, state EffectState) error
 }
 

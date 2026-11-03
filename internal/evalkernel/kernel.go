@@ -91,6 +91,9 @@ type Manager struct {
 	starting     map[string]startup
 	closed       bool
 	admitProcess func(context.Context) (func(), error)
+	// Env is the environment kernels start with; nil inherits the
+	// process's. Set it before the first kernel starts.
+	Env []string
 }
 
 // New doesn't start a runtime. Lost languages require an explicit reset after resume.
@@ -232,7 +235,7 @@ func (m *Manager) acquire(ctx context.Context, language string, reset bool) (*ke
 	if process != nil {
 		process.stop()
 	}
-	replacement, err := startKernel(startCtx, m.cwd, language, m.admitProcess)
+	replacement, err := startKernel(startCtx, m.cwd, language, m.Env, m.admitProcess)
 	m.mu.Lock()
 	delete(m.starting, language)
 	if err == nil {
@@ -257,7 +260,7 @@ func (m *Manager) acquire(ctx context.Context, language string, reset bool) (*ke
 	return replacement, nil
 }
 
-func startKernel(ctx context.Context, cwd, language string, admit ...func(context.Context) (func(), error)) (*kernel, error) {
+func startKernel(ctx context.Context, cwd, language string, env []string, admit ...func(context.Context) (func(), error)) (*kernel, error) {
 	release := func() {}
 	if len(admit) > 0 && admit[0] != nil {
 		var err error
@@ -313,6 +316,7 @@ func startKernel(ctx context.Context, cwd, language string, admit ...func(contex
 	}
 	cmd := exec.Command(executable, append(args, driver)...)
 	cmd.Dir = cwd
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.ExtraFiles = []*os.File{requestRead, responseWrite, lifeRead}
 	cmd.Stdout, cmd.Stderr = outputWrite, outputWrite

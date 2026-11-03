@@ -669,7 +669,7 @@ func open(ctx context.Context, o Options) (_ *Session, err error) {
 		RunTask: func(ctx context.Context, launch work.TaskLaunch) (work.TaskResult, error) {
 			return c.runTask(ctx, cfg, launch)
 		},
-	}, jobs.Options{BashTimeout: cfg.BashTimeout, OnError: func(error) { s.Cancel() }, AdmitProcess: o.admitProcess}, recoveries)
+	}, jobs.Options{BashTimeout: cfg.BashTimeout, Env: cfg.ProcessEnv, OnError: func(error) { s.Cancel() }, AdmitProcess: o.admitProcess}, recoveries)
 	if err != nil {
 		return nil, err
 	}

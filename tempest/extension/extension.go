@@ -45,7 +45,14 @@ type Definition struct {
 	Presets       []AgentPreset                `json:"presets,omitempty"`
 	Tasks         []TaskDefinition             `json:"tasks,omitempty"`
 	Close         func(context.Context) error  `json:"-"`
-	available     func() bool
+	// Environ, when set, filters the environment that the subprocesses of
+	// a session selecting this bundle start with: shell commands,
+	// background jobs, eval kernels and debug adapters. It gets the
+	// process environment, or the previous bundle's result, and must not
+	// modify it. Because the selection is journaled, every open of the
+	// session applies it.
+	Environ   func(environ []string) []string `json:"-"`
+	available func() bool
 }
 
 // Tool is a namespaced definition. Never is the conservative replay default.

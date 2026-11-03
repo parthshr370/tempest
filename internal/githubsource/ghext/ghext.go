@@ -72,8 +72,40 @@ func Definition(gateway model.WorkerGateway, options Options) extension.Definiti
 			{Name: SectionTicket, Render: section(renderTicket)},
 			{Name: SectionTeam, Render: section(renderTeam)},
 		},
-		Tools: t.definitions(),
+		Tools:   t.definitions(),
+		Environ: WorkerEnviron,
 	}
+}
+
+// WorkerEnviron is environ without the variables that select a GitHub or
+// git credential, so a worker's shell, jobs, kernels and debug adapters
+// cannot reach the account through them: GH_* (GH_CONFIG_DIR, GH_TOKEN,
+// GH_HOST and the rest) and GITHUB_*, the askpass helpers, the ssh
+// command and agent socket, and git configuration injected through the
+// environment, which can name a credential helper or an auth header.
+// GIT_CONFIG_GLOBAL stays: dropping it would select ~/.gitconfig instead.
+func WorkerEnviron(environ []string) []string {
+	kept := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		name, _, _ := strings.Cut(entry, "=")
+		if !credentialVariable(name) {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
+}
+
+func credentialVariable(name string) bool {
+	switch name {
+	case "GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT":
+		return true
+	}
+	for _, prefix := range []string{"GH_", "GITHUB_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // section renders from the session's WorkerTicket document. A session

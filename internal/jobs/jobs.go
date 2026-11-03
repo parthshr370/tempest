@@ -57,9 +57,12 @@ const (
 type Options struct {
 	ShellPath     string
 	CommandPrefix string
-	BashTimeout   time.Duration
-	OnError       func(error)
-	AdmitProcess  func(context.Context) (func(), error)
+	// Env is the environment of background commands; nil inherits the
+	// process's.
+	Env          []string
+	BashTimeout  time.Duration
+	OnError      func(error)
+	AdmitProcess func(context.Context) (func(), error)
 }
 
 type entry struct {

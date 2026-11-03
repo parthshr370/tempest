@@ -450,6 +450,9 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return struct{}{}, nil
 	case "tempest/set_budget":
+		if err := s.Authorize(ctx, "set_budget"); err != nil {
+			return nil, failure(err)
+		}
 		budget := s.Snapshot().Budget
 		if p.MaxTurns != nil {
 			budget.MaxTurns = *p.MaxTurns
@@ -481,6 +484,9 @@ func (c *Client) Handle(ctx context.Context, method string, raw json.RawMessage)
 		}
 		return map[string]any{"budget": hub.NewWireBudget(budget)}, nil
 	case "tempest/set_permission_mode":
+		if err := s.Authorize(ctx, "set_permission_mode"); err != nil {
+			return nil, failure(err)
+		}
 		mode, err := permission.ParseMode(p.Mode)
 		if err != nil {
 			return nil, rpc.NewError(-32602, "invalid_params", err.Error())

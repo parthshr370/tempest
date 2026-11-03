@@ -115,7 +115,12 @@ func New(opts Options) (*Server, error) {
 			return nil, err
 		}
 	}
-	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, Elicitor: s.broker.Elicit, MCPServers: opts.DefaultNew.MCPServers, Registry: registry, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
+	// Only the runner's dispatcher may run or change a worker session.
+	var authorize tempest.Authorizer
+	if github != nil {
+		authorize = github.Authorize
+	}
+	host, err := tempest.OpenHost(ctx, tempest.HostOptions{SessionDir: opts.SessionDir, Provider: opts.Provider, Stack: opts.Stack, Prompter: s.broker, Questioner: s.broker.Question, Elicitor: s.broker.Elicit, MCPServers: opts.DefaultNew.MCPServers, Registry: registry, Authorize: authorize, Options: tempest.Options{ExtensionProcesses: opts.ExtensionProcesses}})
 	if err != nil {
 		cancel()
 		return nil, errors.Join(err, closeGitHub(context.Background(), github, registry))
@@ -233,7 +238,7 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 			s.mu.Unlock()
 			return nil, tempest.ErrClosed
 		}
-		if e := s.sessions[id]; e != nil {
+		if e := s.live(id); e != nil {
 			if e.closing {
 				s.mu.Unlock()
 				return nil, tempest.ErrClosed
@@ -270,11 +275,30 @@ func (s *Server) Resume(ctx context.Context, cwd, id string, servers []tempest.M
 	}
 }
 
+// live is the cached entry of id. The Host may close a session this server
+// still holds, as the GitHub dispatcher does when a dispatch finishes; such
+// an entry is dropped, so the next Resume reopens the Host's live session.
+// The caller holds s.mu.
+func (s *Server) live(id string) *entry {
+	e := s.sessions[id]
+	if e != nil && !e.closing && e.session.Closed() {
+		delete(s.sessions, id)
+		return nil
+	}
+	return e
+}
+
+// worker reports whether id is a GitHub worker session, whose lifetime the
+// runner's dispatcher owns.
+func (s *Server) worker(id string) bool {
+	return s.github != nil && s.github.Worker(id)
+}
+
 // Acquire prevents the idle reaper from closing a session until release.
 func (s *Server) Acquire(id string) (*tempest.Session, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e := s.sessions[id]
+	e := s.live(id)
 	if s.closed || e == nil || e.closing {
 		return nil, nil, journal.ErrSessionNotFound
 	}
@@ -285,7 +309,8 @@ func (s *Server) Acquire(id string) (*tempest.Session, func(), error) {
 }
 
 // CloseSession permanently retires a session, even if joining its run times out.
-// Its journal stays locked until that run finishes.
+// Its journal stays locked until that run finishes. A GitHub worker is only
+// released by this server: the dispatcher closes it.
 func (s *Server) CloseSession(ctx context.Context, id string) error {
 	s.mu.Lock()
 	e := s.sessions[id]
@@ -295,7 +320,10 @@ func (s *Server) CloseSession(ctx context.Context, id string) error {
 	}
 	e.closing = true
 	s.mu.Unlock()
-	err := s.host.CloseSession(ctx, id)
+	var err error
+	if !s.worker(id) {
+		err = s.host.CloseSession(ctx, id)
+	}
 	s.mu.Lock()
 	delete(s.sessions, id)
 	s.mu.Unlock()
@@ -345,7 +373,10 @@ func (s *Server) reap(now time.Time) {
 	for _, e := range stale {
 		ctx, cancel := context.WithTimeout(context.Background(), s.opts.ShutdownTimeout)
 		// Close permanently rejects admission, even when its wait expires.
-		_ = s.host.CloseSession(ctx, e.session.ID())
+		// The dispatcher owns a GitHub worker's lifetime.
+		if !s.worker(e.session.ID()) {
+			_ = s.host.CloseSession(ctx, e.session.ID())
+		}
 		cancel()
 		s.mu.Lock()
 		delete(s.sessions, e.session.ID())

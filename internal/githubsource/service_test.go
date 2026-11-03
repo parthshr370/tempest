@@ -177,3 +177,44 @@ func TestGitHubStartupRefusesJournalOfAnotherAccount(t *testing.T) {
 		t.Fatalf("open with another account: %v", err)
 	}
 }
+
+// The state directory holds the control journal and the push repository:
+// startup creates it private and refuses one other users can write.
+func TestGitHubStartupStateDirectory(t *testing.T) {
+	t.Run("created private", func(t *testing.T) {
+		s := newStartup(t, nil)
+		if _, err := s.open(t); err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		info, err := os.Stat(s.options.Config.StateDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o700 {
+			t.Fatalf("state directory mode = %o, want 700", mode)
+		}
+	})
+	for _, mode := range []os.FileMode{0o770, 0o757, 0o777} {
+		t.Run("refuses "+mode.String(), func(t *testing.T) {
+			s := newStartup(t, nil)
+			if err := os.Mkdir(s.options.Config.StateDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(s.options.Config.StateDir, mode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.open(t); err == nil || !strings.Contains(err.Error(), "writable by other users") {
+				t.Fatalf("open with state directory mode %o: %v", mode, err)
+			}
+		})
+	}
+	t.Run("keeps an existing private directory", func(t *testing.T) {
+		s := newStartup(t, nil)
+		if err := os.Mkdir(s.options.Config.StateDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.open(t); err != nil {
+			t.Fatalf("open: %v", err)
+		}
+	})
+}

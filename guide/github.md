@@ -31,11 +31,17 @@ Run the runner only:
 Workers hold **no GitHub write credential**. The dedicated account's `gh`
 configuration directory is passed only to the controller's own `gh` and `git`
 subprocesses. Workers ask for writes through the `github` extension's tools, and
-the controller performs them. This is credential selection, not isolation: a
-worker shell can still read files the OS account can read, which is why the
-account must be dedicated. `serve` refuses to start when `GH_TOKEN`,
-`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` is set in its
-environment, because worker shells would inherit it.
+the controller performs them. A worker's shell commands, background jobs, eval
+kernels and debug adapters start without the variables that select a GitHub or
+git credential: every `GH_*` (including `GH_CONFIG_DIR`) and `GITHUB_*`,
+`GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` and
+git configuration passed through the environment (`GIT_CONFIG_PARAMETERS`,
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`). Other sessions of
+the same `serve` keep them, so `serve` still refuses to start when `GH_TOKEN`,
+`GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` is set.
+This is credential selection, not isolation: a worker shell can still read files
+the OS account can read, the account's `gh` directory and `~/.gitconfig`
+included, which is why the account must be dedicated.
 
 ## Setup
 
@@ -78,8 +84,10 @@ Startup refuses, in this order and before any poll or dispatch, naming the cause
    `account.id`;
 3. the repository missing, renamed, or without push permission for the account;
 4. the clone's remote URL not naming the repository;
-5. another serve already holding `<stateDir>/control.jsonl` for this repository;
-6. a control journal recorded for a different repository ID or account.
+5. a state directory that is not a directory (a symlink included), is owned by
+   another user, or that group or others can write (a new one is created `0700`);
+6. another serve already holding `<stateDir>/control.jsonl` for this repository;
+7. a control journal recorded for a different repository ID or account.
 
 ### Operator file
 
@@ -114,7 +122,7 @@ errors, and each error names its field. Durations use Go syntax (`"90s"`,
 | `repository` | `owner/repo`; must equal `-github` (case-insensitive). |
 | `account` | The dedicated user. `id` is what reconciliation and self-filtering use; `login` is checked against GitHub at startup. `ghPath` and `ghConfigDir` are absolute. |
 | `clone` | Absolute path of the local clone. |
-| `stateDir` | Holds the control journal, Ticket worktrees and the outbox's push repository. Default `<session-dir>/github/<owner>/<repo>`. |
+| `stateDir` | Holds the control journal, Ticket worktrees and the outbox's push repository. Default `<session-dir>/github/<owner>/<repo>`. Keep it, the operator file and the account directory outside every repository checkout. |
 | `poll.interval` | 60s to 1h, default 60s. A larger GitHub `X-Poll-Interval` wins. |
 | `poll.lookback` | Reread window for late-indexed items, default 1h. Event IDs deduplicate rereads. |
 | `poll.retention` | How long a thread stays polled after its last Ticket ended, default 336h. |
@@ -166,8 +174,16 @@ last one merged), `dropped` (the worker reported dropping it) or `stopped`
 Each Ticket gets one worker session for its whole life, in the worktree
 `<stateDir>/worktrees/<TicketID>` on branch `agent/<TicketID>`, with the required
 `github` extension. Load the worker's transcript over ACP with `session/load` and
-the `sessionId` from the Ticket. The worker sees the request, the thread and team
-guidance in its system prompt, and each wake as a block per new input with the
+the `sessionId` from the Ticket, and watch it with `tempest/watch`. Only the
+runner runs or changes a worker: a client's prompt, continue, steer, follow-up,
+task, fork, reset, compact, commit, checkpoint, rewind, budget or permission-mode
+change on it fails, so every worker run is a dispatch, within its slot, budget
+and stop. Steer a Ticket with GitHub comments and the operator methods below.
+Approving a worker's tool call and `session/cancel` still work. A loaded worker
+follows the Ticket's dispatches; `session/close` releases this client's handle
+without closing the worker.
+The worker sees the request, the thread and team guidance in its system prompt,
+and each wake as a block per new input with the
 GitHub text fenced as data. Its GitHub tools are:
 
 | Tool (model name) | What it does |
@@ -295,12 +311,18 @@ the intent ID in the marker; a human may have edited it away) and call
   `pending` with a fresh attempt limit and publishes before the Ticket's later
   writes. Only an `unknown` write can be resent, and not for a stopped Ticket.
 
-After a restart, the runner reconciles before it starts anything new: running
-dispatches are settled from the worker's durable receipt (an interrupted run
-starts a recovery generation that tells the worker to check `git status`,
-`git log` and the `status` tool before repeating anything), and `attempting`
-writes are reconciled as above. On shutdown the loops stop before sessions close;
-running dispatches keep their slots until the next start settles them.
+After a restart, the runner's loops start together. The dispatcher first resumes
+every live dispatch from its committed step: a dispatch is settled only from the
+worker's durable receipt (an interrupted run starts a recovery generation that
+tells the worker to check `git status`, `git log` and the `status` tool before
+repeating anything), and its slot stays held until then. It then admits queued
+Tickets into free slots without waiting for those dispatches to settle. The
+outbox reconciles `attempting` writes as above while it publishes other
+Tickets' writes; one Ticket's writes always go in order. Polling starts at once.
+On shutdown, `serve` stops the loops, then closes the sessions, then the control
+journal. Running dispatches keep their slots until the next start settles them.
+If closing the sessions outlasts the shutdown timeout, a run still finishing
+meets a closed journal: its `github` tools fail, and no write is committed.
 
 ## Not in this build
 

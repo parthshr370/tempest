@@ -143,6 +143,16 @@ the listing. `CloseSession(ctx, id)` closes one owner; `Close(ctx)` closes the h
 its own MCP selection. `AgentOptions.Extensions` selects one session's bundles
 from `HostOptions.Registry` in place of `HostOptions.Extensions` (nil keeps the
 host selection); the selection is journaled, so reopening restores it.
+A Host may close a session another holder still has; `Session.Closed()` reports
+it, and `Open` then returns the live replacement.
+
+`HostOptions.Authorize` sees each session operation as a `tempest.Access` (session
+ID and action such as `submit`, `resume_pending`, `commit`, `rewind`) with the
+caller's context, before the operation reads or changes state; an error refuses
+it. `Session.Authorize(ctx, action)` applies it to controls that take no context,
+such as `SetBudget` (`set_budget`) and `SetPermissionMode`
+(`set_permission_mode`); ACP calls it first. Serve's GitHub runner uses it so
+only its dispatcher runs worker sessions.
 
 Opening and listing do not run accepted input. Call `ResumePending(ctx)` explicitly
 to schedule durable pending work in currently open sessions. It attempts every

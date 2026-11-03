@@ -125,12 +125,16 @@ func TestGitHubConfigNonFiniteBudgetRejected(t *testing.T) {
 func TestGitHubConfigDecodeIsStrict(t *testing.T) {
 	valid := string(encode(t, validConfig()))
 	cases := map[string]string{
-		"unknown field":      strings.Replace(valid, `"merge":"manual"`, `"merge":"manual","autoMerge":true`, 1),
-		"bare number":        strings.Replace(valid, `"interval":"1m0s"`, `"interval":60`, 1),
-		"trailing data":      valid + `{}`,
-		"not an object":      `[]`,
-		"bad -github flag":   valid,
-		"unknown nested key": strings.Replace(valid, `"login":"parth"`, `"login":"parth","role":"admin"`, 1),
+		"unknown field":       strings.Replace(valid, `"merge":"manual"`, `"merge":"manual","autoMerge":true`, 1),
+		"bare number":         strings.Replace(valid, `"interval":"1m0s"`, `"interval":60`, 1),
+		"trailing data":       valid + `{}`,
+		"trailing brace":      valid + `}`,
+		"trailing bracket":    valid + `]`,
+		"trailing brace text": valid + `} trailing`,
+		"trailing garbage":    valid + ` x`,
+		"not an object":       `[]`,
+		"bad -github flag":    valid,
+		"unknown nested key":  strings.Replace(valid, `"login":"parth"`, `"login":"parth","role":"admin"`, 1),
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
