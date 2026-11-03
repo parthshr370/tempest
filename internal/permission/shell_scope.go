@@ -28,7 +28,19 @@ const maxShellStates = 16
 // start in; a loop that needs more asks.
 const maxLoopPasses = 32
 
-var unknownState = shellState{cwd: unknownDirectory}
+// maxShellCommandBytes, maxShellDepth and maxShellWork bound what a walk may
+// spend; a command past any of them asks instead. Linux caps one exec
+// argument (MAX_ARG_STRLEN) at 128 KiB, so bash -c cannot run a longer
+// command there. Work counts tokens read, loop passes included, and the
+// candidate paths each statement copies.
+const (
+	maxShellCommandBytes = 128 << 10
+	maxShellDepth        = 64
+	maxShellWork         = 1 << 20
+)
+
+// unknownState is a state whose directory and GIT_WORK_TREE are unknown.
+var unknownState = shellState{cwd: unknownDirectory, workTree: gitWorkTree{value: cloudcmd.Token{Dynamic: true}, set: true}}
 
 func (s shellStates) union(more ...shellStates) shellStates {
 	out := slices.Clone(s)
@@ -64,14 +76,24 @@ type shellCheck struct {
 
 // walkShell reports whether check matches any statement of command, which
 // starts in cwd. It follows the directory and GIT_WORK_TREE the way the
-// shell scopes them: a subshell, a pipeline member, a background list, a
-// command substitution and a function definition keep their changes to
-// themselves; a statement after && or || runs only in the states that
-// branch can reach; the branches of if and case and every iteration of a
-// loop all count. Nothing is evaluated, so a cd whose effect is uncertain
-// leaves each possible directory as a candidate.
+// shell scopes them: a subshell, a pipeline member, a background list and a
+// command substitution keep their changes to themselves; a statement after
+// && or || runs only in the states that branch can reach; the branches of
+// if and case and every iteration of a loop all count. Nothing is
+// evaluated, so a cd whose effect is uncertain leaves each possible
+// directory as a candidate, and anything that may change the directory in a
+// way the walk does not follow leaves it unknown (see directoryAfter). A
+// command too large to walk within the bounds matches.
 func walkShell(command, cwd string, check shellCheck) bool {
-	w := shellWalk{words: shellWords(command), written: map[string]bool{}, check: check, list: statement{cur: shellStates{{cwd: cwd}}}}
+	if len(command) > maxShellCommandBytes {
+		return true
+	}
+	start := shellState{cwd: cwd}
+	if os.Getenv("BASH_ENV") != "" {
+		// bash runs this file first, and it may cd.
+		start = unknownState
+	}
+	w := shellWalk{words: shellWords(command), written: map[string]bool{}, check: check, list: statement{cur: shellStates{start}}, opaque: environmentOpaque()}
 	return w.walk()
 }
 
@@ -89,6 +111,9 @@ type statement struct {
 	out      shellStates // a finished compound member's result
 	words    []cloudcmd.Token
 	header   bool // for, select or case header words, which run nothing
+	// redirected marks a member with a redirection, which can fail and
+	// skip the command.
+	redirected bool
 }
 
 // scope is an open compound command.
@@ -100,7 +125,7 @@ type scope struct {
 	body     shellStates // the states its first list starts in
 	cond     shellStates // if and loop: the states after the latest condition
 	seen     shellStates // the states every list inside ended in
-	changed  bool        // a statement inside sets the directory or GIT_WORK_TREE
+	opaque   bool        // the walk was opaque when this pass opened it
 	outer    statement   // the enclosing list, resumed at the close
 	written  map[string]bool
 	pattern  bool // case: the next words are an arm's pattern
@@ -119,12 +144,22 @@ type shellWalk struct {
 	// body as commands, so from there on no statement replaces a state; each
 	// only adds candidates.
 	heredoc bool
-	reopen  map[int]shellStates
-	passes  map[int]int
+	// opaque reports that cd may no longer mean the builtin the walk
+	// follows (see opaqueCommand); from there on every cd leaves an unknown
+	// directory.
+	opaque bool
+	// work is the effort spent so far, against maxShellWork.
+	work   int
+	reopen map[int]shellStates
+	passes map[int]int
 }
 
 func (w *shellWalk) walk() bool {
 	for w.i = 0; ; w.i++ {
+		w.work++
+		if w.work > maxShellWork || len(w.scopes) > maxShellDepth {
+			return true
+		}
 		if w.i >= len(w.words) {
 			if len(w.scopes) == 0 {
 				return w.endList(false)
@@ -175,6 +210,8 @@ func (w *shellWalk) operator(text string) bool {
 	case "<":
 		// A process substitution <(...) is read as a substitution.
 		if next, ok := w.next(); ok && next.Text != "(" {
+			w.begin()
+			w.list.redirected = true
 			w.i++
 			if next.Operator && next.Text == "&" {
 				if fd, ok := w.next(); ok && !fd.Operator {
@@ -185,6 +222,8 @@ func (w *shellWalk) operator(text string) bool {
 		return false
 	case "<<":
 		if next, ok := w.next(); ok && !next.Operator {
+			w.begin()
+			w.list.redirected = true
 			w.heredoc = true
 			w.i++
 		}
@@ -258,6 +297,7 @@ func (w *shellWalk) redirect(op string) bool {
 		target = next
 	}
 	w.begin()
+	w.list.redirected = true
 	return w.eachState(func(state shellState, written map[string]bool) bool {
 		return w.check.redirect(op, target, state, written)
 	})
@@ -406,6 +446,8 @@ func (w *shellWalk) eachState(check func(state shellState, written map[string]bo
 	if len(in) == 1 {
 		return check(in[0], w.written)
 	}
+	// Each candidate copies the paths created so far.
+	w.work += len(in) * len(w.written)
 	merged := maps.Clone(w.written)
 	for _, state := range in {
 		written := maps.Clone(w.written)
@@ -432,21 +474,22 @@ func (w *shellWalk) endMember() bool {
 		return true
 	}
 	out := l.out
-	if out == nil {
+	switch {
+	case out == nil && opaqueCommand(words):
+		w.opaque = true
+		out = shellStates{unknownState}
+	case out == nil:
 		for _, state := range l.in {
-			next, changed := stateAfter(words, state)
-			out = out.union(shellStates{next})
-			if changed {
-				for i := range w.scopes {
-					w.scopes[i].changed = true
-				}
-			}
+			out = out.union(shellStates{{cwd: w.directoryAfter(words, state.cwd, l.redirected), workTree: state.workTree.after(words)}})
 		}
+	case l.redirected:
+		// A redirection that fails skips the compound command.
+		out = out.union(l.in)
 	}
 	if w.heredoc {
 		out = out.union(l.in)
 	}
-	l.member, l.in, l.out, l.words = out, nil, nil, nil
+	l.member, l.in, l.out, l.words, l.redirected = out, nil, nil, nil, false
 	return false
 }
 
@@ -520,7 +563,7 @@ func (w *shellWalk) restart(states shellStates) {
 
 func (w *shellWalk) open(kind string) {
 	w.begin()
-	s := scope{kind: kind, function: w.function, at: w.i, in: w.list.in, body: w.list.in, outer: w.list, pattern: kind == "case"}
+	s := scope{kind: kind, function: w.function, at: w.i, in: w.list.in, body: w.list.in, opaque: w.opaque, outer: w.list, pattern: kind == "case"}
 	w.function = false
 	if s.function {
 		// A function body runs when it is called, in any later state.
@@ -531,6 +574,7 @@ func (w *shellWalk) open(kind string) {
 			s.body = again
 			delete(w.reopen, w.i)
 		}
+		w.work += len(w.written)
 		s.written = maps.Clone(w.written)
 	}
 	w.scopes = append(w.scopes, s)
@@ -538,7 +582,8 @@ func (w *shellWalk) open(kind string) {
 }
 
 // close ends the innermost compound command. A loop whose iterations can
-// start in states its body was not read in is read again in those too.
+// start in states its body was not read in, or whose body made the walk
+// opaque after its cds were read, is read again.
 func (w *shellWalk) close() bool {
 	if w.endList(false) {
 		return true
@@ -563,7 +608,7 @@ func (w *shellWalk) close() bool {
 	case "case":
 		out = s.seen.union(s.body, w.list.cur)
 	}
-	if s.kind == "loop" && !out.within(s.body) {
+	if s.kind == "loop" && (!out.within(s.body) || w.opaque && !s.opaque) {
 		if w.passes == nil {
 			w.passes, w.reopen = map[int]int{}, map[int]shellStates{}
 		}
@@ -577,11 +622,10 @@ func (w *shellWalk) close() bool {
 		return false
 	}
 	if s.function {
-		// Defining a function runs nothing; calling it later may change state.
-		out = s.in
-		if s.changed {
-			out = out.union(shellStates{unknownState})
-		}
+		// Defining a function runs nothing, but calling it later may change
+		// the directory, and it may replace cd itself.
+		out = s.in.union(shellStates{unknownState})
+		w.opaque = true
 	}
 	if w.heredoc {
 		out = out.union(s.in, s.seen, w.list.cur)
@@ -591,47 +635,138 @@ func (w *shellWalk) close() bool {
 	return false
 }
 
-// stateAfter returns the state a simple command leaves for the statements
-// after it, and whether the command sets the directory or GIT_WORK_TREE.
-func stateAfter(words []cloudcmd.Token, state shellState) (shellState, bool) {
-	workTree := state.workTree.after(words)
-	cwd, changed := directoryAfter(words, state.cwd)
-	return shellState{cwd: cwd, workTree: workTree}, changed || workTree != state.workTree
+// directoryAfter returns the directory a simple command leaves the shell in.
+// It follows only the plain forms of cd and pushd it fully understands: the
+// command alone or behind command or builtin, cd with no option but -L, one
+// literal argument naming an existing directory (see logicalDirectory), and
+// no redirection, which could fail and skip the cd. Every other command
+// that names cd, pushd or popd, including wrappers such as time, leaves an
+// unknown directory, as does every cd once the walk is opaque.
+func (w *shellWalk) directoryAfter(words []cloudcmd.Token, cwd string, redirected bool) string {
+	command := words
+	if len(command) > 1 && (command[0].Text == "command" || command[0].Text == "builtin") {
+		command = command[1:]
+	}
+	if len(command) > 0 && (command[0].Text == "cd" || command[0].Text == "pushd") {
+		name, args := command[0].Text, command[1:]
+		for name == "cd" && len(args) > 0 && args[0].Text == "-L" {
+			args = args[1:]
+		}
+		if w.opaque || redirected || len(args) != 1 || args[0].Dynamic || args[0].Text == "" || strings.HasPrefix(args[0].Text, "-") || strings.HasPrefix(args[0].Text, "+") {
+			return unknownDirectory
+		}
+		return logicalDirectory(args[0].Text, cwd)
+	}
+	for _, word := range words {
+		switch word.Text {
+		case "cd", "pushd", "popd":
+			return unknownDirectory
+		}
+	}
+	return cwd
 }
 
-// directoryAfter returns the directory a simple command leaves the shell in
-// and whether it is a cd, pushd or popd. A destination the guard cannot know
-// (an expansion, a missing directory, $HOME, $OLDPWD or the directory stack)
-// is unknownDirectory.
-func directoryAfter(words []cloudcmd.Token, cwd string) (string, bool) {
-	for len(words) > 0 && (words[0].Text == "command" || words[0].Text == "builtin" || strings.Contains(words[0].Text, "=")) {
+// logicalDirectory is where cd -L dir leaves the shell when the guard can
+// tell. bash removes the component before each ".." once it checks that it
+// is a directory, then needs an existing directory; resolveTarget takes a
+// ".." only where it is also the physical parent, so bash's logical result
+// and the directory the kernel holds agree. Anything else is unknown.
+func logicalDirectory(dir, cwd string) string {
+	path := resolveTarget(dir, cwd)
+	if path == unknownDirectory || !isDirectory(path) {
+		return unknownDirectory
+	}
+	return path
+}
+
+func isDirectory(path string) bool {
+	if path == "" {
+		path = "."
+	}
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// opaqueCommand reports whether a simple command can change, in a way the
+// walk does not follow, what cd means or where later commands run: it runs
+// text as commands (eval, source, ., a computed command name), sets up
+// commands to run later (trap, alias), replaces builtins (enable) or shell
+// options (shopt, set -P, set -o physical), or may set CDPATH, which
+// redirects a relative cd (any word naming CDPATH, a nameref, or a variable
+// assigned through a computed name).
+func opaqueCommand(words []cloudcmd.Token) bool {
+	for _, word := range words {
+		if strings.Contains(word.Text, "CDPATH") {
+			return true
+		}
+	}
+	for len(words) > 0 && isAssignment(words[0].Text) {
+		words = words[1:]
+	}
+	for len(words) > 1 && (words[0].Text == "command" || words[0].Text == "builtin" || words[0].Text == "time" || words[0].Text == "-p") {
 		words = words[1:]
 	}
 	if len(words) == 0 {
-		return cwd, false
+		return false
 	}
-	switch words[0].Text {
-	case "cd", "pushd":
-		args := words[1:]
-		if words[0].Text == "cd" {
-			for len(args) > 0 && len(args[0].Text) > 1 && args[0].Text[0] == '-' {
-				option := args[0].Text
-				args = args[1:]
-				if option == "--" {
-					break
-				}
+	name, args := words[0], words[1:]
+	if name.Dynamic {
+		// An expanded name holding a "/" runs a file, never a builtin.
+		return !strings.Contains(name.Text, "/")
+	}
+	switch name.Text {
+	case "eval", "source", ".", "trap", "alias", "enable", "shopt":
+		return true
+	case "set":
+		for _, arg := range args {
+			if arg.Dynamic || arg.Text == "physical" || len(arg.Text) > 1 && (arg.Text[0] == '-' || arg.Text[0] == '+') && strings.Contains(arg.Text, "P") {
+				return true
 			}
 		}
-		if len(args) != 1 || args[0].Dynamic || args[0].Text == "-" || strings.HasPrefix(args[0].Text, "+") || words[0].Text == "pushd" && strings.HasPrefix(args[0].Text, "-") {
-			return unknownDirectory, true
+	case "printf":
+		for i, arg := range args {
+			if arg.Text == "-v" && i+1 < len(args) && strings.ContainsAny(args[i+1].Text, "$`") {
+				return true
+			}
 		}
-		target := resolveTarget(args[0].Text, cwd)
-		if info, err := os.Stat(target); err != nil || !info.IsDir() {
-			return unknownDirectory, true
+	case "declare", "typeset", "local", "export", "readonly", "read", "mapfile", "readarray", "getopts", "let":
+		nameref := name.Text == "declare" || name.Text == "typeset" || name.Text == "local"
+		for _, arg := range args {
+			variable, _, _ := strings.Cut(arg.Text, "=")
+			if strings.ContainsAny(variable, "$`") || nameref && strings.HasPrefix(arg.Text, "-") && strings.Contains(arg.Text, "n") {
+				return true
+			}
 		}
-		return target, true
-	case "popd":
-		return unknownDirectory, true
 	}
-	return cwd, false
+	return false
+}
+
+// isAssignment reports whether word is a shell variable assignment: a name
+// of letters, digits and underscores, not starting with a digit, then "=".
+func isAssignment(word string) bool {
+	name, _, ok := strings.Cut(word, "=")
+	if !ok || name == "" || name[0] >= '0' && name[0] <= '9' {
+		return false
+	}
+	for _, char := range name {
+		if char != '_' && (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// environmentOpaque reports whether the environment bash inherits can change
+// what cd means: CDPATH, exported functions, or SHELLOPTS with physical.
+// BASH_ENV, a file bash runs first, also leaves the start unknown.
+func environmentOpaque() bool {
+	if os.Getenv("CDPATH") != "" || os.Getenv("BASH_ENV") != "" || strings.Contains(os.Getenv("SHELLOPTS"), "physical") {
+		return true
+	}
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "BASH_FUNC_") {
+			return true
+		}
+	}
+	return false
 }

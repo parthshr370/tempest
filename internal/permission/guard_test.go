@@ -145,7 +145,7 @@ func TestDestructiveGuardPolicy(t *testing.T) {
 		{"if true; then cd out && git checkout keep.txt; fi", false},
 		{"cd out; for i in 1 2; do git checkout keep.txt; done", false},
 		{"for d in out nested; do (cd $d && ls); done; git checkout main", false},
-		{"cd out; f() { git status; }; f; git checkout keep.txt", false},
+		{"cd out; f() { git status; }; f; git checkout keep.txt", true},
 		{"cd out; echo $(cd ..) > keep.txt", false},
 		{"false && cd out; echo hi > " + filepath.Join(cwd, "new.txt"), false},
 		{"git reset --hard", true},

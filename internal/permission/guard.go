@@ -18,6 +18,9 @@ func IsDestructiveCommand(command string) bool {
 }
 
 func isDestructiveCommand(command, cwd string) bool {
+	if len(command) > maxShellCommandBytes {
+		return true
+	}
 	if mkfsCommandPattern.MatchString(command) {
 		return true
 	}
@@ -184,6 +187,9 @@ func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]b
 		return false
 	}
 	path := resolveTarget(target.Text, cwd)
+	if path == unknownDirectory {
+		return true
+	}
 	if written[path] {
 		return true
 	}
@@ -195,15 +201,45 @@ func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]b
 	return false
 }
 
+// resolveTarget is target's path from cwd. A relative target under an
+// unknown directory is unknownDirectory itself: no ".." can climb out of it.
+// A ".." is taken lexically only where it names the directory the kernel
+// reaches, so a path whose ".." leaves a symlink or a missing directory is
+// unknown too.
 func resolveTarget(target, cwd string) string {
-	if filepath.IsAbs(target) {
-		return filepath.Clean(target)
+	path := cwd
+	switch {
+	case filepath.IsAbs(target):
+		path = string(filepath.Separator)
+	case cwd == unknownDirectory:
+		return unknownDirectory
 	}
-	return filepath.Join(cwd, target)
+	for _, part := range strings.Split(target, "/") {
+		if part == ".." && !parentIsLexical(path) {
+			return unknownDirectory
+		}
+		path = filepath.Join(path, part)
+	}
+	return path
 }
 
-// unknownDirectory stands for a directory the guard cannot know; no path
-// under it can be checked, so every check under it asks.
+// parentIsLexical reports whether path is a directory whose physical parent
+// is the directory its lexical parent names.
+func parentIsLexical(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil || !isDirectory(abs) {
+		return false
+	}
+	physical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	return err == nil && parent == filepath.Dir(physical)
+}
+
+// unknownDirectory stands for a directory or path the guard cannot know.
+// It is a whole value, never a path component, and every check of it asks.
 const unknownDirectory = "\x00"
 
 func allDigits(text string) bool {
