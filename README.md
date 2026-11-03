@@ -4,7 +4,7 @@
 
 <h1 align="center">Tempest</h1>
 
-<p align="center"><strong>A coding agent you can run, resume, and embed as one Go binary.</strong></p>
+<p align="center"><strong>An open-source coding agent in one Go binary. Run it, resume it, embed it.</strong></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
@@ -13,58 +13,33 @@
   <a href="https://github.com/parthshr370/tempest/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/parthshr370/tempest"></a>
 </p>
 
-Tempest is an open-source coding agent that reads and edits files, runs commands,
-and works turn by turn until the job is done. It runs from your terminal, serves
-agent protocols, or embeds in a Go application, without a Node runtime or interpreter.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#use-it-from">Use it from</a> ·
+  <a href="guide/README.md">Guide</a>
+</p>
 
-## At a glance
+Tempest reads your code, edits files, runs commands, and keeps working turn by turn
+until the task is done. It ships as a single static Go binary, with no Node or Python
+runtime to install. Every session is written to an append-only journal, so you can
+stop, crash, or resume without losing work or silently repeating a side effect. The
+same engine runs in your terminal, serves editors and other agents, embeds in Go
+programs, and works GitHub issues from an `@mention`.
 
-- **One static Go binary**, with no runtime dependencies for the harness itself.
-- **Every model route in one harness**: 20 endpoint presets, six protocol adapters, custom endpoints, and exact model IDs.
-- **Crash-safe durable sessions**, with atomic state commits and request-keyed prompt receipts, without silently repeating unknown outside effects.
-- **Hashline edits** anchored to the file you read, with atomic writes and batch rollback recovery.
-- **Permissions and plan mode**, with per-call guards for destructive commands and cloud changes.
-- **Subagents in worktrees**, with durable jobs, messages, and explicit three-way integration.
-- **Claude Code-compatible hooks**, with explicit trust for project commands, plus observation-only model-request hooks.
-- **Go and subprocess extensions**, with named bundles, scoped memos, typed hooks, and pinned result wrappers.
-- **Checkpoint and rewind**, restoring files and branching the conversation without touching your Git index.
-- **Persistent eval kernels** for Python and JavaScript, started only when needed.
-- **ACP, A2A, MCP, and a Go SDK**, sharing durable sessions, permissions, and cost budgets with billed cost.
-- **OpenTelemetry traces and metrics** over OTLP/HTTP, with GenAI span conventions, W3C trace propagation, and Prometheus `/metrics` on `serve`.
+## Why Tempest
 
-## Contents
-
-- [Architecture](#architecture)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Features](#features)
-- [Configuration](#configuration)
-- [Embedding](#embedding)
-- [Development](#development)
-- [Guide](guide/README.md)
-- [License](#license)
-
-## Architecture
-
-All entry points open the same session stack. The agent loop writes to the journal,
-runs tools through the permission gate and hooks, and calls the provider registry.
-
-```mermaid
-flowchart TD
-  CLI["CLI one-shot"] --> S["session + journal"]
-  ACP["serve: ACP and A2A"] --> S
-  MCP["mcp: tempest_run"] --> S
-  SDK["Go SDK: tempest.Open"] --> S
-  S --> L["agent loop"]
-  L -->|tool calls| G["permission gate + hooks"]
-  G --> T["tools, jobs, children"]
-  L -->|model calls| P["provider registry"]
-  P --> A["protocol adapters"]
-```
+- **One static binary.** Build it once and copy it anywhere. Git, language servers and eval interpreters are needed only by the tools that call them.
+- **Any model.** 21 endpoint presets over 6 protocol adapters: Anthropic, OpenAI, Google, OpenRouter, Bedrock, Vertex, Azure, local Ollama, LM Studio, vLLM, llama.cpp and more, plus custom endpoints and backup models.
+- **Sessions that survive crashes.** Each tool call is journaled before it runs. Resume any session; an action whose outcome is unknown is reported, never quietly run again.
+- **Edits anchored to what was read.** Hashline patches name line numbers and a content tag from the model's last read. A stale view is rejected instead of writing to the wrong place, and a multi-file patch is validated before any file is written.
+- **Guardrails built in.** Permission modes, a read-only plan mode, and per-call approval for destructive shell commands and cloud changes.
+- **Subagents in worktrees.** Child agents investigate read-only or write code in their own Git worktree; their patches merge back explicitly, with conflicts reported.
+- **Speaks the protocols.** ACP for editors, A2A and MCP for other agents, a Go SDK for your programs, and a GitHub ticket runner that turns mentions into pull requests.
 
 ## Install
 
-Build from source with **Go 1.26.4 or newer**:
+Build from source with Go 1.26.4 or newer:
 
 ```sh
 git clone https://github.com/parthshr370/tempest.git
@@ -72,128 +47,148 @@ cd tempest
 CGO_ENABLED=0 go build -o bin/tempest ./cmd/harness
 ```
 
-Copy `bin/tempest` onto your `PATH`. The harness needs no runtime installation.
-Tools that invoke Git, language servers, or eval interpreters need those programs
-only when used. See the [guide](guide/README.md) for the full reference.
+Copy `bin/tempest` onto your `PATH`.
 
 ## Quick start
-
-From the checkout:
 
 ```sh
 export OPENROUTER_API_KEY=...
 ./bin/tempest -model 'openrouter:~google/gemini-flash-latest' -p "Explain this project"
-./bin/tempest -continue -p "Create hello.txt with hi"
+./bin/tempest -continue -p "Create hello.txt that says hi"
 ./bin/tempest doctor
 ```
 
-`-continue` opens the latest session in the current directory. Use `-resume <id>`
-for a specific session. Export credentials yourself; Tempest does not load `.env`.
-See [providers](guide/providers.md) for model routes and credentials.
+Each `-p` runs one prompt and exits. `-continue` picks up the latest session in this
+directory with its model; `-resume <id>` opens a specific one. `doctor` checks your
+configuration and credentials offline. Tempest does not read `.env` files, so export
+credentials yourself. See [providers](guide/providers.md) for every model route.
+
+## How it fits together
+
+Every entry point opens the same session stack. Tool calls pass one permission gate;
+model calls go through one provider registry.
+
+```mermaid
+flowchart LR
+  CLI["Terminal: tempest -p"] --> S["Session + journal"]
+  SRV["serve: ACP, A2A"] --> S
+  MCP["mcp: tempest_run"] --> S
+  SDK["Go SDK"] --> S
+  GH["serve -github"] --> S
+  S --> L["Agent loop"]
+  L -->|tool calls| G["Permission gate + hooks"]
+  G --> T["Tools, jobs, subagents"]
+  L -->|model calls| P["Provider registry"]
+  P --> A["Protocol adapters"]
+```
+
+## The agent loop
+
+A run repeats one cycle until the model answers without calling a tool, a budget
+trips, or the loop guard sees repeated work with no progress.
+
+```mermaid
+flowchart TD
+  U["Prompt"] --> M["Model call"]
+  M -->|final answer| D["Done"]
+  M -->|tool calls| G{"Permission gate"}
+  G -->|deny| R["Result: refused"]
+  G -->|allow or approved| J["Journal: tool start"]
+  J --> X["Run tool"]
+  X --> W["Journal: tool result"]
+  R --> C{"Budgets and loop guard"}
+  W --> C
+  C -->|within limits| M
+  C -->|tripped| D
+```
+
+## GitHub ticket runner
+
+`tempest serve -github owner/repo` polls one repository as a dedicated account and
+takes work from a listed person's mention through to a pull request. Merging stays manual.
+
+```mermaid
+flowchart LR
+  A["@mention by a listed person"] --> T["Ticket"]
+  T --> W["Worker session in its own worktree"]
+  W -->|asks to write| O["Outbox: comments, pushes, PRs"]
+  O --> PR["Pull request"]
+  PR -->|review and CI wake the worker| W
+  PR -->|a person merges| E["Ticket ends"]
+```
+
+Workers hold no GitHub write credential, and every write goes through an outbox that
+never blindly resends. There is no sandbox: run it on trusted repositories under a
+dedicated OS account. See the [GitHub ticket runner guide](guide/github.md).
 
 ## Features
 
-### Providers and budgets
+**Models and cost** · [providers](guide/providers.md)
+- Custom endpoints via the `providers` settings or `@<base-url>` on the model ID.
+- Model roles for normal work, read-only planning and small helper tasks.
+- Backup models (`-fallback-model`) take over when a model is unavailable.
+- Run budgets on turns, USD, wall time, tokens and tool calls (`-max-cost`, `-max-turns`, ...).
+- Billed cost first, catalog prices as fallback, unknown prices kept unknown.
 
-- **Exact model IDs**, separate from endpoint, protocol, and catalog metadata.
-- **20 endpoint presets**, plus custom routes for OpenAI-compatible, Responses, Bedrock, and Vertex endpoints.
-- **Model roles** for normal work, read-only planning, and small investigations.
-- **Backup models per role**: when a model is unavailable after its retries, the next one answers, sticks for the run, and is journaled, so a crash resumes on it.
-- **Billed cost first**, catalog prices as fallback, and unknown prices kept unknown.
-- **Catalog-aware limits**, shared across vendor protocols, with context-aware output clamping and configured overrides for unlisted models.
-- **Run budgets** for model calls, USD cost, elapsed time, input/output/total tokens, and tool calls, with whole tool-call batches admitted or refused.
-- **Prompt caching** and typed transient-error retries where the route supports them.
+**Files and code** · [tools](guide/tools.md) · [code intelligence](guide/code-intelligence.md) · [eval](guide/eval.md)
+- Hashline and exact-text edits, atomic writes, rollback for multi-file changes.
+- Bounded reads and search across code, archives, documents and JSON.
+- Language servers (`-enable-lsp`) for definitions, references, renames and diagnostics.
+- Persistent Python and JavaScript eval kernels, started on first use.
 
-[Provider reference](guide/providers.md) · [Run behavior](guide/sessions-and-durability.md#runs)
+**Sessions and safety** · [durability](guide/sessions-and-durability.md) · [permissions](guide/permissions.md) · [checkpoints](guide/checkpoints.md) · [conversations](guide/conversations.md)
+- Append-only journals; resume with `-continue` or `-resume <id>`.
+- Modes `plan`, `default`, `acceptEdits`, `bypass`; guards are guardrails, not a sandbox.
+- Checkpoints with `rewind`, plus `fork`, `reset`, `compact` and `history`.
+- Text, JSON or streaming JSON output, and answers validated against `-output-schema`.
 
-### Files and code
+**Agents and workflow** · [subagents](guide/subagents.md) · [hooks](guide/hooks.md) · [skills](guide/skills-and-context.md) · [extensions](guide/extensions.md)
+- Subagents (`-enable-task`), and agent types defined as files (`tempest agents list`).
+- Background jobs and services with readiness checks, logs, stdin and PTYs.
+- Claude Code-compatible hooks; project hooks run only after you trust them.
+- Skills and `AGENTS.md` / `CLAUDE.md` context; Go and subprocess extensions.
 
-- **Session-start workspace listing**: `git ls-files` or an ignore-aware walk, capped and journaled, in the first user message so the model skips `ls` turns.
-- **Hashline patches** use numbered reads and content tags, not copied old text.
-- **Atomic file writes** and rollback journals protect multi-file mutations.
-- **Bounded reads and search** include archives, documents, JSON queries, and internal URLs.
-- **Language servers** provide definitions, references, rename plans, and fresh diagnostics.
-- **Manifest diffs** compare rendered Kubernetes resources without running a renderer.
+**Protocols and operations** · [servers](guide/serve-and-protocols.md) · [telemetry](guide/telemetry.md) · [environments](guide/environments.md)
+- ACP over stdio or WebSocket, and A2A 1.0 over HTTP.
+- MCP client with OAuth sign-in; large tool sets load on demand. MCP server via `tempest mcp`.
+- OpenTelemetry traces and metrics, and Prometheus `/metrics` on `serve`.
+- Remote workspaces through a workspace daemon (`tempest env`).
 
-[Tool reference](guide/tools.md) · [Code intelligence](guide/code-intelligence.md) · [Workspace listing](guide/skills-and-context.md#workspace-listing)
+## Use it from
 
-### Sessions and safety
+| Where | How |
+|---|---|
+| Terminal | `tempest -p "..."`, then `tempest -continue -p "..."` |
+| Editor (ACP) | `tempest serve` speaks ACP over stdio |
+| Remote clients (ACP WebSocket, A2A) | `TEMPEST_TOKEN=... tempest serve -listen 127.0.0.1:7777` |
+| MCP clients | `tempest mcp` exposes one tool, `tempest_run` |
+| Go code | import `go.harness.dev/harness/tempest` ([SDK guide](guide/sdk.md), [example](examples/embed/main.go)) |
+| GitHub | `tempest serve -github owner/repo -github-config /abs/file.json` |
 
-- **Append-only journals** record tool starts before execution and preserve unknown outcomes.
-- **Plan mode** rejects mutations before allow rules or remembered approvals.
-- **Destructive and cloud guards** ask per call; they are guardrails, not a sandbox.
-- **Checkpoint and rewind** restore protected files and retain an auditable conversation branch.
-- **Text, JSON, or NDJSON output**, with locally validated structured final answers.
-- **Layered settings** with project files, profiles, `-c` overrides, administrator-pinned requirements, and `config show` attribution.
-
-The JSONL journal adapter keeps raw committed history in memory. Bounded read
-pages do not imply disk indexing or a bounded memory working set.
-
-[Sessions and durability](guide/sessions-and-durability.md) · [Permissions](guide/permissions.md) · [Checkpoints](guide/checkpoints.md) · [Configuration](guide/configuration.md)
-
-### Agents and automation
-
-- **Opt-in subagents** investigate read-only or code in detached worktrees when eligible.
-- **Agent types as files** in the repository's `.harness/agents` or `.claude/agents`, or `<agent-dir>/agents`, narrow a child's tools and pick its model role; loading is bounded and stays inside the repository; `tempest agents list` shows them.
-- **Explicit integration** merges child patches against their pinned base, with conflict reporting.
-- **Named jobs and services** support readiness checks, logs, cancellation, stdin, and PTYs.
-- **Trusted hooks and skills** add workflow rules without loading every skill body into the prompt.
-- **`AGENTS.override.md`, `AGENTS.md` and `CLAUDE.md`** load one per directory under a byte cap, with `@file` imports; deeper ones surface once after the read that reaches them, outside the cached prompt, read only inside the workspace and journaled with the result that delivers them.
-- **Persistent eval kernels** keep per-language state across prompts, not across restart or rewind.
-
-[Subagents and jobs](guide/subagents.md) · [Hooks](guide/hooks.md) · [Skills](guide/skills-and-context.md) · [Eval](guide/eval.md)
-
-### Protocols
-
-- **ACP** over stdio or authenticated WebSocket, with snapshots and reconnectable progress.
-- **A2A 1.0** over HTTP for run-oriented tasks and discovery.
-- **MCP client** for explicitly configured, trusted servers: tools, resources (`read mcp://`), prompts as `/<server>:<prompt>` commands, forwarded elicitation, progress and server logs, opt-in sampling on the smol model with user approval and charged to the run, and OAuth 2.1 sign-in (`tempest mcp login`) for HTTP servers. Large MCP and extension tool sets wait behind `tool_search` and load on demand, appended so the cached prompt prefix holds.
-- **MCP server** over stdio, exposing `tempest_run` to other clients.
-- **OpenTelemetry** traces and metrics over OTLP/HTTP JSON, plus Prometheus text at `/metrics`.
-- **GitHub ticket runner** (`serve -github`): polls one repository as a dedicated account, turns `@mentions` from listed people into Tickets with one worker session each, publishes comments, pushes and pull requests through an outbox that never blindly resends, and keeps finite per-Ticket and per-repository budgets. Merging stays manual, and there is no sandbox: use trusted repositories under a dedicated OS account.
-
-[Servers and protocols](guide/serve-and-protocols.md) · [GitHub ticket runner](guide/github.md) · [Telemetry](guide/telemetry.md)
+With a token, `serve -listen` requires it on every connection. Without one it stays on
+loopback and refuses foreign browser origins, which is not authentication. See
+[servers and protocols](guide/serve-and-protocols.md).
 
 ## Configuration
 
-Settings come in layers, each overriding the one below: built-in defaults, managed
-defaults, user `~/.config/harness/settings.json`, project `.harness/settings.json`,
-project-local `.harness/settings.local.json`, a named profile (`-profile`),
-`HARNESS_*` variables, flags, and `-c key.path=value` overrides. Managed
-requirements pin keys an administrator controls, and project settings that run code
-or route credentials apply only after explicit operator trust.
-`tempest config show` prints every effective setting with the layer that set it.
-Optional tools are enabled explicitly, including `-enable-task`, `-enable-web`,
-and `-enable-lsp`. Provider endpoints come from presets, the `providers` registry,
-or an `@<base-url>` model override.
-
-See [configuration](guide/configuration.md) for layers, profiles, overrides,
-managed requirements, flags and environment variables. Run `./bin/tempest -help`
-for command help.
-
-## Embedding
-
-Import `go.harness.dev/harness/tempest` to open sessions, watch updates, prompt,
-cancel, and close from Go. CLI, servers, and SDK use the same session stack.
-
-See the [SDK guide](guide/sdk.md) and [complete embedding example](examples/embed/main.go).
+Settings layer from defaults through `~/.config/harness/settings.json`, project
+`.harness/settings.json`, profiles (`-profile`), `HARNESS_*` variables, flags and
+`-c key=value`. `tempest config show` prints each effective setting and where it came
+from. Details are in the [configuration guide](guide/configuration.md).
 
 ## Development
 
 ```sh
-go build ./...
-go test ./...
-make check   # build, vet, tests, and race checks
-make smoke   # scratch-workspace run with the faux provider
+make check   # build, examples, vet, tests and race tests
+make smoke   # a scripted run in a scratch workspace, no credentials needed
 ```
 
-The [testing guide](guide/testing.md) covers scripted runs without credentials.
-The [education tour](education/README.md) explains the agent loop, providers,
-tools, configuration, permissions, concurrency, and idiomatic Go design.
+The [testing guide](guide/testing.md) covers scripted runs with the faux provider,
+and the [education tour](education/README.md) walks through the codebase.
 
 ## License
 
-**MIT**. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
+MIT. See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 Behavior is ported from [Pi](https://github.com/badlogic/pi-mono) by
 [Mario Zechner](https://github.com/mariozechner), extended via
 [oh-my-pi](https://github.com/can1357/oh-my-pi) by Can Bölük.
@@ -201,7 +196,4 @@ Behavior is ported from [Pi](https://github.com/badlogic/pi-mono) by
 Banner: [Mountain Landscape with Lightning](https://www.nationalgallery.org.uk/paintings/francisque-millet-mountain-landscape-with-lightning)
 by Francisque Millet, c. 1675, National Gallery, London. The painting is in the
 public domain; the banner is a crop of a public domain reproduction.
-
-## Star history
-
-[Star history chart](https://star-history.com/#parthshr370/tempest&Date)
+[Star history](https://star-history.com/#parthshr370/tempest&Date).
