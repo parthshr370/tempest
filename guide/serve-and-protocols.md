@@ -89,6 +89,12 @@ configuration. Serve keeps its startup MCP defaults for resumes that omit endpoi
 overrides, including after idle reap or server restart. Unknown-outcome MCP calls
 are never automatically replayed.
 
+A server that quotes a credential back gets it replaced by `[redacted]` in results,
+errors, notifications and server requests before the model or journal sees them.
+This covers configured header, environment and argument values of at least eight
+characters, the OAuth client secret, and OAuth access tokens: the current one, and
+a replaced one until every call that sent it has been answered.
+
 ### OAuth for HTTP servers
 
 An HTTP server without a configured `Authorization` header that answers `401` gets
@@ -370,9 +376,11 @@ discovery at `GET /.well-known/agent-card.json`. Use `A2A-Version: 1.0`,
 not accept query tokens.
 
 `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, and
-`SubscribeToTask` operate on runs in the server's fixed startup workspace. Set
-`-a2a-base-url https://agent.example` behind a proxy or for a non-loopback listener;
-numeric loopback derives the actual bound address.
+`SubscribeToTask` operate on runs in the server's fixed startup workspace. A
+`contextId` naming a session in any other workspace, such as one an ACP client
+opened elsewhere, fails with `-32603` whether that session is open or only in its
+journal. Set `-a2a-base-url https://agent.example` behind a proxy or for a
+non-loopback listener; numeric loopback derives the actual bound address.
 
 A2A 0.3 method names (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`,
 and so on) fail with `-32601` and a message naming the 1.0 method. A missing or

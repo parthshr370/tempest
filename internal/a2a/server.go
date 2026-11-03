@@ -518,26 +518,29 @@ func (s *Server) send(ctx context.Context, p *model.SendMessageRequest, prompt s
 			s.observers.Done()
 		}
 	}()
+	// Every context runs in the fixed A2A workspace. A supplied context goes
+	// through Resume, which checks the workspace whether the session is
+	// already open or reopened from its journal, so cache residency never
+	// changes the answer. The acquired session is checked again because the
+	// backend may have reopened it between Resume and Acquire.
 	var session *tempest.Session
-	var release func()
 	var err error
 	if p.Message.ContextID == "" {
 		defaults := s.backend.Defaults()
 		session, err = s.backend.New(ctx, s.opts.Cwd, &defaults)
 	} else {
-		session, release, err = s.backend.Acquire(p.Message.ContextID)
-		if errors.Is(err, journal.ErrSessionNotFound) {
-			session, err = s.backend.Resume(ctx, s.opts.Cwd, p.Message.ContextID, nil)
-		}
+		session, err = s.backend.Resume(ctx, s.opts.Cwd, p.Message.ContextID, nil)
 	}
 	if err != nil {
 		return nil, admissionError(err)
 	}
-	if release == nil {
-		session, release, err = s.backend.Acquire(session.ID())
-		if err != nil {
-			return nil, admissionError(err)
-		}
+	session, release, err := s.backend.Acquire(session.ID())
+	if err != nil {
+		return nil, admissionError(err)
+	}
+	if session.Snapshot().Cwd != s.opts.Cwd {
+		release()
+		return nil, admissionError(errForeignWorkspace)
 	}
 	snap, updates, stop := session.Watch(s.backend.RunContext(), tempest.WatchOptions{Buffer: taskQueueSize})
 	contentIdentity, _ := json.Marshal(p.Message.Parts)
@@ -592,6 +595,11 @@ func (s *Server) send(ctx context.Context, p *model.SendMessageRequest, prompt s
 	}()
 	return t, nil
 }
+
+// errForeignWorkspace rejects a context whose session runs outside the A2A
+// workspace. It maps like the backend's own workspace mismatch on Resume.
+var errForeignWorkspace = errors.New("context belongs to another workspace")
+
 func admissionError(err error) *rpcError {
 	if errors.Is(err, tempest.ErrHostLimit) {
 		return protocolError(-32004, "host_limit", nil)
