@@ -61,6 +61,12 @@ func ModelIDFromSpec(raw string) string {
 	return parseModelSpec(raw).ModelID
 }
 
+// ModelProviderFromSpec returns the lowercase provider of a model string's
+// "provider:" prefix, or "" for a bare model id.
+func ModelProviderFromSpec(raw string) string {
+	return parseModelSpec(raw).Provider
+}
+
 // ValidateModelSpec validates a route using the built-in provider registry.
 func ValidateModelSpec(raw string) error { return ValidateModelSpecWithProviders(raw, nil) }
 

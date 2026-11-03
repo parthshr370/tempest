@@ -26,6 +26,29 @@ If the process died mid-run, a tool call that had started but not finished comes
 back to the model as **"outcome unknown"** and is never re-run automatically. A torn
 final line is trimmed.
 
+### Which model a resumed session uses
+
+A resumed session keeps the model its journal records: its provider and endpoint,
+for the run and for the `-max-cost` price check. Only a model chosen for this
+command moves it, and the move is journaled, so later resumes keep the new one:
+
+- `-model <spec>`;
+- `-c model=<spec>`;
+- a managed requirement that pins `model`;
+- a profile selected with `-profile <name>` whose definition sets `model`.
+
+Standing defaults pick the model of new sessions only: `model` in a settings
+file, `HARNESS_MODEL`, and a profile selected with `HARNESS_PROFILE`.
+
+Journals written by tempest before it recorded the full model spec hold only the
+model id. Resuming one takes the provider from the session's run records (or its
+replies). The endpoint was never recorded, so a non-Anthropic route prints a notice:
+if the session ran on a custom endpoint, pass `-model provider:id@<endpoint>`. When
+the configured model has the same id and provider, its spec, endpoint included, is
+used. A journal that names no provider for the id resumes on Anthropic only when the
+id is an Anthropic model in the catalog; otherwise the resume fails and asks for
+`-model`.
+
 ### Tool call journaling
 
 The intent record is synced before the tool executes. On resume, a start with no

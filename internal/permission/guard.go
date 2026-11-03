@@ -28,6 +28,7 @@ func isDestructiveCommand(command, cwd string) bool {
 	}
 	words := shellWords(command)
 	written := make(map[string]bool)
+	var workTree gitWorkTree
 	var invocation []cloudcmd.Token
 	for i := 0; i < len(words); i++ {
 		token := words[i]
@@ -54,20 +55,25 @@ func isDestructiveCommand(command, cwd string) bool {
 				i++
 				continue
 			}
-			if destructiveInvocation(invocation, cwd, written) {
+			if destructiveInvocation(invocation, cwd, written, workTree) {
 				return true
 			}
 			cwd = directoryAfter(invocation, cwd)
+			workTree = workTree.after(invocation)
 			invocation = nil
 			continue
 		}
 		invocation = append(invocation, token)
 	}
-	return destructiveInvocation(invocation, cwd, written)
+	return destructiveInvocation(invocation, cwd, written, workTree)
 }
 
-func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[string]bool) bool {
+// destructiveInvocation reports whether one simple command needs approval.
+// workTree carries GIT_WORK_TREE from earlier statements and from wrappers
+// such as env, so git's operands resolve where git writes.
+func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[string]bool, workTree gitWorkTree) bool {
 	for len(words) > 0 && strings.Contains(words[0].Text, "=") {
+		workTree = workTree.assign(words[0])
 		words = words[1:]
 	}
 	if len(words) == 0 {
@@ -90,15 +96,18 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 				return true
 			}
 			if arg.Text == "-exec" || arg.Text == "-execdir" || arg.Text == "-ok" || arg.Text == "-okdir" {
-				if destructiveInvocation(args[i+1:], cwd, written) {
+				if destructiveInvocation(args[i+1:], cwd, written, workTree) {
 					return true
 				}
 			}
 		}
 	case "xargs", "env", "command", "exec":
 		for i := range args {
-			if destructiveInvocation(args[i:], cwd, written) {
+			if destructiveInvocation(args[i:], cwd, written, workTree) {
 				return true
+			}
+			if name == "env" {
+				cwd = envDirectory(args[i:], cwd)
 			}
 		}
 	case "dd":
@@ -121,7 +130,7 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 	case "cp", "mv":
 		return copyNeedsApproval(args, cwd, written)
 	case "git":
-		return destructiveGit(args, cwd)
+		return destructiveGit(args, cwd, workTree)
 	}
 	if name == "python" || name == "python3" || name == "node" || name == "perl" || name == "ruby" {
 		for i, arg := range args {
@@ -131,6 +140,18 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 		}
 	}
 	return false
+}
+
+// envDirectory is the directory the command after "env -C dir" (or
+// --chdir) runs in, when words starts with that option; otherwise cwd.
+func envDirectory(words []cloudcmd.Token, cwd string) string {
+	if dir, ok := strings.CutPrefix(words[0].Text, "--chdir="); ok {
+		return gitDirectory(cloudcmd.Token{Text: dir, Dynamic: !literalWord(words[0])}, cwd)
+	}
+	if (words[0].Text == "-C" || words[0].Text == "--chdir") && len(words) > 1 {
+		return gitDirectory(words[1], cwd)
+	}
+	return cwd
 }
 
 func copyNeedsApproval(args []cloudcmd.Token, cwd string, written map[string]bool) bool {

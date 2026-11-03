@@ -277,9 +277,11 @@ type workspaceSettings struct {
 func (c *ResolvedConfig) Model() string { return c.model }
 
 // ModelSetForCommand reports whether this command chose the default model: a
-// -model flag, a -c override or a managed requirement. A resumed session
-// keeps the model its journal records unless one of these names another;
-// settings files and HARNESS_MODEL are standing defaults for new sessions.
+// -model flag, a -c override, a managed requirement, or a profile that the
+// -profile flag selected and that sets model. A resumed session keeps the
+// model its journal records unless one of these names another; settings
+// files, HARNESS_MODEL and a profile HARNESS_PROFILE selects are standing
+// defaults for new sessions.
 func (c *ResolvedConfig) ModelSetForCommand() bool { return c.modelSetForCommand }
 
 // PlanModel returns the plan-agent model specification.
@@ -751,7 +753,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		environment:            environmentName,
 		environments:           environments,
 		model:                  settingString(settings.Model),
-		modelSetForCommand:     layered.setByLayer("model", LayerFlag, LayerOverride, LayerRequirement),
+		modelSetForCommand:     layered.setByLayer("model", LayerFlag, LayerOverride, LayerRequirement) || c.Flags.Profile.Set && layered.setByLayer("model", LayerProfile),
 		planModel:              settingString(settings.PlanModel),
 		smolModel:              settingString(settings.SmolModel),
 		fallbackModels:         fallbackModels,

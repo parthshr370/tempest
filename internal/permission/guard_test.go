@@ -184,6 +184,66 @@ func TestDestructiveGuardPolicy(t *testing.T) {
 	}
 }
 
+// TestGitGuardResolvesOperandsInTheSelectedWorkTree covers a checkout whose
+// one operand names a file only in the work tree --work-tree or
+// GIT_WORK_TREE selects, not in the directory git starts from.
+func TestGitGuardResolvesOperandsInTheSelectedWorkTree(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "dir", "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"x", filepath.Join("sub", "y")} {
+		if err := os.WriteFile(filepath.Join(cwd, "dir", name), []byte("dirty"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		command string
+		guarded bool
+	}{
+		{"git --git-dir=dir/.git --work-tree=dir checkout x", true},
+		{"git --git-dir dir/.git --work-tree dir checkout x", true},
+		{"GIT_DIR=dir/.git GIT_WORK_TREE=dir git checkout x", true},
+		{"git --work-tree=" + filepath.Join(cwd, "dir") + " checkout x", true},
+		{"git --work-tree=dir checkout sub/y", true},
+		// A relative work tree resolves after -C.
+		{"git --work-tree=. -C dir checkout x", true},
+		{"GIT_WORK_TREE=. git -C dir checkout x", true},
+		// Inside the work tree git reads operands from the current directory.
+		{"git -C dir/sub --work-tree=.. checkout y", true},
+		{"env GIT_WORK_TREE=dir git checkout x", true},
+		{"GIT_WORK_TREE=dir env git checkout x", true},
+		{"GIT_WORK_TREE=dir command git checkout x", true},
+		{"env -u HOME GIT_WORK_TREE=dir git checkout x", true},
+		{"env -C dir git checkout x", true},
+		{"env --chdir=dir git checkout x", true},
+		{"export GIT_WORK_TREE=dir; git checkout x", true},
+		{"export GIT_DIR=dir/.git GIT_WORK_TREE=dir && git checkout x", true},
+		{"GIT_WORK_TREE=dir; git checkout x", true},
+		// An expanded work tree is unknown, so any one-operand checkout asks.
+		{`git --work-tree="$TREE" checkout main`, true},
+		{"git --work-tree $TREE checkout main", true},
+		{"GIT_WORK_TREE=$TREE git checkout main", true},
+		{"export GIT_WORK_TREE=$TREE; git checkout main", true},
+		{"git --work-tree=dir checkout main", false},
+		{"GIT_WORK_TREE=dir git checkout main", false},
+		{"export GIT_WORK_TREE=dir; git checkout main", false},
+		// Assignments before a command reach that command only.
+		{"GIT_WORK_TREE=dir true; git checkout x", false},
+		// GIT_DIR alone makes the current directory the work tree's top.
+		{"git --git-dir=dir/.git checkout x", false},
+		{"GIT_DIR=dir/.git git checkout x", false},
+	}
+	for _, test := range tests {
+		t.Run(test.command, func(t *testing.T) {
+			out := GateInDirectory(t.Context(), ModeDefault, "bash", commandArgs(test.command), &Policy{}, cwd)
+			if out.Allow == test.guarded || test.guarded && out.Source != SourceGuard {
+				t.Errorf("outcome=%+v; guarded=%v", out, test.guarded)
+			}
+		})
+	}
+}
+
 func TestDestructiveGuardUnknownTarget(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.Symlink("loop", filepath.Join(cwd, "loop")); err != nil {

@@ -84,6 +84,16 @@ Git commands are parsed the way git reads them, after global options such as
 | `worktree remove` | `-f` / `--force`. |
 | `rebase` | Always. |
 
+An operand of `checkout` is checked where git reads it: from the directory after
+`-C <dir>` (and `cd`, `env -C`), and, when `--work-tree <dir>` or `GIT_WORK_TREE`
+selects another work tree, from that work tree's top as well. `GIT_WORK_TREE` counts
+whether it is set before the command (`GIT_WORK_TREE=dir git ...`, `env
+GIT_WORK_TREE=dir git ...`) or earlier in the same command line (`export
+GIT_WORK_TREE=dir; git ...`). A work tree given by an expansion (`$TREE`) is
+unknown, so every one-operand `checkout` under it asks. `--git-dir` or `GIT_DIR`
+alone makes the current directory the top of the work tree, as it does for git. A
+`GIT_WORK_TREE` already in tempest's own environment is not read.
+
 Read-only git (`status`, `log`, `diff`, `show`, `ls-files`, ...) and
 history-adding commands (`add`, `commit`, `fetch`, a plain `push`) never ask. Git
 aliases are not expanded, so an alias that discards work is not caught.

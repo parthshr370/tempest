@@ -32,17 +32,71 @@ type gitCommand struct {
 	pathspecs  []cloudcmd.Token
 	// cwd is the directory relative pathspecs resolve against, after -C.
 	cwd string
+	// workTree is the work tree --work-tree or GIT_WORK_TREE selects, or
+	// "" when neither is set and the work tree is the one around cwd.
+	workTree string
 }
 
-func parseGitCommand(args []cloudcmd.Token, cwd string) (gitCommand, bool) {
+// gitWorkTree is the work tree the environment selects for git through
+// GIT_WORK_TREE, set by an assignment before the command or left by an
+// earlier one. A Dynamic value is unknown.
+type gitWorkTree struct {
+	value cloudcmd.Token
+	set   bool
+}
+
+// assign returns w after the shell assignment word, which selects a work
+// tree only when it sets GIT_WORK_TREE. GIT_DIR alone keeps the current
+// directory as the work tree's top, where operands already resolve.
+func (w gitWorkTree) assign(word cloudcmd.Token) gitWorkTree {
+	value, ok := strings.CutPrefix(word.Text, "GIT_WORK_TREE=")
+	if !ok {
+		return w
+	}
+	return gitWorkTree{value: cloudcmd.Token{Text: value, Dynamic: !literalWord(word)}, set: true}
+}
+
+// after returns the GIT_WORK_TREE an invocation leaves for the commands
+// after it: an export (or declare, typeset, readonly, local) of it, or a
+// statement made only of assignments, which reaches git when the variable
+// is already exported.
+func (w gitWorkTree) after(words []cloudcmd.Token) gitWorkTree {
+	if len(words) == 0 {
+		return w
+	}
+	switch words[0].Text {
+	case "export", "declare", "typeset", "readonly", "local":
+		words = words[1:]
+	default:
+		for _, word := range words {
+			if !strings.Contains(word.Text, "=") {
+				// Assignments before a command apply to that command only.
+				return w
+			}
+		}
+	}
+	for _, word := range words {
+		w = w.assign(word)
+	}
+	return w
+}
+
+func parseGitCommand(args []cloudcmd.Token, cwd string, workTree gitWorkTree) (gitCommand, bool) {
 	for len(args) > 0 && strings.HasPrefix(args[0].Text, "-") {
 		option := args[0]
 		args = args[1:]
+		if value, ok := strings.CutPrefix(option.Text, "--work-tree="); ok {
+			workTree = gitWorkTree{value: cloudcmd.Token{Text: value, Dynamic: !literalWord(option)}, set: true}
+			continue
+		}
 		if !gitGlobalValueOptions[option.Text] || len(args) == 0 {
 			continue
 		}
-		if option.Text == "-C" {
+		switch option.Text {
+		case "-C":
 			cwd = gitDirectory(args[0], cwd)
+		case "--work-tree":
+			workTree = gitWorkTree{value: args[0], set: true}
 		}
 		args = args[1:]
 	}
@@ -50,6 +104,10 @@ func parseGitCommand(args []cloudcmd.Token, cwd string) (gitCommand, bool) {
 		return gitCommand{}, false
 	}
 	command := gitCommand{subcommand: args[0].Text, flags: map[string]bool{}, cwd: cwd}
+	if workTree.set {
+		// git resolves a relative work tree after every -C has run.
+		command.workTree = gitDirectory(workTree.value, cwd)
+	}
 	valueOptions := gitValueOptions[command.subcommand]
 	args = args[1:]
 	for i := 0; i < len(args); i++ {
@@ -82,8 +140,9 @@ func parseGitCommand(args []cloudcmd.Token, cwd string) (gitCommand, bool) {
 	return command, true
 }
 
-// gitDirectory is the directory "git -C dir" runs in; an expanded value is
-// unknown, which makes every pathspec existence check ask.
+// gitDirectory is the directory "git -C dir" runs in, or the work tree
+// "--work-tree dir" selects; an expanded value is unknown, which makes every
+// pathspec existence check ask.
 func gitDirectory(dir cloudcmd.Token, cwd string) string {
 	if !literalWord(dir) {
 		return unknownDirectory
@@ -122,8 +181,8 @@ func (c gitCommand) firstOperand() string {
 // destructiveGit reports whether a git invocation can discard uncommitted
 // work, delete untracked files, or drop commits, stashes, branches or remote
 // history. Read-only and history-adding commands never match.
-func destructiveGit(args []cloudcmd.Token, cwd string) bool {
-	command, ok := parseGitCommand(args, cwd)
+func destructiveGit(args []cloudcmd.Token, cwd string, workTree gitWorkTree) bool {
+	command, ok := parseGitCommand(args, cwd, workTree)
 	if !ok {
 		return false
 	}
@@ -176,20 +235,27 @@ func (c gitCommand) checkoutOverwritesFiles() bool {
 	if len(operands) > 1 {
 		return true
 	}
-	return len(operands) == 1 && gitPathspecMayMatch(operands[0], c.cwd)
+	return len(operands) == 1 && c.pathspecMayMatch(operands[0])
 }
 
 // gitRefForbidden holds characters git forbids in ref names (see
 // git-check-ref-format) that mark a word as a pathspec glob or magic.
 const gitRefForbidden = "*?[:"
 
-// gitPathspecMayMatch reports whether word can name a path: a glob or
-// pathspec magic, an expansion, or a path that exists or cannot be checked.
-func gitPathspecMayMatch(word cloudcmd.Token, cwd string) bool {
+// pathspecMayMatch reports whether word can name a path: a glob or pathspec
+// magic, an expansion, or a path that exists or cannot be checked. With a
+// selected work tree git reads a relative path from cwd when cwd lies inside
+// the work tree and from the work tree's top otherwise, so both are checked.
+func (c gitCommand) pathspecMayMatch(word cloudcmd.Token) bool {
 	if !literalWord(word) || strings.ContainsAny(word.Text, gitRefForbidden) {
 		return true
 	}
-	_, err := os.Lstat(resolveTarget(word.Text, cwd))
+	return pathMayExist(resolveTarget(word.Text, c.cwd)) || c.workTree != "" && pathMayExist(resolveTarget(word.Text, c.workTree))
+}
+
+// pathMayExist reports whether path exists or cannot be checked.
+func pathMayExist(path string) bool {
+	_, err := os.Lstat(path)
 	return err == nil || !os.IsNotExist(err)
 }
 

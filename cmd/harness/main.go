@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 
 	"go.harness.dev/harness/internal/adapter"
 	"go.harness.dev/harness/internal/agent"
+	"go.harness.dev/harness/internal/catalog"
 	"go.harness.dev/harness/internal/config"
 	"go.harness.dev/harness/internal/discovery"
 	"go.harness.dev/harness/internal/document"
@@ -198,7 +200,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	}
 	// Every check below (the -image vision check, the -max-cost price check)
 	// and the route itself use the model the session runs on.
-	defaultModel, err := sessionModel(context.Background(), opts.Config, resumePath)
+	defaultModel, err := sessionModel(context.Background(), opts.Config, resumePath, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "session error: %v\n", err)
 		return 1
@@ -702,7 +704,7 @@ func openSession(ctx context.Context, options tempest.Options, resumePath string
 // session keeps the model its journal records: only a model chosen for this
 // command (see [config.ResolvedConfig.ModelSetForCommand]) moves it, so a
 // -continue without -model stays on the provider the session started on.
-func sessionModel(ctx context.Context, cfg *config.ResolvedConfig, resumePath string) (string, error) {
+func sessionModel(ctx context.Context, cfg *config.ResolvedConfig, resumePath string, stderr io.Writer) (string, error) {
 	configured := cfg.Model()
 	if resumePath == "" || cfg.FauxScript() != "" || cfg.ModelSetForCommand() {
 		return configured, nil
@@ -712,12 +714,66 @@ func sessionModel(ctx context.Context, cfg *config.ResolvedConfig, resumePath st
 		return "", err
 	}
 	saved := strings.TrimSpace(loaded.Model)
-	// Journals written before the CLI recorded specs hold the bare model id;
-	// when it is the configured model's, the configured spec carries its route.
-	if saved == "" || (loaded.Role != "" && loaded.Role != "default") || saved == adapter.ModelIDFromSpec(configured) {
+	if saved == "" || (loaded.Role != "" && loaded.Role != "default") {
 		return configured, nil
 	}
-	return saved, nil
+	registry, err := adapter.Providers(cfg.Providers())
+	if err != nil {
+		return "", err
+	}
+	provider := adapter.ModelProviderFromSpec(saved)
+	if _, ok := registry[provider]; ok {
+		return saved, nil
+	}
+	if provider != "" && recordedProvider(loaded, saved) == "" {
+		// A spec whose provider is no longer configured, not an id holding
+		// a colon; routing reports the missing provider.
+		return saved, nil
+	}
+	return bareSessionModel(loaded, saved, configured, resumePath, stderr)
+}
+
+// bareSessionModel resolves a journaled model id without a provider. A bare
+// id routes to Anthropic, and the CLI journals a full spec for every other
+// route, but journals written before it did hold only the id, whatever the
+// provider. The session's run records (or, in journals without them, its
+// replies) name the provider each run used; the endpoint was never recorded,
+// so a recovered non-Anthropic route says so. With no record the id is
+// Anthropic's only when the catalog lists it there; otherwise the user must
+// name the route.
+func bareSessionModel(loaded *journal.Loaded, id, configured, path string, stderr io.Writer) (string, error) {
+	provider := recordedProvider(loaded, id)
+	configuredProvider := cmp.Or(adapter.ModelProviderFromSpec(configured), "anthropic")
+	switch {
+	case id == adapter.ModelIDFromSpec(configured) && (provider == "" || provider == configuredProvider):
+		// The configured spec carries the same route, endpoint included.
+		return configured, nil
+	case provider == "anthropic":
+		return id, nil
+	case provider != "":
+		fmt.Fprintf(stderr, "notice: resuming on %s:%s, the provider this session's records name; its endpoint was not recorded, so pass -model %s:%s@<endpoint> if it used a custom one\n", provider, id, provider, id)
+		return provider + ":" + id, nil
+	}
+	if _, ok := catalog.Lookup("anthropic", id); ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("%s records model %q without its provider; pass -model <provider>:%s (add @<endpoint> for a custom endpoint) to resume it", path, id, id)
+}
+
+// recordedProvider returns the provider the latest run of model id records,
+// or the latest reply from it when the journal has no run records.
+func recordedProvider(loaded *journal.Loaded, id string) string {
+	for _, run := range slices.Backward(loaded.Runs) {
+		if run.Model == id && run.Provider != "" {
+			return run.Provider
+		}
+	}
+	for _, message := range slices.Backward(loaded.Messages) {
+		if reply, ok := message.(ptypes.AssistantMessage); ok && reply.Model == id && reply.Provider != "" {
+			return reply.Provider
+		}
+	}
+	return ""
 }
 
 // setupLogging installs the redacting default logger and optionally tees diagnostics into the rotating log file.

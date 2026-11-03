@@ -163,7 +163,7 @@ func invocationChangesHookSettings(words []cloudcmd.Token, cwd string) bool {
 		return hooks.HookSettingsPath(destination, cwd)
 	case "rm", "rmdir", "unlink", "shred", "truncate", "mv", "tee", "touch", "dd":
 	case "sed", "perl", "find":
-		if !destructiveInvocation(words, cwd, map[string]bool{}) {
+		if !destructiveInvocation(words, cwd, map[string]bool{}, gitWorkTree{}) {
 			return false
 		}
 	default:
