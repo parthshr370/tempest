@@ -88,30 +88,14 @@ func ApproveHookSettings(ctx context.Context, policy *Policy, tool, callID, cwd 
 }
 
 func shellChangesHookSettings(command, cwd string) bool {
-	words := shellWords(command)
-	var invocation []cloudcmd.Token
-	for i := 0; i < len(words); i++ {
-		token := words[i]
-		if token.Operator && strings.ContainsAny(token.Text, "<>") {
-			if i+1 < len(words) {
-				i++
-				if strings.Contains(token.Text, ">") && hooks.HookSettingsPath(words[i].Text, cwd) {
-					return true
-				}
-			}
-			continue
-		}
-		if token.Operator {
-			if invocationChangesHookSettings(invocation, cwd) {
-				return true
-			}
-			cwd = directoryAfter(invocation, cwd)
-			invocation = nil
-			continue
-		}
-		invocation = append(invocation, token)
-	}
-	return invocationChangesHookSettings(invocation, cwd)
+	return walkShell(command, cwd, shellCheck{
+		command: func(words []cloudcmd.Token, state shellState, _ map[string]bool) bool {
+			return invocationChangesHookSettings(words, state.cwd)
+		},
+		redirect: func(_ string, target cloudcmd.Token, state shellState, _ map[string]bool) bool {
+			return hooks.HookSettingsPath(target.Text, state.cwd)
+		},
+	})
 }
 
 func invocationChangesHookSettings(words []cloudcmd.Token, cwd string) bool {

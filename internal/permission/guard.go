@@ -26,46 +26,29 @@ func isDestructiveCommand(command, cwd string) bool {
 			return true
 		}
 	}
-	words := shellWords(command)
-	written := make(map[string]bool)
-	var workTree gitWorkTree
-	var invocation []cloudcmd.Token
-	for i := 0; i < len(words); i++ {
-		token := words[i]
-		if token.Operator && strings.Contains(token.Text, ">") {
-			if i+1 >= len(words) || words[i+1].Operator {
-				return true
+	return walkShell(command, cwd, destructiveCheck)
+}
+
+// destructiveCheck asks for a simple command or an output redirection that
+// can destroy data in the state it runs in.
+var destructiveCheck = shellCheck{
+	command: func(words []cloudcmd.Token, state shellState, written map[string]bool) bool {
+		return destructiveInvocation(words, state.cwd, written, state.workTree)
+	},
+	redirect: func(op string, target cloudcmd.Token, state shellState, written map[string]bool) bool {
+		switch {
+		case target.Text == "":
+			return true
+		case strings.HasSuffix(op, ">&") && (target.Text == "-" || allDigits(target.Text)):
+			return false
+		case strings.Contains(op, ">>"):
+			if !target.Dynamic {
+				written[resolveTarget(target.Text, state.cwd)] = true
 			}
-			i++
-			target := words[i]
-			if strings.HasSuffix(token.Text, ">&") && (target.Text == "-" || allDigits(target.Text)) {
-				continue
-			}
-			if strings.Contains(token.Text, ">>") {
-				if !target.Dynamic {
-					written[resolveTarget(target.Text, cwd)] = true
-				}
-			} else if targetNeedsApproval(target, cwd, written) {
-				return true
-			}
-			continue
+			return false
 		}
-		if token.Operator {
-			if token.Text == "<" && i+1 < len(words) {
-				i++
-				continue
-			}
-			if destructiveInvocation(invocation, cwd, written, workTree) {
-				return true
-			}
-			cwd = directoryAfter(invocation, cwd)
-			workTree = workTree.after(invocation)
-			invocation = nil
-			continue
-		}
-		invocation = append(invocation, token)
-	}
-	return destructiveInvocation(invocation, cwd, written, workTree)
+		return targetNeedsApproval(target, state.cwd, written)
+	},
 }
 
 // destructiveInvocation reports whether one simple command needs approval.
@@ -222,20 +205,6 @@ func resolveTarget(target, cwd string) string {
 // unknownDirectory stands for a directory the guard cannot know; no path
 // under it can be checked, so every check under it asks.
 const unknownDirectory = "\x00"
-
-func directoryAfter(words []cloudcmd.Token, cwd string) string {
-	if len(words) >= 2 && words[0].Text == "cd" {
-		if words[1].Dynamic {
-			return unknownDirectory
-		}
-		target := resolveTarget(words[1].Text, cwd)
-		if info, err := os.Stat(target); err != nil || !info.IsDir() {
-			return unknownDirectory
-		}
-		return target
-	}
-	return cwd
-}
 
 func allDigits(text string) bool {
 	if text == "" {

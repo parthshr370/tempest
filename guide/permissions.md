@@ -108,6 +108,19 @@ Targets resolve relative to the command's working directory. Copying or moving i
 a directory checks the resulting destination file. If the guard cannot determine
 whether a target exists, it asks. Plan mode still rejects non-destructive writes.
 
+The working directory follows `cd` and `pushd` the way the shell scopes them, and
+`GIT_WORK_TREE` follows its `export` the same way. A change inside `( ... )`,
+`$( ... )`, a pipeline or a background `&` list does not reach the statements after
+it; one inside `{ ... }` does. When a change may or may not have happened, because
+it follows `&&` or `||`, sits in an `if` or `case` branch or a loop, or is made by a
+function, each directory it can leave is checked and any of them can make the
+command ask. A directory the guard cannot know (an expansion, `cd` alone, `cd -`,
+`popd`, or a directory that does not exist yet) makes every relative target ask. A
+`cd` into an existing directory is taken to succeed, so `cd sub && git checkout
+main` and `cd sub; git status` are checked in `sub` only. Here-document bodies are
+read as commands, so after one a `cd` adds a possible directory without removing
+the earlier ones.
+
 The guard also recognizes obvious deletion or overwrite calls in `python -c`,
 `python3 -c`, `node -e`, `perl -e`, and `ruby -e` code, including `rmtree`,
 `os.remove`, `unlink`, `rmdir`, `fs.rm`, `unlinkSync`, and `open(..., 'w')`.
