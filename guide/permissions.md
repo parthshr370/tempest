@@ -112,14 +112,21 @@ The working directory follows `cd` and `pushd` the way the shell scopes them, an
 `GIT_WORK_TREE` follows its `export` the same way. A change inside `( ... )`,
 `$( ... )`, a pipeline or a background `&` list does not reach the statements after
 it; one inside `{ ... }` does. When a change may or may not have happened, because
-it follows `&&` or `||`, sits in an `if` or `case` branch or a loop, or is made by a
-function, each directory it can leave is checked and any of them can make the
-command ask. A directory the guard cannot know (an expansion, `cd` alone, `cd -`,
-`popd`, or a directory that does not exist yet) makes every relative target ask. A
-`cd` into an existing directory is taken to succeed, so `cd sub && git checkout
-main` and `cd sub; git status` are checked in `sub` only. Here-document bodies are
-read as commands, so after one a `cd` adds a possible directory without removing
-the earlier ones.
+it follows `&&` or `||` or sits in an `if` or `case` branch or a loop, each
+directory it can leave is checked and any of them can make the command ask. A `cd`
+into an existing directory is taken to succeed, so `cd sub && git checkout main`
+and `cd sub; git status` are checked in `sub` only. Here-document bodies are read
+as commands, so after one a `cd` adds a possible directory without removing the
+earlier ones.
+
+Directory tracking fails closed: the guard follows only a plain `cd`, `pushd`,
+`command cd` or `builtin cd` with no option but `-L`, one literal argument naming
+an existing directory and no redirection, and anything else that may change the
+directory (`cd -`, `cd -P`, `popd`, a wrapper such as `time`, `eval`, `source`,
+`trap`, a function, `set -P`, or `CDPATH` set) leaves it unknown. Under an unknown
+directory every relative target asks, even one that climbs out with `..`, as does a
+path whose `..` leaves a symlink, and a command over 128 KiB or past the walker's
+nesting and work limits asks outright.
 
 The guard also recognizes obvious deletion or overwrite calls in `python -c`,
 `python3 -c`, `node -e`, `perl -e`, and `ruby -e` code, including `rmtree`,

@@ -255,6 +255,9 @@ func (c gitCommand) pathspecMayMatch(word cloudcmd.Token) bool {
 
 // pathMayExist reports whether path exists or cannot be checked.
 func pathMayExist(path string) bool {
+	if path == unknownDirectory {
+		return true
+	}
 	_, err := os.Lstat(path)
 	return err == nil || !os.IsNotExist(err)
 }
