@@ -114,6 +114,12 @@ func (b *callBudget) finish() {
 	b.timer.Stop()
 }
 
+// orphanedPipeDelay is how long Wait waits, after the root exits, for
+// descendants to close inherited stderr before it closes the pipe itself. A
+// descendant holding stderr must not keep the group kill and the admission
+// slot waiting.
+const orphanedPipeDelay = time.Second
+
 // InstallProcess launches only an explicitly operator-selected argv. No project discovery occurs.
 func (r *Registry) InstallProcess(ctx context.Context, o ProcessOptions) error {
 	if !identifier.MatchString(o.ID) || len(o.Argv) == 0 || o.Argv[0] == "" {
@@ -130,6 +136,7 @@ func (r *Registry) InstallProcess(ctx context.Context, o ProcessOptions) error {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stderr = &boundedLog{remaining: 64 << 10, writer: o.Stderr}
+	cmd.WaitDelay = orphanedPipeDelay
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -155,7 +162,16 @@ func (r *Registry) InstallProcess(ctx context.Context, o ProcessOptions) error {
 		_ = p.conn.Close()
 		return err
 	}
-	go func() { _ = cmd.Wait(); p.closed.Store(true); release(); close(p.done); _ = p.conn.Close() }()
+	go func() {
+		_ = cmd.Wait()
+		// The root's exit doesn't end its group: a child that stayed in it,
+		// closed its streams and ignores SIGTERM would outlive the extension.
+		_ = procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL)
+		p.closed.Store(true)
+		release()
+		close(p.done)
+		_ = p.conn.Close()
+	}()
 	go func() { _ = p.conn.ServeOrdered(p.admit) }()
 	ok := false
 	defer func() {
