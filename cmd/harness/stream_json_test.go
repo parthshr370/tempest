@@ -16,6 +16,7 @@ import (
 	"go.harness.dev/harness/internal/engine/stream"
 	types "go.harness.dev/harness/internal/engine/types"
 	"go.harness.dev/harness/internal/provider/faux"
+	"go.harness.dev/harness/internal/session/journal"
 	"go.harness.dev/harness/tempest"
 )
 
@@ -269,7 +270,7 @@ func TestStreamJSONResumeDoesNotReplayHistory(t *testing.T) {
 	f.AppendResponses(faux.Respond(faux.Text("old assistant text")), faux.Respond(faux.Text("new assistant text")))
 	dir, cwd := t.TempDir(), t.TempDir()
 	options := tempest.Options{SessionDir: dir, Cwd: cwd, New: &tempest.NewSession{}, Stack: &tempest.StackConfig{Model: f.Model(), StreamFn: f.StreamSimple}}
-	sess, err := openSession(context.Background(), options, "", false)
+	sess, err := openSession(context.Background(), options, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +281,11 @@ func TestStreamJSONResumeDoesNotReplayHistory(t *testing.T) {
 	if err := sess.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	sess, err = openSession(context.Background(), options, id, false)
+	path, err := journal.Resolve(context.Background(), dir, cwd, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err = openSession(context.Background(), options, path)
 	if err != nil {
 		t.Fatal(err)
 	}

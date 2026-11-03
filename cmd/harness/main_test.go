@@ -247,6 +247,13 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 	cwd := t.TempDir()
 	open := func(dir, resume, model string) (*tempest.Session, error) {
 		f := faux.New(faux.Options{})
+		path := ""
+		if resume != "" {
+			var err error
+			if path, err = journal.Resolve(ctx, dir, cwd, resume); err != nil {
+				return nil, err
+			}
+		}
 		return openSession(ctx, tempest.Options{
 			SessionDir: dir,
 			Cwd:        cwd,
@@ -255,7 +262,7 @@ func TestOpenSessionRecordsResumedModelChanges(t *testing.T) {
 				Model:    ptypes.Model{ID: model, Provider: "faux"},
 				StreamFn: f.StreamSimple,
 			},
-		}, resume, false)
+		}, path)
 	}
 	for _, test := range []struct {
 		name        string

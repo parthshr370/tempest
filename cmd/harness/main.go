@@ -48,6 +48,7 @@ type commandOptions struct {
 	ExcludeTools      string
 	Resume            string
 	resumeCwd         string
+	resumePath        string
 	resumeEnvironment environment.Reference
 	RequestID         string
 	ExtensionConfig   string
@@ -171,8 +172,39 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		resolvedRetry.Jitter = retry.Jitter{Min: settings.JitterMin, Max: settings.JitterMax}
 		retryConfig = &resolvedRetry
 	}
+	stack := session.StackConfigFromConfig(opts.Config)
+	stack.Telemetry = tel
+	if opts.Config.Environment() == "" && opts.resumeEnvironment.ID != "" {
+		stack.EnvironmentReference = opts.resumeEnvironment
+	}
+	// A resumed session runs in its journal's workspace, so its context files
+	// and agent files come from there, not from where the command started.
+	cwd := opts.resumeCwd
+	if cwd == "" && opts.Config.Environment() == "" {
+		cwd, err = os.Getwd()
+		if err != nil {
+			fmt.Fprintf(stderr, "cwd error: %v\n", err)
+			return 1
+		}
+	} else if cwd == "" {
+		cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
+	}
+	resumePath := opts.resumePath
+	if opts.Continue {
+		if resumePath, err = journal.Recent(context.Background(), opts.Config.SessionDir(), cwd); err != nil {
+			fmt.Fprintf(stderr, "session error: %v\n", err)
+			return 1
+		}
+	}
+	// Every check below (the -image vision check, the -max-cost price check)
+	// and the route itself use the model the session runs on.
+	defaultModel, err := sessionModel(context.Background(), opts.Config, resumePath)
+	if err != nil {
+		fmt.Fprintf(stderr, "session error: %v\n", err)
+		return 1
+	}
 	roleRouting := adapter.RoleRoutingConfig{
-		DefaultModel:       opts.Config.Model(),
+		DefaultModel:       defaultModel,
 		PlanModel:          opts.Config.PlanModel(),
 		SmolModel:          opts.Config.SmolModel(),
 		DefaultFallbacks:   opts.Config.FallbackModels(config.RoleDefault),
@@ -206,6 +238,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		selectedModel = fauxModel
+		defaultModel = fauxModel.ID
 		planSelected = fauxModel
 		stackModel = fauxModel
 		streamFn = fauxProvider.StreamSimple
@@ -242,23 +275,6 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	stack := session.StackConfigFromConfig(opts.Config)
-	stack.Telemetry = tel
-	if opts.Config.Environment() == "" && opts.resumeEnvironment.ID != "" {
-		stack.EnvironmentReference = opts.resumeEnvironment
-	}
-	// A resumed session runs in its journal's workspace, so its context files
-	// and agent files come from there, not from where the command started.
-	cwd := opts.resumeCwd
-	if cwd == "" && opts.Config.Environment() == "" {
-		cwd, err = os.Getwd()
-		if err != nil {
-			fmt.Fprintf(stderr, "cwd error: %v\n", err)
-			return 1
-		}
-	} else if cwd == "" {
-		cwd = tempest.EnvironmentLocation(stack.EnvironmentReference)
-	}
 	// SIGINT/SIGTERM abort the run cleanly: tools are cancelled and joined and
 	// the journal records the aborted run. The first signal then restores the
 	// default handling, so a second one kills a run stuck in a tool that
@@ -335,7 +351,7 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		if err == nil {
-			opts.Resume = filepath.Base(path)
+			resumePath = path
 		}
 	}
 	sess, err := openSession(runCtx, tempest.Options{
@@ -345,12 +361,14 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 		ExtensionProcesses: processes,
 		Elicitor:           question.TerminalElicitor(os.Stdin, stderr),
 		New: &tempest.NewSession{
-			Model:          selectedModel.ID,
+			// The journal records the routable spec, so a resume without
+			// -model routes the same provider and endpoint.
+			Model:          defaultModel,
 			Budget:         opts.Budget,
 			PermissionMode: permissionMode,
 			MCPServers:     opts.Config.MCPServers(),
 		},
-	}, opts.Resume, opts.Continue)
+	}, resumePath)
 	if err != nil {
 		fmt.Fprintf(stderr, "session error: %v\n", err)
 		if hint := mcpStartupHint(err); hint != "" {
@@ -385,10 +403,10 @@ func runOneShot(args []string, stdout, stderr io.Writer) int {
 	if mode == "text" {
 		fmt.Fprintf(stderr, "session: %s (resume with -resume %s)\n", sess.ID(), sess.ID())
 	}
-	switch outcome.StopReason {
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
+	switch {
+	case outcome.StopReason.Failed():
 		return 1
-	case agent.StopAborted:
+	case outcome.StopReason == agent.StopAborted:
 		return exitAborted
 	default:
 		return 0
@@ -447,9 +465,9 @@ func writeRunOutput(stdout, stderr io.Writer, mode string, outcome runOutcome, m
 	if outcome.LastAssistantText != "" {
 		fmt.Fprintln(stdout, outcome.LastAssistantText)
 	}
-	switch outcome.StopReason {
-	case agent.StopCompleted:
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
+	switch {
+	case outcome.StopReason == agent.StopCompleted:
+	case outcome.StopReason.Failed():
 		fmt.Fprintf(stderr, "run failed after %d turns: %v\n", outcome.Turns, outcome.Err)
 	default:
 		fmt.Fprintf(stderr, "run stopped: %s after %d turns\n", outcome.StopReason, outcome.Turns)
@@ -548,7 +566,7 @@ func resolveCommandConfig(opts *commandOptions) error {
 			if opts.resumeCwd != "" {
 				return fmt.Errorf("ambiguous session %q", opts.Resume)
 			}
-			opts.resumeCwd = entry.Header.Cwd
+			opts.resumeCwd, opts.resumePath = entry.Header.Cwd, entry.Path
 			opts.resumeEnvironment, err = journal.EnvironmentReference(context.Background(), entry.Path)
 			if err != nil {
 				return err
@@ -663,28 +681,43 @@ func buildPermissionPolicy(allow, deny []string) permission.Policy {
 	return permission.Policy{Overrides: overrides}
 }
 
-// openSession keeps -continue scoped to the CLI's working directory. A resumed
-// session gets a new prompt, just as it does without -resume.
-func openSession(ctx context.Context, options tempest.Options, resumeID string, continueRecent bool) (*tempest.Session, error) {
-	if resumeID != "" || continueRecent {
-		resume := &tempest.ResumeSession{
-			SessionID:      resumeID,
+// openSession opens the session journaled at resumePath, or a new one when it
+// is empty. A resumed session gets a new prompt, just as it does without
+// -resume.
+func openSession(ctx context.Context, options tempest.Options, resumePath string) (*tempest.Session, error) {
+	if resumePath != "" {
+		options.Resume = &tempest.ResumeSession{
+			Path:           resumePath,
 			Model:          options.New.Model,
 			Budget:         options.New.Budget,
 			PermissionMode: options.New.PermissionMode,
 			MCPServers:     options.New.MCPServers,
 		}
-		if continueRecent {
-			path, err := journal.Recent(ctx, options.SessionDir, options.Cwd)
-			if err != nil {
-				return nil, err
-			}
-			resume.Path = path
-		}
 		options.New = nil
-		options.Resume = resume
 	}
 	return tempest.Open(ctx, options)
+}
+
+// sessionModel returns the default-role model spec the run uses. A resumed
+// session keeps the model its journal records: only a model chosen for this
+// command (see [config.ResolvedConfig.ModelSetForCommand]) moves it, so a
+// -continue without -model stays on the provider the session started on.
+func sessionModel(ctx context.Context, cfg *config.ResolvedConfig, resumePath string) (string, error) {
+	configured := cfg.Model()
+	if resumePath == "" || cfg.FauxScript() != "" || cfg.ModelSetForCommand() {
+		return configured, nil
+	}
+	loaded, err := journal.Load(ctx, resumePath)
+	if err != nil {
+		return "", err
+	}
+	saved := strings.TrimSpace(loaded.Model)
+	// Journals written before the CLI recorded specs hold the bare model id;
+	// when it is the configured model's, the configured spec carries its route.
+	if saved == "" || (loaded.Role != "" && loaded.Role != "default") || saved == adapter.ModelIDFromSpec(configured) {
+		return configured, nil
+	}
+	return saved, nil
 }
 
 // setupLogging installs the redacting default logger and optionally tees diagnostics into the rotating log file.

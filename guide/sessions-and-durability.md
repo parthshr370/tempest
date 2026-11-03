@@ -158,8 +158,19 @@ Every run ends with one of these:
 | `max_turns`, `max_cost`, `max_wall_time`, `max_input_tokens`, `max_output_tokens`, `max_total_tokens`, `max_tool_calls` | A budget tripped. | 0 |
 | `aborted` | SIGINT or SIGTERM. Running tools are cancelled and the run waits for them to return before it ends; a second signal kills the process. | 130 |
 | `error` | The provider failed, or the session journal could not be written. | 1 |
+| `output_invalid` | The final answer still failed `-output-schema` after one correction turn (see [Structured final answers](#structured-final-answers)). | 1 |
+| `output_truncated` | The final answer hit the response output-token limit (`max_tokens`) and is cut off. The text printed is the partial answer. Raise `max_tokens` or ask for a shorter answer. | 1 |
 | `repeated_failure` | The model sent the same tool call, with the same arguments, until it had failed with the same error five times in a row. | 1 |
 | `loop_detected` | The model kept repeating a loop (see [Loops](#loops)) after a host notice told it about that loop. | 1 |
+
+Exit 1 means the run has no usable result: it failed, or its final answer is
+missing, invalid or cut off. A budget stop exits 0: your limit ended a run whose
+transcript is whole, and `-continue` picks it up.
+
+A response cut off at `max_tokens` while it was still writing tool calls does not end
+the run. None of its calls runs, since the last one's arguments are incomplete; each
+gets an error result saying the response hit the output-token limit and to split the
+work into smaller calls, and the run goes on.
 
 ### Budgets
 
@@ -398,9 +409,9 @@ In text mode the last assistant text goes to stdout, and a stop reason other tha
 ```
 
 `cost_usd` is `null` when any call's price was unknown. `error` appears on `error`,
-`output_invalid`, `repeated_failure` and `loop_detected` stops, and `loop`
-(`pattern`, `tools`, `count`, `action`) on `loop_detected`. `message` is the
-transcript's last message.
+`output_invalid`, `output_truncated`, `repeated_failure` and `loop_detected` stops,
+and `loop` (`pattern`, `tools`, `count`, `action`) on `loop_detected`. `message` is
+the transcript's last message.
 
 ### Structured final answers
 

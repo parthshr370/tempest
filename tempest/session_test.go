@@ -207,7 +207,7 @@ func TestResumeSeedsTranscriptAndDiagnostics(t *testing.T) {
 	}
 	defer resumed.Close(context.Background())
 	snap := resumed.Snapshot()
-	if snap.LastRun == nil || !snap.LastRun.Finished || snap.Usage.Total.Input == 0 {
+	if total := snap.Usage.Total; snap.LastRun == nil || !snap.LastRun.Finished || total.Input+total.CacheRead+total.CacheWrite == 0 {
 		t.Fatalf("resumed snapshot=%+v", snap)
 	}
 	history, err := resumed.History(snap.HistoryEpoch, 0, snap.HistoryLen)

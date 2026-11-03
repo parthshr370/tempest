@@ -121,7 +121,7 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 	case "cp", "mv":
 		return copyNeedsApproval(args, cwd, written)
 	case "git":
-		return destructiveGit(args)
+		return destructiveGit(args, cwd)
 	}
 	if name == "python" || name == "python3" || name == "node" || name == "perl" || name == "ruby" {
 		for i, arg := range args {
@@ -172,44 +172,6 @@ func copyNeedsApproval(args []cloudcmd.Token, cwd string, written map[string]boo
 	return targetNeedsApproval(destination, cwd, written)
 }
 
-func destructiveGit(args []cloudcmd.Token) bool {
-	for len(args) > 0 && strings.HasPrefix(args[0].Text, "-") {
-		option := args[0].Text
-		args = args[1:]
-		if (option == "-C" || option == "-c" || option == "--git-dir" || option == "--work-tree") && len(args) > 0 {
-			args = args[1:]
-		}
-	}
-	if len(args) == 0 {
-		return false
-	}
-	subcommand := args[0].Text
-	for _, arg := range args[1:] {
-		switch subcommand {
-		case "reset":
-			if arg.Text == "--hard" || arg.Text == "--merge" || arg.Text == "--keep" {
-				return true
-			}
-		case "clean", "push", "checkout":
-			if strings.HasPrefix(arg.Text, "--force") || strings.HasPrefix(arg.Text, "-") && !strings.HasPrefix(arg.Text, "--") && strings.Contains(arg.Text, "f") || subcommand == "checkout" && arg.Text == "--" {
-				return true
-			}
-		case "branch":
-			if arg.Text == "-D" || arg.Text == "-f" || arg.Text == "--force" {
-				return true
-			}
-		case "stash":
-			if arg.Text == "drop" || arg.Text == "clear" {
-				return true
-			}
-		}
-		if subcommand == "push" && strings.HasPrefix(arg.Text, "+") {
-			return true
-		}
-	}
-	return subcommand == "restore" || subcommand == "rebase"
-}
-
 func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]bool) bool {
 	if target.Dynamic || target.Text == "" {
 		return true
@@ -236,14 +198,18 @@ func resolveTarget(target, cwd string) string {
 	return filepath.Join(cwd, target)
 }
 
+// unknownDirectory stands for a directory the guard cannot know; no path
+// under it can be checked, so every check under it asks.
+const unknownDirectory = "\x00"
+
 func directoryAfter(words []cloudcmd.Token, cwd string) string {
 	if len(words) >= 2 && words[0].Text == "cd" {
 		if words[1].Dynamic {
-			return "\x00"
+			return unknownDirectory
 		}
 		target := resolveTarget(words[1].Text, cwd)
 		if info, err := os.Stat(target); err != nil || !info.IsDir() {
-			return "\x00"
+			return unknownDirectory
 		}
 		return target
 	}

@@ -212,6 +212,7 @@ type Config struct {
 // MCP endpoint credentials stay in memory; callers must not log its private fields.
 type ResolvedConfig struct {
 	model                  string
+	modelSetForCommand     bool
 	planModel              string
 	smolModel              string
 	fallbackModels         map[string][]string
@@ -274,6 +275,12 @@ type workspaceSettings struct {
 
 // Model returns the default model specification.
 func (c *ResolvedConfig) Model() string { return c.model }
+
+// ModelSetForCommand reports whether this command chose the default model: a
+// -model flag, a -c override or a managed requirement. A resumed session
+// keeps the model its journal records unless one of these names another;
+// settings files and HARNESS_MODEL are standing defaults for new sessions.
+func (c *ResolvedConfig) ModelSetForCommand() bool { return c.modelSetForCommand }
 
 // PlanModel returns the plan-agent model specification.
 func (c *ResolvedConfig) PlanModel() string { return c.planModel }
@@ -744,6 +751,7 @@ func (c Config) Resolve() (_ *ResolvedConfig, err error) {
 		environment:            environmentName,
 		environments:           environments,
 		model:                  settingString(settings.Model),
+		modelSetForCommand:     layered.setByLayer("model", LayerFlag, LayerOverride, LayerRequirement),
 		planModel:              settingString(settings.PlanModel),
 		smolModel:              settingString(settings.SmolModel),
 		fallbackModels:         fallbackModels,

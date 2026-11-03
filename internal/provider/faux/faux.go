@@ -432,7 +432,11 @@ func (f *Faux) scheduleChunk(ctx context.Context, chunk string) {
 	}
 }
 
-// withUsageEstimate fabricates cache-aware usage so tests can exercise accounting without a real provider.
+// withUsageEstimate fabricates cache-aware usage so tests can exercise
+// accounting without a real provider. Usage follows the Anthropic shape the
+// rest of tempest uses: Input counts only uncached prompt tokens, so with a
+// session cache every prompt token is a cache read (the prefix shared with the
+// session's previous prompt) or a cache write (the rest), never also input.
 func (f *Faux) withUsageEstimate(message types.AssistantMessage, c types.Context, opts *types.StreamOptions, model types.Model) types.AssistantMessage {
 	promptText := serializeContext(c)
 	promptTokens := estimate.EstimateTextTokens(promptText)
@@ -446,12 +450,10 @@ func (f *Faux) withUsageEstimate(message types.AssistantMessage, c types.Context
 		previousPrompt := f.promptCache[opts.SessionID]
 		if previousPrompt != "" {
 			cachedChars := commonPrefixLength(previousPrompt, promptText)
-			cacheRead = estimate.EstimateTextTokens(previousPrompt[:cachedChars])
-			cacheWrite = estimate.EstimateTextTokens(promptText[cachedChars:])
-			input = maxInt(0, promptTokens-cacheRead)
-		} else {
-			cacheWrite = promptTokens
+			cacheRead = min(promptTokens, estimate.EstimateTextTokens(previousPrompt[:cachedChars]))
 		}
+		cacheWrite = promptTokens - cacheRead
+		input = 0
 		f.promptCache[opts.SessionID] = promptText
 		f.mu.Unlock()
 	}

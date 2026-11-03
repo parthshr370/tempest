@@ -60,19 +60,39 @@ Outside `bypass`, the shell guard requires approval for:
 - deleting files or directories;
 - overwriting or truncating existing files;
 - in-place edits;
-- destructive git operations: `reset --hard`, `clean -f`, `checkout -- <path>`,
-  `restore`, force push, and `branch -D`.
+- destructive git operations, the ones that discard uncommitted work, delete
+  untracked files, or drop commits, stashes, branches or remote history (see below).
 
 It catches direct removals, `find -delete` and `-exec rm`, `xargs rm`, `sed -i`,
 `perl -i`, `truncate`, `dd of=`, and `shred`. Existing protections for dangerous
 system commands, package-changing commands, and fork bombs remain.
 
+Git commands are parsed the way git reads them, after global options such as
+`-C <dir>`, `-c <name>=<value>`, `--git-dir` and `--no-pager`. These ask:
+
+| Command | Asks when |
+|---|---|
+| `checkout` | It writes paths: a pathspec (`checkout .`, `checkout <file>`, `checkout <commit> <file>`, `checkout -- <path>`, a glob), `-f`, or `-p`. An operand that exists as a path counts as a pathspec, as it does for git. `checkout <branch>` and `checkout -b <new>` do not ask. |
+| `restore` | It touches the worktree: always, unless only `--staged` is given. |
+| `rm` | Always, unless `--cached` or `-n`. |
+| `switch` | `-f`, `--force` or `--discard-changes`. |
+| `clean` | Always, unless `-n` / `--dry-run`. |
+| `reset` | `--hard`, `--merge` or `--keep`. |
+| `stash` | `drop` or `clear`. |
+| `branch` | `-D`, `-M`, `-C`, or `-f` / `--force`. |
+| `push` | A force (`-f`, `--force`, `--force-with-lease`), a delete (`-d`, `--delete`, `:<ref>`), a `+<ref>` refspec, `--mirror` or `--prune`; not with `-n`. |
+| `worktree remove` | `-f` / `--force`. |
+| `rebase` | Always. |
+
+Read-only git (`status`, `log`, `diff`, `show`, `ls-files`, ...) and
+history-adding commands (`add`, `commit`, `fetch`, a plain `push`) never ask. Git
+aliases are not expanded, so an alias that discards work is not caught.
+
 What does **not** need guard approval:
 
 - Appends (`>>`, `tee -a`).
 - Writes to new redirect, `tee`, `cp`, or `mv` targets.
-- `git stash`, because it is reversible. Discarding stashes with `drop` or `clear`
-  still asks.
+- `git stash`, because it is reversible.
 
 Targets resolve relative to the command's working directory. Copying or moving into
 a directory checks the resulting destination file. If the guard cannot determine

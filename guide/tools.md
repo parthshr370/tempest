@@ -515,7 +515,7 @@ before it calls.
 
 ### Runtime
 
-- `bash`: workspace shell with a destructive-command guard and a default ten-minute timeout, which `timeout_seconds` overrides. `skill://` and `local://` words expand to paths. `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds. `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal. See [Subagents and jobs](subagents.md).
+- `bash`: workspace shell with a destructive-command guard and a default ten-minute timeout, which `timeout_seconds` overrides. The command ends when its shell exits, and a child it started with `&` is killed then. `skill://` and `local://` words expand to paths. `name` (or `async:true` for an unnamed job) starts a supervised background job with stdin from `/dev/null`, optionally a service that returns once `ready_log`/`ready_port` holds. `stdin:true` keeps a stdin pipe open for `write_stdin`, and `pty:true` runs the job on a pseudo-terminal. See [Subagents and jobs](subagents.md).
 - `eval`: persistent per-session Python/JavaScript code cells, with captured output, tracebacks, interruptible timeouts and explicit reset. Requires `python3`, or `node`/`bun` for JS, only when called. See [Eval](eval.md).
 - `debug`: launch or attach a session-owned debugger, control execution and inspect state. Requires an installed adapter. Plan mode denies all actions.
 - `jobs`: page durable job summaries (with job name and service readiness), or explicitly clean one exported worktree.

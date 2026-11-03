@@ -580,8 +580,7 @@ func (l *agentListener) endRun(event agent.AgentEvent) {
 			intAttribute("tempest.loop.nudges", int64(run.loopNudges)),
 		)
 	}
-	switch result.StopReason {
-	case agent.StopError, agent.StopOutputInvalid, agent.StopRepeatedFailure, agent.StopLoopDetected:
+	if result.StopReason.Failed() {
 		runSpan.status = statusError
 		runSpan.attributes = append(runSpan.attributes, stringAttribute("error.type", string(result.StopReason)))
 		if result.Err != nil {
