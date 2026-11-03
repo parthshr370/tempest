@@ -157,7 +157,10 @@ A profile is a partial settings object under `profiles.<name>` in any settings f
 }
 ```
 
-Select one with `-profile review` or `HARNESS_PROFILE=review`; the flag wins. The
+Select one with `-profile review` or `HARNESS_PROFILE=review`; the flag wins. A
+model set by a profile chosen with `-profile` counts as chosen for the command, so
+it also moves a resumed session; one chosen with `HARNESS_PROFILE` is a standing
+default for new sessions (see [Sessions](sessions-and-durability.md#which-model-a-resumed-session-uses)). The
 profile layer sits above project-local settings and below `HARNESS_*` variables.
 When several files define the same profile, their definitions merge in file order:
 managed defaults, user, project, project-local, then `-c`. Project profiles pass the

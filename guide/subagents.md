@@ -249,6 +249,12 @@ foreground/background mismatch to reject.
 A named job without a readiness condition is ordinary background work: the bash
 timeout bounds it and a one-shot run waits for it to finish.
 
+A command, foreground or job, ends when its shell exits, and so does everything
+left in its process group: a child started with `&` is killed then. A foreground
+`sleep 30 & echo started` returns `started` with exit 0 and a note that the child
+was stopped. Start a server or watcher as a named job or service instead of with
+`&`, so `jobs`, `wait` and `cancel` can see it.
+
 ### Readiness conditions
 
 Readiness conditions make the job a **service**:

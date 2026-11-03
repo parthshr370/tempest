@@ -445,8 +445,8 @@ even if a stdio client keeps stdin open. A second signal exits with code 130;
 Initialize first, create or load a session, then prompt. A `session/prompt` response
 waits for the run to finish; `session/update` and `tempest/*` notifications carry
 progress while it runs. ACP reports `end_turn`, `cancelled`, `max_tokens` (a token
-cap) or `max_turn_requests` (any other budget); `_meta.tempest.stopReason` preserves
-the exact Tempest reason.
+cap, or a final answer cut off at `max_tokens`) or `max_turn_requests` (any other
+budget); `_meta.tempest.stopReason` preserves the exact Tempest reason.
 
 `session/new`, `session/load` and `session/resume` take an absolute `cwd` that must
 be an existing directory. Anything else fails with `-32602` before a session opens.

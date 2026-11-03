@@ -360,6 +360,13 @@ func prepareToolCall(ctx context.Context, currentContext AgentContext, assistant
 	if ctx.Err() != nil {
 		return nil, &immediateOutcome{result: createErrorToolResult("Operation aborted"), isError: true}
 	}
+	// A response cut off at its output-token limit may end inside a call's
+	// arguments, which the provider then closes as {} or a prefix. None of
+	// its calls runs; each is answered with what happened, so the model
+	// splits the work instead of retrying the same oversized call.
+	if assistantMessage.StopReason == types.StopLength {
+		return nil, &immediateOutcome{result: createErrorToolResult(truncatedToolCallMessage(assistantMessage)), isError: true}
+	}
 	var tool AgentTool
 	found := false
 	for _, candidate := range currentContext.Tools {
@@ -672,6 +679,12 @@ func finalizeExecutedToolCall(ctx context.Context, currentContext AgentContext, 
 // createErrorToolResult builds a tool result whose content is the error text.
 func createErrorToolResult(message string) AgentToolResult {
 	return AgentToolResult{Content: []types.ContentBlock{types.NewText(message)}, IsError: true}
+}
+
+// truncatedToolCallMessage answers a call from a response cut off at its
+// output-token limit.
+func truncatedToolCallMessage(message types.AssistantMessage) string {
+	return "Not run: " + outputLimitHit(message) + " before its tool calls were complete, so none of them ran. Split the work into smaller calls: write a large file in parts, or change it with edits, and keep each response well under the limit."
 }
 
 // unknownToolMessage names the tools the session offers, so a call to a
