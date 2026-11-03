@@ -230,6 +230,29 @@ func TestA2AStateArtifactAndOldCancel(t *testing.T) {
 	}
 }
 
+// An ACP session in another workspace is not an A2A context, whether it is
+// open in this server or only in its journal.
+func TestA2ARefusesForeignWorkspaceContext(t *testing.T) {
+	f := faux.New(faux.Options{})
+	f.SetResponses(faux.Respond(faux.Text("own answer")))
+	s := interopServer(t, f, nil, permission.ModeBypass)
+	client := connect(t, s)
+	foreign := newSession(t, client, t.TempDir())
+	refused := func(stage string) {
+		t.Helper()
+		reply := a2aCall(t, s, "SendMessage", sendParams("foreign-"+stage, foreign, false))
+		if reply.Error == nil || reply.Error.Code != -32603 {
+			t.Fatalf("%s: foreign context: error %+v result %s", stage, reply.Error, reply.Result)
+		}
+	}
+	refused("open")
+	call(t, client, "session/close", map[string]any{"sessionId": foreign}, nil)
+	refused("closed")
+	if own := admitted(t, s, sendParams("own", "", false)); own.Status.State != model.TaskStateCompleted {
+		t.Fatalf("own workspace task = %+v", own)
+	}
+}
+
 func TestA2APermissionViaACPOnly(t *testing.T) {
 	for _, choice := range []string{"allow_once", "reject_once", "cancel"} {
 		t.Run(choice, func(t *testing.T) {

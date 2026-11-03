@@ -913,7 +913,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 		timeoutSchema["default"] = defaultSeconds
 	}
 	parameters := schema.JSON{"command": schema.String(), "timeout_seconds": timeoutSchema}
-	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " " + bashURLHelp
+	description := fmt.Sprintf("Execute a bash command in the current working directory. Output is truncated to last %d lines or %dKB.", truncate.DefaultMaxLines, truncate.DefaultMaxBytes/1024) + " The command ends when its shell exits: processes it started in the background with & are killed then. " + bashURLHelp
 	if options.Work != nil && !options.Child {
 		parameters["async"] = schema.JSON{"type": "boolean", "description": "true runs the command as an unnamed background job; name, pty, stdin, ready_log, ready_port and ready_timeout_ms already imply it"}
 		parameters["name"] = schema.JSON{"type": "string", "description": "runs the command as a background job with this name, unique among running jobs, and returns at once; wait, cancel, logs and write_stdin accept the name in place of the job id"}
@@ -924,6 +924,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 		parameters["ready_timeout_ms"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": work.MaxReadyTimeoutMS, "description": "readiness deadline for ready_log/ready_port, default 30000; on timeout the process is killed"}
 		parameters["timeout_seconds"] = schema.JSON{"type": "integer", "minimum": 1, "maximum": maxTimeoutSeconds, "description": fmt.Sprintf("seconds before the command or background job is killed, default %d; a ready_log/ready_port service has no limit unless this is set", int(timeoutDefault/time.Second))}
 		description += " A plain command runs in the foreground and returns its output; it needs none of async, name, pty, stdin or ready_*. To run in the background, set name (or async:true for an unnamed job): the call returns the job handle at once, the job runs until it exits or timeout_seconds passes, and wait, logs and cancel take its name or id. A background job's stdin is /dev/null, so a command that reads input sees end of file; stdin:true keeps a pipe open for write_stdin, and pty:true runs the command on a terminal for interactive programs. With ready_log and/or ready_port the job is a service: the call returns once every condition holds, or fails with the output tail if the process exits first or the deadline passes. A ready service runs until cancelled, until it exits or until the run ends, and does not keep the run open; restart one with cancel {\"name\":...} then start it again."
+		description += " Start servers and watchers as background jobs, not with &."
 	}
 	return agent.AgentTool{
 		Tool: types.Tool{
@@ -996,7 +997,7 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			// Nil Env keeps the inherited environment; a traced call adds TRACEPARENT.
 			cmd.Env = tracecontext.Environ(execCtx, options.Env)
 			if runtime.GOOS != "windows" {
-				cmd.WaitDelay = 2 * time.Second
+				cmd.WaitDelay = bashPipeJoinDelay
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 				cmd.Cancel = func() error { return procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL) }
 			}
@@ -1009,19 +1010,38 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			}
 			acc := toolio.NewOutputAccumulator(toolio.OutputAccumulatorOptions{TempFilePrefix: "harness-bash", TempDir: ToolOutputDir(options.SessionDataDir)})
 			writer := &bashOutputWriter{accumulator: acc, cancel: cancel}
-			cmd.Stdout = writer
-			cmd.Stderr = writer
+			// The shell writes into a pipe the tool owns, so Wait returns when
+			// the shell exits rather than when the last process holding the
+			// pipe (a `cmd &` child) closes it.
+			outputRead, outputWrite, err := os.Pipe()
+			if err != nil {
+				return agent.AgentToolResult{}, err
+			}
+			defer outputRead.Close()
+			cmd.Stdout, cmd.Stderr = outputWrite, outputWrite
 			if onUpdate != nil {
 				onUpdate(agent.AgentToolResult{Content: []types.ContentBlock{}})
 			}
-			if err := cmd.Start(); err != nil {
-				return agent.AgentToolResult{}, err
+			startErr := cmd.Start()
+			if closeErr := outputWrite.Close(); startErr != nil || closeErr != nil {
+				if startErr == nil {
+					cancel()
+					_ = cmd.Wait() // The pipe failure is the error reported.
+				}
+				return agent.AgentToolResult{}, errors.Join(startErr, closeErr)
 			}
+			copied := make(chan error, 1)
+			go func() {
+				_, copyErr := io.Copy(writer, outputRead)
+				copied <- copyErr
+			}()
 			waitErr := cmd.Wait()
+			strayStatus := endCommandGroup(cmd.Process.Pid)
+			copyErr := joinCommandOutput(copied, outputRead)
 			finishErr := acc.Finish()
 			snapshot, snapshotErr := acc.Snapshot(toolio.SnapshotOptions{PersistIfTruncated: true})
 			closeErr := acc.CloseTempFile()
-			if outputErr := errors.Join(writer.err, finishErr, snapshotErr, closeErr); outputErr != nil {
+			if outputErr := errors.Join(writer.err, copyErr, finishErr, snapshotErr, closeErr); outputErr != nil {
 				return agent.AgentToolResult{}, outputErr
 			}
 			text, details := formatBashOutput(snapshot, acc, "(no output)")
@@ -1031,14 +1051,63 @@ func newBashTool(cwd string, options ToolsOptions) agent.AgentTool {
 			if execCtx.Err() == context.Canceled || ctx.Err() != nil {
 				return agent.AgentToolResult{}, errors.New(appendStatus(text, "Command aborted"))
 			}
+			if strayStatus != "" {
+				text = appendStatus(text, strayStatus)
+			}
 			if waitErr != nil {
 				if exitErr, ok := waitErr.(*exec.ExitError); ok {
 					return agent.AgentToolResult{}, errors.New(appendStatus(text, fmt.Sprintf("Command exited with code %d", exitErr.ExitCode())))
 				}
-				return agent.AgentToolResult{}, waitErr
+				return agent.AgentToolResult{}, errors.New(appendStatus(text, waitErr.Error()))
 			}
 			return textResult(text, details), nil
 		},
+	}
+}
+
+// bashPipeJoinDelay bounds how long a finished command's output may stay
+// open: a process that left the command's group (setsid) can hold the pipe.
+const bashPipeJoinDelay = 2 * time.Second
+
+// strayProcessesKilled tells the model its `&` children are gone, so it does
+// not assume a server it started is still running.
+const strayProcessesKilled = "Processes the command left running in the background were killed when it ended. Run long-lived work as a background job (name or async) instead of with &."
+
+// endCommandGroup kills what a finished foreground command left in its
+// process group. A bash call is over when its shell exits; a `cmd &` child
+// would otherwise outlive it, unseen by jobs and cancel. It returns a status
+// line for the result when something was left to kill or could not be.
+func endCommandGroup(pid int) string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
+	switch err := procgroup.Signal(pid, syscall.SIGKILL); {
+	case err == nil:
+		return strayProcessesKilled
+	case errors.Is(err, os.ErrProcessDone):
+		return ""
+	default:
+		return "Processes the command left running in the background could not be killed: " + err.Error()
+	}
+}
+
+// joinCommandOutput waits for the output copy to reach end of file once the
+// group is gone, closing the pipe after bashPipeJoinDelay when a process
+// outside the group still holds it. Closing it is not an output error.
+func joinCommandOutput(copied <-chan error, pipe *os.File) error {
+	timer := time.NewTimer(bashPipeJoinDelay)
+	defer timer.Stop()
+	select {
+	case err := <-copied:
+		return err
+	case <-timer.C:
+		if err := pipe.Close(); err != nil {
+			return err
+		}
+		if err := <-copied; !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+		return nil
 	}
 }
 

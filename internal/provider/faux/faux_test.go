@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"go.harness.dev/harness/internal/engine/estimate"
 	"go.harness.dev/harness/internal/engine/types"
 )
 
@@ -205,6 +206,33 @@ func TestUsageCacheReadForSharedPromptPrefix(t *testing.T) {
 	secondMessage := assertTerminalResult(t, second, types.StopStop)
 	if secondMessage.Usage.CacheRead == 0 {
 		t.Fatalf("second cacheRead = 0, want shared prefix cache read; usage %+v", secondMessage.Usage)
+	}
+}
+
+// Each prompt token is counted once: as uncached input, or with a session
+// cache as a cache read or a cache write, the way providers report usage.
+func TestUsageCountsThePromptOnce(t *testing.T) {
+	f := New(Options{})
+	f.SetResponses(Respond(Text("one")), Respond(Text("two")), Respond(Text("three")))
+	shared := strings.Repeat("shared prompt ", 8)
+	for _, call := range []struct {
+		prompt string
+		opts   *types.StreamOptions
+	}{
+		{shared + "one", &types.StreamOptions{SessionID: "session-1"}},
+		{shared + "two", &types.StreamOptions{SessionID: "session-1"}},
+		{shared + "three", nil},
+	} {
+		streamed := f.Stream(context.Background(), f.Model(), types.Context{SystemPrompt: call.prompt}, call.opts)
+		collectEvents(streamed)
+		usage := assertTerminalResult(t, streamed, types.StopStop).Usage
+		promptTokens := estimate.EstimateTextTokens(serializeContext(types.Context{SystemPrompt: call.prompt}))
+		if prompt := usage.Input + usage.CacheRead + usage.CacheWrite; prompt != promptTokens || usage.TotalTokens != prompt+usage.Output {
+			t.Fatalf("prompt %q: usage %+v counts %d prompt tokens, want %d", call.prompt, usage, prompt, promptTokens)
+		}
+		if cached := call.opts != nil; cached != (usage.Input == 0) {
+			t.Fatalf("prompt %q: usage %+v; uncached input with a session cache = %t", call.prompt, usage, cached)
+		}
 	}
 }
 

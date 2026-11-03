@@ -339,6 +339,87 @@ func TestFramingGateAndAuth(t *testing.T) {
 	}
 }
 
+// A DNS-rebinding page reaches a tokenless loopback listener with its own
+// hostname in Host and Origin. Every authorized route refuses it before any
+// ACP method (session/new with client stdio MCP servers included) can run,
+// while a CLI client naming loopback still connects.
+func TestTokenlessLoopbackRefusesRebindingHost(t *testing.T) {
+	f := faux.New(faux.Options{})
+	s, err := New(Options{SessionDir: t.TempDir(), Cwd: t.TempDir(), Stack: &tempest.StackConfig{Model: f.Model(), StreamFn: f.StreamSimple}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+	h := httptest.NewServer(s.Handler())
+	defer h.Close()
+	if err := s.configureA2A(h.URL); err != nil {
+		t.Fatal(err)
+	}
+	bound := strings.TrimPrefix(h.URL, "http://")
+	_, port, _ := net.SplitHostPort(bound)
+	// Every name dials the real listener, as a rebound DNS answer would.
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, bound)
+	}}}
+	defer client.CloseIdleConnections()
+	dial := func(host, origin string) (*websocket.Conn, int) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		header := http.Header{}
+		if origin != "" {
+			header.Set("Origin", origin)
+		}
+		ws, response, err := websocket.Dial(ctx, "ws://"+host+"/acp", &websocket.DialOptions{HTTPClient: client, HTTPHeader: header})
+		if err != nil {
+			if response == nil {
+				t.Fatalf("dial %s: %v", host, err)
+			}
+			return nil, response.StatusCode
+		}
+		return ws, http.StatusSwitchingProtocols
+	}
+	hostile := net.JoinHostPort("rebind.attacker.example", port)
+	for _, test := range []struct{ host, origin string }{
+		{hostile, "http://" + hostile},
+		{hostile, ""},
+		{bound, "http://" + hostile},
+		{bound, "http://localhost:3000"},
+	} {
+		if ws, code := dial(test.host, test.origin); code != http.StatusForbidden {
+			if ws != nil {
+				_ = ws.CloseNow()
+			}
+			t.Errorf("/acp Host=%s Origin=%q: status %d, want 403", test.host, test.origin, code)
+		}
+	}
+	request, _ := http.NewRequest("POST", "http://"+hostile+"/a2a", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{}}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("A2A-Version", "1.0")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Errorf("/a2a rebinding Host without Origin: status %d, want 403", response.StatusCode)
+	}
+	for _, host := range []string{bound, net.JoinHostPort("localhost", port)} {
+		ws, code := dial(host, "")
+		if ws == nil {
+			t.Fatalf("CLI client Host=%s: status %d", host, code)
+		}
+		conn := rpc.NewWebSocket(ws)
+		go conn.Serve(func(context.Context, string, json.RawMessage) (any, *rpc.Error) { return nil, nil })
+		wire := &wireClient{conn: conn}
+		call(t, wire, "initialize", map[string]int{"protocolVersion": 1}, nil)
+		if newSession(t, wire, s.opts.Cwd) == "" {
+			t.Fatalf("CLI client Host=%s: no session", host)
+		}
+		_ = conn.Close()
+	}
+}
+
 func TestRegistryLeaseReaperAndConcurrentResume(t *testing.T) {
 	f := faux.New(faux.Options{})
 	s := newServer(t, f, nil, permission.ModeBypass, nil)

@@ -418,7 +418,8 @@ func TestSessionMCPSamplingAnsweredAfterToolResultIsChargedToTheRun(t *testing.T
 // the request before the sampling model is called.
 func TestSessionMCPSamplingHonorsMaxCost(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	priced := types.ModelCost{Input: 100, Output: 100}
+	// Faux reports a cached session's prompt as cache writes, not input.
+	priced := types.ModelCost{Input: 100, Output: 100, CacheWrite: 100}
 	root := faux.New(faux.Options{Models: []faux.ModelDef{{ID: "root", Input: []string{"text"}, Cost: priced, ContextWindow: 128000, MaxTokens: 50}}})
 	smol := faux.New(faux.Options{Models: []faux.ModelDef{{ID: "smol-model", Input: []string{"text"}, Cost: priced, ContextWindow: 128000, MaxTokens: 50}}})
 	server := MCPServerConfig{Name: "fixture", Transport: "stdio", Command: mcpFixtureServer, Permission: "allow", Sampling: true}

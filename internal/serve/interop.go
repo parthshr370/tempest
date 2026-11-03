@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -111,8 +112,18 @@ func (s *Server) resumeOpen(ctx context.Context, cwd, id string, servers []tempe
 	_ = s.host.CloseSession(closeCtx, session.ID())
 	return nil, tempest.ErrClosed
 }
+
+// authorize guards /acp, /a2a and /metrics. With a token, the bearer (or, for
+// queryToken routes, ?token=) must match. Without one, the request's Host
+// must name loopback or the advertised origin: a DNS-rebinding page reaches
+// the loopback port with its own hostname, which no check on Origin alone can
+// tell from the server's. With checkOrigin, a present Origin header must be
+// the advertised origin; clients that send none, such as CLIs, pass.
 func (s *Server) authorize(queryToken, checkOrigin bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		closed, origin := s.closed, s.origin
+		s.mu.Unlock()
 		if s.opts.Token != "" {
 			header := r.Header.Get("Authorization")
 			token := ""
@@ -126,10 +137,10 @@ func (s *Server) authorize(queryToken, checkOrigin bool, next http.Handler) http
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
+		} else if !trustedHost(r.Host, origin) {
+			http.Error(w, "host not allowed without a token", http.StatusForbidden)
+			return
 		}
-		s.mu.Lock()
-		closed, origin := s.closed, s.origin
-		s.mu.Unlock()
 		if closed {
 			http.Error(w, "shutting down", http.StatusServiceUnavailable)
 			return
@@ -140,6 +151,26 @@ func (s *Server) authorize(queryToken, checkOrigin bool, next http.Handler) http
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// trustedHost reports whether an unauthenticated request's Host header is one
+// the operator chose: localhost, a literal loopback address, or the host of
+// the advertised origin. Names are never resolved, since a resolver answer is
+// exactly what a rebinding attacker controls.
+func trustedHost(host, origin string) bool {
+	if _, advertised, ok := strings.Cut(origin, "://"); ok && strings.EqualFold(host, advertised) {
+		return true
+	}
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	name = strings.TrimSuffix(strings.TrimPrefix(name, "["), "]")
+	if strings.EqualFold(name, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
 }
 func (s *Server) handleA2A(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()

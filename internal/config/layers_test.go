@@ -497,6 +497,37 @@ func TestProfileSelection(t *testing.T) {
 	}
 }
 
+// A model is chosen for this command by -model, -c model=, or a profile the
+// -profile flag selects; settings, HARNESS_MODEL and a HARNESS_PROFILE
+// profile are standing defaults, which a resumed session does not follow.
+func TestModelSetForCommand(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*layerWorkspace)
+		want  bool
+	}{
+		{"settings", func(w *layerWorkspace) { w.write(w.user, `{"model":"anthropic:user"}`) }, false},
+		{"HARNESS_MODEL", func(w *layerWorkspace) { w.env["HARNESS_MODEL"] = "anthropic:env" }, false},
+		{"HARNESS_PROFILE", func(w *layerWorkspace) { w.env["HARNESS_PROFILE"] = "fast" }, false},
+		{"-profile without a model", func(w *layerWorkspace) { w.flags.Profile = StringInput{Value: "plain", Set: true} }, false},
+		{"-profile", func(w *layerWorkspace) { w.flags.Profile = StringInput{Value: "fast", Set: true} }, true},
+		{"-model", func(w *layerWorkspace) { w.flags.Model = StringInput{Value: "anthropic:flag", Set: true} }, true},
+		{"-c model=", func(w *layerWorkspace) {
+			w.flags.Overrides = StringsInput{Set: true, Values: []string{"model=anthropic:override"}}
+		}, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			w := newLayerWorkspace(t)
+			w.write(w.user, `{"profiles":{"fast":{"model":"openai:gpt-4.1"},"plain":{"enable_web":true}}}`)
+			test.setup(w)
+			if got := w.mustResolve().ModelSetForCommand(); got != test.want {
+				t.Fatalf("ModelSetForCommand = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 // A null profile definition unsets the same profile in lower files, and a
 // null profiles member unsets them all. In a repository file the unset
 // follows the trust rules: keys it could not set itself stay.

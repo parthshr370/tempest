@@ -89,6 +89,12 @@ configuration. Serve keeps its startup MCP defaults for resumes that omit endpoi
 overrides, including after idle reap or server restart. Unknown-outcome MCP calls
 are never automatically replayed.
 
+A server that quotes a credential back gets it replaced by `[redacted]` in results,
+errors, notifications and server requests before the model or journal sees them.
+This covers configured header, environment and argument values of at least eight
+characters, the OAuth client secret, and OAuth access tokens: the current one, and
+a replaced one until every call that sent it has been answered.
+
 ### OAuth for HTTP servers
 
 An HTTP server without a configured `Authorization` header that answers `401` gets
@@ -343,10 +349,23 @@ Once bound, it prints one stderr line such as
 `-listen 127.0.0.1:0` the line shows the port the OS picked.
 
 Connect to `ws://127.0.0.1:7777/acp` with `Authorization: Bearer change-me` or
-`?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. A token is required off
-loopback; when one is configured, loopback connections need it too.
-`GET /healthz` is unauthenticated and reports session and running counts.
-`GET /metrics` serves Prometheus text behind the same token; see
+`?token=change-me`. `-token` overrides `TEMPEST_TOKEN`. `/acp`, `/a2a` and
+`/metrics` follow one rule:
+
+- **With a token**, every request needs it, loopback included.
+- **Without a token**, `-listen` binds only to numeric loopback or `localhost`, and
+  the connection is not authenticated: any local process that can reach the port
+  has the full ACP surface, including `session/new` in any directory with client
+  stdio MCP commands. The request's `Host` header must be `localhost`, a literal
+  loopback address or the A2A base URL's host, so a DNS-rebinding web page, which
+  sends its own hostname, is refused with 403. Set a token whenever other users
+  share the machine.
+- **A browser `Origin` header**, when present, must equal the server's own origin
+  (the A2A base URL, or the bound `http://127.0.0.1:<port>`); any other origin gets
+  403. CLI and native clients send no `Origin` and are unaffected.
+
+`GET /healthz` and the agent card are public; `/healthz` reports session and
+running counts. `GET /metrics` serves Prometheus text; see
 [Telemetry](telemetry.md). WebSocket mode does not also serve stdio.
 
 ### A2A 1.0
@@ -357,9 +376,11 @@ discovery at `GET /.well-known/agent-card.json`. Use `A2A-Version: 1.0`,
 not accept query tokens.
 
 `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, and
-`SubscribeToTask` operate on runs in the server's fixed startup workspace. Set
-`-a2a-base-url https://agent.example` behind a proxy or for a non-loopback listener;
-numeric loopback derives the actual bound address.
+`SubscribeToTask` operate on runs in the server's fixed startup workspace. A
+`contextId` naming a session in any other workspace, such as one an ACP client
+opened elsewhere, fails with `-32603` whether that session is open or only in its
+journal. Set `-a2a-base-url https://agent.example` behind a proxy or for a
+non-loopback listener; numeric loopback derives the actual bound address.
 
 A2A 0.3 method names (`message/send`, `message/stream`, `tasks/get`, `tasks/cancel`,
 and so on) fail with `-32601` and a message naming the 1.0 method. A missing or
@@ -424,8 +445,8 @@ even if a stdio client keeps stdin open. A second signal exits with code 130;
 Initialize first, create or load a session, then prompt. A `session/prompt` response
 waits for the run to finish; `session/update` and `tempest/*` notifications carry
 progress while it runs. ACP reports `end_turn`, `cancelled`, `max_tokens` (a token
-cap) or `max_turn_requests` (any other budget); `_meta.tempest.stopReason` preserves
-the exact Tempest reason.
+cap, or a final answer cut off at `max_tokens`) or `max_turn_requests` (any other
+budget); `_meta.tempest.stopReason` preserves the exact Tempest reason.
 
 `session/new`, `session/load` and `session/resume` take an absolute `cwd` that must
 be an existing directory. Anything else fails with `-32602` before a session opens.

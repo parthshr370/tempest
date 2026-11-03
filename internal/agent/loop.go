@@ -12,7 +12,10 @@
 // Abort or context cancellation ([StopAborted]), a [Budget] limit checked at
 // turn boundaries ([StopMaxTurns], [StopMaxCost], [StopMaxWallTime] and the
 // token caps), a response whose tool calls would pass the tool-call cap
-// ([StopMaxToolCalls]), or a failure ([StopError]). A run with an output
+// ([StopMaxToolCalls]), or a failure ([StopError]). A final answer cut off at
+// the response output-token limit ends the run with [StopOutputTruncated];
+// tool calls in a cut-off response are answered with that error instead of
+// running (see executor.go). A run with an output
 // schema whose final answer still fails it after one correction turn ends
 // with [StopOutputInvalid]. A run whose model sends one tool call unchanged
 // until it has failed the same way [RepeatedFailureLimit] times in a row ends
@@ -840,12 +843,20 @@ func applyTurnUpdate(config *AgentLoopConfig, current *AgentContext, update *Age
 const maxOutputCorrections = 1
 
 // complete ends a run whose model has nothing left to do. Without an output
-// schema that is StopCompleted. With one, the final answer is validated: a
-// valid answer lands in RunResult.Output; an invalid one gets a correction
-// prompt, returned for the next turn, until the correction is spent, then the
-// run ends with StopOutputInvalid.
+// schema that is StopCompleted. A final answer cut off at the response
+// output-token limit ends the run with StopOutputTruncated: it is incomplete,
+// and no schema check or correction can restore what was not generated. With
+// a schema, the final answer is validated: a valid answer lands in
+// RunResult.Output; an invalid one gets a correction prompt, returned for the
+// next turn, until the correction is spent, then the run ends with
+// StopOutputInvalid.
 func (run *loopRun) complete() []work.QueuedMessage {
 	run.result.StopReason = StopCompleted
+	if final, ok := lastAssistantMessage(run.messages); ok && final.StopReason == types.StopLength {
+		run.result.StopReason = StopOutputTruncated
+		run.result.Err = fmt.Errorf("the final answer is cut off: %s; raise max_tokens or ask for a shorter answer", outputLimitHit(final))
+		return nil
+	}
 	schema := run.config.OutputSchema
 	if schema == nil {
 		return nil
@@ -868,20 +879,34 @@ func (run *loopRun) complete() []work.QueuedMessage {
 
 // finalAnswerText is the text of the run's last assistant message.
 func finalAnswerText(messages []types.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		message, ok := messages[i].(types.AssistantMessage)
-		if !ok {
-			continue
-		}
-		var text strings.Builder
-		for _, block := range message.Content {
-			if block.Type == types.BlockText {
-				text.WriteString(block.Text)
-			}
-		}
-		return text.String()
+	message, ok := lastAssistantMessage(messages)
+	if !ok {
+		return ""
 	}
-	return ""
+	var text strings.Builder
+	for _, block := range message.Content {
+		if block.Type == types.BlockText {
+			text.WriteString(block.Text)
+		}
+	}
+	return text.String()
+}
+
+func lastAssistantMessage(messages []types.Message) (types.AssistantMessage, bool) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if message, ok := messages[i].(types.AssistantMessage); ok {
+			return message, true
+		}
+	}
+	return types.AssistantMessage{}, false
+}
+
+// outputLimitHit describes a response that stopped at its output-token limit.
+func outputLimitHit(message types.AssistantMessage) string {
+	if message.Usage.Output > 0 {
+		return fmt.Sprintf("the response hit its output-token limit after %d tokens", message.Usage.Output)
+	}
+	return "the response hit its output-token limit"
 }
 
 // hasToolCalls reports whether the assistant message requests any tool call.

@@ -18,6 +18,9 @@ func IsDestructiveCommand(command string) bool {
 }
 
 func isDestructiveCommand(command, cwd string) bool {
+	if len(command) > maxShellCommandBytes {
+		return true
+	}
 	if mkfsCommandPattern.MatchString(command) {
 		return true
 	}
@@ -26,48 +29,37 @@ func isDestructiveCommand(command, cwd string) bool {
 			return true
 		}
 	}
-	words := shellWords(command)
-	written := make(map[string]bool)
-	var invocation []cloudcmd.Token
-	for i := 0; i < len(words); i++ {
-		token := words[i]
-		if token.Operator && strings.Contains(token.Text, ">") {
-			if i+1 >= len(words) || words[i+1].Operator {
-				return true
-			}
-			i++
-			target := words[i]
-			if strings.HasSuffix(token.Text, ">&") && (target.Text == "-" || allDigits(target.Text)) {
-				continue
-			}
-			if strings.Contains(token.Text, ">>") {
-				if !target.Dynamic {
-					written[resolveTarget(target.Text, cwd)] = true
-				}
-			} else if targetNeedsApproval(target, cwd, written) {
-				return true
-			}
-			continue
-		}
-		if token.Operator {
-			if token.Text == "<" && i+1 < len(words) {
-				i++
-				continue
-			}
-			if destructiveInvocation(invocation, cwd, written) {
-				return true
-			}
-			cwd = directoryAfter(invocation, cwd)
-			invocation = nil
-			continue
-		}
-		invocation = append(invocation, token)
-	}
-	return destructiveInvocation(invocation, cwd, written)
+	return walkShell(command, cwd, destructiveCheck)
 }
 
-func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[string]bool) bool {
+// destructiveCheck asks for a simple command or an output redirection that
+// can destroy data in the state it runs in.
+var destructiveCheck = shellCheck{
+	command: func(words []cloudcmd.Token, state shellState, written map[string]bool) bool {
+		return destructiveInvocation(words, state.cwd, written, state.workTree)
+	},
+	redirect: func(op string, target cloudcmd.Token, state shellState, written map[string]bool) bool {
+		switch {
+		case target.Text == "":
+			return true
+		case strings.HasSuffix(op, ">&") && (target.Text == "-" || allDigits(target.Text)):
+			return false
+		case strings.Contains(op, ">>"):
+			if !target.Dynamic {
+				written[resolveTarget(target.Text, state.cwd)] = true
+			}
+			return false
+		}
+		return targetNeedsApproval(target, state.cwd, written)
+	},
+}
+
+// destructiveInvocation reports whether one simple command needs approval.
+// workTree carries GIT_WORK_TREE from earlier statements and from wrappers
+// such as env, so git's operands resolve where git writes.
+func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[string]bool, workTree gitWorkTree) bool {
 	for len(words) > 0 && strings.Contains(words[0].Text, "=") {
+		workTree = workTree.assign(words[0])
 		words = words[1:]
 	}
 	if len(words) == 0 {
@@ -90,15 +82,18 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 				return true
 			}
 			if arg.Text == "-exec" || arg.Text == "-execdir" || arg.Text == "-ok" || arg.Text == "-okdir" {
-				if destructiveInvocation(args[i+1:], cwd, written) {
+				if destructiveInvocation(args[i+1:], cwd, written, workTree) {
 					return true
 				}
 			}
 		}
 	case "xargs", "env", "command", "exec":
 		for i := range args {
-			if destructiveInvocation(args[i:], cwd, written) {
+			if destructiveInvocation(args[i:], cwd, written, workTree) {
 				return true
+			}
+			if name == "env" {
+				cwd = envDirectory(args[i:], cwd)
 			}
 		}
 	case "dd":
@@ -121,7 +116,7 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 	case "cp", "mv":
 		return copyNeedsApproval(args, cwd, written)
 	case "git":
-		return destructiveGit(args)
+		return destructiveGit(args, cwd, workTree)
 	}
 	if name == "python" || name == "python3" || name == "node" || name == "perl" || name == "ruby" {
 		for i, arg := range args {
@@ -131,6 +126,18 @@ func destructiveInvocation(words []cloudcmd.Token, cwd string, written map[strin
 		}
 	}
 	return false
+}
+
+// envDirectory is the directory the command after "env -C dir" (or
+// --chdir) runs in, when words starts with that option; otherwise cwd.
+func envDirectory(words []cloudcmd.Token, cwd string) string {
+	if dir, ok := strings.CutPrefix(words[0].Text, "--chdir="); ok {
+		return gitDirectory(cloudcmd.Token{Text: dir, Dynamic: !literalWord(words[0])}, cwd)
+	}
+	if (words[0].Text == "-C" || words[0].Text == "--chdir") && len(words) > 1 {
+		return gitDirectory(words[1], cwd)
+	}
+	return cwd
 }
 
 func copyNeedsApproval(args []cloudcmd.Token, cwd string, written map[string]bool) bool {
@@ -172,44 +179,6 @@ func copyNeedsApproval(args []cloudcmd.Token, cwd string, written map[string]boo
 	return targetNeedsApproval(destination, cwd, written)
 }
 
-func destructiveGit(args []cloudcmd.Token) bool {
-	for len(args) > 0 && strings.HasPrefix(args[0].Text, "-") {
-		option := args[0].Text
-		args = args[1:]
-		if (option == "-C" || option == "-c" || option == "--git-dir" || option == "--work-tree") && len(args) > 0 {
-			args = args[1:]
-		}
-	}
-	if len(args) == 0 {
-		return false
-	}
-	subcommand := args[0].Text
-	for _, arg := range args[1:] {
-		switch subcommand {
-		case "reset":
-			if arg.Text == "--hard" || arg.Text == "--merge" || arg.Text == "--keep" {
-				return true
-			}
-		case "clean", "push", "checkout":
-			if strings.HasPrefix(arg.Text, "--force") || strings.HasPrefix(arg.Text, "-") && !strings.HasPrefix(arg.Text, "--") && strings.Contains(arg.Text, "f") || subcommand == "checkout" && arg.Text == "--" {
-				return true
-			}
-		case "branch":
-			if arg.Text == "-D" || arg.Text == "-f" || arg.Text == "--force" {
-				return true
-			}
-		case "stash":
-			if arg.Text == "drop" || arg.Text == "clear" {
-				return true
-			}
-		}
-		if subcommand == "push" && strings.HasPrefix(arg.Text, "+") {
-			return true
-		}
-	}
-	return subcommand == "restore" || subcommand == "rebase"
-}
-
 func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]bool) bool {
 	if target.Dynamic || target.Text == "" {
 		return true
@@ -218,6 +187,9 @@ func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]b
 		return false
 	}
 	path := resolveTarget(target.Text, cwd)
+	if path == unknownDirectory {
+		return true
+	}
 	if written[path] {
 		return true
 	}
@@ -229,26 +201,46 @@ func targetNeedsApproval(target cloudcmd.Token, cwd string, written map[string]b
 	return false
 }
 
+// resolveTarget is target's path from cwd. A relative target under an
+// unknown directory is unknownDirectory itself: no ".." can climb out of it.
+// A ".." is taken lexically only where it names the directory the kernel
+// reaches, so a path whose ".." leaves a symlink or a missing directory is
+// unknown too.
 func resolveTarget(target, cwd string) string {
-	if filepath.IsAbs(target) {
-		return filepath.Clean(target)
+	path := cwd
+	switch {
+	case filepath.IsAbs(target):
+		path = string(filepath.Separator)
+	case cwd == unknownDirectory:
+		return unknownDirectory
 	}
-	return filepath.Join(cwd, target)
+	for _, part := range strings.Split(target, "/") {
+		if part == ".." && !parentIsLexical(path) {
+			return unknownDirectory
+		}
+		path = filepath.Join(path, part)
+	}
+	return path
 }
 
-func directoryAfter(words []cloudcmd.Token, cwd string) string {
-	if len(words) >= 2 && words[0].Text == "cd" {
-		if words[1].Dynamic {
-			return "\x00"
-		}
-		target := resolveTarget(words[1].Text, cwd)
-		if info, err := os.Stat(target); err != nil || !info.IsDir() {
-			return "\x00"
-		}
-		return target
+// parentIsLexical reports whether path is a directory whose physical parent
+// is the directory its lexical parent names.
+func parentIsLexical(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil || !isDirectory(abs) {
+		return false
 	}
-	return cwd
+	physical, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return false
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
+	return err == nil && parent == filepath.Dir(physical)
 }
+
+// unknownDirectory stands for a directory or path the guard cannot know.
+// It is a whole value, never a path component, and every check of it asks.
+const unknownDirectory = "\x00"
 
 func allDigits(text string) bool {
 	if text == "" {

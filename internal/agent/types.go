@@ -335,6 +335,9 @@ const (
 	// StopOutputInvalid: the final answer still failed the run's output
 	// schema after the correction turn. [RunResult.Err] carries why.
 	StopOutputInvalid StopReason = "output_invalid"
+	// StopOutputTruncated: the final answer hit the response output-token
+	// limit (max_tokens) and is cut off. [RunResult.Err] says so.
+	StopOutputTruncated StopReason = "output_truncated"
 	// StopRepeatedFailure: the model sent the same tool call, with the same
 	// arguments, until it had failed with the same error RepeatedFailureLimit
 	// times in a row. [RunResult.Err] names the call and its error.
@@ -345,6 +348,18 @@ const (
 	StopLoopDetected StopReason = "loop_detected"
 )
 
+// Failed reports whether a run ended without a usable result: the run
+// failed, or its final answer is missing, invalid or cut off.
+// [RunResult.Err] says why. A budget stop is not a failure: the caller's
+// limit ended a run whose transcript is whole and can continue.
+func (r StopReason) Failed() bool {
+	switch r {
+	case StopError, StopOutputInvalid, StopOutputTruncated, StopRepeatedFailure, StopLoopDetected:
+		return true
+	}
+	return false
+}
+
 // RunResult is how one run ended. Prompt and Continue return it, and the run's
 // agent_end event carries it.
 type RunResult struct {
@@ -352,8 +367,7 @@ type RunResult struct {
 	RunID      string
 	ElapsedMS  int64
 	StopReason StopReason
-	// Err is set when StopReason is StopError, StopOutputInvalid,
-	// StopRepeatedFailure or StopLoopDetected.
+	// Err is set when StopReason.Failed() is true.
 	Err error
 	// Turns counts model calls made in this run.
 	Turns int

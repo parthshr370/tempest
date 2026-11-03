@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -192,6 +193,16 @@ func (manager *Manager) runBash(ctx context.Context, record *entry) {
 				cancel()
 			}
 		}
+	}
+	// The job is its shell. A `cmd &` child it leaves in its group would
+	// outlive the job unseen by wait and cancel, and hold its output open, so
+	// the group ends with the shell.
+	if groupErr := procgroup.Signal(cmd.Process.Pid, syscall.SIGKILL); groupErr != nil && !errors.Is(groupErr, os.ErrProcessDone) {
+		output.mu.Lock()
+		if output.err == nil {
+			output.err = fmt.Errorf("kill the job's background processes: %w", groupErr)
+		}
+		output.mu.Unlock()
 	}
 	if stdinErr := input.processExited(); stdinErr != nil {
 		output.mu.Lock()

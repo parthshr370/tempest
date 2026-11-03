@@ -60,23 +60,73 @@ Outside `bypass`, the shell guard requires approval for:
 - deleting files or directories;
 - overwriting or truncating existing files;
 - in-place edits;
-- destructive git operations: `reset --hard`, `clean -f`, `checkout -- <path>`,
-  `restore`, force push, and `branch -D`.
+- destructive git operations, the ones that discard uncommitted work, delete
+  untracked files, or drop commits, stashes, branches or remote history (see below).
 
 It catches direct removals, `find -delete` and `-exec rm`, `xargs rm`, `sed -i`,
 `perl -i`, `truncate`, `dd of=`, and `shred`. Existing protections for dangerous
 system commands, package-changing commands, and fork bombs remain.
 
+Git commands are parsed the way git reads them, after global options such as
+`-C <dir>`, `-c <name>=<value>`, `--git-dir` and `--no-pager`. These ask:
+
+| Command | Asks when |
+|---|---|
+| `checkout` | It writes paths: a pathspec (`checkout .`, `checkout <file>`, `checkout <commit> <file>`, `checkout -- <path>`, a glob), `-f`, or `-p`. An operand that exists as a path counts as a pathspec, as it does for git. `checkout <branch>` and `checkout -b <new>` do not ask. |
+| `restore` | It touches the worktree: always, unless only `--staged` is given. |
+| `rm` | Always, unless `--cached` or `-n`. |
+| `switch` | `-f`, `--force` or `--discard-changes`. |
+| `clean` | Always, unless `-n` / `--dry-run`. |
+| `reset` | `--hard`, `--merge` or `--keep`. |
+| `stash` | `drop` or `clear`. |
+| `branch` | `-D`, `-M`, `-C`, or `-f` / `--force`. |
+| `push` | A force (`-f`, `--force`, `--force-with-lease`), a delete (`-d`, `--delete`, `:<ref>`), a `+<ref>` refspec, `--mirror` or `--prune`; not with `-n`. |
+| `worktree remove` | `-f` / `--force`. |
+| `rebase` | Always. |
+
+An operand of `checkout` is checked where git reads it: from the directory after
+`-C <dir>` (and `cd`, `env -C`), and, when `--work-tree <dir>` or `GIT_WORK_TREE`
+selects another work tree, from that work tree's top as well. `GIT_WORK_TREE` counts
+whether it is set before the command (`GIT_WORK_TREE=dir git ...`, `env
+GIT_WORK_TREE=dir git ...`) or earlier in the same command line (`export
+GIT_WORK_TREE=dir; git ...`). A work tree given by an expansion (`$TREE`) is
+unknown, so every one-operand `checkout` under it asks. `--git-dir` or `GIT_DIR`
+alone makes the current directory the top of the work tree, as it does for git. A
+`GIT_WORK_TREE` already in tempest's own environment is not read.
+
+Read-only git (`status`, `log`, `diff`, `show`, `ls-files`, ...) and
+history-adding commands (`add`, `commit`, `fetch`, a plain `push`) never ask. Git
+aliases are not expanded, so an alias that discards work is not caught.
+
 What does **not** need guard approval:
 
 - Appends (`>>`, `tee -a`).
 - Writes to new redirect, `tee`, `cp`, or `mv` targets.
-- `git stash`, because it is reversible. Discarding stashes with `drop` or `clear`
-  still asks.
+- `git stash`, because it is reversible.
 
 Targets resolve relative to the command's working directory. Copying or moving into
 a directory checks the resulting destination file. If the guard cannot determine
 whether a target exists, it asks. Plan mode still rejects non-destructive writes.
+
+The working directory follows `cd` and `pushd` the way the shell scopes them, and
+`GIT_WORK_TREE` follows its `export` the same way. A change inside `( ... )`,
+`$( ... )`, a pipeline or a background `&` list does not reach the statements after
+it; one inside `{ ... }` does. When a change may or may not have happened, because
+it follows `&&` or `||` or sits in an `if` or `case` branch or a loop, each
+directory it can leave is checked and any of them can make the command ask. A `cd`
+into an existing directory is taken to succeed, so `cd sub && git checkout main`
+and `cd sub; git status` are checked in `sub` only. Here-document bodies are read
+as commands, so after one a `cd` adds a possible directory without removing the
+earlier ones.
+
+Directory tracking fails closed: the guard follows only a plain `cd`, `pushd`,
+`command cd` or `builtin cd` with no option but `-L`, one literal argument naming
+an existing directory and no redirection, and anything else that may change the
+directory (`cd -`, `cd -P`, `popd`, a wrapper such as `time`, `eval`, `source`,
+`trap`, a function, `set -P`, or `CDPATH` set) leaves it unknown. Under an unknown
+directory every relative target asks, even one that climbs out with `..`, as does a
+path whose `..` leaves a symlink, and a command over 128 KiB or past the walker's
+nesting and work limits asks outright.
 
 The guard also recognizes obvious deletion or overwrite calls in `python -c`,
 `python3 -c`, `node -e`, `perl -e`, and `ruby -e` code, including `rmtree`,

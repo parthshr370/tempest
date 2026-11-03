@@ -40,7 +40,7 @@ func TestMCPHTTPNeverReplaysAmbiguousPOST(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wire, err := dialHTTP(configs[0], Handlers{})
+	wire, err := dialHTTP(configs[0], Handlers{}, newCredentialRedactor(configs[0]))
 	if err != nil {
 		t.Fatal(err)
 	}

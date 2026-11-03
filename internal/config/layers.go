@@ -1262,6 +1262,12 @@ func (s *layeredSettings) configured(key string) bool {
 	return ok && source.Layer != LayerDefault
 }
 
+// setByLayer reports whether one of layers set key.
+func (s *layeredSettings) setByLayer(key string, layers ...string) bool {
+	source, ok := s.sources[key]
+	return ok && slices.Contains(layers, source.Layer)
+}
+
 // layerSet holds the operator's layers: files (managed defaults, then user),
 // variables, flags and -c overrides.
 type layerSet struct {

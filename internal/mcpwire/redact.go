@@ -1,20 +1,41 @@
 package mcpwire
 
 import (
+	"context"
 	"encoding/json"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"go.harness.dev/harness/internal/mcpconfig"
 	"go.harness.dev/harness/internal/rpc"
 )
 
-type credentialRedactor struct{ replacer *strings.Replacer }
+// credentialRedactor replaces one connection's credentials with [redacted]
+// in everything the server sends back: the configured headers, environment,
+// argv and OAuth client secret, and the bearer tokens Auth hands out. A token
+// is held while it is the transport's current token and while any exchange
+// that sent it is still being answered, so a rotation never unredacts an
+// answer in flight and replaced tokens do not accumulate.
+type credentialRedactor struct {
+	static []string
+	// dynamic is set when an Auth supplies tokens; only then do exchanges
+	// track what they sent.
+	dynamic  bool
+	replacer atomic.Pointer[strings.Replacer]
+	mu       sync.Mutex
+	held     map[string]int
+}
 
-func newCredentialRedactor(cfg mcpconfig.Server) credentialRedactor {
+// secretLength is the shortest value treated as a credential, so short
+// configuration values such as "1" don't mangle every response.
+const secretLength = 8
+
+func newCredentialRedactor(cfg mcpconfig.Server) *credentialRedactor {
 	values := make(map[string]bool)
 	add := func(value string) {
-		if len(value) >= 8 {
+		if len(value) >= secretLength {
 			values[value] = true
 		}
 	}
@@ -33,9 +54,26 @@ func newCredentialRedactor(cfg mcpconfig.Server) credentialRedactor {
 	if cfg.OAuth != nil {
 		add(cfg.OAuth.ClientSecret)
 	}
-	secrets := make([]string, 0, len(values))
+	r := &credentialRedactor{held: make(map[string]int)}
 	for value := range values {
-		secrets = append(secrets, value)
+		r.static = append(r.static, value)
+	}
+	r.rebuildLocked()
+	return r
+}
+
+// rebuildLocked publishes a replacer for the static and held secrets,
+// longest first so a secret containing another is replaced whole.
+func (r *credentialRedactor) rebuildLocked() {
+	secrets := append([]string(nil), r.static...)
+	for value := range r.held {
+		if !contains(r.static, value) {
+			secrets = append(secrets, value)
+		}
+	}
+	if len(secrets) == 0 {
+		r.replacer.Store(nil)
+		return
 	}
 	sort.Slice(secrets, func(i, j int) bool {
 		if len(secrets[i]) != len(secrets[j]) {
@@ -47,23 +85,115 @@ func newCredentialRedactor(cfg mcpconfig.Server) credentialRedactor {
 	for _, secret := range secrets {
 		pairs = append(pairs, secret, "[redacted]")
 	}
-	if len(pairs) == 0 {
-		return credentialRedactor{}
-	}
-	return credentialRedactor{strings.NewReplacer(pairs...)}
+	r.replacer.Store(strings.NewReplacer(pairs...))
 }
 
-func (r credentialRedactor) text(value string) string {
-	if r.replacer == nil {
+func contains(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+// hold keeps token redacted until release. Holds of one token nest.
+func (r *credentialRedactor) hold(token string) (release func()) {
+	if len(token) < secretLength {
+		return func() {}
+	}
+	r.mu.Lock()
+	r.held[token]++
+	if r.held[token] == 1 {
+		r.rebuildLocked()
+	}
+	r.mu.Unlock()
+	return sync.OnceFunc(func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.held[token]--; r.held[token] == 0 {
+			delete(r.held, token)
+			r.rebuildLocked()
+		}
+	})
+}
+
+type exchangeKey struct{}
+
+// exchange is one logical request and everything its answer carries: the
+// response, an error, and server messages on its stream. It holds each
+// token it sent until the last of those has been scrubbed.
+type exchange struct {
+	mu       sync.Mutex
+	refs     int
+	releases []func()
+}
+
+// track starts an exchange on ctx. The caller scrubs the outcome, then
+// calls end.
+func (r *credentialRedactor) track(ctx context.Context) (_ context.Context, end func()) {
+	if !r.dynamic {
+		return ctx, func() {}
+	}
+	e := &exchange{refs: 1}
+	return context.WithValue(ctx, exchangeKey{}, e), sync.OnceFunc(e.leave)
+}
+
+// sent records that a request on ctx carried token.
+func (r *credentialRedactor) sent(ctx context.Context, token string) {
+	e, _ := ctx.Value(exchangeKey{}).(*exchange)
+	if e == nil {
+		return
+	}
+	release := r.hold(token)
+	e.mu.Lock()
+	if e.refs == 0 {
+		e.mu.Unlock()
+		release()
+		return
+	}
+	e.releases = append(e.releases, release)
+	e.mu.Unlock()
+}
+
+// join extends the exchange on ctx, if any, while a server message it
+// carried is handled.
+func join(ctx context.Context) (leave func()) {
+	e, _ := ctx.Value(exchangeKey{}).(*exchange)
+	if e == nil {
+		return func() {}
+	}
+	e.mu.Lock()
+	e.refs++
+	e.mu.Unlock()
+	return sync.OnceFunc(e.leave)
+}
+
+func (e *exchange) leave() {
+	e.mu.Lock()
+	e.refs--
+	var releases []func()
+	if e.refs == 0 {
+		releases, e.releases = e.releases, nil
+	}
+	e.mu.Unlock()
+	for _, release := range releases {
+		release()
+	}
+}
+
+func (r *credentialRedactor) text(value string) string {
+	replacer := r.replacer.Load()
+	if replacer == nil {
 		return value
 	}
-	return r.replacer.Replace(value)
+	return replacer.Replace(value)
 }
 
 // json scrubs decoded strings, including escaped credentials, without changing
 // number precision or copying a response that needs no replacements.
-func (r credentialRedactor) json(raw json.RawMessage) json.RawMessage {
-	if r.replacer == nil {
+func (r *credentialRedactor) json(raw json.RawMessage) json.RawMessage {
+	if r.replacer.Load() == nil {
 		return raw
 	}
 	var out []byte
@@ -108,11 +238,11 @@ type redactedError struct {
 func (e redactedError) Error() string { return e.message }
 func (e redactedError) Unwrap() error { return e.error }
 
-func (r credentialRedactor) err(err error) error {
+func (r *credentialRedactor) err(err error) error {
 	if err == nil {
 		return nil
 	}
-	if remote, ok := err.(*rpc.Error); ok && r.replacer != nil {
+	if remote, ok := err.(*rpc.Error); ok && r.replacer.Load() != nil {
 		safe := *remote
 		safe.Message = r.text(safe.Message)
 		safe.Data = r.value(safe.Data)
@@ -124,7 +254,7 @@ func (r credentialRedactor) err(err error) error {
 	return err
 }
 
-func (r credentialRedactor) value(value any) any {
+func (r *credentialRedactor) value(value any) any {
 	switch value := value.(type) {
 	case string:
 		return r.text(value)
