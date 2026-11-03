@@ -42,6 +42,31 @@ func TestCredentialRedactor(t *testing.T) {
 	}
 }
 
+// An Auth token stays redacted while it is current or an exchange that sent
+// it is still being answered, and is dropped after, so rotation does not
+// grow the set.
+func TestAuthTokenHoldLifetime(t *testing.T) {
+	const one, two = "oauth-token-one-abcdef", "oauth-token-two-abcdef"
+	redactor := newCredentialRedactor(mcpconfig.Server{Headers: map[string]string{"X-Private": "static-secret"}})
+	redactor.dynamic = true
+	wire := &httpTransport{redactor: redactor}
+	ctx, end := redactor.track(context.Background())
+	wire.sendToken(ctx, one)
+	leave := join(ctx)
+	wire.sendToken(context.Background(), two)
+	end()
+	if got := redactor.text(one + " " + two); got != "[redacted] [redacted]" {
+		t.Fatalf("held by a server message of its exchange: %q", got)
+	}
+	leave()
+	if got := redactor.text(one + " " + two + " static-secret"); got != one+" [redacted] [redacted]" {
+		t.Fatalf("after its exchange ended: %q", got)
+	}
+	if len(redactor.held) != 1 {
+		t.Fatalf("held tokens = %v, want only the current one", redactor.held)
+	}
+}
+
 func TestConfiguredHeaderIsRedactedFromSuccessfulToolResults(t *testing.T) {
 	const secret = "qa-private-header-success-483921"
 	peer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

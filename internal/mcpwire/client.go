@@ -71,7 +71,7 @@ type Client struct {
 	callTimeout time.Duration
 	mu          sync.Mutex
 	closed      bool
-	redactor    credentialRedactor
+	redactor    *credentialRedactor
 }
 
 // Version returns the negotiated protocol revision.
@@ -90,7 +90,9 @@ func (c *Client) Alive() bool {
 // Dial starts the transport and completes initialize/initialized without guessing revisions.
 func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers) (_ *Client, err error) {
 	redactor := newCredentialRedactor(cfg)
-	defer func() { err = redactor.err(err) }()
+	redactor.dynamic = handlers.Auth != nil
+	ctx, end := redactor.track(ctx)
+	defer func() { err = redactor.err(err); end() }()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -135,7 +137,7 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 	if cfg.Transport == "stdio" {
 		wire, err = dialStdio(startupCtx, cfg, cwd, handlers, redactor)
 	} else {
-		wire, err = dialHTTP(cfg, handlers)
+		wire, err = dialHTTP(cfg, handlers, redactor)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("mcp_startup: server %s transport: %w", cfg.Name, err)
@@ -233,9 +235,11 @@ func Dial(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handle
 
 // Call sends one request. Cancellation never replays it and retires uncertain tool calls.
 func (c *Client) Call(ctx context.Context, method string, params any) (raw json.RawMessage, err error) {
+	ctx, end := c.redactor.track(ctx)
 	defer func() {
 		raw = c.redactor.json(raw)
 		err = c.redactor.err(err)
+		end()
 	}()
 	callCtx, cancel := context.WithTimeout(ctx, c.callTimeout)
 	defer cancel()

@@ -134,7 +134,12 @@ Caller cancellation, ordinary RPC errors, and oversized outgoing requests fail
 only their call. A hard process timeout, malformed result, or disconnect makes
 the generation unavailable to new required selections. Retirement drains, then
 terminates and kills an unresponsive process group within a bounded close.
-A disconnect is not proof an outside effect stopped.
+Whenever the root process exits, on shutdown or on its own, Tempest kills the rest
+of its process group, including children that ignore SIGTERM or closed their
+streams. A child still holding the root's stderr delays that kill, and the
+release of the process slot, by at most one second. A child that left the group
+(`setsid`) is outside this cleanup. A disconnect is not proof an outside effect
+stopped.
 
 The repository includes equivalent Go, Python standard-library, and JavaScript
 fixtures in `tempest/extension/testdata`.

@@ -70,10 +70,10 @@ type stdioTransport struct {
 	closeErr  error
 	faultMu   sync.Mutex
 	fault     error
-	redactor  credentialRedactor
+	redactor  *credentialRedactor
 }
 
-func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers, redactor credentialRedactor) (*stdioTransport, error) {
+func dialStdio(ctx context.Context, cfg mcpconfig.Server, cwd string, handlers Handlers, redactor *credentialRedactor) (*stdioTransport, error) {
 	command := exec.Command(cfg.Command, cfg.Args...)
 	command.Dir = cwd
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

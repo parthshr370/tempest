@@ -37,6 +37,7 @@ type httpTransport struct {
 	client    *http.Client
 	proxy     func(*http.Request) (*url.URL, error) // hides the server's address when it answers
 	handlers  Handlers
+	redactor  *credentialRedactor
 	ctx       context.Context
 	cancel    context.CancelFunc
 	mu        sync.Mutex
@@ -47,16 +48,37 @@ type httpTransport struct {
 	workers   sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
+	// token is the bearer Auth last handed out; releaseToken ends its
+	// redaction hold once another replaces it.
+	token        string
+	releaseToken func()
 }
 
-func dialHTTP(cfg mcpconfig.Server, handlers Handlers) (*httpTransport, error) {
+func dialHTTP(cfg mcpconfig.Server, handlers Handlers, redactor *credentialRedactor) (*httpTransport, error) {
 	startup, _ := time.ParseDuration(cfg.StartupTimeout)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = startup
 	transport.DialContext = (&net.Dialer{Timeout: startup, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = startup
 	ctx, cancel := context.WithCancel(context.Background())
-	return &httpTransport{cfg: cfg, handlers: handlers, ctx: ctx, cancel: cancel, proxy: transport.Proxy, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("mcp_protocol: redirects are forbidden") }}}, nil
+	return &httpTransport{cfg: cfg, handlers: handlers, redactor: redactor, ctx: ctx, cancel: cancel, proxy: transport.Proxy, client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("mcp_protocol: redirects are forbidden") }}}, nil
+}
+
+// sendToken keeps an Auth token redacted while it is current and while the
+// exchange on ctx that sends it is answered.
+func (h *httpTransport) sendToken(ctx context.Context, token string) {
+	h.redactor.sent(ctx, token)
+	h.mu.Lock()
+	if token == h.token {
+		h.mu.Unlock()
+		return
+	}
+	previous := h.releaseToken
+	h.token, h.releaseToken = token, h.redactor.hold(token)
+	h.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
 }
 func (h *httpTransport) setVersion(version string) { h.mu.Lock(); h.version = version; h.mu.Unlock() }
 func (h *httpTransport) alive() bool {
@@ -104,6 +126,7 @@ func (h *httpTransport) request(ctx context.Context, method string, body []byte,
 				return nil, &AuthError{Err: err}
 			}
 			if token != "" {
+				h.sendToken(ctx, token)
 				req.Header.Set("Authorization", "Bearer "+token)
 			}
 		}
@@ -243,8 +266,12 @@ func (h *httpTransport) serverMessage(ctx context.Context, message httpMessage) 
 	}
 	h.workers.Add(1)
 	h.mu.Unlock()
+	// The message may quote a token its stream's request sent, so that
+	// exchange stays held until the message has been handled.
+	leave := join(ctx)
 	go func() {
 		defer h.workers.Done()
+		defer leave()
 		if len(message.ID) == 0 {
 			if h.handlers.Notify != nil {
 				h.handlers.Notify(message.Method, message.Params)
@@ -503,8 +530,12 @@ func (h *httpTransport) listen() {
 	cursor := ""
 	retry := defaultSSERetry
 	for h.ctx.Err() == nil {
-		response, err := h.request(h.ctx, http.MethodGet, nil, false, cursor, false)
+		// Messages on this stream may quote the token that opened it, so the
+		// stream is one exchange until its body closes.
+		stream, end := h.redactor.track(h.ctx)
+		response, err := h.request(stream, http.MethodGet, nil, false, cursor, false)
 		if err != nil {
+			end()
 			if h.ctx.Err() != nil || !h.alive() {
 				return
 			}
@@ -540,6 +571,7 @@ func (h *httpTransport) listen() {
 		}
 		if response.StatusCode == http.StatusMethodNotAllowed {
 			response.Body.Close()
+			end()
 			if cursor != "" {
 				_ = h.serverMessage(h.ctx, httpMessage{JSONRPC: "2.0", Method: "notifications/tools/list_changed", Params: json.RawMessage(`{}`)})
 			}
@@ -547,6 +579,7 @@ func (h *httpTransport) listen() {
 		}
 		if response.StatusCode != http.StatusOK || responseType(response) != "text/event-stream" {
 			response.Body.Close()
+			end()
 			if cursor != "" {
 				cursor = ""
 				_ = h.serverMessage(h.ctx, httpMessage{JSONRPC: "2.0", Method: "notifications/tools/list_changed", Params: json.RawMessage(`{}`)})
@@ -579,12 +612,13 @@ func (h *httpTransport) listen() {
 				err = decodeErr
 				break
 			}
-			if dispatchErr := h.serverMessage(h.ctx, message); dispatchErr != nil {
+			if dispatchErr := h.serverMessage(stream, message); dispatchErr != nil {
 				err = dispatchErr
 				break
 			}
 		}
 		response.Body.Close()
+		end()
 		if h.ctx.Err() != nil {
 			return
 		}
